@@ -1,0 +1,11 @@
+[package]
+name = "voxelot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+croaring = "2"
+fxhash = "0.2"
+
+[dev-dependencies]
+anyhow = "1"
