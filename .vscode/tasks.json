@@ -49,6 +49,18 @@
 				"$rustc"
 			],
 			"group": "build"
+		},
+		{
+			"label": "cargo build (voxelot)",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"build"
+			],
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
 		}
 	]
 }

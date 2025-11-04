@@ -7,5 +7,13 @@ edition = "2021"
 croaring = "2"
 fxhash = "0.2"
 
+# wgpu-based viewer (desktop)
+wgpu = "27.0.1"
+winit = "0.30.12"
+pollster = "0.4.0"
+bytemuck = "1.13"
+env_logger = "0.11.8"
+
 [dev-dependencies]
 anyhow = "1"
+
