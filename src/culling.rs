@@ -315,23 +315,21 @@ fn collect_voxels_recursive(
     result: &mut Vec<VoxelInstance>,
 ) {
     for ((lx, ly, lz), voxel) in chunk.iter() {
-        // Calculate world position  
         let world_x = chunk_offset[0] + lx as i64 * scale;
         let world_y = chunk_offset[1] + ly as i64 * scale;
         let world_z = chunk_offset[2] + lz as i64 * scale;
         
-        let voxel_center = [
-            world_x as f32 + (scale as f32 / 2.0),
-            world_y as f32 + (scale as f32 / 2.0),
-            world_z as f32 + (scale as f32 / 2.0),
-        ];
-        
-        let distance = camera.distance_to(voxel_center);
-        
         match voxel {
             Voxel::Solid(voxel_type) => {
-                // Render solid voxel if visible
+                // For solid voxels, just add them directly (most common case)
+                let voxel_center = [
+                    world_x as f32 + (scale as f32 / 2.0),
+                    world_y as f32 + (scale as f32 / 2.0),
+                    world_z as f32 + (scale as f32 / 2.0),
+                ];
+                
                 if camera.is_in_front(voxel_center) {
+                    let distance = camera.distance_to(voxel_center);
                     result.push(VoxelInstance {
                         position: [world_x, world_y, world_z],
                         voxel_type: *voxel_type,
@@ -340,18 +338,24 @@ fn collect_voxels_recursive(
                 }
             }
             Voxel::Chunk(sub_chunk) => {
-                // LOD decision: should we descend or render as single voxel?
+                // For sub-chunks, check distance and decide whether to recurse
+                let voxel_center = [
+                    world_x as f32 + (scale as f32 / 2.0),
+                    world_y as f32 + (scale as f32 / 2.0),
+                    world_z as f32 + (scale as f32 / 2.0),
+                ];
+                
+                let distance = camera.distance_to(voxel_center);
+                
                 if distance < LOD_SUBDIVIDE_DISTANCE {
-                    // Close enough - recurse into sub-chunk
+                    // Recurse into sub-chunk
                     collect_voxels_recursive(
                         sub_chunk,
                         [world_x, world_y, world_z],
-                        scale,  // Same scale for now (flat hierarchy)
+                        scale,
                         camera,
                         result,
                     );
-                } else {
-                    // Too far - could render as single voxel, but for now skip
                 }
             }
         }
@@ -362,68 +366,74 @@ fn collect_voxels_recursive(
 pub fn cull_visible_voxels(world: &World, camera: &Camera) -> Vec<VoxelInstance> {
     let mut instances = Vec::new();
     
-    // Determine which chunks might be visible
-    let cam_chunk_x = (camera.position[0] / 16.0).floor() as i64;
-    let cam_chunk_y = (camera.position[1] / 16.0).floor() as i64;
-    let cam_chunk_z = (camera.position[2] / 16.0).floor() as i64;
+    // Far plane radius squared
+    let far_sq = camera.far * camera.far;
     
-    // Search radius in chunks
-    let radius = (camera.far / 16.0).ceil() as i64 + 1;
-    
-    for cx in (cam_chunk_x - radius)..=(cam_chunk_x + radius) {
-        for cy in (cam_chunk_y - radius)..=(cam_chunk_y + radius) {
-            for cz in (cam_chunk_z - radius)..=(cam_chunk_z + radius) {
-                if let Some(chunk) = world.get_chunk((cx, cy, cz)) {
-                    // Get chunk bounding box
-                    let min = [
-                        (cx * 16) as f32,
-                        (cy * 16) as f32,
-                        (cz * 16) as f32,
-                    ];
-                    let max = [
-                        min[0] + 16.0,
-                        min[1] + 16.0,
-                        min[2] + 16.0,
-                    ];
-                    
-                    // Frustum cull the chunk
-                    let passes_frustum = camera.frustum_cull_aabb(min, max);
-                    
-                    if !passes_frustum {
-                        continue;
-                    }
-                    
-                    // Fast marginal test: is camera position inside chunk influence?
-                    // This works for hierarchical chunks because sub-chunk projection bits
-                    // are propagated up the hierarchy during subdivision
-                    let local_cam_x = camera.position[0] - (cx * 16) as f32;
-                    let local_cam_y = camera.position[1] - (cy * 16) as f32;
-                    let local_cam_z = camera.position[2] - (cz * 16) as f32;
-                    
-                    // Check if any voxel exists on the camera's projected axes
-                    let cam_x_bit = local_cam_x.clamp(0.0, 15.0) as u8;
-                    let cam_y_bit = local_cam_y.clamp(0.0, 15.0) as u8;
-                    let cam_z_bit = local_cam_z.clamp(0.0, 15.0) as u8;
-                    
-                    // Marginal culling: if no voxels on camera's ray, skip
-                    if (chunk.px & (1 << cam_x_bit)) == 0 &&
-                       (chunk.py & (1 << cam_y_bit)) == 0 &&
-                       (chunk.pz & (1 << cam_z_bit)) == 0 {
-                        // No voxels near camera ray - skip entire chunk
-                        continue;
-                    }
-                    
-                    // Use recursive culling to handle hierarchical chunks
-                    collect_voxels_recursive(
-                        chunk,
-                        [cx * 16, cy * 16, cz * 16],
-                        1,  // Root level scale = 1
-                        camera,
-                        &mut instances,
-                    );
-                }
-            }
+    // Iterate existing chunks and filter by distance
+    for ((cx, cy, cz), chunk) in world.chunks() {
+        // Check if chunk is within far plane distance
+        let chunk_center = [
+            (cx * 16) as f32 + 8.0,
+            (cy * 16) as f32 + 8.0,
+            (cz * 16) as f32 + 8.0,
+        ];
+        let dx = chunk_center[0] - camera.position[0];
+        let dy = chunk_center[1] - camera.position[1];
+        let dz = chunk_center[2] - camera.position[2];
+        let dist_sq = dx*dx + dy*dy + dz*dz;
+        
+        // Skip chunks beyond far plane (with some margin for chunk size)
+        if dist_sq > far_sq + 16.0*16.0*3.0 {
+            continue;
         }
+        
+        // Get chunk bounding box
+        let min = [
+            (cx * 16) as f32,
+            (cy * 16) as f32,
+            (cz * 16) as f32,
+        ];
+        let max = [
+            min[0] + 16.0,
+            min[1] + 16.0,
+            min[2] + 16.0,
+        ];
+        
+        // Frustum cull the chunk
+        let passes_frustum = camera.frustum_cull_aabb(min, max);
+        
+        if !passes_frustum {
+            continue;
+        }
+        
+        // Fast marginal test: is camera position inside chunk influence?
+        // This works for hierarchical chunks because sub-chunk projection bits
+        // are propagated up the hierarchy during subdivision
+        let local_cam_x = camera.position[0] - (cx * 16) as f32;
+        let local_cam_y = camera.position[1] - (cy * 16) as f32;
+        let local_cam_z = camera.position[2] - (cz * 16) as f32;
+        
+        // Check if any voxel exists on the camera's projected axes
+        let cam_x_bit = local_cam_x.clamp(0.0, 15.0) as u8;
+        let cam_y_bit = local_cam_y.clamp(0.0, 15.0) as u8;
+        let cam_z_bit = local_cam_z.clamp(0.0, 15.0) as u8;
+        
+        // Marginal culling: if no voxels on camera's ray, skip
+        if (chunk.px & (1 << cam_x_bit)) == 0 &&
+           (chunk.py & (1 << cam_y_bit)) == 0 &&
+           (chunk.pz & (1 << cam_z_bit)) == 0 {
+            // No voxels near camera ray - skip entire chunk
+            continue;
+        }
+        
+        // Use recursive culling to handle hierarchical chunks
+        collect_voxels_recursive(
+            chunk,
+            [cx * 16, cy * 16, cz * 16],
+            1,  // Root level scale = 1
+            camera,
+            &mut instances,
+        );
     }
     
     instances
@@ -434,54 +444,54 @@ pub fn cull_visible_voxels(world: &World, camera: &Camera) -> Vec<VoxelInstance>
 pub fn cull_visible_voxels_with_occlusion(world: &World, camera: &Camera) -> Vec<VoxelInstance> {
     let mut instances = Vec::new();
     
-    // Determine which chunks might be visible
-    let cam_chunk_x = (camera.position[0] / 16.0).floor() as i64;
-    let cam_chunk_y = (camera.position[1] / 16.0).floor() as i64;
-    let cam_chunk_z = (camera.position[2] / 16.0).floor() as i64;
-    
-    // Search radius in chunks
-    let radius = (camera.far / 16.0).ceil() as i64 + 1;
+    // Far plane radius squared
+    let far_sq = camera.far * camera.far;
     
     // Collect all potentially visible chunks with their distances
     let mut chunks_to_process = Vec::new();
     
-    for cx in (cam_chunk_x - radius)..=(cam_chunk_x + radius) {
-        for cy in (cam_chunk_y - radius)..=(cam_chunk_y + radius) {
-            for cz in (cam_chunk_z - radius)..=(cam_chunk_z + radius) {
-                if let Some(chunk) = world.get_chunk((cx, cy, cz)) {
-                    // Quick rejection: check if chunk is empty
-                    if chunk.is_empty() {
-                        continue;
-                    }
-                    
-                    // Get chunk bounding box
-                    let min = [
-                        (cx * 16) as f32,
-                        (cy * 16) as f32,
-                        (cz * 16) as f32,
-                    ];
-                    let max = [
-                        min[0] + 16.0,
-                        min[1] + 16.0,
-                        min[2] + 16.0,
-                    ];
-                    
-                    // Frustum cull the chunk
-                    if !camera.frustum_cull_aabb(min, max) {
-                        continue;
-                    }
-                    
-                    let center = [
-                        (cx * 16 + 8) as f32,
-                        (cy * 16 + 8) as f32,
-                        (cz * 16 + 8) as f32,
-                    ];
-                    let distance = camera.distance_to(center);
-                    
-                    chunks_to_process.push(((cx, cy, cz), chunk, distance));
-                }
-            }
+    for ((cx, cy, cz), chunk) in world.chunks() {
+        // Quick rejection: check if chunk is empty
+        if chunk.is_empty() {
+            continue;
         }
+        
+        // Check if chunk is within far plane distance
+        let chunk_center = [
+            (cx * 16) as f32 + 8.0,
+            (cy * 16) as f32 + 8.0,
+            (cz * 16) as f32 + 8.0,
+        ];
+        let dx = chunk_center[0] - camera.position[0];
+        let dy = chunk_center[1] - camera.position[1];
+        let dz = chunk_center[2] - camera.position[2];
+        let dist_sq = dx*dx + dy*dy + dz*dz;
+        
+        // Skip chunks beyond far plane (with some margin for chunk size)
+        if dist_sq > far_sq + 16.0*16.0*3.0 {
+            continue;
+        }
+        
+        // Get chunk bounding box
+        let min = [
+            (cx * 16) as f32,
+            (cy * 16) as f32,
+            (cz * 16) as f32,
+        ];
+        let max = [
+            min[0] + 16.0,
+            min[1] + 16.0,
+            min[2] + 16.0,
+        ];
+        
+        // Frustum cull the chunk
+        if !camera.frustum_cull_aabb(min, max) {
+            continue;
+        }
+        
+        let distance = dist_sq.sqrt();
+        
+        chunks_to_process.push(((cx, cy, cz), chunk, distance));
     }
     
     // Sort chunks front-to-back for occlusion
@@ -510,48 +520,53 @@ pub fn cull_visible_voxels_with_occlusion(world: &World, camera: &Camera) -> Vec
 pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> Vec<VoxelInstance> {
     use rayon::prelude::*;
     
-    // Determine which chunks might be visible
-    let cam_chunk_x = (camera.position[0] / 16.0).floor() as i64;
-    let cam_chunk_y = (camera.position[1] / 16.0).floor() as i64;
-    let cam_chunk_z = (camera.position[2] / 16.0).floor() as i64;
-    
-    // Search radius in chunks
-    let radius = (camera.far / 16.0).ceil() as i64 + 1;
+    // Far plane radius squared
+    let far_sq = camera.far * camera.far;
     
     // Collect all potentially visible chunks with their positions
-    let mut chunks_to_process = Vec::new();
-    
-    for cx in (cam_chunk_x - radius)..=(cam_chunk_x + radius) {
-        for cy in (cam_chunk_y - radius)..=(cam_chunk_y + radius) {
-            for cz in (cam_chunk_z - radius)..=(cam_chunk_z + radius) {
-                if let Some(chunk) = world.get_chunk((cx, cy, cz)) {
-                    // Quick rejection: check if chunk is empty
-                    if chunk.is_empty() {
-                        continue;
-                    }
-                    
-                    // Get chunk bounding box
-                    let min = [
-                        (cx * 16) as f32,
-                        (cy * 16) as f32,
-                        (cz * 16) as f32,
-                    ];
-                    let max = [
-                        min[0] + 16.0,
-                        min[1] + 16.0,
-                        min[2] + 16.0,
-                    ];
-                    
-                    // Frustum cull the chunk
-                    if !camera.frustum_cull_aabb(min, max) {
-                        continue;
-                    }
-                    
-                    chunks_to_process.push(((cx, cy, cz), chunk));
-                }
+    let chunks_to_process: Vec<_> = world.chunks()
+        .filter_map(|((cx, cy, cz), chunk)| {
+            // Quick rejection: check if chunk is empty
+            if chunk.is_empty() {
+                return None;
             }
-        }
-    }
+            
+            // Check if chunk is within far plane distance
+            let chunk_center = [
+                (cx * 16) as f32 + 8.0,
+                (cy * 16) as f32 + 8.0,
+                (cz * 16) as f32 + 8.0,
+            ];
+            let dx = chunk_center[0] - camera.position[0];
+            let dy = chunk_center[1] - camera.position[1];
+            let dz = chunk_center[2] - camera.position[2];
+            let dist_sq = dx*dx + dy*dy + dz*dz;
+            
+            // Skip chunks beyond far plane (with some margin for chunk size)
+            if dist_sq > far_sq + 16.0*16.0*3.0 {
+                return None;
+            }
+            
+            // Get chunk bounding box
+            let min = [
+                (cx * 16) as f32,
+                (cy * 16) as f32,
+                (cz * 16) as f32,
+            ];
+            let max = [
+                min[0] + 16.0,
+                min[1] + 16.0,
+                min[2] + 16.0,
+            ];
+            
+            // Frustum cull the chunk
+            if !camera.frustum_cull_aabb(min, max) {
+                return None;
+            }
+            
+            Some(((cx, cy, cz), chunk))
+        })
+        .collect();
     
     // Process chunks in parallel
     let visible_voxels: Vec<Vec<VoxelInstance>> = chunks_to_process
@@ -578,41 +593,50 @@ pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> Vec<Voxel
 
 /// Get chunk render info with LOD levels
 pub fn get_visible_chunks(world: &World, camera: &Camera) -> Vec<ChunkRenderInfo> {
-    let mut chunk_infos = Vec::new();
+    let far_sq = camera.far * camera.far;
     
-    let cam_chunk_x = (camera.position[0] / 16.0).floor() as i64;
-    let cam_chunk_y = (camera.position[1] / 16.0).floor() as i64;
-    let cam_chunk_z = (camera.position[2] / 16.0).floor() as i64;
-    
-    let radius = (camera.far / 16.0).ceil() as i64 + 1;
-    
-    for cx in (cam_chunk_x - radius)..=(cam_chunk_x + radius) {
-        for cy in (cam_chunk_y - radius)..=(cam_chunk_y + radius) {
-            for cz in (cam_chunk_z - radius)..=(cam_chunk_z + radius) {
-                if world.get_chunk((cx, cy, cz)).is_some() {
-                    let min = [
-                        (cx * 16) as f32,
-                        (cy * 16) as f32,
-                        (cz * 16) as f32,
-                    ];
-                    let max = [
-                        min[0] + 16.0,
-                        min[1] + 16.0,
-                        min[2] + 16.0,
-                    ];
-                    
-                    if camera.frustum_cull_aabb(min, max) {
-                        chunk_infos.push(ChunkRenderInfo::new((cx, cy, cz), camera.position));
-                    }
-                }
+    let chunk_infos: Vec<_> = world.chunks()
+        .filter_map(|((cx, cy, cz), _chunk)| {
+            // Check if chunk is within far plane distance
+            let chunk_center = [
+                (cx * 16) as f32 + 8.0,
+                (cy * 16) as f32 + 8.0,
+                (cz * 16) as f32 + 8.0,
+            ];
+            let dx = chunk_center[0] - camera.position[0];
+            let dy = chunk_center[1] - camera.position[1];
+            let dz = chunk_center[2] - camera.position[2];
+            let dist_sq = dx*dx + dy*dy + dz*dz;
+            
+            // Skip chunks beyond far plane (with some margin for chunk size)
+            if dist_sq > far_sq + 16.0*16.0*3.0 {
+                return None;
             }
-        }
-    }
+            
+            let min = [
+                (cx * 16) as f32,
+                (cy * 16) as f32,
+                (cz * 16) as f32,
+            ];
+            let max = [
+                min[0] + 16.0,
+                min[1] + 16.0,
+                min[2] + 16.0,
+            ];
+            
+            if camera.frustum_cull_aabb(min, max) {
+                Some(ChunkRenderInfo::new((cx, cy, cz), camera.position))
+            } else {
+                None
+            }
+        })
+        .collect();
     
     // Sort by distance for efficient rendering
-    chunk_infos.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal));
+    let mut sorted_infos = chunk_infos;
+    sorted_infos.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal));
     
-    chunk_infos
+    sorted_infos
 }
 
 // Vector math helpers
