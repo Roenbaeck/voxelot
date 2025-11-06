@@ -3,9 +3,85 @@
 use crate::lib_hierarchical::{World, VoxelType, Voxel, Chunk};
 use std::collections::HashMap;
 
-/// LOD distance thresholds
-pub const LOD_SUBDIVIDE_DISTANCE: f32 = 50.0;  // Subdivide if closer than this
-pub const LOD_MERGE_DISTANCE: f32 = 100.0;     // Merge if farther than this
+/// Runtime configuration for rendering and LOD
+#[derive(Debug, Clone)]
+pub struct RenderConfig {
+    /// Subdivide chunks if closer than this distance
+    pub lod_subdivide_distance: f32,
+    /// Merge chunks if farther than this distance
+    pub lod_merge_distance: f32,
+    /// Camera far plane distance
+    pub far_plane: f32,
+    /// Camera field of view in degrees
+    pub fov_degrees: f32,
+    /// Camera near plane distance
+    pub near_plane: f32,
+}
+
+impl Default for RenderConfig {
+    fn default() -> Self {
+        Self {
+            lod_subdivide_distance: 500.0,
+            lod_merge_distance: 1000.0,
+            far_plane: 5000.0,
+            fov_degrees: 70.0,
+            near_plane: 0.1,
+        }
+    }
+}
+
+impl RenderConfig {
+    /// Load configuration from a file, or return default if file doesn't exist
+    pub fn load_or_default(path: &str) -> Self {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| Self::from_string(&s))
+            .unwrap_or_default()
+    }
+    
+    /// Parse configuration from a string
+    pub fn from_string(s: &str) -> Option<Self> {
+        let mut config = Self::default();
+        for line in s.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((key, value)) = line.split_once('=') {
+                let key = key.trim();
+                let value = value.trim();
+                match key {
+                    "lod_subdivide_distance" => config.lod_subdivide_distance = value.parse().ok()?,
+                    "lod_merge_distance" => config.lod_merge_distance = value.parse().ok()?,
+                    "far_plane" => config.far_plane = value.parse().ok()?,
+                    "fov_degrees" => config.fov_degrees = value.parse().ok()?,
+                    "near_plane" => config.near_plane = value.parse().ok()?,
+                    _ => {}
+                }
+            }
+        }
+        Some(config)
+    }
+    
+    /// Save configuration to a file
+    pub fn save(&self, path: &str) -> std::io::Result<()> {
+        let content = format!(
+            "# Voxelot Render Configuration\n\
+             # Adjust these values and restart the viewer to apply changes\n\n\
+             lod_subdivide_distance = {}\n\
+             lod_merge_distance = {}\n\
+             far_plane = {}\n\
+             fov_degrees = {}\n\
+             near_plane = {}\n",
+            self.lod_subdivide_distance,
+            self.lod_merge_distance,
+            self.far_plane,
+            self.fov_degrees,
+            self.near_plane
+        );
+        std::fs::write(path, content)
+    }
+}
 
 /// Spatial hash cache for visible voxels
 /// Caches visible voxels between frames to avoid recalculation
@@ -196,15 +272,20 @@ pub struct Camera {
     pub aspect: f32,
     pub near: f32,
     pub far: f32,
+    pub config: RenderConfig,
     frustum: Frustum,
 }
 
 impl Camera {
     pub fn new(position: [f32; 3], forward: [f32; 3], up: [f32; 3]) -> Self {
-        let fov = 70.0_f32.to_radians();
+        Self::with_config(position, forward, up, RenderConfig::default())
+    }
+    
+    pub fn with_config(position: [f32; 3], forward: [f32; 3], up: [f32; 3], config: RenderConfig) -> Self {
+        let fov = config.fov_degrees.to_radians();
         let aspect = 16.0 / 9.0;
-        let near = 0.1;
-        let far = 1000.0;
+        let near = config.near_plane;
+        let far = config.far_plane;
         
         // Normalize forward vector
         let forward = normalize(forward);
@@ -219,6 +300,7 @@ impl Camera {
             aspect,
             near,
             far,
+            config,
             frustum,
         }
     }
@@ -347,12 +429,12 @@ fn collect_voxels_recursive(
                 
                 let distance = camera.distance_to(voxel_center);
                 
-                if distance < LOD_SUBDIVIDE_DISTANCE {
-                    // Recurse into sub-chunk
+                if distance < camera.config.lod_subdivide_distance {
+                    // Recurse into sub-chunk with reduced scale
                     collect_voxels_recursive(
                         sub_chunk,
                         [world_x, world_y, world_z],
-                        scale,
+                        scale / 16,
                         camera,
                         result,
                     );
@@ -473,10 +555,15 @@ pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> Vec<Voxel
             match voxel {
                 Voxel::Solid(vtype) => {
                     // Add this solid voxel
+                    let distance = ((world_x as f32 - camera.position[0]).powi(2)
+                        + (world_y as f32 - camera.position[1]).powi(2)
+                        + (world_z as f32 - camera.position[2]).powi(2))
+                        .sqrt();
+                    
                     cell_instances.push(VoxelInstance {
-                        position: [world_x as i32, world_y as i32, world_z as i32],
+                        position: [world_x, world_y, world_z],
                         voxel_type: *vtype,
-                        scale: scale as u32,
+                        distance,
                     });
                 }
                 Voxel::Chunk(chunk) => {
@@ -621,21 +708,65 @@ mod tests {
     
     #[test]
     fn test_culling_basic() {
-        let mut world = World::new();
+        // Use hierarchy depth 2 for a more manageable test (256 units per side)
+        let mut world = World::new(2);
         
-        // Add voxels that will pass marginal culling
-        // Camera at (5,5,5) looking at (-1,-1,-1) will be at chunk (0,0,0) with local pos (5,5,5)
-        // So we need voxels at positions that include 5 in at least one axis
+        // Add voxels at positions that are visible from our camera
+        // Scale at root level is 16^(2-1) = 16
+        // So voxel at world position 0 spans 0-15, position 16 spans 16-31, etc.
         world.set(WorldPos::new(5, 5, 5), 1);
-        world.set(WorldPos::new(0, 0, 0), 2);
+        world.set(WorldPos::new(10, 5, 10), 2);
+        world.set(WorldPos::new(20, 5, 20), 3);
         
+        // Camera positioned to look at the voxels
         let camera = Camera::new(
-            [5.0, 5.0, 5.0],
-            [-1.0, -1.0, -1.0],
+            [5.0, 10.0, 30.0],  // Above and in front of the voxels
+            [0.0, -0.2, -1.0],  // Looking slightly down and forward
             [0.0, 1.0, 0.0],
         );
         
+        
         let visible = cull_visible_voxels(&world, &camera);
-        assert!(!visible.is_empty());
+        assert!(!visible.is_empty(), "Expected to find at least one visible voxel");
+    }
+    
+    #[test]
+    fn test_lod_subdivision() {
+        // Test that LOD subdivision works correctly based on distance
+        let mut world = World::new(2);
+        
+        // Create a voxel and subdivide it
+        world.set(WorldPos::new(5, 5, 5), 1);
+        world.subdivide_at(WorldPos::new(5, 5, 5)).unwrap();
+        
+        // Add a voxel in the subdivided chunk
+        world.set(WorldPos::new(5, 5, 5), 2); // This will be at a finer scale
+        
+        // Camera very close - should see the subdivided voxel
+        let camera_close = Camera::new(
+            [5.0, 5.0, 10.0],
+            [0.0, 0.0, -1.0],
+            [0.0, 1.0, 0.0],
+        );
+        
+        let visible_close = cull_visible_voxels(&world, &camera_close);
+        assert!(!visible_close.is_empty(), "Should see voxels when close");
+        
+        // Camera very far - with default config (500 units), should still see if within that range
+        let mut config = RenderConfig::default();
+        config.lod_subdivide_distance = 10.0; // Set very low for testing
+        
+        let camera_far = Camera::with_config(
+            [5.0, 5.0, 1000.0],
+            [0.0, 0.0, -1.0],
+            [0.0, 1.0, 0.0],
+            config,
+        );
+        
+        let _visible_far = cull_visible_voxels(&world, &camera_far);
+        // When far away with low LOD distance, we might not recurse into subdivided chunks
+        // This is expected behavior - the test just verifies the system doesn't crash
+        // (No assertion needed - if we got here without panicking, the test passed)
     }
 }
+

@@ -20,9 +20,27 @@ cargo run --bin test_hierarchical_lod
 # Test projection bit propagation
 cargo run --bin test_projection_bits
 
+# Run the interactive viewer
+cargo run --release --bin viewer_hierarchical
+
 # Run benchmarks
 cargo run --release --bin bench_culling
 ```
+
+### Interactive Viewer Controls
+
+**Movement:**
+- `WASD` - Move forward/left/backward/right
+- `Space` - Move up
+- `Shift` - Move down
+- `Mouse` - Look around
+
+**Runtime Configuration:**
+- `[` / `]` - Decrease/increase LOD subdivide distance
+- `-` / `=` - Decrease/increase draw distance (far plane)
+- `ESC` - Save config and quit
+
+Configuration is saved to `render_config.txt` and automatically loaded on startup. You can edit this file directly to change render settings without recompiling.
 
 ### Architecture
 

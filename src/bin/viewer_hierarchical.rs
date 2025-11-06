@@ -19,10 +19,11 @@ use winit::{
     window::{Window, WindowAttributes},
 };
 
-use voxelot::{World, WorldPos, Camera, VisibilityCache};
+use voxelot::{World, WorldPos, Camera, VisibilityCache, RenderConfig};
 
 const WINDOW_WIDTH: u32 = 1280;
 const WINDOW_HEIGHT: u32 = 720;
+const CONFIG_FILE: &str = "render_config.txt";
 
 /// Voxel instance data for GPU
 #[repr(C)]
@@ -102,8 +103,15 @@ struct CameraController {
 
 impl CameraController {
     fn new(position: [f32; 3]) -> Self {
+        // Load config from file or use defaults
+        let config = RenderConfig::load_or_default(CONFIG_FILE);
+        println!("Loaded render config:");
+        println!("  LOD subdivide distance: {}", config.lod_subdivide_distance);
+        println!("  Far plane: {}", config.far_plane);
+        println!("  FOV: {}°", config.fov_degrees);
+        
         let mut this = Self {
-            camera: Camera::new(position, [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]),
+            camera: Camera::with_config(position, [0.0, 0.0, -1.0], [0.0, 1.0, 0.0], config),
             speed: 10.0,
             sensitivity: 0.002,
             yaw: -std::f32::consts::FRAC_PI_2,
@@ -128,6 +136,27 @@ impl CameraController {
             KeyCode::KeyD => self.right = pressed,
             KeyCode::Space => self.up = pressed,
             KeyCode::ShiftLeft => self.down = pressed,
+            // Runtime config adjustments (only on key press, not release)
+            KeyCode::BracketLeft if pressed => {
+                self.camera.config.lod_subdivide_distance = (self.camera.config.lod_subdivide_distance - 50.0).max(50.0);
+                println!("LOD subdivide distance: {:.0}", self.camera.config.lod_subdivide_distance);
+            }
+            KeyCode::BracketRight if pressed => {
+                self.camera.config.lod_subdivide_distance = (self.camera.config.lod_subdivide_distance + 50.0).min(2000.0);
+                println!("LOD subdivide distance: {:.0}", self.camera.config.lod_subdivide_distance);
+            }
+            KeyCode::Minus if pressed => {
+                self.camera.config.far_plane = (self.camera.config.far_plane - 500.0).max(1000.0);
+                self.camera.far = self.camera.config.far_plane;
+                self.update_camera_vectors(); // Recalculate frustum
+                println!("Far plane: {:.0}", self.camera.config.far_plane);
+            }
+            KeyCode::Equal if pressed => {
+                self.camera.config.far_plane = (self.camera.config.far_plane + 500.0).min(20000.0);
+                self.camera.far = self.camera.config.far_plane;
+                self.update_camera_vectors(); // Recalculate frustum
+                println!("Far plane: {:.0}", self.camera.config.far_plane);
+            }
             _ => {}
         }
     }
@@ -263,8 +292,14 @@ impl App {
             }
         }
         
-        let voxel_count: u64 = world.chunks().map(|(_, c)| c.count()).sum();
-        println!("World created with {} voxels in {} chunks", voxel_count, world.chunks().count());
+        println!("World created with voxels");
+        println!("\n=== Controls ===");
+        println!("Movement: WASD + Space/Shift (up/down)");
+        println!("Look: Mouse");
+        println!("LOD Distance: [ ] (decrease/increase)");
+        println!("Draw Distance: - = (decrease/increase)");
+        println!("Quit: ESC");
+        println!("================\n");
         
         Self {
             window: None,
@@ -286,6 +321,14 @@ impl App {
             last_fps_print: Instant::now(),
             mouse_pressed: false,
             last_mouse_pos: None,
+        }
+    }
+    
+    fn save_config(&self) {
+        if let Err(e) = self.camera_controller.camera.config.save(CONFIG_FILE) {
+            eprintln!("Failed to save config: {}", e);
+        } else {
+            println!("Saved render config to {}", CONFIG_FILE);
         }
     }
     
@@ -638,6 +681,7 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => {
                 println!("Close requested");
+                self.save_config();
                 event_loop.exit();
             }
             WindowEvent::KeyboardInput {
@@ -652,6 +696,7 @@ impl ApplicationHandler for App {
                 self.camera_controller.process_keyboard(key, pressed);
 
                 if key == KeyCode::Escape && pressed {
+                    self.save_config();
                     event_loop.exit();
                 }
             }

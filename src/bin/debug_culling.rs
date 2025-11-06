@@ -18,25 +18,24 @@ fn main() {
     if let Some(voxel) = root.get(0, 0, 0) {
         match voxel {
             Voxel::Chunk(sub) => {
-                    println!("Voxel at (0,0,0) is a Chunk with {} voxels", sub.count());
-                    
-                    // Check a few voxels in the sub-chunk
-                    println!("\nSample voxels in sub-chunk:");
-                    for x in 0..3 {
-                        for y in 0..3 {
-                            for z in 0..3 {
-                                if let Some(v) = sub.get(x, y, z) {
-                                    match v {
-                                        Voxel::Solid(t) => println!("  ({},{},{}) = Solid({})", x, y, z, t),
-                                        Voxel::Chunk(_) => println!("  ({},{},{}) = Chunk", x, y, z),
-                                    }
+                println!("Voxel at (0,0,0) is a Chunk with {} voxels", sub.count());
+                
+                // Check a few voxels in the sub-chunk
+                println!("\nSample voxels in sub-chunk:");
+                for x in 0..3 {
+                    for y in 0..3 {
+                        for z in 0..3 {
+                            if let Some(v) = sub.get(x, y, z) {
+                                match v {
+                                    Voxel::Solid(t) => println!("  ({},{},{}) = Solid({})", x, y, z, t),
+                                    Voxel::Chunk(_) => println!("  ({},{},{}) = Chunk", x, y, z),
                                 }
                             }
                         }
                     }
                 }
-                _ => println!("Voxel is not a chunk!"),
             }
+            _ => println!("Voxel is not a chunk!"),
         }
     }
     

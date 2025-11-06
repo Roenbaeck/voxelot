@@ -371,6 +371,7 @@ pub struct World {
     hierarchy_depth: u8,
     
     /// Base chunk size (always 16)
+    #[allow(dead_code)]
     chunk_size: u32,
 }
 
