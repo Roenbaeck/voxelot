@@ -7,6 +7,7 @@ edition = "2021"
 croaring = "2"
 fxhash = "0.2"
 rayon = "1.10"
+glam = "0.27"
 
 # wgpu-based viewer (desktop)
 wgpu = "27.0.1"

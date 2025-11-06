@@ -9,6 +9,8 @@
 
 use std::sync::Arc;
 use std::time::Instant;
+use wgpu::util::DeviceExt;
+use glam::{Mat4, Vec3};
 use winit::{
     application::ApplicationHandler,
     event::*,
@@ -30,6 +32,58 @@ struct VoxelInstanceRaw {
     voxel_type: u32,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct CubeVertex {
+    position: [f32; 3],
+    normal: [f32; 3],
+}
+
+const CUBE_VERTICES: &[CubeVertex] = &[
+    // Front face
+    CubeVertex { position: [0.0, 0.0, 1.0], normal: [0.0, 0.0, 1.0] },
+    CubeVertex { position: [1.0, 0.0, 1.0], normal: [0.0, 0.0, 1.0] },
+    CubeVertex { position: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 1.0] },
+    CubeVertex { position: [0.0, 0.0, 1.0], normal: [0.0, 0.0, 1.0] },
+    CubeVertex { position: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 1.0] },
+    CubeVertex { position: [0.0, 1.0, 1.0], normal: [0.0, 0.0, 1.0] },
+    // Back face
+    CubeVertex { position: [1.0, 0.0, 0.0], normal: [0.0, 0.0, -1.0] },
+    CubeVertex { position: [0.0, 0.0, 0.0], normal: [0.0, 0.0, -1.0] },
+    CubeVertex { position: [0.0, 1.0, 0.0], normal: [0.0, 0.0, -1.0] },
+    CubeVertex { position: [1.0, 0.0, 0.0], normal: [0.0, 0.0, -1.0] },
+    CubeVertex { position: [0.0, 1.0, 0.0], normal: [0.0, 0.0, -1.0] },
+    CubeVertex { position: [1.0, 1.0, 0.0], normal: [0.0, 0.0, -1.0] },
+    // Top face
+    CubeVertex { position: [0.0, 1.0, 0.0], normal: [0.0, 1.0, 0.0] },
+    CubeVertex { position: [0.0, 1.0, 1.0], normal: [0.0, 1.0, 0.0] },
+    CubeVertex { position: [1.0, 1.0, 1.0], normal: [0.0, 1.0, 0.0] },
+    CubeVertex { position: [0.0, 1.0, 0.0], normal: [0.0, 1.0, 0.0] },
+    CubeVertex { position: [1.0, 1.0, 1.0], normal: [0.0, 1.0, 0.0] },
+    CubeVertex { position: [1.0, 1.0, 0.0], normal: [0.0, 1.0, 0.0] },
+    // Bottom face
+    CubeVertex { position: [0.0, 0.0, 1.0], normal: [0.0, -1.0, 0.0] },
+    CubeVertex { position: [0.0, 0.0, 0.0], normal: [0.0, -1.0, 0.0] },
+    CubeVertex { position: [1.0, 0.0, 0.0], normal: [0.0, -1.0, 0.0] },
+    CubeVertex { position: [0.0, 0.0, 1.0], normal: [0.0, -1.0, 0.0] },
+    CubeVertex { position: [1.0, 0.0, 0.0], normal: [0.0, -1.0, 0.0] },
+    CubeVertex { position: [1.0, 0.0, 1.0], normal: [0.0, -1.0, 0.0] },
+    // Right face
+    CubeVertex { position: [1.0, 0.0, 1.0], normal: [1.0, 0.0, 0.0] },
+    CubeVertex { position: [1.0, 0.0, 0.0], normal: [1.0, 0.0, 0.0] },
+    CubeVertex { position: [1.0, 1.0, 0.0], normal: [1.0, 0.0, 0.0] },
+    CubeVertex { position: [1.0, 0.0, 1.0], normal: [1.0, 0.0, 0.0] },
+    CubeVertex { position: [1.0, 1.0, 0.0], normal: [1.0, 0.0, 0.0] },
+    CubeVertex { position: [1.0, 1.0, 1.0], normal: [1.0, 0.0, 0.0] },
+    // Left face
+    CubeVertex { position: [0.0, 0.0, 0.0], normal: [-1.0, 0.0, 0.0] },
+    CubeVertex { position: [0.0, 0.0, 1.0], normal: [-1.0, 0.0, 0.0] },
+    CubeVertex { position: [0.0, 1.0, 1.0], normal: [-1.0, 0.0, 0.0] },
+    CubeVertex { position: [0.0, 0.0, 0.0], normal: [-1.0, 0.0, 0.0] },
+    CubeVertex { position: [0.0, 1.0, 1.0], normal: [-1.0, 0.0, 0.0] },
+    CubeVertex { position: [0.0, 1.0, 0.0], normal: [-1.0, 0.0, 0.0] },
+];
+
 /// Camera controller for 6DOF movement
 struct CameraController {
     camera: Camera,
@@ -37,7 +91,6 @@ struct CameraController {
     sensitivity: f32,
     yaw: f32,
     pitch: f32,
-    
     // Input state
     forward: bool,
     backward: bool,
@@ -49,21 +102,24 @@ struct CameraController {
 
 impl CameraController {
     fn new(position: [f32; 3]) -> Self {
-        Self {
+        let mut this = Self {
             camera: Camera::new(position, [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]),
             speed: 10.0,
             sensitivity: 0.002,
             yaw: -std::f32::consts::FRAC_PI_2,
-            pitch: 0.0,
+            pitch: -0.3, // look slightly downward by default
             forward: false,
             backward: false,
             left: false,
             right: false,
             up: false,
             down: false,
-        }
+        };
+        // Initialize forward/up vectors from yaw/pitch immediately
+        this.update_camera_vectors();
+        this
     }
-    
+
     fn process_keyboard(&mut self, key: KeyCode, pressed: bool) {
         match key {
             KeyCode::KeyW => self.forward = pressed,
@@ -75,35 +131,30 @@ impl CameraController {
             _ => {}
         }
     }
-    
+
     fn process_mouse(&mut self, delta_x: f64, delta_y: f64) {
         self.yaw += delta_x as f32 * self.sensitivity;
         self.pitch -= delta_y as f32 * self.sensitivity;
-        
         // Clamp pitch
         self.pitch = self.pitch.clamp(-std::f32::consts::FRAC_PI_2 + 0.1, std::f32::consts::FRAC_PI_2 - 0.1);
-        
         self.update_camera_vectors();
     }
-    
+
     fn update_camera_vectors(&mut self) {
         let forward = [
             self.yaw.cos() * self.pitch.cos(),
             self.pitch.sin(),
             self.yaw.sin() * self.pitch.cos(),
         ];
-        
         let up = [0.0, 1.0, 0.0];
-        
         self.camera.update(self.camera.position, forward, up);
     }
-    
+
     fn update(&mut self, dt: f32) {
         let mut velocity = [0.0, 0.0, 0.0];
-        
         let forward = self.camera.forward;
         let right = self.camera.right();
-        
+
         if self.forward {
             velocity[0] += forward[0];
             velocity[1] += forward[1];
@@ -130,7 +181,7 @@ impl CameraController {
         if self.down {
             velocity[1] -= 1.0;
         }
-        
+
         // Normalize velocity
         let len = (velocity[0] * velocity[0] + velocity[1] * velocity[1] + velocity[2] * velocity[2]).sqrt();
         if len > 0.001 {
@@ -138,7 +189,7 @@ impl CameraController {
             velocity[1] /= len;
             velocity[2] /= len;
         }
-        
+
         // Apply movement
         let pos = self.camera.position;
         self.camera.position = [
@@ -146,7 +197,7 @@ impl CameraController {
             pos[1] + velocity[1] * self.speed * dt,
             pos[2] + velocity[2] * self.speed * dt,
         ];
-        
+
         self.update_camera_vectors();
     }
 }
@@ -161,6 +212,9 @@ struct App {
     render_pipeline: Option<wgpu::RenderPipeline>,
     uniform_buffer: Option<wgpu::Buffer>,
     bind_group: Option<wgpu::BindGroup>,
+    cube_vertex_buffer: Option<wgpu::Buffer>,
+    instance_buffer: Option<wgpu::Buffer>,
+    instance_capacity: usize,
     
     world: World,
     camera_controller: CameraController,
@@ -221,8 +275,11 @@ impl App {
             render_pipeline: None,
             uniform_buffer: None,
             bind_group: None,
+            cube_vertex_buffer: None,
+            instance_buffer: None,
+            instance_capacity: 0,
             world,
-            camera_controller: CameraController::new([0.0, 20.0, 50.0]),
+            camera_controller: CameraController::new([0.0, 15.0, 60.0]),
             visibility_cache: VisibilityCache::new(),
             last_frame: Instant::now(),
             frame_count: 0,
@@ -317,6 +374,13 @@ impl App {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 buffers: &[
+                    // Slot 0: Per-vertex data (position + normal)
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<CubeVertex>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![2 => Float32x3, 3 => Float32x3],
+                    },
+                    // Slot 1: Per-instance data (position + type)
                     wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<VoxelInstanceRaw>() as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Instance,
@@ -339,7 +403,7 @@ impl App {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
+                cull_mode: None, // Disable culling to see if triangles are backwards
                 polygon_mode: wgpu::PolygonMode::Fill,
                 unclipped_depth: false,
                 conservative: false,
@@ -379,6 +443,13 @@ impl App {
             ],
         });
         
+        // Create cube vertex buffer with positions and normals
+        let cube_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Cube Vertex Buffer"),
+            contents: bytemuck::cast_slice(CUBE_VERTICES),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        
         self.window = Some(window);
         self.surface = Some(surface);
         self.device = Some(device);
@@ -387,6 +458,7 @@ impl App {
         self.render_pipeline = Some(render_pipeline);
         self.uniform_buffer = Some(uniform_buffer);
         self.bind_group = Some(bind_group);
+        self.cube_vertex_buffer = Some(cube_vertex_buffer);
         
         println!("wgpu initialized");
     }
@@ -423,13 +495,24 @@ impl App {
             return; // Nothing to render
         }
         
-        let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Instance Buffer"),
-            size: (instances.len() * std::mem::size_of::<VoxelInstanceRaw>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        queue.write_buffer(&instance_buffer, 0, bytemuck::cast_slice(&instances));
+        if self.instance_capacity < instances.len() {
+            // If we don't have enough capacity, create a new buffer
+            self.instance_capacity = instances.len().next_power_of_two();
+            
+            if let Some(old_buffer) = self.instance_buffer.take() {
+                old_buffer.destroy();
+            }
+
+            self.instance_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Instance Buffer"),
+                size: (self.instance_capacity * std::mem::size_of::<VoxelInstanceRaw>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+
+        // Write data to the buffer
+        queue.write_buffer(self.instance_buffer.as_ref().unwrap(), 0, bytemuck::cast_slice(&instances));
         
         // Get surface texture
         let output = match surface.get_current_texture() {
@@ -461,17 +544,23 @@ impl App {
         
         let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
         
-        // Create MVP matrix
+        // Create MVP matrix using glam (column-major, right-handed)
         let aspect = config.width as f32 / config.height as f32;
-        let projection = perspective(self.camera_controller.camera.fov, aspect, 0.1, 1000.0);
-        let view_matrix = look_at(
-            self.camera_controller.camera.position,
-            add_vec(self.camera_controller.camera.position, self.camera_controller.camera.forward),
-            self.camera_controller.camera.up,
-        );
-        let mvp = mat_mul(&projection, &view_matrix);
-        
-        queue.write_buffer(self.uniform_buffer.as_ref().unwrap(), 0, bytemuck::cast_slice(&mvp));
+        let projection = Mat4::perspective_rh(self.camera_controller.camera.fov, aspect, 0.1, 1000.0);
+        let eye = Vec3::from(self.camera_controller.camera.position);
+        let center = eye + Vec3::from(self.camera_controller.camera.forward) * 100.0; // look far ahead
+        let up = Vec3::from(self.camera_controller.camera.up);
+        let view_mat = Mat4::look_at_rh(eye, center, up);
+        // Convert from OpenGL-style NDC (glam) to wgpu's 0..1 depth range
+        const OPENGL_TO_WGPU_MATRIX: Mat4 = Mat4::from_cols_array(&[
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 0.5, 0.0,
+            0.0, 0.0, 0.5, 1.0,
+        ]);
+        let mvp = OPENGL_TO_WGPU_MATRIX * projection * view_mat;
+        let mvp_cols: [[f32; 4]; 4] = mvp.to_cols_array_2d();
+        queue.write_buffer(self.uniform_buffer.as_ref().unwrap(), 0, bytemuck::cast_slice(&mvp_cols));
         
         // Create command encoder
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -488,7 +577,7 @@ impl App {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 0.1,
                             g: 0.2,
-                            b: 0.3,
+                            b: 0.3,  // Dark blue background
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -509,7 +598,8 @@ impl App {
             
             render_pass.set_pipeline(self.render_pipeline.as_ref().unwrap());
             render_pass.set_bind_group(0, self.bind_group.as_ref().unwrap(), &[]);
-            render_pass.set_vertex_buffer(0, instance_buffer.slice(..));
+            render_pass.set_vertex_buffer(0, self.cube_vertex_buffer.as_ref().unwrap().slice(..));
+            render_pass.set_vertex_buffer(1, self.instance_buffer.as_ref().unwrap().slice(..));
             render_pass.draw(0..36, 0..instances.len() as u32); // 36 vertices for a cube
         }
         
@@ -560,7 +650,7 @@ impl ApplicationHandler for App {
             } => {
                 let pressed = state == ElementState::Pressed;
                 self.camera_controller.process_keyboard(key, pressed);
-                
+
                 if key == KeyCode::Escape && pressed {
                     event_loop.exit();
                 }
@@ -588,6 +678,11 @@ impl ApplicationHandler for App {
                         config.width = new_size.width;
                         config.height = new_size.height;
                         surface.configure(device, config);
+
+                        // Update camera aspect and frustum for culling
+                        self.camera_controller.camera.aspect = config.width as f32 / config.height as f32;
+                        let cam = &self.camera_controller.camera;
+                        self.camera_controller.camera.update(cam.position, cam.forward, cam.up);
                     }
                 }
             }
@@ -603,69 +698,7 @@ impl ApplicationHandler for App {
 }
 
 // Matrix math helpers
-fn perspective(fov: f32, aspect: f32, near: f32, far: f32) -> [[f32; 4]; 4] {
-    let f = 1.0 / (fov / 2.0).tan();
-    [
-        [f / aspect, 0.0, 0.0, 0.0],
-        [0.0, f, 0.0, 0.0],
-        [0.0, 0.0, (far + near) / (near - far), -1.0],
-        [0.0, 0.0, (2.0 * far * near) / (near - far), 0.0],
-    ]
-}
-
-fn look_at(eye: [f32; 3], center: [f32; 3], up: [f32; 3]) -> [[f32; 4]; 4] {
-    let f = normalize_vec(sub_vec(center, eye));
-    let s = normalize_vec(cross_vec(f, up));
-    let u = cross_vec(s, f);
-    
-    [
-        [s[0], u[0], -f[0], 0.0],
-        [s[1], u[1], -f[1], 0.0],
-        [s[2], u[2], -f[2], 0.0],
-        [-dot_vec(s, eye), -dot_vec(u, eye), dot_vec(f, eye), 1.0],
-    ]
-}
-
-fn mat_mul(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
-    let mut result = [[0.0; 4]; 4];
-    for i in 0..4 {
-        for j in 0..4 {
-            for k in 0..4 {
-                result[i][j] += a[i][k] * b[k][j];
-            }
-        }
-    }
-    result
-}
-
-fn add_vec(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
-}
-
-fn sub_vec(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
-
-fn cross_vec(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-
-fn dot_vec(a: [f32; 3], b: [f32; 3]) -> f32 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-fn normalize_vec(v: [f32; 3]) -> [f32; 3] {
-    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-    if len > 0.0001 {
-        [v[0] / len, v[1] / len, v[2] / len]
-    } else {
-        v
-    }
-}
+// (old CPU-side math helpers removed; using glam Mat4/Vec3 instead)
 
 fn main() {
     env_logger::init();

@@ -7,10 +7,6 @@ struct Uniforms {
 @group(0) @binding(0)
 var<uniform> uniforms: Uniforms;
 
-struct VertexInput {
-    @location(0) position: vec3<f32>,
-    @location(1) voxel_type: u32,
-};
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -85,24 +81,22 @@ fn get_voxel_color(voxel_type: u32) -> vec3<f32> {
 
 @vertex
 fn vs_main(
-    @builtin(vertex_index) vertex_index: u32,
-    input: VertexInput,
+    @location(0) instance_position: vec3<f32>,
+    @location(1) instance_voxel_type: u32,
+    @location(2) vertex_position: vec3<f32>,
+    @location(3) vertex_normal: vec3<f32>,
 ) -> VertexOutput {
     var output: VertexOutput;
     
-    // Get cube vertex for this vertex index
-    let vertex = CUBE_VERTICES[vertex_index];
-    
     // Position the cube at the voxel's world position
-    let world_pos = vec4<f32>(input.position + vertex, 1.0);
+    let world_pos = vec4<f32>(instance_position + vertex_position, 1.0);
     output.position = uniforms.mvp * world_pos;
     
-    // Get normal for this face
-    let face_index = vertex_index / 6u;
-    output.normal = CUBE_NORMALS[face_index];
+    // Use the per-vertex normal from the buffer
+    output.normal = vertex_normal;
     
     // Get color based on voxel type
-    output.color = get_voxel_color(input.voxel_type);
+    output.color = get_voxel_color(instance_voxel_type);
     
     return output;
 }
