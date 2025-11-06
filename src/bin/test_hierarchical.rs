@@ -6,44 +6,42 @@ fn main() {
     println!("Hierarchical Voxel Engine Test");
     println!("================================\n");
     
-    // Create a world
-    let mut world = World::new();
+    // Create a world (depth 3 = 4,096 units per side)
+    let mut world = World::new(3);
+    println!("World size: {} units per side\n", world.world_size());
     
     // Add some test voxels
     println!("Creating test world...");
     
     // Create a simple structure - a platform
-    for x in -5..=5 {
-        for z in -5..=5 {
+    for x in 0..=10 {
+        for z in 0..=10 {
             world.set(WorldPos::new(x, 0, z), 1); // Ground
         }
     }
     
     // Add a tower
     for y in 1..=5 {
-        world.set(WorldPos::new(0, y, 0), 2);
+        world.set(WorldPos::new(5, y, 5), 2);
     }
     
     // Add some scattered blocks
-    world.set(WorldPos::new(3, 1, 3), 3);
-    world.set(WorldPos::new(-3, 1, -3), 4);
-    world.set(WorldPos::new(3, 1, -3), 5);
-    world.set(WorldPos::new(-3, 1, 3), 6);
+    world.set(WorldPos::new(8, 1, 8), 3);
+    world.set(WorldPos::new(2, 1, 2), 4);
+    world.set(WorldPos::new(8, 1, 2), 5);
+    world.set(WorldPos::new(2, 1, 8), 6);
     
     // Add a wall for occlusion testing
     for y in 0..=3 {
-        for x in -2..=2 {
-            world.set(WorldPos::new(x, y, -2), 7);
+        for x in 3..=7 {
+            world.set(WorldPos::new(x, y, 3), 7);
         }
     }
     
     // Count voxels
-    let total_voxels: usize = world.chunks()
-        .map(|(_, chunk)| chunk.count() as usize)
-        .sum();
+    let total_voxels = world.root().count();
     
-    println!("World created with {} voxels", total_voxels);
-    println!("Number of chunks: {}\n", world.chunks().count());
+    println!("World created with {} voxels in root chunk\n", total_voxels);
     
     // Test retrieval
     println!("Testing voxel retrieval:");
@@ -118,15 +116,14 @@ fn main() {
     println!("  Looking from +Z side: {} voxels visible", visible_from_side.len());
     println!();
     
-    // Test chunk marginal culling
-    println!("Testing chunk structure:");
-    for ((cx, cy, cz), chunk) in world.chunks().take(3) {
-        println!("  Chunk ({}, {}, {}):", cx, cy, cz);
-        println!("    Voxels: {}", chunk.count());
-        println!("    px: {:016b}", chunk.px);
-        println!("    py: {:016b}", chunk.py);
-        println!("    pz: {:016b}", chunk.pz);
-    }
+    // Test root chunk structure
+    println!("Testing root chunk structure:");
+    let root = world.root();
+    println!("  Root chunk:");
+    println!("    Voxels: {}", root.count());
+    println!("    px: {:016b}", root.px);
+    println!("    py: {:016b}", root.py);
+    println!("    pz: {:016b}", root.pz);
     
     println!("\n✓ All tests complete!");
 }

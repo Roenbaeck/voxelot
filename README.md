@@ -7,9 +7,9 @@ A high-performance sparse voxel engine using hierarchical chunks with LOD and Ro
 - **Hierarchical LOD**: Automatic subdivision and merging based on camera distance
 - **Fast Culling**: 3-layer performance (marginal → frustum → presence)
 - **Memory Efficient**: ~1 byte per voxel with Roaring Bitmap compression
-- **Infinite Worlds**: Sparse HashMap-based chunk storage
+- **Bounded-but-Huge Worlds**: 16^n units (e.g., 16⁴ = 65,536³ voxels)
 - **Exact Queries**: No false positives via presence bitmaps
-- **Recursive Structure**: "Chunks all the way" - uniform at every level
+- **True "Chunks All the Way"**: World IS a Chunk - uniform structure at every level!
 
 ### Quick Start
 
@@ -39,7 +39,19 @@ struct Chunk {
     presence: Bitmap,           // Exact presence (Roaring)
     voxels: Vec<Voxel>,         // Indexed by rank - uniform at all levels!
 }
+
+struct World {
+    root: Chunk,                // The world IS a chunk!
+    hierarchy_depth: u8,        // Determines world size: 16^depth
+    chunk_size: u32,            // Base chunk size (always 16)
+}
 ```
+
+**World Sizes by Hierarchy Depth:**
+- Depth 1: 16³ = 4,096 voxels
+- Depth 2: 256³ = 16,777,216 voxels
+- Depth 3: 4,096³ = 68,719,476,736 voxels
+- Depth 4: 65,536³ = 281,474,976,710,656 voxels
 
 **"Chunks all the way" philosophy:**
 - Uniform Chunk structure at every level of hierarchy

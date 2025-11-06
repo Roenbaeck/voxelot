@@ -1,15 +1,14 @@
 //! Hierarchical Sparse Voxel Engine using Roaring Bitmaps
 //!
 //! "Chunks all the way" philosophy:
-//! - Uniform Chunk structure at every level
+//! - Uniform Chunk structure at every level (including the World root!)
 //! - Each position in a chunk is a Voxel (enum: Solid or Chunk)
 //! - Marginal bitmaps (px/py/pz) for fast rejection
 //! - Roaring bitmap for exact presence
 //! - Rank-based indexing into voxel array
-//! - Infinite worlds via sparse HashMap
+//! - Bounded but huge worlds: 16^n units (e.g., 16^4 = 65,536³)
 
 use croaring::Bitmap;
-use std::collections::HashMap;
 
 /// Voxel type identifier
 pub type VoxelType = u8;
@@ -355,105 +354,215 @@ impl WorldPos {
     pub fn new(x: i64, y: i64, z: i64) -> Self {
         Self { x, y, z }
     }
-    
-    /// Convert world position to chunk coordinate and local position
-    pub fn to_chunk_local(&self) -> (WorldPos, (u8, u8, u8)) {
-        let chunk_x = self.x.div_euclid(16);
-        let chunk_y = self.y.div_euclid(16);
-        let chunk_z = self.z.div_euclid(16);
-        
-        let local_x = self.x.rem_euclid(16) as u8;
-        let local_y = self.y.rem_euclid(16) as u8;
-        let local_z = self.z.rem_euclid(16) as u8;
-        
-        (WorldPos::new(chunk_x, chunk_y, chunk_z), (local_x, local_y, local_z))
-    }
 }
 
-/// The voxel world - infinite sparse storage
+/// The voxel world - "chunks all the way" means the World IS a Chunk!
+///
+/// The hierarchy depth determines world size: 16^depth units per side
+/// - depth 1: 16³ = 4,096 voxels
+/// - depth 2: 256³ = 16,777,216 voxels  
+/// - depth 3: 4,096³ = 68,719,476,736 voxels
+/// - depth 4: 65,536³ = 281,474,976,710,656 voxels
 pub struct World {
-    /// Top-level chunks (currently flat, can be extended to hierarchy)
-    chunks: HashMap<(i64, i64, i64), Chunk>,
+    /// The root chunk - everything is a chunk!
+    root: Chunk,
+    
+    /// Hierarchy depth (1 = single chunk, 2+ = nested)
+    hierarchy_depth: u8,
+    
+    /// Base chunk size (always 16)
+    chunk_size: u32,
 }
 
 impl World {
-    pub fn new() -> Self {
+    /// Create a new world with the specified hierarchy depth
+    ///
+    /// World size will be 16^depth units per side:
+    /// - depth 1: 16 units (single chunk)
+    /// - depth 2: 256 units
+    /// - depth 3: 4,096 units
+    /// - depth 4: 65,536 units (recommended for large worlds)
+    pub fn new(hierarchy_depth: u8) -> Self {
+        assert!(hierarchy_depth > 0, "Hierarchy depth must be at least 1");
+        let world_size = 16u64.pow(hierarchy_depth as u32);
+        println!("Creating world: {} units per side ({} levels deep)", world_size, hierarchy_depth);
+        
         Self {
-            chunks: HashMap::new(),
+            root: Chunk::new(),
+            hierarchy_depth,
+            chunk_size: 16,
         }
+    }
+    
+    /// Get the world size (units per side)
+    pub fn world_size(&self) -> u64 {
+        16u64.pow(self.hierarchy_depth as u32)
+    }
+    
+    /// Get the hierarchy depth
+    pub fn hierarchy_depth(&self) -> u8 {
+        self.hierarchy_depth
+    }
+    
+    /// Convert world position to a path through the hierarchy
+    /// Returns a Vec of (x, y, z) tuples, one for each level from root to leaf
+    fn position_to_path(&self, pos: WorldPos) -> Result<Vec<(u8, u8, u8)>, &'static str> {
+        let world_size = self.world_size() as i64;
+        
+        // Check bounds
+        if pos.x < 0 || pos.y < 0 || pos.z < 0 
+            || pos.x >= world_size || pos.y >= world_size || pos.z >= world_size {
+            return Err("Position out of world bounds");
+        }
+        
+        let mut path = Vec::with_capacity(self.hierarchy_depth as usize);
+        let mut x = pos.x;
+        let mut y = pos.y;
+        let mut z = pos.z;
+        
+        // Walk down the hierarchy from root to leaf
+        // At each level, extract the 4-bit index for that level
+        for level in (0..self.hierarchy_depth).rev() {
+            let divisor = 16i64.pow(level as u32);
+            let local_x = (x / divisor) as u8 & 0xF;
+            let local_y = (y / divisor) as u8 & 0xF;
+            let local_z = (z / divisor) as u8 & 0xF;
+            path.push((local_x, local_y, local_z));
+            
+            x %= divisor;
+            y %= divisor;
+            z %= divisor;
+        }
+        
+        Ok(path)
+    }
+    
+    /// Navigate to a chunk at the given path depth (0 = root, depth-1 = leaf parent)
+    fn navigate_to<'a>(&'a self, path: &[(u8, u8, u8)], depth: usize) -> Option<&'a Chunk> {
+        let mut current = &self.root;
+        
+        for &(x, y, z) in &path[..depth] {
+            match current.get(x, y, z)? {
+                Voxel::Chunk(chunk) => current = chunk,
+                Voxel::Solid(_) => return None, // Hit a solid before reaching target depth
+            }
+        }
+        
+        Some(current)
+    }
+    
+    /// Navigate to a mutable chunk at the given path depth, creating sub-chunks as needed
+    fn navigate_to_mut<'a>(&'a mut self, path: &[(u8, u8, u8)], depth: usize) -> &'a mut Chunk {
+        let mut current = &mut self.root;
+        
+        for &(x, y, z) in &path[..depth] {
+            let idx = Chunk::flat_index(x, y, z);
+            
+            // Check if voxel exists and what type it is
+            let needs_chunk = if current.presence.contains(idx) {
+                let rank = current.presence.rank(idx) as usize;
+                !matches!(current.voxels[rank - 1], Voxel::Chunk(_))
+            } else {
+                true
+            };
+            
+            // Create or ensure it's a chunk
+            if needs_chunk {
+                current.set_chunk(x, y, z, Chunk::new());
+            }
+            
+            // Navigate into the chunk
+            let rank = current.presence.rank(idx) as usize;
+            match &mut current.voxels[rank - 1] {
+                Voxel::Chunk(chunk) => current = chunk,
+                _ => unreachable!(),
+            }
+        }
+        
+        current
     }
     
     /// Get voxel type at world position (only works for Solid voxels)
     pub fn get(&self, pos: WorldPos) -> Option<VoxelType> {
-        let (chunk_pos, local) = pos.to_chunk_local();
-        let chunk = self.chunks.get(&(chunk_pos.x, chunk_pos.y, chunk_pos.z))?;
-        chunk.get_type(local.0, local.1, local.2)
+        let path = self.position_to_path(pos).ok()?;
+        
+        // Navigate to the parent chunk
+        let parent = self.navigate_to(&path, self.hierarchy_depth as usize - 1)?;
+        
+        // Get the leaf position
+        let &(x, y, z) = path.last()?;
+        parent.get_type(x, y, z)
     }
     
     /// Set a solid voxel at world position
     pub fn set(&mut self, pos: WorldPos, voxel_type: VoxelType) {
-        let (chunk_pos, local) = pos.to_chunk_local();
-        let chunk = self.chunks
-            .entry((chunk_pos.x, chunk_pos.y, chunk_pos.z))
-            .or_insert_with(Chunk::new);
-        chunk.set(local.0, local.1, local.2, voxel_type);
+        let path = match self.position_to_path(pos) {
+            Ok(p) => p,
+            Err(_) => return, // Out of bounds, silently ignore
+        };
+        
+        // Navigate to the parent chunk, creating as needed
+        let parent = self.navigate_to_mut(&path, self.hierarchy_depth as usize - 1);
+        
+        // Set the leaf voxel
+        let &(x, y, z) = path.last().unwrap();
+        parent.set(x, y, z, voxel_type);
     }
     
     /// Remove a voxel at world position
     pub fn remove(&mut self, pos: WorldPos) {
-        let (chunk_pos, local) = pos.to_chunk_local();
-        if let Some(chunk) = self.chunks.get_mut(&(chunk_pos.x, chunk_pos.y, chunk_pos.z)) {
-            chunk.remove(local.0, local.1, local.2);
-            if chunk.is_empty() {
-                self.chunks.remove(&(chunk_pos.x, chunk_pos.y, chunk_pos.z));
-            }
-        }
+        let path = match self.position_to_path(pos) {
+            Ok(p) => p,
+            Err(_) => return, // Out of bounds
+        };
+        
+        // Navigate to the parent chunk
+        let parent = self.navigate_to_mut(&path, self.hierarchy_depth as usize - 1);
+        
+        // Remove the leaf voxel
+        let &(x, y, z) = path.last().unwrap();
+        parent.remove(x, y, z);
     }
     
-    /// Get all chunks
-    pub fn chunks(&self) -> impl Iterator<Item = ((i64, i64, i64), &Chunk)> {
-        self.chunks.iter().map(|(k, v)| (*k, v))
+    /// Get the root chunk
+    pub fn root(&self) -> &Chunk {
+        &self.root
     }
     
-    /// Get mutable reference to a chunk
-    pub fn get_chunk_mut(&mut self, chunk_pos: (i64, i64, i64)) -> &mut Chunk {
-        self.chunks.entry(chunk_pos).or_insert_with(Chunk::new)
-    }
-    
-    /// Get reference to a chunk
-    pub fn get_chunk(&self, chunk_pos: (i64, i64, i64)) -> Option<&Chunk> {
-        self.chunks.get(&chunk_pos)
+    /// Get mutable root chunk
+    pub fn root_mut(&mut self) -> &mut Chunk {
+        &mut self.root
     }
     
     /// Subdivide a voxel at world position
     pub fn subdivide_at(&mut self, pos: WorldPos) -> Result<(), &'static str> {
-        let (chunk_pos, local) = pos.to_chunk_local();
-        let chunk = self.chunks
-            .get_mut(&(chunk_pos.x, chunk_pos.y, chunk_pos.z))
-            .ok_or("No chunk at this position")?;
-        chunk.subdivide(local.0, local.1, local.2)
+        let path = self.position_to_path(pos)?;
+        let parent = self.navigate_to_mut(&path, self.hierarchy_depth as usize - 1);
+        let &(x, y, z) = path.last().ok_or("Invalid path")?;
+        parent.subdivide(x, y, z)
     }
     
     /// Try to merge a subdivided voxel back to solid
     pub fn merge_at(&mut self, pos: WorldPos) -> Result<bool, &'static str> {
-        let (chunk_pos, local) = pos.to_chunk_local();
-        let chunk = self.chunks
-            .get_mut(&(chunk_pos.x, chunk_pos.y, chunk_pos.z))
-            .ok_or("No chunk at this position")?;
-        chunk.try_merge(local.0, local.1, local.2)
+        let path = self.position_to_path(pos)?;
+        let parent = self.navigate_to_mut(&path, self.hierarchy_depth as usize - 1);
+        let &(x, y, z) = path.last().ok_or("Invalid path")?;
+        parent.try_merge(x, y, z)
     }
     
-    /// Get the hierarchy depth at a world position
+    /// Get the hierarchy depth at a world position (beyond the base depth)
     pub fn depth_at(&self, pos: WorldPos) -> Option<usize> {
-        let (chunk_pos, local) = pos.to_chunk_local();
-        let chunk = self.chunks.get(&(chunk_pos.x, chunk_pos.y, chunk_pos.z))?;
-        chunk.depth_at(local.0, local.1, local.2)
+        let path = self.position_to_path(pos).ok()?;
+        let parent = self.navigate_to(&path, self.hierarchy_depth as usize - 1)?;
+        let &(x, y, z) = path.last()?;
+        parent.depth_at(x, y, z)
     }
 }
 
 impl Default for World {
     fn default() -> Self {
-        Self::new()
+        // Default to depth 3 (4,096 units per side)
+        Self::new(3)
     }
 }
 
@@ -507,7 +616,7 @@ mod tests {
     
     #[test]
     fn test_world() {
-        let mut world = World::new();
+        let mut world = World::new(3); // 4,096 units per side
         
         world.set(WorldPos::new(0, 0, 0), 1);
         world.set(WorldPos::new(100, 200, 300), 2);
@@ -515,5 +624,30 @@ mod tests {
         assert_eq!(world.get(WorldPos::new(0, 0, 0)), Some(1));
         assert_eq!(world.get(WorldPos::new(100, 200, 300)), Some(2));
         assert_eq!(world.get(WorldPos::new(1, 1, 1)), None);
+    }
+    
+    #[test]
+    fn test_world_sizes() {
+        assert_eq!(World::new(1).world_size(), 16);
+        assert_eq!(World::new(2).world_size(), 256);
+        assert_eq!(World::new(3).world_size(), 4096);
+        assert_eq!(World::new(4).world_size(), 65536);
+    }
+    
+    #[test]
+    fn test_world_bounds() {
+        let mut world = World::new(2); // 256 units
+        
+        // In bounds
+        world.set(WorldPos::new(0, 0, 0), 1);
+        world.set(WorldPos::new(255, 255, 255), 2);
+        assert_eq!(world.get(WorldPos::new(0, 0, 0)), Some(1));
+        assert_eq!(world.get(WorldPos::new(255, 255, 255)), Some(2));
+        
+        // Out of bounds
+        world.set(WorldPos::new(256, 0, 0), 3);
+        world.set(WorldPos::new(-1, 0, 0), 4);
+        assert_eq!(world.get(WorldPos::new(256, 0, 0)), None);
+        assert_eq!(world.get(WorldPos::new(-1, 0, 0)), None);
     }
 }

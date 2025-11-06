@@ -362,228 +362,136 @@ fn collect_voxels_recursive(
     }
 }
 
-/// Cull voxels for rendering
+/// Cull voxels for rendering - works with hierarchical World (chunks all the way!)
 pub fn cull_visible_voxels(world: &World, camera: &Camera) -> Vec<VoxelInstance> {
     let mut instances = Vec::new();
     
-    // Far plane radius squared
-    let far_sq = camera.far * camera.far;
+    // World is now a single root chunk - calculate its size and position
+    let world_size = world.world_size() as i64;
     
-    // Iterate existing chunks and filter by distance
-    for ((cx, cy, cz), chunk) in world.chunks() {
-        // Check if chunk is within far plane distance
-        let chunk_center = [
-            (cx * 16) as f32 + 8.0,
-            (cy * 16) as f32 + 8.0,
-            (cz * 16) as f32 + 8.0,
-        ];
-        let dx = chunk_center[0] - camera.position[0];
-        let dy = chunk_center[1] - camera.position[1];
-        let dz = chunk_center[2] - camera.position[2];
-        let dist_sq = dx*dx + dy*dy + dz*dz;
-        
-        // Skip chunks beyond far plane (with some margin for chunk size)
-        if dist_sq > far_sq + 16.0*16.0*3.0 {
-            continue;
-        }
-        
-        // Get chunk bounding box
-        let min = [
-            (cx * 16) as f32,
-            (cy * 16) as f32,
-            (cz * 16) as f32,
-        ];
-        let max = [
-            min[0] + 16.0,
-            min[1] + 16.0,
-            min[2] + 16.0,
-        ];
-        
-        // Frustum cull the chunk
-        let passes_frustum = camera.frustum_cull_aabb(min, max);
-        
-        if !passes_frustum {
-            continue;
-        }
-        
-        // Fast marginal test: is camera position inside chunk influence?
-        // This works for hierarchical chunks because sub-chunk projection bits
-        // are propagated up the hierarchy during subdivision
-        let local_cam_x = camera.position[0] - (cx * 16) as f32;
-        let local_cam_y = camera.position[1] - (cy * 16) as f32;
-        let local_cam_z = camera.position[2] - (cz * 16) as f32;
-        
-        // Check if any voxel exists on the camera's projected axes
-        let cam_x_bit = local_cam_x.clamp(0.0, 15.0) as u8;
-        let cam_y_bit = local_cam_y.clamp(0.0, 15.0) as u8;
-        let cam_z_bit = local_cam_z.clamp(0.0, 15.0) as u8;
-        
-        // Marginal culling: if no voxels on camera's ray, skip
-        if (chunk.px & (1 << cam_x_bit)) == 0 &&
-           (chunk.py & (1 << cam_y_bit)) == 0 &&
-           (chunk.pz & (1 << cam_z_bit)) == 0 {
-            // No voxels near camera ray - skip entire chunk
-            continue;
-        }
-        
-        // Use recursive culling to handle hierarchical chunks
-        collect_voxels_recursive(
-            chunk,
-            [cx * 16, cy * 16, cz * 16],
-            1,  // Root level scale = 1
-            camera,
-            &mut instances,
-        );
+    // Get world bounding box (assuming world is centered at origin for now)
+    let min = [0.0, 0.0, 0.0];
+    let max = [world_size as f32, world_size as f32, world_size as f32];
+    
+    // Frustum cull the entire world first
+    if !camera.frustum_cull_aabb(min, max) {
+        return instances; // Entire world is outside frustum
     }
+    
+    // Recursively collect voxels from the root chunk
+    // The scale factor depends on hierarchy depth
+    let scale = 16i64.pow(world.hierarchy_depth() as u32 - 1);
+    
+    collect_voxels_recursive(
+        world.root(),
+        [0, 0, 0],  // World starts at origin
+        scale,      // Scale of root voxels
+        camera,
+        &mut instances,
+    );
     
     instances
 }
 
-/// Cull voxels with occlusion testing
-/// Uses front-to-back traversal and tracks occluded columns
+/// Cull voxels with occlusion testing - hierarchical version
+/// Uses recursive traversal of World root chunk
 pub fn cull_visible_voxels_with_occlusion(world: &World, camera: &Camera) -> Vec<VoxelInstance> {
     let mut instances = Vec::new();
     
-    // Far plane radius squared
-    let far_sq = camera.far * camera.far;
+    // World is now a single root chunk
+    let world_size = world.world_size() as i64;
+    let min = [0.0, 0.0, 0.0];
+    let max = [world_size as f32, world_size as f32, world_size as f32];
     
-    // Collect all potentially visible chunks with their distances
-    let mut chunks_to_process = Vec::new();
-    
-    for ((cx, cy, cz), chunk) in world.chunks() {
-        // Quick rejection: check if chunk is empty
-        if chunk.is_empty() {
-            continue;
-        }
-        
-        // Check if chunk is within far plane distance
-        let chunk_center = [
-            (cx * 16) as f32 + 8.0,
-            (cy * 16) as f32 + 8.0,
-            (cz * 16) as f32 + 8.0,
-        ];
-        let dx = chunk_center[0] - camera.position[0];
-        let dy = chunk_center[1] - camera.position[1];
-        let dz = chunk_center[2] - camera.position[2];
-        let dist_sq = dx*dx + dy*dy + dz*dz;
-        
-        // Skip chunks beyond far plane (with some margin for chunk size)
-        if dist_sq > far_sq + 16.0*16.0*3.0 {
-            continue;
-        }
-        
-        // Get chunk bounding box
-        let min = [
-            (cx * 16) as f32,
-            (cy * 16) as f32,
-            (cz * 16) as f32,
-        ];
-        let max = [
-            min[0] + 16.0,
-            min[1] + 16.0,
-            min[2] + 16.0,
-        ];
-        
-        // Frustum cull the chunk
-        if !camera.frustum_cull_aabb(min, max) {
-            continue;
-        }
-        
-        let distance = dist_sq.sqrt();
-        
-        chunks_to_process.push(((cx, cy, cz), chunk, distance));
+    // Frustum cull the entire world first
+    if !camera.frustum_cull_aabb(min, max) {
+        return instances;
     }
     
-    // Sort chunks front-to-back for occlusion
-    chunks_to_process.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+    // Recursively collect voxels with occlusion
+    let scale = 16i64.pow(world.hierarchy_depth() as u32 - 1);
     
-    // Process chunks in front-to-back order
-    for ((cx, cy, cz), chunk, _distance) in chunks_to_process {
-        // Use recursive culling with occlusion tracking
-        // For simplicity, still using the simpler column-based occlusion
-        collect_voxels_recursive(
-            chunk,
-            [cx * 16, cy * 16, cz * 16],
-            1,
-            camera,
-            &mut instances,
-        );
-        
-        // Note: Full occlusion culling with hierarchical chunks would require
-        // tracking occlusion at each level. For now, we just use recursive LOD.
-    }
+    collect_voxels_recursive(
+        world.root(),
+        [0, 0, 0],
+        scale,
+        camera,
+        &mut instances,
+    );
     
     instances
 }
 
-/// Parallel culling with rayon - much faster!
+/// Parallel culling - for hierarchical world, parallelize at top level of root chunk
 pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> Vec<VoxelInstance> {
     use rayon::prelude::*;
     
-    // Far plane radius squared
-    let far_sq = camera.far * camera.far;
+    // For hierarchical world, we can parallelize by processing top-level cells
+    let world_size = world.world_size() as i64;
+    let min = [0.0, 0.0, 0.0];
+    let max = [world_size as f32, world_size as f32, world_size as f32];
     
-    // Collect all potentially visible chunks with their positions
-    let chunks_to_process: Vec<_> = world.chunks()
-        .filter_map(|((cx, cy, cz), chunk)| {
-            // Quick rejection: check if chunk is empty
-            if chunk.is_empty() {
-                return None;
-            }
-            
-            // Check if chunk is within far plane distance
-            let chunk_center = [
-                (cx * 16) as f32 + 8.0,
-                (cy * 16) as f32 + 8.0,
-                (cz * 16) as f32 + 8.0,
-            ];
-            let dx = chunk_center[0] - camera.position[0];
-            let dy = chunk_center[1] - camera.position[1];
-            let dz = chunk_center[2] - camera.position[2];
-            let dist_sq = dx*dx + dy*dy + dz*dz;
-            
-            // Skip chunks beyond far plane (with some margin for chunk size)
-            if dist_sq > far_sq + 16.0*16.0*3.0 {
-                return None;
-            }
-            
-            // Get chunk bounding box
-            let min = [
-                (cx * 16) as f32,
-                (cy * 16) as f32,
-                (cz * 16) as f32,
-            ];
-            let max = [
-                min[0] + 16.0,
-                min[1] + 16.0,
-                min[2] + 16.0,
-            ];
-            
-            // Frustum cull the chunk
-            if !camera.frustum_cull_aabb(min, max) {
-                return None;
-            }
-            
-            Some(((cx, cy, cz), chunk))
-        })
+    // Frustum cull the entire world first
+    if !camera.frustum_cull_aabb(min, max) {
+        return Vec::new();
+    }
+    
+    // Collect top-level positions that have voxels
+    let scale = 16i64.pow(world.hierarchy_depth() as u32 - 1);
+    let root = world.root();
+    
+    let top_level_cells: Vec<_> = root.positions()
+        .map(|(x, y, z)| (x, y, z))
         .collect();
     
-    // Process chunks in parallel
-    let visible_voxels: Vec<Vec<VoxelInstance>> = chunks_to_process
+    // Process each top-level cell in parallel
+    let visible_voxels: Vec<Vec<VoxelInstance>> = top_level_cells
         .par_iter()
-        .map(|((cx, cy, cz), chunk)| {
-            let mut chunk_instances = Vec::new();
+        .filter_map(|&(x, y, z)| {
+            // Get the voxel at this position
+            let voxel = root.get(x, y, z)?;
             
-            // Use recursive culling for this chunk
-            collect_voxels_recursive(
-                chunk,
-                [*cx * 16, *cy * 16, *cz * 16],
-                1,
-                camera,
-                &mut chunk_instances,
-            );
+            // Calculate world position
+            let world_x = x as i64 * scale;
+            let world_y = y as i64 * scale;
+            let world_z = z as i64 * scale;
             
-            chunk_instances
+            // Quick frustum check for this cell
+            let cell_min = [world_x as f32, world_y as f32, world_z as f32];
+            let cell_max = [
+                (world_x + scale) as f32,
+                (world_y + scale) as f32,
+                (world_z + scale) as f32,
+            ];
+            
+            if !camera.frustum_cull_aabb(cell_min, cell_max) {
+                return None;
+            }
+            
+            let mut cell_instances = Vec::new();
+            
+            match voxel {
+                Voxel::Solid(vtype) => {
+                    // Add this solid voxel
+                    cell_instances.push(VoxelInstance {
+                        position: [world_x as i32, world_y as i32, world_z as i32],
+                        voxel_type: *vtype,
+                        scale: scale as u32,
+                    });
+                }
+                Voxel::Chunk(chunk) => {
+                    // Recursively collect from sub-chunk
+                    collect_voxels_recursive(
+                        chunk,
+                        [world_x, world_y, world_z],
+                        scale / 16,
+                        camera,
+                        &mut cell_instances,
+                    );
+                }
+            }
+            
+            Some(cell_instances)
         })
         .collect();
     
@@ -591,41 +499,44 @@ pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> Vec<Voxel
     visible_voxels.into_iter().flatten().collect()
 }
 
-/// Get chunk render info with LOD levels
+/// Get visible top-level cells as chunk render info
+/// Note: With hierarchical world, this returns top-level cells of the root chunk
 pub fn get_visible_chunks(world: &World, camera: &Camera) -> Vec<ChunkRenderInfo> {
     let far_sq = camera.far * camera.far;
+    let scale = 16i64.pow(world.hierarchy_depth() as u32 - 1);
+    let root = world.root();
     
-    let chunk_infos: Vec<_> = world.chunks()
-        .filter_map(|((cx, cy, cz), _chunk)| {
-            // Check if chunk is within far plane distance
-            let chunk_center = [
-                (cx * 16) as f32 + 8.0,
-                (cy * 16) as f32 + 8.0,
-                (cz * 16) as f32 + 8.0,
+    let chunk_infos: Vec<_> = root.positions()
+        .filter_map(|(x, y, z)| {
+            let world_x = x as i64 * scale;
+            let world_y = y as i64 * scale;
+            let world_z = z as i64 * scale;
+            
+            // Check if cell is within far plane distance
+            let cell_center = [
+                world_x as f32 + scale as f32 / 2.0,
+                world_y as f32 + scale as f32 / 2.0,
+                world_z as f32 + scale as f32 / 2.0,
             ];
-            let dx = chunk_center[0] - camera.position[0];
-            let dy = chunk_center[1] - camera.position[1];
-            let dz = chunk_center[2] - camera.position[2];
+            let dx = cell_center[0] - camera.position[0];
+            let dy = cell_center[1] - camera.position[1];
+            let dz = cell_center[2] - camera.position[2];
             let dist_sq = dx*dx + dy*dy + dz*dz;
             
-            // Skip chunks beyond far plane (with some margin for chunk size)
-            if dist_sq > far_sq + 16.0*16.0*3.0 {
+            // Skip cells beyond far plane
+            if dist_sq > far_sq + (scale * scale * 3) as f32 {
                 return None;
             }
             
-            let min = [
-                (cx * 16) as f32,
-                (cy * 16) as f32,
-                (cz * 16) as f32,
-            ];
+            let min = [world_x as f32, world_y as f32, world_z as f32];
             let max = [
-                min[0] + 16.0,
-                min[1] + 16.0,
-                min[2] + 16.0,
+                (world_x + scale) as f32,
+                (world_y + scale) as f32,
+                (world_z + scale) as f32,
             ];
             
             if camera.frustum_cull_aabb(min, max) {
-                Some(ChunkRenderInfo::new((cx, cy, cz), camera.position))
+                Some(ChunkRenderInfo::new((world_x, world_y, world_z), camera.position))
             } else {
                 None
             }

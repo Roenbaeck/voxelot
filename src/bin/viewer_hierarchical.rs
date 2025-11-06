@@ -229,14 +229,14 @@ struct App {
 
 impl App {
     fn new() -> Self {
-        // Create world with test data
-        let mut world = World::new();
+        // Create world with test data (depth 3 = 4,096 units)
+        let mut world = World::new(3);
         
-        println!("Creating test world...");
+        println!("Creating test world (size: {} units)...", world.world_size());
         
         // Ground plane
-        for x in -50..50 {
-            for z in -50..50 {
+        for x in 0..100 {
+            for z in 0..100 {
                 if (x + z) % 3 == 0 {
                     world.set(WorldPos::new(x, 0, z), 1);
                 }
@@ -245,9 +245,9 @@ impl App {
         
         // Towers
         for i in 0..5 {
-            let x = (i - 2) * 20;
+            let x = 30 + i * 20;
             for y in 1..=(10 + i * 3) {
-                world.set(WorldPos::new(x, y, 0), 2);
+                world.set(WorldPos::new(x, y, 50), 2);
             }
         }
         

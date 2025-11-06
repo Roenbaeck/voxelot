@@ -5,10 +5,12 @@ use voxelot::{World, WorldPos, Camera, cull_visible_voxels};
 fn main() {
     println!("=== Hierarchical LOD Test ===\n");
     
-    let mut world = World::new();
+    // Create a depth-2 world (256 units per side)
+    let mut world = World::new(2);
+    println!("World size: {} units per side", world.world_size());
     
     // Create a simple test world
-    println!("1. Creating test world with single voxel at origin");
+    println!("\n1. Creating test world with single voxel at origin");
     world.set(WorldPos::new(0, 0, 0), 1);
     
     // Verify depth
@@ -24,14 +26,13 @@ fn main() {
     println!("   Depth after subdivision: {:?}", depth);
     assert_eq!(depth, Some(1), "Should be depth 1 (contains sub-chunk)");
     
-    // Check what's in the chunk now
-    if let Some(chunk) = world.get_chunk((0, 0, 0)) {
-        println!("   Chunk at origin has {} voxels", chunk.count());
-        if let Some(voxel) = chunk.get(0, 0, 0) {
-            match voxel {
-                voxelot::Voxel::Solid(_) => println!("   - Voxel is Solid"),
-                voxelot::Voxel::Chunk(sub) => println!("   - Voxel is Chunk with {} voxels", sub.count()),
-            }
+    // Check the root chunk
+    let root = world.root();
+    println!("   Root chunk has {} voxels", root.count());
+    if let Some(voxel) = root.get(0, 0, 0) {
+        match voxel {
+            voxelot::Voxel::Solid(_) => println!("   - Voxel is Solid"),
+            voxelot::Voxel::Chunk(sub) => println!("   - Voxel is Chunk with {} voxels", sub.count()),
         }
     }
     
