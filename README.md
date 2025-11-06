@@ -7,9 +7,9 @@ A high-performance sparse voxel engine using hierarchical chunks with LOD and Ro
 - **Hierarchical LOD**: Automatic subdivision and merging based on camera distance
 - **Fast Culling**: 3-layer performance (marginal → frustum → presence)
 - **Memory Efficient**: ~1 byte per voxel with Roaring Bitmap compression
-- **Infinite Worlds**: Sparse HashMap-based chunk storage
+- **Bounded-but-Huge Worlds**: 16^n units (e.g., 16⁴ = 65,536³ voxels)
 - **Exact Queries**: No false positives via presence bitmaps
-- **Recursive Structure**: "Chunks all the way" - uniform at every level
+- **True "Chunks All the Way"**: World IS a Chunk - uniform structure at every level!
 
 ### Quick Start
 
@@ -20,9 +20,27 @@ cargo run --bin test_hierarchical_lod
 # Test projection bit propagation
 cargo run --bin test_projection_bits
 
+# Run the interactive viewer
+cargo run --release --bin viewer_hierarchical
+
 # Run benchmarks
 cargo run --release --bin bench_culling
 ```
+
+### Interactive Viewer Controls
+
+**Movement:**
+- `WASD` - Move forward/left/backward/right
+- `Space` - Move up
+- `Shift` - Move down
+- `Mouse` - Look around
+
+**Runtime Configuration:**
+- `[` / `]` - Decrease/increase LOD subdivide distance
+- `-` / `=` - Decrease/increase draw distance (far plane)
+- `ESC` - Save config and quit
+
+Configuration is saved to `render_config.txt` and automatically loaded on startup. You can edit this file directly to change render settings without recompiling.
 
 ### Architecture
 
@@ -39,7 +57,19 @@ struct Chunk {
     presence: Bitmap,           // Exact presence (Roaring)
     voxels: Vec<Voxel>,         // Indexed by rank - uniform at all levels!
 }
+
+struct World {
+    root: Chunk,                // The world IS a chunk!
+    hierarchy_depth: u8,        // Determines world size: 16^depth
+    chunk_size: u32,            // Base chunk size (always 16)
+}
 ```
+
+**World Sizes by Hierarchy Depth:**
+- Depth 1: 16³ = 4,096 voxels
+- Depth 2: 256³ = 16,777,216 voxels
+- Depth 3: 4,096³ = 68,719,476,736 voxels
+- Depth 4: 65,536³ = 281,474,976,710,656 voxels
 
 **"Chunks all the way" philosophy:**
 - Uniform Chunk structure at every level of hierarchy

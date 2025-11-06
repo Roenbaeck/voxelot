@@ -9,13 +9,14 @@ use std::time::Instant;
 use voxelot::{World, WorldPos, Camera, cull_visible_voxels_with_occlusion, cull_visible_voxels_parallel, VisibilityCache};
 
 fn create_test_world() -> World {
-    let mut world = World::new();
+    // Create a depth-3 world (4,096 units per side) - large enough for the test
+    let mut world = World::new(3);
     
-    println!("Creating test world...");
+    println!("Creating test world (size: {} units per side)...", world.world_size());
     
     // Ground plane
-    for x in -50..50 {
-        for z in -50..50 {
+    for x in 0..100 {
+        for z in 0..100 {
             if (x + z) % 3 == 0 {
                 world.set(WorldPos::new(x, 0, z), 1);
             }
@@ -24,23 +25,23 @@ fn create_test_world() -> World {
     
     // Towers
     for i in 0..5 {
-        let x = (i - 2) * 20;
+        let x = 30 + i * 20;
         for y in 1..=(10 + i * 3) {
-            world.set(WorldPos::new(x, y, 0), 2);
+            world.set(WorldPos::new(x, y, 50), 2);
         }
     }
     
     // Scattered structures
     for i in 0..10 {
-        let x = (i * 13 - 30) % 40;
-        let z = (i * 17 - 20) % 40;
+        let x = (i * 13) % 90 + 5;
+        let z = (i * 17) % 90 + 5;
         for y in 1..5 {
             world.set(WorldPos::new(x, y, z), 3);
         }
     }
     
-    let voxel_count: u64 = world.chunks().map(|(_, c)| c.count()).sum();
-    println!("World: {} voxels in {} chunks\n", voxel_count, world.chunks().count());
+    let voxel_count = world.root().count();
+    println!("World: {} voxels in root chunk\n", voxel_count);
     
     world
 }

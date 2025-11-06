@@ -5,38 +5,37 @@ use voxelot::{World, WorldPos, Camera, Voxel};
 fn main() {
     println!("=== Debug Hierarchical Culling ===\n");
     
-    let mut world = World::new();
+    let mut world = World::new(2); // 256 units per side
     
     // Create and subdivide a voxel
     world.set(WorldPos::new(0, 0, 0), 1);
     world.subdivide_at(WorldPos::new(0, 0, 0)).unwrap();
     
     // Verify what we have
-    if let Some(chunk) = world.get_chunk((0, 0, 0)) {
-        println!("Root chunk has {} voxels", chunk.count());
-        
-        if let Some(voxel) = chunk.get(0, 0, 0) {
-            match voxel {
-                Voxel::Chunk(sub) => {
-                    println!("Voxel at (0,0,0) is a Chunk with {} voxels", sub.count());
-                    
-                    // Check a few voxels in the sub-chunk
-                    println!("\nSample voxels in sub-chunk:");
-                    for x in 0..3 {
-                        for y in 0..3 {
-                            for z in 0..3 {
-                                if let Some(v) = sub.get(x, y, z) {
-                                    match v {
-                                        Voxel::Solid(t) => println!("  ({},{},{}) = Solid({})", x, y, z, t),
-                                        Voxel::Chunk(_) => println!("  ({},{},{}) = Chunk", x, y, z),
-                                    }
+    let root = world.root();
+    println!("Root chunk has {} voxels", root.count());
+    
+    if let Some(voxel) = root.get(0, 0, 0) {
+        match voxel {
+            Voxel::Chunk(sub) => {
+                println!("Voxel at (0,0,0) is a Chunk with {} voxels", sub.count());
+                
+                // Check a few voxels in the sub-chunk
+                println!("\nSample voxels in sub-chunk:");
+                for x in 0..3 {
+                    for y in 0..3 {
+                        for z in 0..3 {
+                            if let Some(v) = sub.get(x, y, z) {
+                                match v {
+                                    Voxel::Solid(t) => println!("  ({},{},{}) = Solid({})", x, y, z, t),
+                                    Voxel::Chunk(_) => println!("  ({},{},{}) = Chunk", x, y, z),
                                 }
                             }
                         }
                     }
                 }
-                _ => println!("Voxel is not a chunk!"),
             }
+            _ => println!("Voxel is not a chunk!"),
         }
     }
     

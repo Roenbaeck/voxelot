@@ -3,7 +3,7 @@ use std::time::Instant;
 use voxelot::{World, WorldPos, Camera, cull_visible_voxels};
 
 fn main() {
-    let mut world = World::new();
+    let mut world = World::new(2); // 256 units per side
     
     // Create a simple world with 100 voxels
     for i in 0..10 {
