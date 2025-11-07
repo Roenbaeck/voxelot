@@ -27,6 +27,23 @@ cargo run --release --bin viewer_hierarchical
 cargo run --release --bin bench_culling
 ```
 
+### Data Generation (Voxelizing Real World Tiles)
+
+Two generators are now provided:
+
+1. `osm_voxel_generator.py` – legacy one-shot Overpass query producing a coarse static dump `osm_voxels.txt`.
+2. `voxel_generator_tiles.py` – new dry-coded tile-based prototype (no external deps yet) that rasterizes synthetic building footprints per Web Mercator tile and writes `osm_voxels_new.txt` plus a meta file.
+
+Planned evolution of the tile generator:
+- Replace synthetic footprints with real vector tile (MVT) decoding.
+- Add height inference heuristics (already stubbed) and roof shape variants.
+- Introduce per-tile material palettes & compressed binary output.
+- Hook into streaming residency so tiles load/unload around the camera.
+
+Output compatibility: Both generators currently emit ASCII lines `x y z voxel_type` so the existing Rust ingestion path can remain unchanged while the pipeline is upgraded.
+
+See `VOXEL_GENERATOR_REVAMP.md` for detailed architecture and roadmap.
+
 ### Interactive Viewer Controls
 
 **Movement:**
