@@ -263,20 +263,45 @@ impl App {
         
         println!("Creating test world (size: {} units)...", world.world_size());
         
-        // Ground plane
-        for x in 0..100 {
-            for z in 0..100 {
-                if (x + z) % 3 == 0 {
-                    world.set(WorldPos::new(x, 0, z), 1);
+        // Load OSM voxel data
+        println!("Loading OSM voxel data...");
+        match std::fs::read_to_string("osm_voxels.txt") {
+            Ok(content) => {
+                let mut voxel_count = 0;
+                for line in content.lines() {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() == 4 {
+                        if let (Ok(x), Ok(y), Ok(z), Ok(voxel_type)) = (
+                            parts[0].parse::<i64>(),
+                            parts[1].parse::<i64>(),
+                            parts[2].parse::<i64>(),
+                            parts[3].parse::<u8>(),
+                        ) {
+                            world.set(WorldPos::new(x, y, z), voxel_type);
+                            voxel_count += 1;
+                        }
+                    }
                 }
+                println!("Loaded {} voxels from OSM data", voxel_count);
             }
-        }
-        
-        // Towers
-        for i in 0..5 {
-            let x = 30 + i * 20;
-            for y in 1..=(10 + i * 3) {
-                world.set(WorldPos::new(x, y, 50), 2);
+            Err(e) => {
+                println!("Failed to load osm_voxels.txt: {}. Using fallback world generation.", e);
+                // Fallback: simple ground plane
+                for x in 0..100 {
+                    for z in 0..100 {
+                        if (x + z) % 3 == 0 {
+                            world.set(WorldPos::new(x, 0, z), 1);
+                        }
+                    }
+                }
+                
+                // Fallback: some towers
+                for i in 0..5 {
+                    let x = 30 + i * 20;
+                    for y in 1..=(10 + i * 3) {
+                        world.set(WorldPos::new(x, y, 50), 2);
+                    }
+                }
             }
         }
         
@@ -314,7 +339,7 @@ impl App {
             instance_buffer: None,
             instance_capacity: 0,
             world,
-            camera_controller: CameraController::new([0.0, 15.0, 60.0]),
+            camera_controller: CameraController::new([980.0, 50.0, 970.0]),
             visibility_cache: VisibilityCache::new(),
             last_frame: Instant::now(),
             frame_count: 0,
@@ -560,9 +585,25 @@ impl App {
         // Get surface texture
         let output = match surface.get_current_texture() {
             Ok(texture) => texture,
-            Err(_) => {
-                // Recreate surface
-                surface.configure(device, config);
+            Err(e) => {
+                eprintln!("Surface error: {:?}", e);
+                // Handle specific surface errors
+                match e {
+                    wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => {
+                        // Recreate surface
+                        surface.configure(device, config);
+                    }
+                    wgpu::SurfaceError::OutOfMemory => {
+                        eprintln!("Out of memory!");
+                        return;
+                    }
+                    wgpu::SurfaceError::Timeout => {
+                        eprintln!("Surface timeout!");
+                    }
+                    _ => {
+                        eprintln!("Other surface error");
+                    }
+                }
                 return;
             }
         };
@@ -677,6 +718,13 @@ impl ApplicationHandler for App {
         }
     }
     
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // Continuously update and render
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+    
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _window_id: winit::window::WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
@@ -733,9 +781,6 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 self.render();
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
             }
             _ => {}
         }

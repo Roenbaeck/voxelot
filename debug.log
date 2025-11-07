@@ -1,0 +1,3 @@
+Total buildings: 100
+Generated voxels: 21268
+First building: {'type': 'node', 'id': 368043006, 'lat': 40.7430556, 'lon': -73.9891667, 'tags': {'addr:state': 'NY', 'building': 'yes', 'ele': '12', 'gnis:feature_id': '2072051', 'name': 'Cross Chambers', 'source': 'USGS Geonames'}}
