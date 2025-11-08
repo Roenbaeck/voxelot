@@ -40,6 +40,21 @@ struct CubeVertex {
     normal: [f32; 3],
 }
 
+/// Uniforms for shader (matches shader layout exactly)
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Uniforms {
+    mvp: [[f32; 4]; 4],           // 64 bytes
+    sun_direction: [f32; 3],      // 12 bytes
+    fog_density: f32,             // 4 bytes (was _padding1)
+    sun_color: [f32; 3],          // 12 bytes  
+    _padding2: f32,               // 4 bytes
+    ambient_color: [f32; 3],      // 12 bytes
+    time_of_day: f32,             // 4 bytes
+    // Total: 112 bytes (needs padding to 128 for alignment)
+    _padding3: [f32; 4],          // 16 bytes padding
+}
+
 const CUBE_VERTICES: &[CubeVertex] = &[
     // Front face
     CubeVertex { position: [0.0, 0.0, 1.0], normal: [0.0, 0.0, 1.0] },
@@ -137,21 +152,21 @@ impl CameraController {
             KeyCode::Space => self.up = pressed,
             KeyCode::ShiftLeft => self.down = pressed,
             // Runtime config adjustments (only on key press, not release)
-            KeyCode::BracketLeft if pressed => {
+            KeyCode::KeyQ if pressed => {
                 self.camera.config.lod_subdivide_distance = (self.camera.config.lod_subdivide_distance - 50.0).max(50.0);
                 println!("LOD subdivide distance: {:.0}", self.camera.config.lod_subdivide_distance);
             }
-            KeyCode::BracketRight if pressed => {
+            KeyCode::KeyE if pressed => {
                 self.camera.config.lod_subdivide_distance = (self.camera.config.lod_subdivide_distance + 50.0).min(2000.0);
                 println!("LOD subdivide distance: {:.0}", self.camera.config.lod_subdivide_distance);
             }
-            KeyCode::Minus if pressed => {
+            KeyCode::KeyZ if pressed => {
                 self.camera.config.far_plane = (self.camera.config.far_plane - 500.0).max(1000.0);
                 self.camera.far = self.camera.config.far_plane;
                 self.update_camera_vectors(); // Recalculate frustum
                 println!("Far plane: {:.0}", self.camera.config.far_plane);
             }
-            KeyCode::Equal if pressed => {
+            KeyCode::KeyC if pressed => {
                 self.camera.config.far_plane = (self.camera.config.far_plane + 500.0).min(20000.0);
                 self.camera.far = self.camera.config.far_plane;
                 self.update_camera_vectors(); // Recalculate frustum
@@ -254,6 +269,10 @@ struct App {
     
     mouse_pressed: bool,
     last_mouse_pos: Option<(f64, f64)>,
+    
+    // Lighting state
+    time_of_day: f32,
+    fog_density: f32,
 }
 
 impl App {
@@ -320,9 +339,11 @@ impl App {
         println!("World created with voxels");
         println!("\n=== Controls ===");
         println!("Movement: WASD + Space/Shift (up/down)");
-        println!("Look: Mouse");
-        println!("LOD Distance: [ ] (decrease/increase)");
-        println!("Draw Distance: - = (decrease/increase)");
+        println!("Look: Right Mouse + drag");
+        println!("LOD Distance: Q/E (decrease/increase)");
+        println!("Draw Distance: Z/C (decrease/increase)");
+        println!("Time of Day: T (cycle through day/night)");
+        println!("Fog Density: F/G (decrease/increase)");
         println!("Quit: ESC");
         println!("================\n");
         
@@ -346,6 +367,8 @@ impl App {
             last_fps_print: Instant::now(),
             mouse_pressed: false,
             last_mouse_pos: None,
+            time_of_day: 0.5, // Start at noon
+            fog_density: 0.0015, // Default fog density
         }
     }
     
@@ -354,6 +377,34 @@ impl App {
             eprintln!("Failed to save config: {}", e);
         } else {
             println!("Saved render config to {}", CONFIG_FILE);
+        }
+    }
+    
+    fn process_lighting_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::KeyT => {
+                // Cycle through time of day: noon -> sunset -> night -> sunrise -> noon
+                self.time_of_day = (self.time_of_day + 0.25) % 1.0;
+                let time_name = match (self.time_of_day * 4.0) as u32 {
+                    0 => "Midnight",
+                    1 => "Sunrise",
+                    2 => "Noon",
+                    3 => "Sunset",
+                    _ => "Unknown",
+                };
+                println!("Time of day: {} ({:.2})", time_name, self.time_of_day);
+            }
+            KeyCode::KeyF => {
+                // Decrease fog density
+                self.fog_density = (self.fog_density - 0.0002).max(0.0);
+                println!("Fog density: {:.4}", self.fog_density);
+            }
+            KeyCode::KeyG => {
+                // Increase fog density
+                self.fog_density = (self.fog_density + 0.0002).min(0.01);
+                println!("Fog density: {:.4}", self.fog_density);
+            }
+            _ => {}
         }
     }
     
@@ -416,7 +467,7 @@ impl App {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -492,12 +543,22 @@ impl App {
             cache: None,
         });
         
-        // Create uniform buffer
-        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        // Create uniform buffer with proper size for Uniforms struct
+        let uniforms = Uniforms {
+            mvp: [[0.0; 4]; 4], // Will be filled in render()
+            sun_direction: [0.5, 1.0, 0.3],
+            fog_density: 0.0015,
+            sun_color: [1.0, 0.95, 0.8],
+            _padding2: 0.0,
+            ambient_color: [0.3, 0.35, 0.45],
+            time_of_day: 0.5,
+            _padding3: [0.0; 4],
+        };
+        
+        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Uniform Buffer"),
-            size: 128, // MVP matrix
+            contents: bytemuck::cast_slice(&[uniforms]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
         });
         
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -644,7 +705,40 @@ impl App {
         ]);
         let mvp = OPENGL_TO_WGPU_MATRIX * projection * view_mat;
         let mvp_cols: [[f32; 4]; 4] = mvp.to_cols_array_2d();
-        queue.write_buffer(self.uniform_buffer.as_ref().unwrap(), 0, bytemuck::cast_slice(&mvp_cols));
+        
+        // Calculate lighting based on time of day
+        let time_angle = self.time_of_day * std::f32::consts::TAU; // 0..2π
+        let sun_height = time_angle.sin();
+        let sun_direction = [
+            time_angle.cos() * 0.5,
+            sun_height,
+            0.3,
+        ];
+        
+        let (sun_color, ambient_color) = if self.time_of_day < 0.25 || self.time_of_day > 0.75 {
+            // Night - moon (cool blue)
+            ([0.3, 0.3, 0.5], [0.05, 0.05, 0.15])
+        } else if self.time_of_day < 0.35 || self.time_of_day > 0.65 {
+            // Sunrise/sunset - warm orange/red
+            ([1.0, 0.6, 0.3], [0.3, 0.2, 0.2])
+        } else {
+            // Day - bright yellow sun, blue sky ambient
+            ([1.0, 0.95, 0.8], [0.3, 0.35, 0.45])
+        };
+        
+        // Update uniforms with MVP and lighting data
+        let uniforms = Uniforms {
+            mvp: mvp_cols,
+            sun_direction,
+            fog_density: self.fog_density,
+            sun_color,
+            _padding2: 0.0,
+            ambient_color,
+            time_of_day: self.time_of_day,
+            _padding3: [0.0; 4],
+        };
+        
+        queue.write_buffer(self.uniform_buffer.as_ref().unwrap(), 0, bytemuck::cast_slice(&[uniforms]));
         
         // Create command encoder
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -742,6 +836,11 @@ impl ApplicationHandler for App {
             } => {
                 let pressed = state == ElementState::Pressed;
                 self.camera_controller.process_keyboard(key, pressed);
+                
+                // Handle lighting controls on key press only
+                if pressed {
+                    self.process_lighting_key(key);
+                }
 
                 if key == KeyCode::Escape && pressed {
                     self.save_config();

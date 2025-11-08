@@ -1,7 +1,14 @@
-// Voxel rendering shader for hierarchical chunks
+// Voxel rendering shader for hierarchical chunks with global lighting
 
 struct Uniforms {
-    mvp: mat4x4<f32>,
+    mvp: mat4x4<f32>,           // 64 bytes
+    sun_direction: vec3<f32>,   // 12 bytes - Direction TO the sun (normalized)
+    fog_density: f32,           // 4 bytes - Fog density (was _padding1)
+    sun_color: vec3<f32>,       // 12 bytes - Sun color (e.g., warm yellow)
+    _padding2: f32,             // 4 bytes
+    ambient_color: vec3<f32>,   // 12 bytes - Ambient/sky color
+    time_of_day: f32,           // 4 bytes - 0.0 = midnight, 0.5 = noon, 1.0 = midnight
+    // _padding3: vec4<f32> in Rust (16 bytes) - shader doesn't need to declare trailing padding
 };
 
 @group(0) @binding(0)
@@ -103,12 +110,27 @@ fn vs_main(
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    // Simple lighting
-    let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.3));
-    let ambient = 0.3;
-    let diffuse = max(dot(input.normal, light_dir), 0.0) * 0.7;
-    let lighting = ambient + diffuse;
+    // Global sun/moon lighting from uniforms
+    let sun_dir = normalize(uniforms.sun_direction);
     
+    // Diffuse lighting from sun
+    let diffuse = max(dot(input.normal, sun_dir), 0.0);
+    let sun_contribution = diffuse * uniforms.sun_color;
+    
+    // Ambient lighting (sky/moonlight)
+    let ambient = uniforms.ambient_color;
+    
+    // Combine lighting
+    let lighting = ambient + sun_contribution;
+    
+    // Apply lighting to voxel color
     let color = input.color * lighting;
-    return vec4<f32>(color, 1.0);
+    
+    // Atmospheric fog with dynamic density from uniforms
+    let fog_color = vec3<f32>(0.7, 0.8, 0.9); // Light blue sky
+    let distance = length(input.position.xyz);
+    let fog_factor = 1.0 - exp(-uniforms.fog_density * distance);
+    let final_color = mix(color, fog_color, fog_factor * 0.5);
+    
+    return vec4<f32>(final_color, 1.0);
 }
