@@ -48,14 +48,20 @@ See `VOXEL_GENERATOR_REVAMP.md` for detailed architecture and roadmap.
 
 **Movement:**
 - `WASD` - Move forward/left/backward/right
-- `Space` - Move up
-- `Shift` - Move down
-- `Mouse` - Look around
+- `Arrow Up/Down` - Move up/down
+- `Right Mouse + Drag` - Look around
 
 **Runtime Configuration:**
-- `[` / `]` - Decrease/increase LOD subdivide distance
-- `-` / `=` - Decrease/increase draw distance (far plane)
+- `Q` / `E` - Decrease/increase LOD subdivide distance
+- `Z` / `C` - Decrease/increase draw distance (far plane)
+- `T` - Cycle time of day (midnight → sunrise → noon → sunset)
+- `F` / `G` - Decrease/increase fog density
 - `ESC` - Save config and quit
+
+**Visual Features:**
+- **Dynamic Lighting**: Day/night cycle with realistic sun/moon colors and positions
+- **Atmospheric Fog**: Exponential distance fog with adjustable density (0.0-0.01)
+- **Backface Culling**: GPU-level optimization reducing fragment work by ~50%
 
 Configuration is saved to `render_config.txt` and automatically loaded on startup. You can edit this file directly to change render settings without recompiling.
 

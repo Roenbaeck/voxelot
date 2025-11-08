@@ -149,8 +149,8 @@ impl CameraController {
             KeyCode::KeyS => self.backward = pressed,
             KeyCode::KeyA => self.left = pressed,
             KeyCode::KeyD => self.right = pressed,
-            KeyCode::Space => self.up = pressed,
-            KeyCode::ShiftLeft => self.down = pressed,
+            KeyCode::ArrowUp => self.up = pressed,
+            KeyCode::ArrowDown => self.down = pressed,
             // Runtime config adjustments (only on key press, not release)
             KeyCode::KeyQ if pressed => {
                 self.camera.config.lod_subdivide_distance = (self.camera.config.lod_subdivide_distance - 50.0).max(50.0);
@@ -338,7 +338,7 @@ impl App {
         
         println!("World created with voxels");
         println!("\n=== Controls ===");
-        println!("Movement: WASD + Space/Shift (up/down)");
+        println!("Movement: WASD + Arrow Up/Down (up/down)");
         println!("Look: Right Mouse + drag");
         println!("LOD Distance: Q/E (decrease/increase)");
         println!("Draw Distance: Z/C (decrease/increase)");

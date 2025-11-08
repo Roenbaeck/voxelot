@@ -2,94 +2,17 @@
 
 ## Current Status
 
-### 🔴 **Critical Bugs Found** (Must Fix!)
-
-#### 1. **Shader/Buffer Size Mismatch** - Will cause crashes or visual glitches!
-**Location**: `viewer_hierarchical.rs` line ~430, ~563
-
-**Problem**: 
-- Shader expects 128-byte uniform (MVP + lighting + fog)
-- Rust only allocates 128 bytes BUT only writes 64 bytes (MVP matrix)
-- Rest of buffer is uninitialized garbage → shader reads random data for lighting!
-
-**Fix**:
-```rust
-// Current (WRONG):
-let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-    size: 128, // MVP matrix  <-- LIES! Has more fields!
-    ...
-});
-queue.write_buffer(..., 0, bytemuck::cast_slice(&mvp_cols)); // Only 64 bytes!
-
-// Fixed:
-#[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct Uniforms {
-    mvp: [[f32; 4]; 4],           // 64 bytes
-    sun_direction: [f32; 3],      // 12 bytes
-    _padding1: f32,                // 4 bytes (alignment)
-    sun_color: [f32; 3],          // 12 bytes  
-    _padding2: f32,                // 4 bytes
-    ambient_color: [f32; 3],      // 12 bytes
-    time_of_day: f32,             // 4 bytes
-    _padding3: [f32; 3],          // 12 bytes (alignment)
-}
-// Total: 128 bytes ✓
-
-let uniforms = Uniforms {
-    mvp: mvp_cols,
-    sun_direction: [0.5, 1.0, 0.3],  // Default sun
-    _padding1: 0.0,
-    sun_color: [1.0, 0.95, 0.8],
-    _padding2: 0.0,
-    ambient_color: [0.3, 0.35, 0.45],
-    time_of_day: 0.5,
-    _padding3: [0.0; 3],
-};
-
-let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-    label: Some("Uniform Buffer"),
-    contents: bytemuck::cast_slice(&[uniforms]),
-    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-});
-```
-
-#### 2. **Shader Visibility Wrong** - Fragment shader can't read uniforms!
-**Location**: `viewer_hierarchical.rs` line ~351
-
-**Problem**: Uniforms only visible to vertex shader, but fragment shader needs them for lighting!
-
-**Fix**:
-```rust
-// Current (WRONG):
-wgpu::BindGroupLayoutEntry {
-    visibility: wgpu::ShaderStages::VERTEX,  // Fragment can't see it!
-    ...
-}
-
-// Fixed:
-wgpu::BindGroupLayoutEntry {
-    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-    ...
-}
-```
-
-#### 3. **Backface Culling Disabled** - Wastes 50% of fragment shader work!
-
-**Fix**: Already documented in main section below.
-
----
-
 ### ✅ Already Implemented
-- **Frustum Culling**: Camera frustum culling is working in `culling.rs`
+- **Frustum Culling**: Camera frustum culling working in `culling.rs`
 - **Hierarchical LOD**: Distance-based subdivision/merging (`LOD_SUBDIVIDE_DISTANCE = 50.0`)
-- **Global Sun/Moon Lighting**: Shader has `sun_direction`, `sun_color`, `ambient_color` uniforms
-- **Atmospheric Fog**: Exponential fog with configurable density in fragment shader
+- **Global Sun/Moon Lighting**: Dynamic time-based lighting with configurable sun direction, colors, and ambient lighting
+- **Atmospheric Fog**: Exponential fog with runtime-adjustable density (F/G keys, range 0.0-0.01)
 - **Parallel Culling**: Rayon-based parallel chunk processing
 - **Occlusion Culling**: Front-to-back traversal with visibility caching
-
-### ⚠️ Partially Implemented
-- **Backface Culling**: Currently DISABLED (`cull_mode: None`) - Easy win by enabling!
+- **Backface Culling**: GPU-level culling enabled (`cull_mode: Some(wgpu::Face::Back)`)
+- **Proper Shader Uniforms**: 128-byte aligned uniform buffer with lighting parameters
+- **Dynamic Time of Day**: Keyboard-controlled day/night cycle (T key) with realistic color transitions
+- **Keyboard Controls**: International layout-friendly (arrow keys, alpha keys only)
 
 ### ❌ Not Yet Implemented
 - **Greedy Meshing**: Still drawing 36 vertices per voxel
@@ -104,9 +27,10 @@ wgpu::BindGroupLayoutEntry {
 
 ### 1. 🚀 **Greedy Meshing** (10-100x vertex reduction)
 **Impact**: HUGE - reduces vertices by 90%+ for solid regions  
-**Complexity**: Medium
+**Complexity**: Medium  
+**Note**: **Do this FIRST** - it inherently includes neighbor culling and produces far fewer faces to manage
 
-Merge adjacent voxel faces into larger quads. Instead of 6 faces per voxel, create one merged face for entire runs.
+Merge adjacent voxel faces into larger quads. Instead of 6 faces per voxel, create one merged face for entire runs. This algorithm naturally only creates faces where needed (at chunk boundaries and air interfaces), so it combines both greedy meshing AND neighbor-based face culling in one pass.
 
 ```rust
 // Algorithm outline:
@@ -122,6 +46,7 @@ fn greedy_mesh(chunk: &Chunk) -> Vec<Quad> {
             for y in 0..16 {
                 for x in 0..16 {
                     if should_draw_face(x, y, slice, dir) && !visited[x][y][slice] {
+                        // should_draw_face already checks neighbors - no face if solid neighbor!
                         // Expand horizontally
                         let mut width = 1;
                         while can_expand_x(x + width, y, slice, dir) { width += 1; }
@@ -140,45 +65,44 @@ fn greedy_mesh(chunk: &Chunk) -> Vec<Quad> {
     }
     quads
 }
+
+fn should_draw_face(pos: Pos, direction: Dir, chunk: &Chunk) -> bool {
+    let neighbor_pos = pos + direction.offset();
+    
+    // Don't draw face if:
+    // 1. Neighbor is solid (internal face)
+    // 2. Same voxel type (will be merged anyway)
+    if !chunk.in_bounds(neighbor_pos) {
+        return true; // Chunk edge - exposed
+    }
+    
+    let neighbor = chunk.get(neighbor_pos);
+    match neighbor {
+        None => true,                              // Air - draw face
+        Some(voxel) if voxel.is_transparent() => true,  // Transparent - draw face
+        Some(_) => false,                          // Solid neighbor - cull!
+    }
+}
 ```
+
+**Why greedy meshing comes first**:
+- Doing per-voxel neighbor checks first, then greedy meshing would check neighbors twice
+- Greedy meshing naturally produces only external faces (neighbor culling is built-in)
+- Result is already optimized quads, not individual faces to cull later
+- Mesh caching becomes much more valuable with fewer, larger primitives
 
 **Integration**:
 - Generate mesh per chunk instead of per voxel
 - Cache meshes - only regenerate when chunk changes
 - Update instance buffer with quads instead of cubes
 
-### 2. ⚡ **Face Culling** (60-80% vertex reduction)
-**Impact**: High - only draw external faces  
+### 2. ⚡ **Additional Face Optimizations** (Applied to greedy mesh output)
+**Impact**: Medium - optimizations on top of greedy meshing  
 **Complexity**: Low
 
-Face culling eliminates faces that won't be visible, dramatically reducing vertex count. There are several types of culling that can be combined:
+Once you have greedy meshed quads, these optimizations can be applied:
 
-#### **2a. Neighbor-Based Culling** (Most Important)
-Don't draw faces adjacent to solid voxels:
-
-```rust
-fn should_draw_face(pos: Pos, direction: Dir, chunk: &Chunk) -> bool {
-    let neighbor_pos = pos + direction.offset();
-    
-    // Draw face if:
-    // 1. At chunk boundary (exposed to air/other chunks)
-    // 2. Neighbor voxel is empty/air
-    // 3. Neighbor voxel is transparent (glass, water, etc.)
-    
-    if !chunk.in_bounds(neighbor_pos) {
-        return true; // Chunk edge - might be visible
-    }
-    
-    let neighbor = chunk.get(neighbor_pos);
-    match neighbor {
-        None => true,                              // Empty - draw face
-        Some(voxel) if voxel.is_transparent() => true,  // Transparent - draw face
-        Some(_) => false,                          // Solid neighbor - cull face
-    }
-}
-```
-
-#### **2b. Backface Culling** (GPU-Level, Enable by Default)
+#### **2a. Backface Culling** (GPU-Level) ✅ **Already Enabled**
 GPU automatically culls faces pointing away from camera. This is "free" when enabled:
 
 ```rust
@@ -190,47 +114,27 @@ wgpu::PrimitiveState {
 }
 ```
 
-**How it works**: For opaque cubes, you can only see 3 faces maximum from any viewpoint. The GPU automatically skips the other 3 faces pointing away from camera. This is handled in hardware and costs almost nothing.
+**How it works**: For opaque quads, you can only see one side from any viewpoint. The GPU automatically skips faces pointing away from camera. This is handled in hardware and costs almost nothing.
 
-**Important**: This requires proper winding order in your cube vertices (counter-clockwise when viewed from outside).
+**Status**: ✅ Already implemented and working!
 
-#### **2c. View-Frustum Culling** (Per-Voxel, Advanced)
-For individual voxels within view frustum, you could theoretically skip faces based on camera direction, but this is usually not worth it because:
-- The GPU already does backface culling efficiently
-- Per-voxel CPU culling adds overhead
-- Only beneficial for very large voxels or special cases
-
-**Recommendation**: Use 2a (neighbor-based) + 2b (GPU backface culling). This combination gives you 80%+ reduction with minimal cost.
+#### **2b. Inter-Chunk Face Culling** (Advanced)
+After greedy meshing individual chunks, you can cull faces between adjacent chunks:
 
 ```rust
-// Combined approach:
-fn build_mesh(chunk: &Chunk) -> Vec<Face> {
-    let mut faces = Vec::new();
-    
-    for (pos, voxel) in chunk.iter_voxels() {
-        // Only for opaque voxels
-        if !voxel.is_opaque() {
-            continue; // Transparent voxels need all faces (for now)
-        }
-        
-        // Check each of 6 possible faces
-        for direction in [Dir::PosX, Dir::NegX, Dir::PosY, Dir::NegY, Dir::PosZ, Dir::NegZ] {
-            // Neighbor-based culling
-            if should_draw_face(pos, direction, chunk) {
-                faces.push(Face::new(pos, direction, voxel.voxel_type));
-            }
-            // GPU will handle backface culling automatically
-        }
-    }
-    
-    faces
+fn cull_chunk_boundary_faces(chunk_a: &Mesh, chunk_b: &Mesh, boundary: Plane) {
+    // For quads on chunk_a's boundary that face chunk_b:
+    // Remove if chunk_b has a matching quad on its boundary facing back
+    // This eliminates internal faces between chunks
 }
 ```
 
-**Expected Results**:
-- Neighbor culling: ~80% reduction (only external faces remain)
-- GPU backface culling: ~50% additional reduction on remaining faces
-- **Combined**: Only 10% of original faces are drawn (~90% reduction!)
+**Note**: This is more complex with greedy meshed quads since you need to check if quads overlap at boundaries. Often easier to just let GPU backface culling handle it.
+
+**Expected Results with Greedy Meshing**:
+- Greedy meshing with built-in neighbor culling: ~95% reduction (only external faces, merged into large quads)
+- GPU backface culling on remaining faces: ~50% additional reduction
+- **Combined**: Only ~2-5% of original per-voxel faces are drawn (~95-98% reduction!)
 
 ### 3. 📏 **LOD Using Hierarchy** (Distance-based simplification)
 **Status**: ✅ **Partially Implemented** - subdivision works, but no large-chunk rendering  
@@ -530,75 +434,7 @@ if key == KeyCode::BracketRight {
 - Can optimize with separable blur (horizontal then vertical)
 - ~2-3ms per frame at 1080p with 19 samples
 
-
-
-### 6. ☀️ **Global Sun/Moon Lighting**
-**Status**: ✅ **Shader Ready** - just needs Rust uniform updates  
-**Effect**: Dynamic time of day, atmospheric lighting  
-**Performance Cost**: Negligible (already in shader!)
-
-The shader already has all the lighting infrastructure! Just need to update the Rust-side uniforms.
-
-**What's Already Working**:
-- Sun direction, color, and ambient color in shader
-- Diffuse lighting calculation
-- Atmospheric fog integration
-
-**Implementation** (update uniforms struct in Rust):
-```rust
-#[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct Uniforms {
-    mvp: [[f32; 4]; 4],
-    sun_direction: [f32; 3],
-    _padding1: f32,
-    sun_color: [f32; 3],
-    _padding2: f32,
-    ambient_color: [f32; 3],
-    time_of_day: f32,
-}
-
-// Update each frame:
-fn update_lighting(&mut self, time: f32) {
-    // Animate sun position (0.0 = midnight, 0.5 = noon, 1.0 = midnight)
-    let time_of_day = (time * 0.1) % 1.0; // Slow rotation
-    let angle = time_of_day * std::f32::consts::TAU;
-    
-    // Sun moves in arc across sky
-    self.uniforms.sun_direction = [
-        angle.cos() * 0.5,
-        angle.sin(),  // High at noon, low at sunrise/sunset
-        0.3,
-    ];
-    
-    // Color changes with time
-    if time_of_day < 0.25 || time_of_day > 0.75 {
-        // Night - moon (cool blue)
-        self.uniforms.sun_color = [0.3, 0.3, 0.5];
-        self.uniforms.ambient_color = [0.05, 0.05, 0.15];
-    } else if time_of_day < 0.3 || time_of_day > 0.7 {
-        // Sunrise/sunset - warm orange
-        self.uniforms.sun_color = [1.0, 0.6, 0.3];
-        self.uniforms.ambient_color = [0.3, 0.2, 0.2];
-    } else {
-        // Day - bright yellow sun
-        self.uniforms.sun_color = [1.0, 0.95, 0.8];
-        self.uniforms.ambient_color = [0.3, 0.35, 0.45]; // Blue sky ambient
-    }
-}
-```
-
-### 7. 🌫️ **Atmospheric Fog**
-**Status**: ✅ **Fully Implemented** in shader!  
-**Effect**: Depth cues and atmospheric perspective
-
-Already working! Exponential fog in fragment shader. Currently tuned as:
-```wgsl
-let fog_density = 0.0015;  // Adjustable
-let fog_color = vec3<f32>(0.7, 0.8, 0.9);  // Light blue sky
-```
-
-To adjust, simply edit these values in `shaders/voxel.wgsl`.
+---
 
 ## Quick Wins (Easy to Implement)
 
@@ -637,55 +473,60 @@ fn get_voxel_color(voxel_type: u32, normal: vec3<f32>) -> vec3<f32> {
 
 ## Implementation Priority
 
-**Phase 1 - Immediate Wins** (< 1 hour, huge impact!):
-1. ✅ **Enable backface culling** - Change `cull_mode: None` to `Some(wgpu::Face::Back)` (~50% reduction!)
-2. **Verify vertex winding** - Ensure counter-clockwise from outside
+**Phase 1 - Immediate Wins** ✅ **COMPLETED**:
+1. ✅ Enable backface culling - Changed `cull_mode: None` to `Some(wgpu::Face::Back)` (~50% reduction!)
+2. ✅ Fix shader uniform visibility - Added FRAGMENT visibility to bind group
+3. ✅ Create proper Uniforms struct - 128-byte aligned with lighting parameters
+4. ✅ Implement dynamic lighting - Time-based sun/moon with keyboard control (T key)
+5. ✅ Add adjustable fog - Runtime fog density control (F/G keys, 0.0-0.01 range)
+6. ✅ Keyboard remapping - International layout support (arrow keys, alpha keys only)
 
-**Phase 2 - Face Culling** (2-3 hours):
-1. Implement neighbor-based face culling (~80% reduction)
-2. Add voxel transparency support
+**Phase 2 - Greedy Meshing** (6-8 hours) - **DO THIS FIRST**:
+1. Implement greedy meshing algorithm (includes neighbor culling)
+2. Add mesh caching system per chunk
+3. Handle chunk updates (regenerate mesh on change)
+4. Update rendering to use quads instead of per-voxel cubes
 
 **Phase 3 - Tilt-Shift DoF** (3-4 hours):
 1. Create offscreen render targets
-2. Implement DoF shader (provided above)
+2. Implement DoF shader (provided in this document)
 3. Add Rust integration
 4. Add keyboard controls for tuning
 
-**Phase 4 - Greedy Meshing** (6-8 hours):
-1. Implement meshing algorithm
-2. Add mesh caching system
-3. Handle chunk updates
-
-**Phase 5 - Advanced** (optional):
-1. Complete LOD large-chunk rendering
-2. GPU-driven rendering
-3. Advanced shadows
+**Phase 4 - Advanced Optimizations** (optional):
+1. Inter-chunk face culling (for greedy meshed boundaries)
+2. Complete LOD large-chunk rendering
+3. GPU-driven rendering with compute shaders
+4. Advanced shadows
 
 ---
 
 ## Expected Results
 
 **Performance** (with all optimizations):
-- Backface culling: ~50% fewer fragments (EASY WIN!)
-- Neighbor face culling: ~80% fewer vertices  
-- Greedy meshing: ~95% fewer vertices
+- ✅ Backface culling: ~50% fewer fragments (COMPLETED!)
+- Greedy meshing with neighbor culling: ~95% fewer vertices (only external faces, merged into quads)
 - Complete LOD: ~70% fewer draw calls
 - **Combined**: 100-1000x improvement for large scenes!
 
 **Visuals**:
-- ✅ **Already have**: Global lighting, atmospheric fog
+- ✅ **Implemented**: Global lighting with day/night cycle, adjustable atmospheric fog, backface culling
 - 🎨 **With DoF**: Professional miniature/toy world aesthetic
-- 🌅 **With dynamic lighting**: Day/night cycles, atmospheric scenes
+- 🌅 **With dynamic lighting**: Day/night cycles, atmospheric scenes ✅ **DONE**
 - **Together**: Polished, distinctive visual style
 
 ## Summary
 
-**Current State**: Good foundation with lighting and fog working. Main bottleneck is drawing all faces of all voxels (36 vertices each).
+**Current State**: ✅ Solid foundation with dynamic lighting, adjustable fog, and backface culling working. Main bottleneck is now drawing all faces of all voxels (36 vertices each).
 
-**Biggest Impact Changes**:
-1. Enable backface culling (1 line change, 50% gain!)
-2. Add DoF for tilt-shift toy aesthetic
-3. Implement face culling (80% reduction)
-4. Add greedy meshing (10-100x improvement)
+**Biggest Impact Changes** (Next Steps):
+1. ✅ ~~Enable backface culling~~ - **COMPLETED**
+2. ✅ ~~Add dynamic lighting~~ - **COMPLETED**
+3. ✅ ~~Add adjustable fog~~ - **COMPLETED**
+4. **Implement greedy meshing** (95% vertex reduction, includes neighbor culling) - **DO THIS NEXT**
+5. Add DoF for tilt-shift toy aesthetic (shader code provided)
+6. Add inter-chunk face culling (optional optimization after greedy meshing)
 
-The shader infrastructure is solid - performance gains are mostly about reducing geometry submission!
+**Key Insight**: Greedy meshing should be done BEFORE standalone neighbor culling, as it naturally produces only external faces while merging them into larger quads. Doing per-voxel neighbor checks first would be redundant work.
+
+The shader infrastructure is now solid with proper uniforms and dynamic lighting - performance gains are mostly about reducing geometry submission!
