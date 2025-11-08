@@ -13,6 +13,27 @@ use croaring::Bitmap;
 /// Voxel type identifier
 pub type VoxelType = u8;
 
+/// Convert a VoxelType to RGBA color (matches shader's get_voxel_color)
+pub fn voxel_type_to_rgba(voxel_type: VoxelType) -> [u8; 4] {
+    let (r, g, b) = match voxel_type {
+        1 => (0.3, 0.7, 0.3), // Green ground
+        2 => (0.7, 0.3, 0.3), // Red tower
+        3 => (0.3, 0.3, 0.7), // Blue
+        4 => (0.7, 0.7, 0.3), // Yellow
+        5 => (0.7, 0.3, 0.7), // Magenta
+        6 => (0.3, 0.7, 0.7), // Cyan
+        7 => (0.5, 0.5, 0.5), // Gray wall
+        _ => (1.0, 1.0, 1.0), // White default
+    };
+    
+    [
+        (r * 255.0) as u8,
+        (g * 255.0) as u8,
+        (b * 255.0) as u8,
+        255, // Fully opaque
+    ]
+}
+
 /// A voxel is either solid or contains a sub-chunk
 #[derive(Clone, Debug)]
 pub enum Voxel {
@@ -30,6 +51,7 @@ pub enum Voxel {
 /// - voxels: Array indexed by rank(position)
 ///   - At leaf level: Voxel::Solid(type)
 ///   - At branch level: Voxel::Chunk(sub_chunk)
+/// - LOD metadata: voxel_count and average_color for distance rendering
 #[derive(Clone, Debug)]
 pub struct Chunk {
     /// Marginal X bitmap: bit i set if any voxel exists at x=i
@@ -47,6 +69,13 @@ pub struct Chunk {
     /// Voxel array indexed by rank
     /// Can be Voxel::Solid (leaf) or Voxel::Chunk (branch)
     pub voxels: Vec<Voxel>,
+    
+    /// LOD metadata: Number of solid voxels in this chunk
+    pub voxel_count: u32,
+    
+    /// LOD metadata: Average RGBA color for distance rendering
+    /// Alpha represents occupancy (0 = empty, 255 = fully dense)
+    pub average_color: [u8; 4],
 }
 
 impl Chunk {
@@ -58,6 +87,8 @@ impl Chunk {
             pz: 0,
             presence: Bitmap::new(),
             voxels: Vec::new(),
+            voxel_count: 0,
+            average_color: [0, 0, 0, 0], // Empty chunk = transparent
         }
     }
     
@@ -201,6 +232,44 @@ impl Chunk {
     /// Check if this chunk is empty
     pub fn is_empty(&self) -> bool {
         self.presence.is_empty()
+    }
+    
+    /// Update LOD metadata: voxel_count and average_color
+    /// Should be called after modifying chunk contents
+    pub fn update_lod_metadata(&mut self) {
+        const TOTAL_SLOTS: u32 = 16 * 16 * 16; // 4096
+        
+        let mut color_sum = [0u32; 4]; // RGBA
+        let mut solid_count = 0u32;
+        
+        // Sum colors of all solid voxels
+        for voxel in &self.voxels {
+            if let Voxel::Solid(voxel_type) = voxel {
+                let rgba = voxel_type_to_rgba(*voxel_type);
+                color_sum[0] += rgba[0] as u32;
+                color_sum[1] += rgba[1] as u32;
+                color_sum[2] += rgba[2] as u32;
+                color_sum[3] += rgba[3] as u32;
+                solid_count += 1;
+            }
+            // Note: Voxel::Chunk is not counted as solid for LOD purposes
+            // When rendering, subdivided chunks will recursively update their own LOD
+        }
+        
+        self.voxel_count = solid_count;
+        
+        // Average across ALL slots (including empty ones)
+        // This makes sparse chunks naturally transparent (low alpha)
+        if solid_count > 0 {
+            self.average_color = [
+                (color_sum[0] / TOTAL_SLOTS) as u8,
+                (color_sum[1] / TOTAL_SLOTS) as u8,
+                (color_sum[2] / TOTAL_SLOTS) as u8,
+                (color_sum[3] / TOTAL_SLOTS) as u8,
+            ];
+        } else {
+            self.average_color = [0, 0, 0, 0]; // Empty = transparent
+        }
     }
     
     /// Iterator over all voxel positions
@@ -557,6 +626,25 @@ impl World {
         let parent = self.navigate_to(&path, self.hierarchy_depth as usize - 1)?;
         let &(x, y, z) = path.last()?;
         parent.depth_at(x, y, z)
+    }
+    
+    /// Update LOD metadata for all chunks recursively (call after world generation)
+    /// This walks through the entire hierarchy and updates voxel_count and average_color
+    pub fn update_all_lod_metadata(&mut self) {
+        Self::update_chunk_lod_recursive(&mut self.root);
+    }
+    
+    /// Recursive helper to update LOD metadata bottom-up
+    fn update_chunk_lod_recursive(chunk: &mut Chunk) {
+        // First, recursively update all sub-chunks
+        for voxel in &mut chunk.voxels {
+            if let Voxel::Chunk(sub_chunk) = voxel {
+                Self::update_chunk_lod_recursive(sub_chunk);
+            }
+        }
+        
+        // Then update this chunk's metadata
+        chunk.update_lod_metadata();
     }
 }
 

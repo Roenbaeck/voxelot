@@ -10,6 +10,8 @@ pub struct RenderConfig {
     pub lod_subdivide_distance: f32,
     /// Merge chunks if farther than this distance
     pub lod_merge_distance: f32,
+    /// Render distant chunks as simplified blocks beyond this distance
+    pub lod_render_distance: f32,
     /// Camera far plane distance
     pub far_plane: f32,
     /// Camera field of view in degrees
@@ -23,6 +25,7 @@ impl Default for RenderConfig {
         Self {
             lod_subdivide_distance: 500.0,
             lod_merge_distance: 1000.0,
+            lod_render_distance: 800.0,
             far_plane: 5000.0,
             fov_degrees: 70.0,
             near_plane: 0.1,
@@ -348,6 +351,10 @@ pub struct VoxelInstance {
     pub position: [i64; 3],
     pub voxel_type: VoxelType,
     pub distance: f32,
+    /// Optional: Custom RGBA color for LOD rendering (overrides voxel_type color if Some)
+    pub custom_color: Option<[u8; 4]>,
+    /// Scale factor for this voxel (1 = normal voxel, 16 = chunk-sized block, etc.)
+    pub scale: i64,
 }
 
 /// Chunk rendering info with LOD
@@ -416,11 +423,13 @@ fn collect_voxels_recursive(
                         position: [world_x, world_y, world_z],
                         voxel_type: *voxel_type,
                         distance,
+                        custom_color: None,  // Use voxel_type's default color
+                        scale: 1,  // Normal 1x1x1 voxel
                     });
                 }
             }
             Voxel::Chunk(sub_chunk) => {
-                // For sub-chunks, check distance and decide whether to recurse
+                // For sub-chunks, check distance and decide whether to recurse or render as LOD
                 let voxel_center = [
                     world_x as f32 + (scale as f32 / 2.0),
                     world_y as f32 + (scale as f32 / 2.0),
@@ -429,8 +438,19 @@ fn collect_voxels_recursive(
                 
                 let distance = camera.distance_to(voxel_center);
                 
-                if distance < camera.config.lod_subdivide_distance {
-                    // Recurse into sub-chunk with reduced scale
+                // NEW: LOD rendering - if far away and chunk has voxels, render as single block
+                if distance >= camera.config.lod_render_distance && sub_chunk.voxel_count > 0 {
+                    // Render entire chunk as one large colored block
+                    // Alpha in average_color represents density/occupancy
+                    result.push(VoxelInstance {
+                        position: [world_x, world_y, world_z],
+                        voxel_type: 0,  // Ignored when custom_color is Some
+                        distance,
+                        custom_color: Some(sub_chunk.average_color),
+                        scale: 16,  // Chunk is 16x16x16
+                    });
+                } else if distance < camera.config.lod_subdivide_distance {
+                    // Close up - recurse into sub-chunk with reduced scale
                     collect_voxels_recursive(
                         sub_chunk,
                         [world_x, world_y, world_z],
@@ -439,6 +459,7 @@ fn collect_voxels_recursive(
                         result,
                     );
                 }
+                // else: medium distance, no voxels, or empty - skip rendering
             }
         }
     }
@@ -564,6 +585,8 @@ pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> Vec<Voxel
                         position: [world_x, world_y, world_z],
                         voxel_type: *vtype,
                         distance,
+                        custom_color: None,
+                        scale: 1,
                     });
                 }
                 Voxel::Chunk(chunk) => {

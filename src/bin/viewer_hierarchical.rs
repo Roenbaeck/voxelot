@@ -31,6 +31,8 @@ const CONFIG_FILE: &str = "render_config.txt";
 struct VoxelInstanceRaw {
     position: [f32; 3],
     voxel_type: u32,
+    scale: f32,              // Scale factor (1.0 = 1x1x1, 16.0 = 16x16x16 chunk)
+    custom_color: [f32; 4],  // RGBA custom color (if custom_color.a > 0, use this instead of voxel_type)
 }
 
 #[repr(C)]
@@ -273,6 +275,9 @@ struct App {
     // Lighting state
     time_of_day: f32,
     fog_density: f32,
+    
+    // LOD state
+    lod_distance: f32,
 }
 
 impl App {
@@ -337,11 +342,18 @@ impl App {
         }
         
         println!("World created with voxels");
+        
+        // Update LOD metadata for all chunks (for distance-based rendering)
+        println!("Updating LOD metadata...");
+        world.update_all_lod_metadata();
+        println!("LOD metadata updated");
+        
         println!("\n=== Controls ===");
         println!("Movement: WASD + Arrow Up/Down (up/down)");
         println!("Look: Right Mouse + drag");
-        println!("LOD Distance: Q/E (decrease/increase)");
+        println!("Camera LOD Distance: Q/E (decrease/increase)");
         println!("Draw Distance: Z/C (decrease/increase)");
+        println!("Chunk LOD Distance: K/L (decrease/increase)");
         println!("Time of Day: T (cycle through day/night)");
         println!("Fog Density: F/G (decrease/increase)");
         println!("Quit: ESC");
@@ -369,6 +381,7 @@ impl App {
             last_mouse_pos: None,
             time_of_day: 0.5, // Start at noon
             fog_density: 0.0015, // Default fog density
+            lod_distance: 800.0, // Default LOD render distance
         }
     }
     
@@ -403,6 +416,18 @@ impl App {
                 // Increase fog density
                 self.fog_density = (self.fog_density + 0.0002).min(0.01);
                 println!("Fog density: {:.4}", self.fog_density);
+            }
+            KeyCode::KeyK => {
+                // Decrease LOD distance (more detail at distance)
+                self.lod_distance = (self.lod_distance - 100.0).max(100.0);
+                self.camera_controller.camera.config.lod_render_distance = self.lod_distance;
+                println!("LOD distance: {:.0} units", self.lod_distance);
+            }
+            KeyCode::KeyL => {
+                // Increase LOD distance (less detail at distance)
+                self.lod_distance = (self.lod_distance + 100.0).min(5000.0);
+                self.camera_controller.camera.config.lod_render_distance = self.lod_distance;
+                println!("LOD distance: {:.0} units", self.lod_distance);
             }
             _ => {}
         }
@@ -497,13 +522,18 @@ impl App {
                     wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<CubeVertex>() as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![2 => Float32x3, 3 => Float32x3],
+                        attributes: &wgpu::vertex_attr_array![4 => Float32x3, 5 => Float32x3],
                     },
-                    // Slot 1: Per-instance data (position + type)
+                    // Slot 1: Per-instance data (position, type, scale, custom_color)
                     wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<VoxelInstanceRaw>() as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Uint32],
+                        attributes: &wgpu::vertex_attr_array![
+                            0 => Float32x3,  // position
+                            1 => Uint32,     // voxel_type
+                            2 => Float32,    // scale
+                            3 => Float32x4   // custom_color (RGBA)
+                        ],
                     }
                 ],
                 compilation_options: Default::default(),
@@ -613,9 +643,24 @@ impl App {
         // Convert to GPU instances
         let instances: Vec<VoxelInstanceRaw> = visible
             .iter()
-            .map(|v| VoxelInstanceRaw {
-                position: [v.position[0] as f32, v.position[1] as f32, v.position[2] as f32],
-                voxel_type: v.voxel_type as u32,
+            .map(|v| {
+                let custom_color_f32 = if let Some(rgba) = v.custom_color {
+                    [
+                        rgba[0] as f32 / 255.0,
+                        rgba[1] as f32 / 255.0,
+                        rgba[2] as f32 / 255.0,
+                        rgba[3] as f32 / 255.0,
+                    ]
+                } else {
+                    [0.0, 0.0, 0.0, 0.0] // Alpha = 0 means use voxel_type color
+                };
+                
+                VoxelInstanceRaw {
+                    position: [v.position[0] as f32, v.position[1] as f32, v.position[2] as f32],
+                    voxel_type: v.voxel_type as u32,
+                    scale: v.scale as f32,
+                    custom_color: custom_color_f32,
+                }
             })
             .collect();
         

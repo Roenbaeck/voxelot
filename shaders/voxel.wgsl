@@ -90,20 +90,27 @@ fn get_voxel_color(voxel_type: u32) -> vec3<f32> {
 fn vs_main(
     @location(0) instance_position: vec3<f32>,
     @location(1) instance_voxel_type: u32,
-    @location(2) vertex_position: vec3<f32>,
-    @location(3) vertex_normal: vec3<f32>,
+    @location(2) instance_scale: f32,
+    @location(3) instance_custom_color: vec4<f32>,
+    @location(4) vertex_position: vec3<f32>,
+    @location(5) vertex_normal: vec3<f32>,
 ) -> VertexOutput {
     var output: VertexOutput;
     
-    // Position the cube at the voxel's world position
-    let world_pos = vec4<f32>(instance_position + vertex_position, 1.0);
+    // Scale the vertex position, then add to instance position
+    let scaled_vertex_pos = vertex_position * instance_scale;
+    let world_pos = vec4<f32>(instance_position + scaled_vertex_pos, 1.0);
     output.position = uniforms.mvp * world_pos;
     
     // Use the per-vertex normal from the buffer
     output.normal = vertex_normal;
     
-    // Get color based on voxel type
-    output.color = get_voxel_color(instance_voxel_type);
+    // Use custom color if alpha > 0, otherwise use voxel type color
+    if (instance_custom_color.a > 0.0) {
+        output.color = instance_custom_color.rgb;
+    } else {
+        output.color = get_voxel_color(instance_voxel_type);
+    }
     
     return output;
 }

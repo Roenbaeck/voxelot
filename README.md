@@ -52,8 +52,9 @@ See `VOXEL_GENERATOR_REVAMP.md` for detailed architecture and roadmap.
 - `Right Mouse + Drag` - Look around
 
 **Runtime Configuration:**
-- `Q` / `E` - Decrease/increase LOD subdivide distance
+- `Q` / `E` - Decrease/increase camera LOD subdivide distance
 - `Z` / `C` - Decrease/increase draw distance (far plane)
+- `K` / `L` - Decrease/increase chunk LOD render distance (100-5000 units)
 - `T` - Cycle time of day (midnight → sunrise → noon → sunset)
 - `F` / `G` - Decrease/increase fog density
 - `ESC` - Save config and quit
@@ -62,6 +63,10 @@ See `VOXEL_GENERATOR_REVAMP.md` for detailed architecture and roadmap.
 - **Dynamic Lighting**: Day/night cycle with realistic sun/moon colors and positions
 - **Atmospheric Fog**: Exponential distance fog with adjustable density (0.0-0.01)
 - **Backface Culling**: GPU-level optimization reducing fragment work by ~50%
+- **Distance-Based LOD**: Distant chunks (>800 units default) render as simplified colored blocks
+  - Chunks automatically compute average RGBA color (alpha = occupancy)
+  - Sparse chunks naturally appear transparent
+  - Runtime adjustable with K/L keys for performance tuning
 
 Configuration is saved to `render_config.txt` and automatically loaded on startup. You can edit this file directly to change render settings without recompiling.
 
