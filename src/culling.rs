@@ -410,56 +410,98 @@ fn collect_voxels_recursive(
         
         match voxel {
             Voxel::Solid(voxel_type) => {
-                // For solid voxels, just add them directly (most common case)
+                // For solid voxels at this hierarchy level, render as a single solid block of the current scale
+                // This avoids descending to individual leaf voxels for culling/rendering.
                 let voxel_center = [
                     world_x as f32 + (scale as f32 / 2.0),
                     world_y as f32 + (scale as f32 / 2.0),
                     world_z as f32 + (scale as f32 / 2.0),
                 ];
-                
+
                 if camera.is_in_front(voxel_center) {
                     let distance = camera.distance_to(voxel_center);
                     result.push(VoxelInstance {
                         position: [world_x, world_y, world_z],
                         voxel_type: *voxel_type,
                         distance,
-                        custom_color: None,  // Use voxel_type's default color
-                        scale: 1,  // Normal 1x1x1 voxel
+                        custom_color: None, // Use voxel_type's default color
+                        scale,              // Render this solid as a block of size `scale`
                     });
                 }
             }
             Voxel::Chunk(sub_chunk) => {
-                // For sub-chunks, check distance and decide whether to recurse or render as LOD
+                // For sub-chunks, decide whether to recurse deeper or stop at the final chunk level.
                 let voxel_center = [
                     world_x as f32 + (scale as f32 / 2.0),
                     world_y as f32 + (scale as f32 / 2.0),
                     world_z as f32 + (scale as f32 / 2.0),
                 ];
-                
+
                 let distance = camera.distance_to(voxel_center);
-                
-                // NEW: LOD rendering - if far away and chunk has voxels, render as single block
+
+                // If far away and chunk has voxels, render entire chunk as a single averaged-color block (LOD)
                 if distance >= camera.config.lod_render_distance && sub_chunk.voxel_count > 0 {
-                    // Render entire chunk as one large colored block
-                    // Alpha in average_color represents density/occupancy
                     result.push(VoxelInstance {
                         position: [world_x, world_y, world_z],
-                        voxel_type: 0,  // Ignored when custom_color is Some
+                        voxel_type: 0,                     // Ignored when custom_color is Some
                         distance,
                         custom_color: Some(sub_chunk.average_color),
-                        scale: 16,  // Chunk is 16x16x16
+                        scale,                              // Render the sub-chunk as a single block of this scale
                     });
-                } else if distance < camera.config.lod_subdivide_distance {
-                    // Close up - recurse into sub-chunk with reduced scale
+                    continue;
+                }
+
+                // Determine next scale if we were to descend into this sub-chunk
+                let next_scale = scale / 16;
+
+                if next_scale > 1 {
+                    // We are not yet at the final chunk level; recurse to reach the bottom-level chunk
                     collect_voxels_recursive(
                         sub_chunk,
                         [world_x, world_y, world_z],
-                        scale / 16,
+                        next_scale,
                         camera,
                         result,
                     );
+                } else {
+                    // We've reached the final chunk level (leaf chunk of 16x16x16 voxels).
+                    if distance >= camera.config.lod_render_distance {
+                        // Far: render as a single averaged-color block
+                        if sub_chunk.voxel_count > 0 {
+                            result.push(VoxelInstance {
+                                position: [world_x, world_y, world_z],
+                                voxel_type: 0,
+                                distance,
+                                custom_color: Some(sub_chunk.average_color),
+                                scale, // at leaf chunk level, `scale` should be 16
+                            });
+                        }
+                    } else {
+                        // Near: emit individual voxels inside this bottom-level chunk
+                        for ((sx, sy, sz), v) in sub_chunk.iter() {
+                            if let Voxel::Solid(t) = v {
+                                let vx = world_x + sx as i64 * 1; // next_scale == 1
+                                let vy = world_y + sy as i64 * 1;
+                                let vz = world_z + sz as i64 * 1;
+                                let center = [
+                                    vx as f32 + 0.5,
+                                    vy as f32 + 0.5,
+                                    vz as f32 + 0.5,
+                                ];
+                                if camera.is_in_front(center) {
+                                    let d = camera.distance_to(center);
+                                    result.push(VoxelInstance {
+                                        position: [vx, vy, vz],
+                                        voxel_type: *t,
+                                        distance: d,
+                                        custom_color: None,
+                                        scale: 1,
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
-                // else: medium distance, no voxels, or empty - skip rendering
             }
         }
     }
@@ -586,18 +628,59 @@ pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> Vec<Voxel
                         voxel_type: *vtype,
                         distance,
                         custom_color: None,
-                        scale: 1,
+                        scale, // render as a block of current scale (no per-voxel descent)
                     });
                 }
                 Voxel::Chunk(chunk) => {
-                    // Recursively collect from sub-chunk
-                    collect_voxels_recursive(
-                        chunk,
-                        [world_x, world_y, world_z],
-                        scale / 16,
-                        camera,
-                        &mut cell_instances,
-                    );
+                    // Recursively collect from sub-chunk until bottom chunk level.
+                    let next_scale = scale / 16;
+                    if next_scale > 1 {
+                        collect_voxels_recursive(
+                            chunk,
+                            [world_x, world_y, world_z],
+                            next_scale,
+                            camera,
+                            &mut cell_instances,
+                        );
+                    } else {
+                        // Bottom-level chunk: near = individual voxels, far = averaged block
+                        let center = [
+                            world_x as f32 + (scale as f32 / 2.0),
+                            world_y as f32 + (scale as f32 / 2.0),
+                            world_z as f32 + (scale as f32 / 2.0),
+                        ];
+                        let distance = camera.distance_to(center);
+                        if distance >= camera.config.lod_render_distance {
+                            if chunk.voxel_count > 0 {
+                                cell_instances.push(VoxelInstance {
+                                    position: [world_x, world_y, world_z],
+                                    voxel_type: 0,
+                                    distance,
+                                    custom_color: Some(chunk.average_color),
+                                    scale, // scale should be 16 here
+                                });
+                            }
+                        } else {
+                            for ((sx, sy, sz), v) in chunk.iter() {
+                                if let Voxel::Solid(t) = v {
+                                    let vx = world_x + sx as i64;
+                                    let vy = world_y + sy as i64;
+                                    let vz = world_z + sz as i64;
+                                    let vcenter = [vx as f32 + 0.5, vy as f32 + 0.5, vz as f32 + 0.5];
+                                    if camera.is_in_front(vcenter) {
+                                        let d = camera.distance_to(vcenter);
+                                        cell_instances.push(VoxelInstance {
+                                            position: [vx, vy, vz],
+                                            voxel_type: *t,
+                                            distance: d,
+                                            custom_color: None,
+                                            scale: 1,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             

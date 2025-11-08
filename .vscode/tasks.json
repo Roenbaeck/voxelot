@@ -31,31 +31,8 @@
 			"command": "cargo",
 			"args": [
 				"run",
-				"--quiet"
-			],
-			"problemMatcher": [
-				"$rustc"
-			],
-			"group": "build"
-		},
-		{
-			"label": "cargo test (voxelot)",
-			"type": "shell",
-			"command": "cargo",
-			"args": [
-				"test"
-			],
-			"problemMatcher": [
-				"$rustc"
-			],
-			"group": "build"
-		},
-		{
-			"label": "cargo build (voxelot)",
-			"type": "shell",
-			"command": "cargo",
-			"args": [
-				"build"
+				"--bin",
+				"viewer_hierarchical"
 			],
 			"problemMatcher": [
 				"$rustc"
