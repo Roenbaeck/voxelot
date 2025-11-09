@@ -116,7 +116,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     color_sum = base_color;
     weight_sum = 1.0;
 
-    let blur_radius = coc * 18.0;
+    let blur_radius = coc * 28.0;
     let rotation = hash12(base_uv) * TAU;
 
     for (var i: u32 = 0u; i < SAMPLE_COUNT; i = i + 1u) {

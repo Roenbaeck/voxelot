@@ -53,8 +53,8 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let average_color = sample_sum * 0.25;
 
     let brightness = max(max(average_color.r, average_color.g), average_color.b);
-    let weight = smoothstep(bloom.threshold, bloom.threshold + bloom.knee, brightness)
-        * bloom.intensity;
+    let highlight = smoothstep(bloom.threshold, bloom.threshold + bloom.knee, brightness);
+    let weight = highlight * highlight * bloom.intensity;
     let bloom_color = average_color * weight;
     return vec4<f32>(bloom_color, 1.0);
 }
