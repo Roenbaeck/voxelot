@@ -21,7 +21,7 @@ use winit::{
 
 use voxelot::{World, WorldPos, Camera, VisibilityCache, RenderConfig};
 use voxelot::generate_chunk_mesh;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 macro_rules! viewer_debug {
     ($($arg:tt)*) => {
@@ -348,6 +348,8 @@ struct App {
     world: World,
     camera_controller: CameraController,
     visibility_cache: VisibilityCache,
+    pending_chunk_meshes: VecDeque<(i64, i64, i64)>,
+    pending_chunk_set: HashSet<(i64, i64, i64)>,
     last_frame: Instant,
     frame_count: u64,
     last_fps_print: Instant,
@@ -369,6 +371,12 @@ impl App {
         let mut world = World::new(3);
         
         println!("Creating world (size: {} units)...", world.world_size());
+
+        let mut initial_camera = if cfg!(feature = "test-block-world") {
+            [50.0, 15.0, 65.0]
+        } else {
+            [680.0, 50.0, 670.0]
+        };
 
         if cfg!(feature = "test-block-world") {
             viewer_debug!("Creating test block: 3x5x7 voxels at (50,10,50)");
@@ -414,6 +422,12 @@ impl App {
             match std::fs::read_to_string("osm_voxels.txt") {
                 Ok(content) => {
                     let mut voxel_count = 0;
+                    let mut min_x = i64::MAX;
+                    let mut max_x = i64::MIN;
+                    let mut min_y = i64::MAX;
+                    let mut max_y = i64::MIN;
+                    let mut min_z = i64::MAX;
+                    let mut max_z = i64::MIN;
                     for line in content.lines() {
                         let parts: Vec<&str> = line.split_whitespace().collect();
                         if parts.len() == 4 {
@@ -425,10 +439,24 @@ impl App {
                             ) {
                                 world.set(WorldPos::new(x, y, z), voxel_type);
                                 voxel_count += 1;
+                                min_x = min_x.min(x);
+                                max_x = max_x.max(x);
+                                min_y = min_y.min(y);
+                                max_y = max_y.max(y);
+                                min_z = min_z.min(z);
+                                max_z = max_z.max(z);
                             }
                         }
                     }
                     println!("Loaded {} voxels from OSM data", voxel_count);
+
+                    if voxel_count > 0 {
+                        let center_x = (min_x + max_x) as f32 * 0.5;
+                        let center_z = (min_z + max_z) as f32 * 0.5;
+                        // Hover above the tallest structure with a bit of headroom
+                        let eye_height = (max_y + 30).max(40) as f32;
+                        initial_camera = [center_x, eye_height, center_z];
+                    }
                 }
                 Err(e) => {
                     println!("Failed to load osm_voxels.txt: {}. Using fallback world generation.", e);
@@ -447,6 +475,8 @@ impl App {
                             world.set(WorldPos::new(x, y, 50), 2);
                         }
                     }
+
+                    initial_camera = [60.0, 40.0, 120.0];
                 }
             }
         }
@@ -456,12 +486,6 @@ impl App {
         println!("Updating LOD metadata...");
         world.update_all_lod_metadata();
         println!("LOD metadata updated");
-
-        let camera_position = if cfg!(feature = "test-block-world") {
-            [50.0, 15.0, 65.0]
-        } else {
-            [680.0, 50.0, 670.0]
-        };
 
         println!("\n=== Controls ===");
         println!("Movement: WASD + Space/Shift (up/down)");
@@ -491,8 +515,10 @@ impl App {
             mesh_cache: HashMap::new(),
             instance_capacity: 0,
             world,
-            camera_controller: CameraController::new(camera_position),
+            camera_controller: CameraController::new(initial_camera),
             visibility_cache: VisibilityCache::new(),
+            pending_chunk_meshes: VecDeque::new(),
+            pending_chunk_set: HashSet::new(),
             last_frame: Instant::now(),
             frame_count: 0,
             last_fps_print: Instant::now(),
@@ -811,100 +837,128 @@ impl App {
         let cull_start = Instant::now();
         let visible = self.visibility_cache.update(&self.camera_controller.camera, &self.world);
         let cull_time = cull_start.elapsed();
-        
-        // Group scale==1 voxels by leaf chunk origin (x&!15,y&!15,z&!15)
-        let mut leaf_groups: HashMap<(i64,i64,i64), usize> = HashMap::new();
+
+        let grouping_start = Instant::now();
+        // Collect unique leaf chunk origins flagged by the culler
+        let mut leaf_chunks: HashSet<(i64, i64, i64)> = HashSet::new();
         for v in &visible {
-            if v.scale == 1 {
-                let key = (v.position[0] & !15, v.position[1] & !15, v.position[2] & !15);
-                *leaf_groups.entry(key).or_insert(0) += 1;
+            if v.is_leaf_chunk {
+                leaf_chunks.insert((v.position[0], v.position[1], v.position[2]));
             }
         }
+        let grouping_time = grouping_start.elapsed();
 
-        // Build mesh for any group present (near leaf chunk), and mark those voxels for removal
+        let mesh_start = Instant::now();
+        // Build mesh for any chunk present (near leaf chunk), and mark those chunks for drawing
         let mut mesh_keys: HashSet<(i64,i64,i64)> = HashSet::new();
         let mut new_meshes_created = 0;
         let mut chunks_not_found = 0;
-        for (&key, &_count) in leaf_groups.iter() {
-            // Ensure mesh in cache
-            if !self.mesh_cache.contains_key(&key) {
-                if let Some(chunk) = self.world.get_leaf_chunk_at_origin(WorldPos::new(key.0, key.1, key.2)) {
-                    let mesh = generate_chunk_mesh(chunk);
-                    if !mesh.indices.is_empty() {
-                        // DEBUG: Print info for first mesh
-                        if new_meshes_created == 0 {
-                            let num_voxels = chunk.iter().count();
-                            viewer_debug!(
-                                "DEBUG first mesh at ({},{},{}): {} voxels in chunk, {} vertices, {} triangles",
-                                key.0, key.1, key.2, num_voxels, mesh.vertices.len(), mesh.indices.len() / 3
-                            );
-                            // Print ALL vertices to verify the mesh structure
-                            for (i, v) in mesh.vertices.iter().enumerate() {
-                                viewer_debug!(
-                                    "  vertex {}: pos=[{:.1},{:.1},{:.1}] normal=[{:.1},{:.1},{:.1}]",
-                                    i, v.position[0], v.position[1], v.position[2],
-                                    v.normal[0], v.normal[1], v.normal[2]
-                                );
-                            }
-                        }
-                        
-                        // Upload to GPU with offset to world coordinates
-                        let vb_data: Vec<MeshVertexRaw> = mesh.vertices.iter().map(|v| {
-                            MeshVertexRaw {
-                                position: [
-                                    v.position[0] + key.0 as f32,
-                                    v.position[1] + key.1 as f32,
-                                    v.position[2] + key.2 as f32,
-                                ],
-                                normal: v.normal,
-                                color: v.color,
-                            }
-                        }).collect();
-                        let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("Chunk Mesh Vertex Buffer"),
-                            contents: bytemuck::cast_slice(&vb_data),
-                            usage: wgpu::BufferUsages::VERTEX,
-                        });
-                        let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("Chunk Mesh Index Buffer"),
-                            contents: bytemuck::cast_slice(&mesh.indices),
-                            usage: wgpu::BufferUsages::INDEX,
-                        });
-                        viewer_debug!(
-                            "Created mesh for chunk ({},{},{}): {} vertices, {} triangles",
-                            key.0, key.1, key.2, mesh.vertices.len(), mesh.indices.len() / 3
-                        );
-                        self.mesh_cache.insert(key, (vbuf, ibuf, mesh.indices.len() as u32));
-                        mesh_keys.insert(key);  // Only mark for filtering if mesh was created
-                        new_meshes_created += 1;
-                    }
-                } else {
-                    chunks_not_found += 1;
-                }
+        let mut missing_chunks: HashSet<(i64, i64, i64)> = HashSet::new();
+
+        for &key in &leaf_chunks {
+            if self.mesh_cache.contains_key(&key) {
+                mesh_keys.insert(key);
             } else {
-                mesh_keys.insert(key);  // Mesh exists in cache, mark for filtering
+                missing_chunks.insert(key);
+                if !self.pending_chunk_set.contains(&key) {
+                    self.pending_chunk_meshes.push_back(key);
+                    self.pending_chunk_set.insert(key);
+                }
             }
         }
+
+        const MAX_MESHES_PER_FRAME: usize = 4;
+        let mut processed_meshes = 0;
+        while processed_meshes < MAX_MESHES_PER_FRAME {
+            let Some(key) = self.pending_chunk_meshes.pop_front() else {
+                break;
+            };
+            self.pending_chunk_set.remove(&key);
+
+            match self.world.get_leaf_chunk_at_origin(WorldPos::new(key.0, key.1, key.2)) {
+                Some(chunk) => {
+                    let mesh = generate_chunk_mesh(chunk);
+                    if mesh.indices.is_empty() {
+                        processed_meshes += 1;
+                        continue;
+                    }
+
+                    if new_meshes_created == 0 {
+                        let num_voxels = chunk.iter().count();
+                        viewer_debug!(
+                            "DEBUG first mesh at ({},{},{}): {} voxels in chunk, {} vertices, {} triangles",
+                            key.0, key.1, key.2, num_voxels, mesh.vertices.len(), mesh.indices.len() / 3
+                        );
+                        for (i, v) in mesh.vertices.iter().enumerate() {
+                            viewer_debug!(
+                                "  vertex {}: pos=[{:.1},{:.1},{:.1}] normal=[{:.1},{:.1},{:.1}]",
+                                i, v.position[0], v.position[1], v.position[2],
+                                v.normal[0], v.normal[1], v.normal[2]
+                            );
+                        }
+                    }
+
+                    let vb_data: Vec<MeshVertexRaw> = mesh.vertices.iter().map(|v| {
+                        MeshVertexRaw {
+                            position: [
+                                v.position[0] + key.0 as f32,
+                                v.position[1] + key.1 as f32,
+                                v.position[2] + key.2 as f32,
+                            ],
+                            normal: v.normal,
+                            color: v.color,
+                        }
+                    }).collect();
+                    let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("Chunk Mesh Vertex Buffer"),
+                        contents: bytemuck::cast_slice(&vb_data),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
+                    let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("Chunk Mesh Index Buffer"),
+                        contents: bytemuck::cast_slice(&mesh.indices),
+                        usage: wgpu::BufferUsages::INDEX,
+                    });
+                    viewer_debug!(
+                        "Created mesh for chunk ({},{},{}): {} vertices, {} triangles",
+                        key.0, key.1, key.2, mesh.vertices.len(), mesh.indices.len() / 3
+                    );
+                    self.mesh_cache.insert(key, (vbuf, ibuf, mesh.indices.len() as u32));
+                    new_meshes_created += 1;
+
+                    if leaf_chunks.contains(&key) {
+                        mesh_keys.insert(key);
+                        missing_chunks.remove(&key);
+                    }
+                }
+                None => {
+                    chunks_not_found += 1;
+                }
+            }
+
+            processed_meshes += 1;
+        }
+        let mesh_time = mesh_start.elapsed();
         
         if chunks_not_found > 0 && self.frame_count == 0 {
-            println!("Warning: {} out of {} potential chunks not found (OSM voxels are not in subdivided chunks)", 
-                chunks_not_found, leaf_groups.len());
-        }
-        
-        if cfg!(feature = "viewer-debug") && self.frame_count % 60 == 0 {
-            let filtered_instances = visible.iter().filter(|v| {
-                !(v.scale == 1 && mesh_keys.contains(&(v.position[0] & !15, v.position[1] & !15, v.position[2] & !15)))
-            }).count();
-            viewer_debug!(
-                "Mesh stats: {} cached meshes, {} new this frame, {} potential chunks, {} instances after filtering",
-                self.mesh_cache.len(), new_meshes_created, leaf_groups.len(), filtered_instances
+            println!(
+                "Warning: {} out of {} potential chunks not found (OSM voxels are not in subdivided chunks)",
+                chunks_not_found,
+                leaf_chunks.len()
             );
         }
 
         // Convert remaining instances (exclude those belonging to meshed chunks)
+        let instance_start = Instant::now();
         let instances: Vec<VoxelInstanceRaw> = visible
             .iter()
-            .filter(|v| !(v.scale == 1 && mesh_keys.contains(&(v.position[0] & !15, v.position[1] & !15, v.position[2] & !15))))
+            .filter(|v| {
+                if v.is_leaf_chunk {
+                    !mesh_keys.contains(&(v.position[0], v.position[1], v.position[2]))
+                } else {
+                    true
+                }
+            })
             .map(|v| {
                 let custom_color_f32 = if let Some(rgba) = v.custom_color {
                     [
@@ -913,10 +967,12 @@ impl App {
                         rgba[2] as f32 / 255.0,
                         rgba[3] as f32 / 255.0,
                     ]
+                } else if v.is_leaf_chunk {
+                    [0.4, 0.4, 0.45, 0.6]
                 } else {
                     [0.0, 0.0, 0.0, 0.0] // Alpha = 0 means use voxel_type color
                 };
-                
+
                 VoxelInstanceRaw {
                     position: [v.position[0] as f32, v.position[1] as f32, v.position[2] as f32],
                     voxel_type: v.voxel_type as u32,
@@ -925,15 +981,25 @@ impl App {
                 }
             })
             .collect();
-        
-        // Update or create instance buffer (we might still render meshes even if instances is empty)
+        let instance_time = instance_start.elapsed();
+
+        if cfg!(feature = "viewer-debug") && self.frame_count % 60 == 0 {
+            viewer_debug!(
+                "Mesh stats: {} cached meshes, {} new this frame, {} potential chunks, pending {}, fallback instances {}",
+                self.mesh_cache.len(),
+                new_meshes_created,
+                leaf_chunks.len(),
+                self.pending_chunk_meshes.len(),
+                instances.len()
+            );
+        }
+
         let has_meshes_to_draw = !mesh_keys.is_empty();
         if instances.is_empty() && !has_meshes_to_draw {
             return; // Nothing to render at all
         }
         
         if self.instance_capacity < instances.len() {
-            // If we don't have enough capacity, create a new buffer
             self.instance_capacity = instances.len().next_power_of_two();
             
             if let Some(old_buffer) = self.instance_buffer.take() {
@@ -1122,12 +1188,19 @@ impl App {
         // Stats
         self.frame_count += 1;
         if now.duration_since(self.last_fps_print).as_secs() >= 1 {
+            let total_visible = visible.len();
             println!(
-                "FPS: {}, Visible voxels: {}, Meshed chunks: {}, Cull time: {:.2}ms",
+                "FPS: {}, Visible items: {}, Leaf chunks: {}, Meshed chunks: {}, Pending: {}, Fallback: {}, Cull: {:.2}ms, Group: {:.2}ms, Mesh: {:.2}ms, Instances: {:.2}ms",
                 self.frame_count,
-                instances.len(),
+                total_visible,
+                leaf_chunks.len(),
                 mesh_keys.len(),
-                cull_time.as_secs_f64() * 1000.0
+                self.pending_chunk_meshes.len(),
+                missing_chunks.len(),
+                cull_time.as_secs_f64() * 1000.0,
+                grouping_time.as_secs_f64() * 1000.0,
+                mesh_time.as_secs_f64() * 1000.0,
+                instance_time.as_secs_f64() * 1000.0
             );
             self.frame_count = 0;
             self.last_fps_print = now;

@@ -355,6 +355,8 @@ pub struct VoxelInstance {
     pub custom_color: Option<[u8; 4]>,
     /// Scale factor for this voxel (1 = normal voxel, 16 = chunk-sized block, etc.)
     pub scale: i64,
+    /// Whether this instance represents a leaf chunk that should be rendered via a cached mesh.
+    pub is_leaf_chunk: bool,
 }
 
 /// Chunk rendering info with LOD
@@ -426,6 +428,7 @@ fn collect_voxels_recursive(
                         distance,
                         custom_color: None, // Use voxel_type's default color
                         scale,              // Render this solid as a block of size `scale`
+                        is_leaf_chunk: false,
                     });
                 }
             }
@@ -447,6 +450,7 @@ fn collect_voxels_recursive(
                         distance,
                         custom_color: Some(sub_chunk.average_color),
                         scale,                              // Render the sub-chunk as a single block of this scale
+                        is_leaf_chunk: false,
                     });
                     continue;
                 }
@@ -474,31 +478,20 @@ fn collect_voxels_recursive(
                                 distance,
                                 custom_color: Some(sub_chunk.average_color),
                                 scale, // at leaf chunk level, `scale` should be 16
+                                is_leaf_chunk: false,
                             });
                         }
                     } else {
-                        // Near: emit individual voxels inside this bottom-level chunk
-                        for ((sx, sy, sz), v) in sub_chunk.iter() {
-                            if let Voxel::Solid(t) = v {
-                                let vx = world_x + sx as i64 * 1; // next_scale == 1
-                                let vy = world_y + sy as i64 * 1;
-                                let vz = world_z + sz as i64 * 1;
-                                let center = [
-                                    vx as f32 + 0.5,
-                                    vy as f32 + 0.5,
-                                    vz as f32 + 0.5,
-                                ];
-                                if camera.is_in_front(center) {
-                                    let d = camera.distance_to(center);
-                                    result.push(VoxelInstance {
-                                        position: [vx, vy, vz],
-                                        voxel_type: *t,
-                                        distance: d,
-                                        custom_color: None,
-                                        scale: 1,
-                                    });
-                                }
-                            }
+                        // Near: request the leaf chunk mesh instead of descending to individual voxels.
+                        if sub_chunk.voxel_count > 0 {
+                            result.push(VoxelInstance {
+                                position: [world_x, world_y, world_z],
+                                voxel_type: 0,
+                                distance,
+                                custom_color: None,
+                                scale, // chunk size (16)
+                                is_leaf_chunk: true,
+                            });
                         }
                     }
                 }
@@ -629,6 +622,7 @@ pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> Vec<Voxel
                         distance,
                         custom_color: None,
                         scale, // render as a block of current scale (no per-voxel descent)
+                        is_leaf_chunk: false,
                     });
                 }
                 Voxel::Chunk(chunk) => {
@@ -658,26 +652,19 @@ pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> Vec<Voxel
                                     distance,
                                     custom_color: Some(chunk.average_color),
                                     scale, // scale should be 16 here
+                                    is_leaf_chunk: false,
                                 });
                             }
                         } else {
-                            for ((sx, sy, sz), v) in chunk.iter() {
-                                if let Voxel::Solid(t) = v {
-                                    let vx = world_x + sx as i64;
-                                    let vy = world_y + sy as i64;
-                                    let vz = world_z + sz as i64;
-                                    let vcenter = [vx as f32 + 0.5, vy as f32 + 0.5, vz as f32 + 0.5];
-                                    if camera.is_in_front(vcenter) {
-                                        let d = camera.distance_to(vcenter);
-                                        cell_instances.push(VoxelInstance {
-                                            position: [vx, vy, vz],
-                                            voxel_type: *t,
-                                            distance: d,
-                                            custom_color: None,
-                                            scale: 1,
-                                        });
-                                    }
-                                }
+                            if chunk.voxel_count > 0 {
+                                cell_instances.push(VoxelInstance {
+                                    position: [world_x, world_y, world_z],
+                                    voxel_type: 0,
+                                    distance,
+                                    custom_color: None,
+                                    scale,
+                                    is_leaf_chunk: true,
+                                });
                             }
                         }
                     }

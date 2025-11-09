@@ -32,7 +32,7 @@ cargo run --release --bin bench_culling
 Two generators are now provided:
 
 1. `osm_voxel_generator.py` – legacy one-shot Overpass query producing a coarse static dump `osm_voxels.txt`.
-2. `voxel_generator_tiles.py` – new dry-coded tile-based prototype (no external deps yet) that rasterizes synthetic building footprints per Web Mercator tile and writes `osm_voxels_new.txt` plus a meta file.
+2. `voxel_generator_tiles.py` – new dry-coded tile-based prototype (no external deps yet) that rasterizes synthetic building footprints per Web Mercator tile and writes the viewer-ready `osm_voxels.txt` plus `osm_voxels_meta.json`.
 
 Planned evolution of the tile generator:
 - Replace synthetic footprints with real vector tile (MVT) decoding.
@@ -40,9 +40,23 @@ Planned evolution of the tile generator:
 - Introduce per-tile material palettes & compressed binary output.
 - Hook into streaming residency so tiles load/unload around the camera.
 
-Output compatibility: Both generators currently emit ASCII lines `x y z voxel_type` so the existing Rust ingestion path can remain unchanged while the pipeline is upgraded.
+Output compatibility: Both generators currently emit ASCII lines `x y z voxel_type` so the existing Rust ingestion path can remain unchanged while the pipeline is upgraded. The meta JSON documents tile stats for tooling.
 
 See `VOXEL_GENERATOR_REVAMP.md` for detailed architecture and roadmap.
+
+Regenerate the default New York sample world with:
+
+```bash
+./.venv/bin/python voxel_generator_tiles.py \
+    --center-lon -74.0060 \
+    --center-lat 40.7128 \
+    --zoom 15 \
+    --radius 2 \
+    --voxels-per-tile 128 \
+    --meters-per-voxel 1.25 \
+    --max-height-voxels 192 \
+    --seed 1337
+```
 
 ### Interactive Viewer Controls
 
@@ -75,6 +89,7 @@ See `VOXEL_GENERATOR_REVAMP.md` for detailed architecture and roadmap.
   - Chunks automatically compute average RGBA color (alpha = occupancy)
   - Sparse chunks naturally appear transparent
   - Runtime adjustable with K/L keys for performance tuning
+- **Chunk Mesh Streaming**: Greedy-meshed leaf chunks stream in gradually with a fallback preview so camera motion stays stutter-free even when new data appears
 
 Configuration is saved to `render_config.txt` and automatically loaded on startup. You can edit this file directly to change render settings without recompiling.
 
