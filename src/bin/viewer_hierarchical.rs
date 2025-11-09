@@ -1123,9 +1123,10 @@ impl App {
         self.frame_count += 1;
         if now.duration_since(self.last_fps_print).as_secs() >= 1 {
             println!(
-                "FPS: {}, Visible voxels: {}, Cull time: {:.2}ms",
+                "FPS: {}, Visible voxels: {}, Meshed chunks: {}, Cull time: {:.2}ms",
                 self.frame_count,
                 instances.len(),
+                mesh_keys.len(),
                 cull_time.as_secs_f64() * 1000.0
             );
             self.frame_count = 0;
