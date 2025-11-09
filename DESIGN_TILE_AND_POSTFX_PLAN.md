@@ -12,7 +12,7 @@ OSM ingestion | Python script `osm_voxel_generator.py` pulls a fixed Overpass bo
 World representation | Hierarchical sparse chunk tree (16^n) with roaring bitmaps and LOD recursion by distance. | Great base; lacks paging, streaming hooks, prioritization queues, edit journaling.
 Culling | CPU frustum culling + distance-based LOD; optional parallel top-level traversal. | No hierarchical occlusion, no screen-space error, no temporal coherence beyond simple cache.
 Rendering | Single pass voxel instancing with per-instance position/type; flat Lambert-ish lighting in `voxel.wgsl`. | No G‑Buffer, no deferred/compute stages, no normal/albedo buffers, no temporal history, no depth pyramid.
-Post FX | None. | Missing TAA, SSAO, SSR, Bloom, DoF chain.
+Post FX | Bloom chain + tilt-shift DoF gather/smoothing (viewer). | Missing TAA, SSAO, SSR, tone mapping chain.
 Asset/Material | Hard-coded voxel colors by type. | Needs material atlas + physical-ish params (albedo, roughness, emissive).
 
 ## 2. Guiding Principles
@@ -20,7 +20,7 @@ Asset/Material | Hard-coded voxel colors by type. | Needs material atlas + physi
 - Separate data acquisition (OSM vector tiles) from voxelization & residency management.
 - Introduce a FrameGraph / RenderGraph to schedule passes and manage intermediate textures.
 - Use GPU-friendly compressed per-tile buffers (quantized coords, Morton order) feeding a compute expansion or meshlet path.
-- Favor incremental adoption: G-Buffer first; add TAA; then enable SSAO/SSR/Bloom/DoF.
+- Favor incremental adoption: G-Buffer first; add TAA; then enable SSAO/SSR; existing bloom/DoF passes can be folded into the framegraph later.
 
 ## 3. Tile / Streaming Architecture
 ### 3.1 Sources
@@ -51,14 +51,12 @@ Option A: Maintain world root as sparse occupancy; each resident tile writes int
 Eviction: detach leaf references; decrement block refcount; free GPU buffers when zero.
 
 ## 4. Rendering Pipeline Roadmap
-Order of adoption (each stage validated before next):
+Order of adoption (each stage validated before next — Bloom/DoF already exist and will be slotted at the tail of the graph):
 1. Depth + Albedo + Normal + Material G-Buffer (replace direct color in vertex/fragment).
 2. TAA (history buffer, velocity buffer, jittered projection, clamp heuristics).
 3. SSAO (HBAO-like or GTAO-lite) using depth + normal pyramids.
 4. Screen-Space Reflections (hierarchical ray march on depth pyramid) + fallback roughness cone trace (approx) or reflection probe.
-5. Bloom (dual-filter mip chain + energy-conserving combine).
-6. Depth of Field (physical circle of confusion, gather pass, optional bokeh shape). Order may shift Bloom after DoF depending on artistic preference.
-7. Lighting improvements: directional sun + ambient probe + voxel-based emissive.
+5. Lighting improvements: directional sun + ambient probe + voxel-based emissive.
 
 ### 4.1 Required Buffers
 Name | Format | Notes
@@ -78,8 +76,8 @@ LuminanceAvg | R16F | Temporal exposure adaptation.
 3. TAA: takes current HDR + history + velocity; outputs smoothed HDR + updates history.
 4. SSAO: optional; modulates indirect diffuse.
 5. SSR: composites reflections into specular channel.
-6. BloomExtract + BloomBlur (mip chain) + BloomComposite.
-7. DoF (gather or scatter) operating on TAA-resolved color.
+6. BloomExtract + BloomBlur (mip chain) + BloomComposite — reuse existing viewer implementation, wrap as graph pass.
+7. DoF (gather + smoothing) operating on TAA-resolved color — existing WGSL passes slot in after bloom.
 8. ToneMap + Gamma + UI overlay.
 
 ### 4.3 Temporal Anti-Aliasing Details
@@ -100,13 +98,12 @@ LuminanceAvg | R16F | Temporal exposure adaptation.
 - Fallback: environment probe / sky if miss.
 
 ### 4.6 Bloom
-- Threshold in HDR space (e.g. luminance > 1.0) with soft knee.
-- Downsample chain with prefilter; upsample additive with energy scaling.
+- ✅ Implemented dual-pass bloom (threshold + mip-chain blur + composite) in the viewer.
+- TODO: Port the existing pass into the future framegraph and expose tuning in `render_config.txt`.
 
 ### 4.7 DoF
-- Compute circle of confusion (CoC) from focal distance & aperture.
-- Separate near/far blur; use tile-based gather to limit over-blur on foreground edges.
-- Optionally integrate with TAA reprojection.
+- ✅ Implemented tilt-shift DoF gather (`dof_blur.wgsl`) with separable Gaussian smoothing (`dof_smooth.wgsl`).
+- TODO: Integrate with upcoming TAA/jitter to stabilize bokeh and expose focus-band presets.
 
 ## 5. GPU Data Layout for Voxels
 Option to replace per-vertex duplication with:
@@ -136,8 +133,8 @@ P2 | TAA + Velocity | Jitter, velocity calc, history mgmt | Medium
 P3 | Streaming Tile Skeleton | TileId, request queue, async downloader stub, integration points | Medium
 P4 | SSAO + Depth Pyramid | Compute passes, bilateral blur | Medium
 P5 | SSR + Reflection Fallback | Depth pyramid march, roughness integration | High
-P6 | Bloom | Threshold + mip chain | Low
-P7 | DoF | CoC calc + blur + composite | Medium
+P6 | Bloom (shipped) | Rehost existing threshold + mip chain inside framegraph | Low
+P7 | DoF (shipped) | Maintain CoC tuning, hook into TAA once available | Medium
 P8 | Full OSM Vector Tile Ingestion | Vector tile decode (protobuf), voxelization, eviction | High
 P9 | Hi-Z Occlusion + Screen Error LOD | Depth pyramid reuse, error heuristic | Medium
 

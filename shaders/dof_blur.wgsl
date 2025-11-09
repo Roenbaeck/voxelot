@@ -52,12 +52,29 @@ fn linearize_depth(depth: f32) -> f32 {
 
 fn calculate_coc(linear_depth: f32) -> f32 {
     let distance_from_focal = abs(linear_depth - dof_uniforms.focal_distance);
-    if distance_from_focal < dof_uniforms.focal_range {
+    let focus_band = dof_uniforms.focal_range * 4.0;
+    if distance_from_focal < focus_band {
         return 0.0;
     }
-    let blur = (distance_from_focal - dof_uniforms.focal_range) /
-        max(dof_uniforms.focal_distance, 1e-3);
-    return min(blur * dof_uniforms.blur_strength, 1.0);
+    let focal_norm = max(dof_uniforms.focal_distance, 1e-3);
+    let softness = max(focus_band * 0.8, focal_norm * 0.25);
+    let base = clamp((distance_from_focal - focus_band) / (softness + 1.0), 0.0, 6.0);
+    let linear_cap = 1.25;
+    let linear_scale = 0.26;
+    var base_coc = base * linear_scale;
+
+    if (base > linear_cap) {
+        let exp_input = base - linear_cap;
+        let exp_curve = 1.0 - exp(-exp_input * 0.8);
+        let exp_gain = 0.75 + base * 0.32;
+        let offset = linear_cap * linear_scale;
+        base_coc = offset + exp_curve * exp_gain;
+    }
+    let far_distance = max(linear_depth - dof_uniforms.focal_distance, 0.0);
+    let far_ratio = clamp(far_distance / (focal_norm * 0.65 + 25.0), 0.0, 4.0);
+    let far_boost = 1.0 + far_ratio * 2.4 + far_ratio * far_ratio * 1.2;
+    let strength = base_coc * dof_uniforms.blur_strength * far_boost;
+    return clamp(strength, 0.0, 5.0);
 }
 
 const TAU: f32 = 6.2831853;
@@ -93,6 +110,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let dimensions_u = textureDimensions(color_texture, 0);
     let dimensions = vec2<f32>(dimensions_u);
     let pixel_size = 1.0 / dimensions;
+    let focal_norm = max(dof_uniforms.focal_distance, 1e-3);
 
     let base_uv = clamp(input.uv, vec2<f32>(0.0), vec2<f32>(1.0));
     let base_coords = vec2<i32>(base_uv * (dimensions - vec2<f32>(1.0)));
@@ -116,7 +134,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     color_sum = base_color;
     weight_sum = 1.0;
 
-    let blur_radius = coc * 28.0;
+    let blur_radius = coc * (22.0 + 20.0 * dof_uniforms.blur_strength);
     let rotation = hash12(base_uv) * TAU;
 
     for (var i: u32 = 0u; i < SAMPLE_COUNT; i = i + 1u) {
@@ -138,7 +156,13 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             continue;
         }
 
-        let depth_weight = 1.0 - min(abs(linear_depth - sample_linear_depth) / 20.0, 1.0);
+    let depth_diff = abs(linear_depth - sample_linear_depth);
+    let depth_avg = (linear_depth + sample_linear_depth) * 0.5;
+    let coc_mix = max(coc, sample_coc);
+    let far_scale = 1.0 + clamp(depth_avg / focal_norm, 0.0, 8.0) * 1.3;
+    let dynamic_tolerance = 24.0 + clamp(coc_mix, 0.0, 1.5) * 260.0;
+    let depth_tolerance = (dynamic_tolerance + depth_avg * 0.28) * far_scale;
+    let depth_weight = 1.0 - clamp(depth_diff / depth_tolerance, 0.0, 1.0);
         let radius_norm = clamp(length(rotated), 0.0, 1.0);
         let shape_weight = 1.0 - radius_norm * radius_norm;
         let tap_weight = sample_coc * depth_weight * shape_weight;

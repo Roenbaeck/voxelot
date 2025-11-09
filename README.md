@@ -86,6 +86,7 @@ Regenerate the default New York sample world with:
 **Visual Features:**
 - **Dynamic Lighting**: Day/night cycle with realistic sun/moon colors and positions
 - **Atmospheric Fog**: Exponential distance fog with adjustable density (0.0-0.01)
+- **Tilt-Shift DoF & Bloom**: Configurable depth of field with Gaussian smoothing plus cinematic bloom pipeline
 - **Backface Culling**: GPU-level optimization reducing fragment work by ~50%
 - **Distance-Based LOD**: Distant chunks (>800 units default) render as simplified colored blocks
   - Chunks automatically compute average RGBA color (alpha = occupancy)

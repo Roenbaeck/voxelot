@@ -12,251 +12,21 @@
 - **Backface Culling**: GPU-level culling enabled (`cull_mode: Some(wgpu::Face::Back)`)
 - **Greedy Meshing**: Leaf-chunk quads merged and cached (feature-gated debug logging available)
 - **Proper Shader Uniforms**: 128-byte aligned uniform buffer with lighting parameters
-- **Dynamic Time of Day**: Keyboard-controlled day/night cycle (T key) with realistic color transitions
-- **Keyboard Controls**: International layout-friendly (arrow keys, alpha keys only)
-
-### ❌ Not Yet Implemented
-- **Neighbor-Based Face Culling**: Drawing all 6 faces even when occluded
-- **Depth of Field Post-Process**: No DoF shader exists yet
-- **Mesh Caching**: Regenerating geometry every frame
-- **GPU-Driven Rendering**: CPU-based culling only
-
----
-
-## Priority Performance Improvements (Highest Impact First)
-
-### 1. 🚀 **Greedy Meshing** (10-100x vertex reduction)
-**Status**: ✅ Completed — per-leaf chunks now generate cached greedy meshes via `meshing.rs::generate_chunk_mesh`, and the viewer uploads the merged quads to GPU buffers.  
-**Impact**: HUGE - reduces vertices by 90%+ for solid regions  
-**Complexity**: Medium  
-**Note**: Remaining opportunities include refining cache eviction and inter-chunk face deduping.
-
-Merge adjacent voxel faces into larger quads. Instead of 6 faces per voxel, create one merged face for entire runs. This algorithm naturally only creates faces where needed (at chunk boundaries and air interfaces), so it combines both greedy meshing AND neighbor-based face culling in one pass.
-
-```rust
-// Algorithm outline:
-fn greedy_mesh(chunk: &Chunk) -> Vec<Quad> {
-    let mut quads = Vec::new();
-    let mut visited = [[[false; 16]; 16]; 16];
-    
-    // For each direction (±X, ±Y, ±Z)
-    for dir in [Dir::PosX, Dir::NegX, ...] {
-        // Sweep through slices perpendicular to direction
-        for slice in 0..16 {
-            // Find rectangular regions of same type
-            for y in 0..16 {
-                for x in 0..16 {
-                    if should_draw_face(x, y, slice, dir) && !visited[x][y][slice] {
-                        // should_draw_face already checks neighbors - no face if solid neighbor!
-                        // Expand horizontally
-                        let mut width = 1;
-                        while can_expand_x(x + width, y, slice, dir) { width += 1; }
-                        
-                        // Expand vertically
-                        let mut height = 1;
-                        while can_expand_y(x, y + height, slice, dir, width) { height += 1; }
-                        
-                        // Create merged quad
-                        quads.push(Quad { x, y, slice, width, height, dir });
-                        mark_visited(x, y, slice, width, height);
-                    }
-                }
-            }
-        }
-    }
-    quads
-}
-
-fn should_draw_face(pos: Pos, direction: Dir, chunk: &Chunk) -> bool {
-    let neighbor_pos = pos + direction.offset();
-    
-    // Don't draw face if:
-    // 1. Neighbor is solid (internal face)
-    // 2. Same voxel type (will be merged anyway)
-    if !chunk.in_bounds(neighbor_pos) {
-        return true; // Chunk edge - exposed
-    }
-    
-    let neighbor = chunk.get(neighbor_pos);
-    match neighbor {
-        None => true,                              // Air - draw face
-        Some(voxel) if voxel.is_transparent() => true,  // Transparent - draw face
-        Some(_) => false,                          // Solid neighbor - cull!
-    }
-}
-```
-
-**Why greedy meshing comes first**:
-- Doing per-voxel neighbor checks first, then greedy meshing would check neighbors twice
-- Greedy meshing naturally produces only external faces (neighbor culling is built-in)
-- Result is already optimized quads, not individual faces to cull later
-- Mesh caching becomes much more valuable with fewer, larger primitives
-
-**Integration**:
-- Generate mesh per chunk instead of per voxel
-- Cache meshes - only regenerate when chunk changes
-- Update instance buffer with quads instead of cubes
-
-### 2. ⚡ **Additional Face Optimizations** (Applied to greedy mesh output)
-**Impact**: Medium - optimizations on top of greedy meshing  
-**Complexity**: Low
-
-Once you have greedy meshed quads, these optimizations can be applied:
-
-#### **2a. Backface Culling** (GPU-Level) ✅ **Already Enabled**
-GPU automatically culls faces pointing away from camera. This is "free" when enabled:
-
-```rust
-// In wgpu pipeline setup:
-wgpu::PrimitiveState {
-    cull_mode: Some(wgpu::Face::Back),  // Cull back-facing triangles
-    front_face: wgpu::FrontFace::Ccw,   // Counter-clockwise = front
-    ..Default::default()
-}
-```
-
-**How it works**: For opaque quads, you can only see one side from any viewpoint. The GPU automatically skips faces pointing away from camera. This is handled in hardware and costs almost nothing.
-
-**Status**: ✅ Already implemented and working!
-
-#### **2b. Inter-Chunk Face Culling** (Advanced)
-After greedy meshing individual chunks, you can cull faces between adjacent chunks:
-
-```rust
-fn cull_chunk_boundary_faces(chunk_a: &Mesh, chunk_b: &Mesh, boundary: Plane) {
-    // For quads on chunk_a's boundary that face chunk_b:
-    // Remove if chunk_b has a matching quad on its boundary facing back
-    // This eliminates internal faces between chunks
-}
-```
-
-**Note**: This is more complex with greedy meshed quads since you need to check if quads overlap at boundaries. Often easier to just let GPU backface culling handle it.
-
-**Expected Results with Greedy Meshing**:
-- Greedy meshing with built-in neighbor culling: ~95% reduction (only external faces, merged into large quads)
-- GPU backface culling on remaining faces: ~50% additional reduction
-- **Combined**: Only ~2-5% of original per-voxel faces are drawn (~95-98% reduction!)
-
-### 3. 📏 **LOD Using Hierarchy** (Distance-based simplification)
-**Status**: ✅ **Partially Implemented** - subdivision works, but no large-chunk rendering  
-**Impact**: Medium-High for large scenes  
-**Complexity**: Low (you already have the hierarchy!)
-
-Currently implemented: Voxels subdivide when camera gets closer than 50 units. What's missing: drawing distant sub-chunks as single large cubes instead of recursing.
-
-```rust
-// In culling phase (ADD THIS):
-fn collect_with_lod(chunk: &Chunk, world_pos: Vec3, distance: f32, scale: u32) {
-    // NEW: If far away, draw entire chunk as one large cube
-    if distance > LOD_DISTANCE * scale as f32 {
-        instances.push(VoxelInstance {
-            position: world_pos,
-            scale: scale * 16, // Entire 16³ chunk as one voxel
-            voxel_type: chunk.most_common_type(), // Or average color
-        });
-        return; // Don't recurse
-    }
-    
-    // EXISTING: Close up - recurse into sub-chunks or draw individual voxels
-    match voxel {
-        Voxel::Solid(_) => { /* draw as normal */ }
-        Voxel::Chunk(sub) => {
-            if distance < LOD_SUBDIVIDE_DISTANCE {
-                collect_with_lod(sub, ...); // Recurse
-            }
-        }
-    }
-}
-
-const LOD_DISTANCE: f32 = 200.0; // Tune this
-```
-
-### 4. 🎮 **GPU-Driven Rendering** (Reduce CPU overhead)
-**Status**: ❌ Not Implemented  
-**Impact**: Medium for scenes with many chunks  
-**Complexity**: High
-
-Use indirect drawing to let GPU decide what to draw:
-```rust
-// Store all instances in GPU buffer
-// Use compute shader to:
-// 1. Frustum cull
-// 2. Occlusion cull (using HiZ buffer)
-// 3. Write visible indices to indirect draw buffer
-
-wgpu::RenderPass::draw_indirect(indirect_buffer)
-```
-
----
-
-## Visual Enhancements
-
 ### 5. 🎨 **Depth of Field (DoF) Blur - "Tilt-Shift" Effect**
-**Status**: ❌ Not Implemented (shader needs to be created)  
-**Effect**: Miniature/toy world look with selective focus  
-**Performance Cost**: Medium (post-process, ~2-3ms at 1080p)
+**Status**: ✅ Implemented (2025-11)  
+**Implementation**: Primary gather pass in `shaders/dof_blur.wgsl`, followed by separable Gaussian smoothing in `shaders/dof_smooth.wgsl`, integrated in `viewer_hierarchical.rs` with dynamic uniforms and render targets shared with the bloom chain. Runtime controls (`/`, `,`, `.`) adjust focus distance and strength; smoothing parameters respond to frame resolution.
 
-The "tilt-shift" effect makes your voxel world look like a miniature diorama by:
-- Keeping a focal plane sharp (e.g., where camera is looking)
-- Blurring everything closer and farther away
-- Creating shallow depth-of-field like macro photography
+**Current Behaviour**:
+- Wide focus band with piecewise linear/exponential CoC curve for gentle transitions.
+- Far-field amplification keeps distant geometry soft while near focus stays crisp.
+- Bloom operates after DoF to accentuate highlights without re-blurring.
 
-**Implementation Steps**:
-1. **Render to offscreen textures** (color + depth)
-2. **Apply DoF post-process shader** 
-3. **Display to screen**
+**Next Enhancements (optional):**
+- Feed TAA history/tap jitter into DoF to reduce temporal noise.
+- Add bokeh shape controls or highlight preservation tweaks for bright emissive voxels.
+- Expose advanced tuning (focus band multiplier, smoothing radius) via config UI or hotkeys.
 
-#### DoF Shader (Create: `shaders/dof_blur.wgsl`)
-
-```wgsl
-// Depth of Field post-processing shader for "tilt-shift" toy world effect
-
-struct DoFUniforms {
-    focal_distance: f32,      // Distance that's in focus (world units)
-    focal_range: f32,         // Range of sharp focus (world units)
-    blur_strength: f32,       // Maximum blur amount (0.0-1.0)
-    near_plane: f32,          // Camera near plane
-    far_plane: f32,           // Camera far plane
-    _padding: vec3<f32>,
-};
-
-@group(0) @binding(0)
-var<uniform> dof_uniforms: DoFUniforms;
-
-@group(0) @binding(1)
-var color_texture: texture_2d<f32>;
-
-@group(0) @binding(2)
-var depth_texture: texture_depth_2d;
-
-@group(0) @binding(3)
-var texture_sampler: sampler;
-
-struct VertexOutput {
-    @builtin(position) position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-};
-
-// Full-screen triangle (no vertex buffer needed)
-@vertex
-fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
-    var output: VertexOutput;
-    let x = f32((vertex_index << 1u) & 2u);
-    let y = f32(vertex_index & 2u);
-    output.position = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
-    output.uv = vec2<f32>(x, y);
-    return output;
-}
-
-// Convert depth buffer value to linear world distance
-fn linearize_depth(depth: f32) -> f32 {
-    let near = dof_uniforms.near_plane;
-    let far = dof_uniforms.far_plane;
-    let z_ndc = depth * 2.0 - 1.0; // To NDC
-    return (2.0 * near * far) / (far + near - z_ndc * (far - near));
-}
-
-// Calculate circle of confusion (blur amount) based on depth
+Performance remains ~2 ms @ 1080p thanks to separable smoothing and early-out paths for in-focus pixels.
 fn calculate_coc(linear_depth: f32) -> f32 {
     let distance_from_focal = abs(linear_depth - dof_uniforms.focal_distance);
     
@@ -488,11 +258,10 @@ fn get_voxel_color(voxel_type: u32, normal: vec3<f32>) -> vec3<f32> {
 3. Handle chunk updates (regenerate mesh on change)
 4. Update rendering to use quads instead of per-voxel cubes
 
-**Phase 3 - Tilt-Shift DoF** (3-4 hours):
-1. Create offscreen render targets
-2. Implement DoF shader (provided in this document)
-3. Add Rust integration
-4. Add keyboard controls for tuning
+**Phase 3 - Tilt-Shift DoF** ✅ Completed:
+- Added offscreen pipeline, primary DoF gather pass, separable smoothing, and bloom ordering.
+- Keyboard controls wired for focal distance/range; defaults tuned for tilt-shift look.
+- Follow-up ideas: optional TAA integration, UI exposure for smoothing radius.
 
 **Phase 4 - Advanced Optimizations** (optional):
 1. Inter-chunk face culling (for greedy meshed boundaries)
@@ -511,9 +280,9 @@ fn get_voxel_color(voxel_type: u32, normal: vec3<f32>) -> vec3<f32> {
 - **Combined**: 100-1000x improvement for large scenes!
 
 **Visuals**:
-- ✅ **Implemented**: Global lighting with day/night cycle, adjustable atmospheric fog, backface culling
-- 🎨 **With DoF**: Professional miniature/toy world aesthetic
-- 🌅 **With dynamic lighting**: Day/night cycles, atmospheric scenes ✅ **DONE**
+- ✅ Global lighting with day/night cycle, adjustable atmospheric fog, backface culling
+- ✅ Tilt-shift DoF and bloom deliver the miniature aesthetic now in viewer builds
+- 🌅 Dynamic lighting + fog combos keep scenes atmospheric across times of day
 - **Together**: Polished, distinctive visual style
 
 ## Summary
@@ -525,7 +294,7 @@ fn get_voxel_color(voxel_type: u32, normal: vec3<f32>) -> vec3<f32> {
 2. ✅ ~~Add dynamic lighting~~ - **COMPLETED**
 3. ✅ ~~Add adjustable fog~~ - **COMPLETED**
 4. **Implement greedy meshing** (95% vertex reduction, includes neighbor culling) - **DO THIS NEXT**
-5. Add DoF for tilt-shift toy aesthetic (shader code provided)
+5. Polish DoF/bloom stack as needed (expose advanced controls, consider TAA integration)
 6. Add inter-chunk face culling (optional optimization after greedy meshing)
 
 **Key Insight**: Greedy meshing should be done BEFORE standalone neighbor culling, as it naturally produces only external faces while merging them into larger quads. Doing per-voxel neighbor checks first would be redundant work.

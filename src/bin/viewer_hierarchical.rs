@@ -113,6 +113,13 @@ struct CompositeUniforms {
     _padding0: f32,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct DoFSmoothUniforms {
+    direction_radius: [f32; 4],
+    texel_coc: [f32; 4],
+}
+
 #[derive(Copy, Clone, Debug)]
 struct BloomSettings {
     threshold: f32,
@@ -560,20 +567,28 @@ struct App {
     bloom_ping_view: Option<wgpu::TextureView>,
     bloom_pong_texture: Option<wgpu::Texture>,
     bloom_pong_view: Option<wgpu::TextureView>,
+    dof_smooth_ping_texture: Option<wgpu::Texture>,
+    dof_smooth_ping_view: Option<wgpu::TextureView>,
     bloom_extract_pipeline: Option<wgpu::RenderPipeline>,
     bloom_blur_pipeline: Option<wgpu::RenderPipeline>,
     composite_pipeline: Option<wgpu::RenderPipeline>,
+    dof_smooth_pipeline: Option<wgpu::RenderPipeline>,
     bloom_extract_bind_group_layout: Option<wgpu::BindGroupLayout>,
     bloom_blur_bind_group_layout: Option<wgpu::BindGroupLayout>,
     composite_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    dof_smooth_bind_group_layout: Option<wgpu::BindGroupLayout>,
     bloom_extract_bind_group: Option<wgpu::BindGroup>,
     bloom_blur_horizontal_bind_group: Option<wgpu::BindGroup>,
     bloom_blur_vertical_bind_group: Option<wgpu::BindGroup>,
+    dof_smooth_horizontal_bind_group: Option<wgpu::BindGroup>,
+    dof_smooth_vertical_bind_group: Option<wgpu::BindGroup>,
     composite_bind_group: Option<wgpu::BindGroup>,
     bloom_extract_uniform_buffer: Option<wgpu::Buffer>,
     bloom_blur_horizontal_uniform_buffer: Option<wgpu::Buffer>,
     bloom_blur_vertical_uniform_buffer: Option<wgpu::Buffer>,
     composite_uniform_buffer: Option<wgpu::Buffer>,
+    dof_smooth_horizontal_uniform_buffer: Option<wgpu::Buffer>,
+    dof_smooth_vertical_uniform_buffer: Option<wgpu::Buffer>,
     dof_settings: DoFSettings,
     dof_enabled: bool,
     bloom_settings: BloomSettings,
@@ -777,24 +792,32 @@ impl App {
             bloom_ping_view: None,
             bloom_pong_texture: None,
             bloom_pong_view: None,
+            dof_smooth_ping_texture: None,
+            dof_smooth_ping_view: None,
             bloom_extract_pipeline: None,
             bloom_blur_pipeline: None,
             composite_pipeline: None,
+            dof_smooth_pipeline: None,
             bloom_extract_bind_group_layout: None,
             bloom_blur_bind_group_layout: None,
             composite_bind_group_layout: None,
+            dof_smooth_bind_group_layout: None,
             bloom_extract_bind_group: None,
             bloom_blur_horizontal_bind_group: None,
             bloom_blur_vertical_bind_group: None,
+            dof_smooth_horizontal_bind_group: None,
+            dof_smooth_vertical_bind_group: None,
             composite_bind_group: None,
             bloom_extract_uniform_buffer: None,
             bloom_blur_horizontal_uniform_buffer: None,
             bloom_blur_vertical_uniform_buffer: None,
             composite_uniform_buffer: None,
+            dof_smooth_horizontal_uniform_buffer: None,
+            dof_smooth_vertical_uniform_buffer: None,
             dof_settings: DoFSettings {
                 focal_distance: 120.0,
-                focal_range: 24.0,
-                blur_strength: 1.0,
+                focal_range: 16.0,
+                blur_strength: 1.6,
             },
             dof_enabled: true,
             bloom_settings: BloomSettings {
@@ -953,7 +976,7 @@ impl App {
                 println!("DoF blur strength: {:.2}", self.dof_settings.blur_strength);
             }
             KeyCode::Quote => {
-                self.dof_settings.blur_strength = (self.dof_settings.blur_strength + 0.1).min(1.0);
+                self.dof_settings.blur_strength = (self.dof_settings.blur_strength + 0.1).min(2.5);
                 println!("DoF blur strength: {:.2}", self.dof_settings.blur_strength);
             }
             KeyCode::Slash => {
@@ -1025,6 +1048,23 @@ impl App {
         let post_color_view =
             post_color_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+        let dof_smooth_ping_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("DoF Smooth Ping Texture"),
+            size: wgpu::Extent3d {
+                width: config.width,
+                height: config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let dof_smooth_ping_view =
+            dof_smooth_ping_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
         let bloom_extent = wgpu::Extent3d {
             width: (config.width / 2).max(1),
             height: (config.height / 2).max(1),
@@ -1063,12 +1103,15 @@ impl App {
         self.offscreen_depth_texture = Some(depth_texture);
         self.post_color_view = Some(post_color_view);
         self.post_color_texture = Some(post_color_texture);
+        self.dof_smooth_ping_view = Some(dof_smooth_ping_view);
+        self.dof_smooth_ping_texture = Some(dof_smooth_ping_texture);
         self.bloom_ping_view = Some(bloom_ping_view);
         self.bloom_ping_texture = Some(bloom_ping_texture);
         self.bloom_pong_view = Some(bloom_pong_view);
         self.bloom_pong_texture = Some(bloom_pong_texture);
 
         self.update_dof_bind_group();
+        self.update_dof_smooth_bind_groups();
         self.update_bloom_uniforms();
         self.update_bloom_bind_groups();
     }
@@ -1115,6 +1158,139 @@ impl App {
                 },
             ],
         }));
+    }
+
+    fn update_dof_smooth_bind_groups(&mut self) {
+        let (
+            Some(device),
+            Some(layout),
+            Some(post_view),
+            Some(depth_view),
+            Some(sampler),
+            Some(dof_buffer),
+            Some(horizontal_buffer),
+            Some(vertical_buffer),
+            Some(ping_view),
+        ) = (
+            self.device.as_ref(),
+            self.dof_smooth_bind_group_layout.as_ref(),
+            self.post_color_view.as_ref(),
+            self.offscreen_depth_view.as_ref(),
+            self.post_sampler.as_ref(),
+            self.dof_uniform_buffer.as_ref(),
+            self.dof_smooth_horizontal_uniform_buffer.as_ref(),
+            self.dof_smooth_vertical_uniform_buffer.as_ref(),
+            self.dof_smooth_ping_view.as_ref(),
+        )
+        else {
+            return;
+        };
+
+        self.dof_smooth_horizontal_bind_group =
+            Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("DoF Smooth Horizontal Bind Group"),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: dof_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(post_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(depth_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: horizontal_buffer.as_entire_binding(),
+                    },
+                ],
+            }));
+
+        self.dof_smooth_vertical_bind_group =
+            Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("DoF Smooth Vertical Bind Group"),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: dof_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(ping_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(depth_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: vertical_buffer.as_entire_binding(),
+                    },
+                ],
+            }));
+    }
+
+    fn build_dof_smooth_uniforms(
+        &self,
+        target_width: u32,
+        target_height: u32,
+        direction: [f32; 2],
+    ) -> DoFSmoothUniforms {
+        let blur_strength = if self.dof_enabled {
+            self.dof_settings.blur_strength
+        } else {
+            0.0
+        };
+        let width = target_width.max(1) as f32;
+        let height = target_height.max(1) as f32;
+        let radius = if blur_strength <= 0.01 {
+            0.0
+        } else {
+            0.85 + blur_strength * 3.2
+        };
+        let coc_scale = if blur_strength <= 0.01 {
+            0.0
+        } else {
+            0.9 + blur_strength * 1.15
+        };
+        let coc_bias = -0.05;
+
+        DoFSmoothUniforms {
+            direction_radius: [direction[0], direction[1], radius, coc_scale],
+            texel_coc: [1.0 / width, 1.0 / height, coc_bias, 0.0],
+        }
+    }
+
+    fn update_dof_smooth_uniforms(&mut self) {
+        let (Some(queue), Some(config), Some(h_buffer), Some(v_buffer)) = (
+            self.queue.as_ref(),
+            self.config.as_ref(),
+            self.dof_smooth_horizontal_uniform_buffer.as_ref(),
+            self.dof_smooth_vertical_uniform_buffer.as_ref(),
+        ) else {
+            return;
+        };
+
+        let width = config.width.max(1);
+        let height = config.height.max(1);
+        let horizontal = self.build_dof_smooth_uniforms(width, height, [1.0, 0.0]);
+        let vertical = self.build_dof_smooth_uniforms(width, height, [0.0, 1.0]);
+
+        queue.write_buffer(h_buffer, 0, bytemuck::cast_slice(&[horizontal]));
+        queue.write_buffer(v_buffer, 0, bytemuck::cast_slice(&[vertical]));
     }
 
     fn update_bloom_uniforms(&mut self) {
@@ -1554,6 +1730,131 @@ impl App {
             cache: None,
         });
 
+        let dof_smooth_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("DoF Smooth Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/dof_smooth.wgsl").into()),
+        });
+
+        let dof_smooth_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("DoF Smooth Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let dof_smooth_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("DoF Smooth Pipeline Layout"),
+                bind_group_layouts: &[&dof_smooth_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        let dof_smooth_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("DoF Smooth Pipeline"),
+            layout: Some(&dof_smooth_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &dof_smooth_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &dof_smooth_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
+
+        let dof_smooth_horizontal_uniforms = DoFSmoothUniforms {
+            direction_radius: [1.0, 0.0, 0.0, 0.0],
+            texel_coc: [0.0, 0.0, 0.0, 0.0],
+        };
+        let dof_smooth_horizontal_uniform_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("DoF Smooth Horizontal Uniform Buffer"),
+                contents: bytemuck::cast_slice(&[dof_smooth_horizontal_uniforms]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+
+        let dof_smooth_vertical_uniforms = DoFSmoothUniforms {
+            direction_radius: [0.0, 1.0, 0.0, 0.0],
+            texel_coc: [0.0, 0.0, 0.0, 0.0],
+        };
+        let dof_smooth_vertical_uniform_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("DoF Smooth Vertical Uniform Buffer"),
+                contents: bytemuck::cast_slice(&[dof_smooth_vertical_uniforms]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+
         let post_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("DoF Sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -1906,6 +2207,14 @@ impl App {
         self.dof_uniform_buffer = Some(dof_uniform_buffer);
         self.post_sampler = Some(post_sampler);
         self.dof_bind_group = None;
+        self.dof_smooth_pipeline = Some(dof_smooth_pipeline);
+        self.dof_smooth_bind_group_layout = Some(dof_smooth_bind_group_layout);
+        self.dof_smooth_horizontal_uniform_buffer = Some(dof_smooth_horizontal_uniform_buffer);
+        self.dof_smooth_vertical_uniform_buffer = Some(dof_smooth_vertical_uniform_buffer);
+        self.dof_smooth_horizontal_bind_group = None;
+        self.dof_smooth_vertical_bind_group = None;
+        self.dof_smooth_ping_texture = None;
+        self.dof_smooth_ping_view = None;
         self.bloom_extract_pipeline = Some(bloom_extract_pipeline);
         self.bloom_blur_pipeline = Some(bloom_blur_pipeline);
         self.composite_pipeline = Some(composite_pipeline);
@@ -2373,6 +2682,64 @@ impl App {
             post_pass.draw(0..3, 0..1);
         } else {
             eprintln!("DoF resources unavailable; skipping post-process!");
+        }
+
+        let run_smoothing = self.dof_enabled && self.dof_settings.blur_strength > 0.01;
+        if run_smoothing {
+            self.update_dof_smooth_uniforms();
+
+            if let (
+                Some(dof_smooth_pipeline),
+                Some(horizontal_bind_group),
+                Some(vertical_bind_group),
+                Some(dof_smooth_ping_view),
+                Some(post_color_view),
+            ) = (
+                self.dof_smooth_pipeline.as_ref(),
+                self.dof_smooth_horizontal_bind_group.as_ref(),
+                self.dof_smooth_vertical_bind_group.as_ref(),
+                self.dof_smooth_ping_view.as_ref(),
+                self.post_color_view.as_ref(),
+            ) {
+                let mut smooth_pass_h = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("DoF Smooth Horizontal Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: dof_smooth_ping_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                smooth_pass_h.set_pipeline(dof_smooth_pipeline);
+                smooth_pass_h.set_bind_group(0, horizontal_bind_group, &[]);
+                smooth_pass_h.draw(0..3, 0..1);
+                drop(smooth_pass_h);
+
+                let mut smooth_pass_v = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("DoF Smooth Vertical Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: post_color_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                smooth_pass_v.set_pipeline(dof_smooth_pipeline);
+                smooth_pass_v.set_bind_group(0, vertical_bind_group, &[]);
+                smooth_pass_v.draw(0..3, 0..1);
+            }
         }
 
         if self.bloom_enabled {
