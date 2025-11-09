@@ -66,25 +66,25 @@ const CUBE_NORMALS: array<vec3<f32>, 6> = array<vec3<f32>, 6>(
 fn get_voxel_color(voxel_type: u32) -> vec3<f32> {
     switch (voxel_type) {
         case 1u: {
-            return vec3<f32>(0.3, 0.7, 0.3); // Green ground
+            return vec3<f32>(0.1, 0.9, 0.3); // Neon grass highlights
         }
         case 2u: {
-            return vec3<f32>(0.7, 0.3, 0.3); // Red tower
+            return vec3<f32>(1.0, 0.35, 0.35); // Sunlit red concrete
         }
         case 3u: {
-            return vec3<f32>(0.3, 0.3, 0.7); // Blue
+            return vec3<f32>(0.35, 0.5, 1.0); // Electric blue panels
         }
         case 4u: {
-            return vec3<f32>(0.7, 0.7, 0.3); // Yellow
+            return vec3<f32>(0.95, 0.9, 0.35); // Warm accent lighting
         }
         case 5u: {
-            return vec3<f32>(0.7, 0.3, 0.7); // Magenta
+            return vec3<f32>(0.95, 0.4, 1.0); // Vibrant magenta glass
         }
         case 6u: {
-            return vec3<f32>(0.3, 0.7, 0.7); // Cyan
+            return vec3<f32>(0.3, 0.95, 1.0); // Cyan signage glow
         }
         case 7u: {
-            return vec3<f32>(0.5, 0.5, 0.5); // Gray wall
+            return vec3<f32>(0.85, 0.85, 0.85); // Bright concrete walls
         }
         default: {
             return vec3<f32>(1.0, 1.0, 1.0); // White default

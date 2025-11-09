@@ -28,11 +28,17 @@ struct VertexOutput {
 
 @vertex
 fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0),
+        vec2<f32>(-1.0, 3.0),
+    );
+
+    let pos = positions[vertex_index];
     var output: VertexOutput;
-    let x = f32((vertex_index << 1u) & 2u);
-    let y = f32(vertex_index & 2u);
-    output.position = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
-    output.uv = vec2<f32>(x, y);
+    output.position = vec4<f32>(pos, 0.0, 1.0);
+    let uv = pos * 0.5 + vec2<f32>(0.5, 0.5);
+    output.uv = vec2<f32>(uv.x, 1.0 - uv.y);
     return output;
 }
 

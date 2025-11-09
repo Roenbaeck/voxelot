@@ -16,13 +16,13 @@ pub type VoxelType = u8;
 /// Convert a VoxelType to RGBA color (matches shader's get_voxel_color)
 pub fn voxel_type_to_rgba(voxel_type: VoxelType) -> [u8; 4] {
     let (r, g, b) = match voxel_type {
-        1 => (0.3, 0.7, 0.3), // Green ground
-        2 => (0.7, 0.3, 0.3), // Red tower
-        3 => (0.3, 0.3, 0.7), // Blue
-        4 => (0.7, 0.7, 0.3), // Yellow
-        5 => (0.7, 0.3, 0.7), // Magenta
-        6 => (0.3, 0.7, 0.7), // Cyan
-        7 => (0.5, 0.5, 0.5), // Gray wall
+        1 => (0.1, 0.9, 0.3), // Neon grass highlights
+        2 => (1.0, 0.35, 0.35), // Sunlit red concrete
+        3 => (0.35, 0.5, 1.0), // Electric blue panels
+        4 => (0.95, 0.9, 0.35), // Warm accent lighting
+        5 => (0.95, 0.4, 1.0), // Vibrant magenta glass
+        6 => (0.3, 0.95, 1.0), // Cyan signage glow
+        7 => (0.85, 0.85, 0.85), // Bright concrete walls
         _ => (1.0, 1.0, 1.0), // White default
     };
 

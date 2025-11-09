@@ -71,8 +71,8 @@ struct Uniforms {
     _padding2: f32,          // 4 bytes
     ambient_color: [f32; 3], // 12 bytes
     time_of_day: f32,        // 4 bytes
-    // Total: 112 bytes (needs padding to 128 for alignment)
-    _padding3: [f32; 4], // 16 bytes padding
+    // Total prior to padding: 112 bytes. Add 32 bytes tail padding (2 vec4 slots)
+    _padding3: [f32; 8], // 32 bytes padding to satisfy 144-byte uniform expectations
 }
 
 /// Depth-of-field runtime settings (CPU-side convenience)
@@ -81,6 +81,47 @@ struct DoFSettings {
     focal_distance: f32,
     focal_range: f32,
     blur_strength: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct BloomExtractUniforms {
+    threshold: f32,
+    knee: f32,
+    intensity: f32,
+    _padding0: f32,
+    source_texel_size: [f32; 2],
+    _padding1: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct BloomBlurUniforms {
+    direction: [f32; 2],
+    radius: f32,
+    _padding0: f32,
+    texel_size: [f32; 2],
+    _padding1: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct CompositeUniforms {
+    bloom_strength: f32,
+    saturation_boost: f32,
+    exposure: f32,
+    _padding0: f32,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct BloomSettings {
+    threshold: f32,
+    knee: f32,
+    intensity: f32,
+    bloom_strength: f32,
+    saturation_boost: f32,
+    exposure: f32,
+    blur_radius: f32,
 }
 
 const DOF_UNIFORM_FLOATS: usize = 12;
@@ -513,8 +554,30 @@ struct App {
     offscreen_color_view: Option<wgpu::TextureView>,
     offscreen_depth_texture: Option<wgpu::Texture>,
     offscreen_depth_view: Option<wgpu::TextureView>,
+    post_color_texture: Option<wgpu::Texture>,
+    post_color_view: Option<wgpu::TextureView>,
+    bloom_ping_texture: Option<wgpu::Texture>,
+    bloom_ping_view: Option<wgpu::TextureView>,
+    bloom_pong_texture: Option<wgpu::Texture>,
+    bloom_pong_view: Option<wgpu::TextureView>,
+    bloom_extract_pipeline: Option<wgpu::RenderPipeline>,
+    bloom_blur_pipeline: Option<wgpu::RenderPipeline>,
+    composite_pipeline: Option<wgpu::RenderPipeline>,
+    bloom_extract_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    bloom_blur_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    composite_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    bloom_extract_bind_group: Option<wgpu::BindGroup>,
+    bloom_blur_horizontal_bind_group: Option<wgpu::BindGroup>,
+    bloom_blur_vertical_bind_group: Option<wgpu::BindGroup>,
+    composite_bind_group: Option<wgpu::BindGroup>,
+    bloom_extract_uniform_buffer: Option<wgpu::Buffer>,
+    bloom_blur_horizontal_uniform_buffer: Option<wgpu::Buffer>,
+    bloom_blur_vertical_uniform_buffer: Option<wgpu::Buffer>,
+    composite_uniform_buffer: Option<wgpu::Buffer>,
     dof_settings: DoFSettings,
     dof_enabled: bool,
+    bloom_settings: BloomSettings,
+    bloom_enabled: bool,
 }
 
 impl App {
@@ -667,6 +730,8 @@ impl App {
         println!("Chunk LOD Distance: K/L (decrease/increase)");
         println!("Time of Day: T (cycle through day/night)");
         println!("Fog Density: F/G (decrease/increase)");
+        println!("Depth of Field: / (toggle), , and . adjust focus");
+        println!("Bloom: B (toggle)");
         println!("Quit: ESC");
         println!("================\n");
 
@@ -706,12 +771,42 @@ impl App {
             offscreen_color_view: None,
             offscreen_depth_texture: None,
             offscreen_depth_view: None,
+            post_color_texture: None,
+            post_color_view: None,
+            bloom_ping_texture: None,
+            bloom_ping_view: None,
+            bloom_pong_texture: None,
+            bloom_pong_view: None,
+            bloom_extract_pipeline: None,
+            bloom_blur_pipeline: None,
+            composite_pipeline: None,
+            bloom_extract_bind_group_layout: None,
+            bloom_blur_bind_group_layout: None,
+            composite_bind_group_layout: None,
+            bloom_extract_bind_group: None,
+            bloom_blur_horizontal_bind_group: None,
+            bloom_blur_vertical_bind_group: None,
+            composite_bind_group: None,
+            bloom_extract_uniform_buffer: None,
+            bloom_blur_horizontal_uniform_buffer: None,
+            bloom_blur_vertical_uniform_buffer: None,
+            composite_uniform_buffer: None,
             dof_settings: DoFSettings {
                 focal_distance: 120.0,
                 focal_range: 40.0,
                 blur_strength: 0.7,
             },
             dof_enabled: true,
+            bloom_settings: BloomSettings {
+                threshold: 0.9,
+                knee: 0.9,
+                intensity: 1.4,
+                bloom_strength: 1.2,
+                saturation_boost: 1.35,
+                exposure: 1.12,
+                blur_radius: 3.0,
+            },
+            bloom_enabled: true,
         }
     }
 
@@ -731,6 +826,55 @@ impl App {
         data[3] = self.camera_controller.camera.near;
         data[4] = self.camera_controller.camera.far;
         data
+    }
+
+    fn build_bloom_extract_uniforms(
+        &self,
+        src_width: u32,
+        src_height: u32,
+    ) -> BloomExtractUniforms {
+        BloomExtractUniforms {
+            threshold: self.bloom_settings.threshold,
+            knee: self.bloom_settings.knee,
+            intensity: self.bloom_settings.intensity,
+            _padding0: 0.0,
+            source_texel_size: [
+                1.0 / src_width.max(1) as f32,
+                1.0 / src_height.max(1) as f32,
+            ],
+            _padding1: [0.0; 2],
+        }
+    }
+
+    fn build_bloom_blur_uniforms(
+        &self,
+        target_width: u32,
+        target_height: u32,
+        direction: [f32; 2],
+    ) -> BloomBlurUniforms {
+        BloomBlurUniforms {
+            direction,
+            radius: self.bloom_settings.blur_radius,
+            _padding0: 0.0,
+            texel_size: [
+                1.0 / target_width.max(1) as f32,
+                1.0 / target_height.max(1) as f32,
+            ],
+            _padding1: [0.0; 2],
+        }
+    }
+
+    fn build_composite_uniforms(&self) -> CompositeUniforms {
+        CompositeUniforms {
+            bloom_strength: if self.bloom_enabled {
+                self.bloom_settings.bloom_strength
+            } else {
+                0.0
+            },
+            saturation_boost: self.bloom_settings.saturation_boost,
+            exposure: self.bloom_settings.exposure,
+            _padding0: 0.0,
+        }
     }
 
     fn process_lighting_key(&mut self, key: KeyCode) {
@@ -756,6 +900,17 @@ impl App {
                 // Increase fog density
                 self.fog_density = (self.fog_density + 0.0002).min(0.01);
                 println!("Fog density: {:.4}", self.fog_density);
+            }
+            KeyCode::KeyB => {
+                self.bloom_enabled = !self.bloom_enabled;
+                println!(
+                    "Bloom {}",
+                    if self.bloom_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
             }
             KeyCode::KeyK => {
                 // Decrease LOD distance (more detail at distance)
@@ -853,12 +1008,69 @@ impl App {
         });
         let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+        let post_color_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Post DoF Color Texture"),
+            size: wgpu::Extent3d {
+                width: config.width,
+                height: config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let post_color_view =
+            post_color_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let bloom_extent = wgpu::Extent3d {
+            width: (config.width / 2).max(1),
+            height: (config.height / 2).max(1),
+            depth_or_array_layers: 1,
+        };
+
+        let bloom_ping_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Bloom Ping Texture"),
+            size: bloom_extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let bloom_ping_view =
+            bloom_ping_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let bloom_pong_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Bloom Pong Texture"),
+            size: bloom_extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let bloom_pong_view =
+            bloom_pong_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
         self.offscreen_color_view = Some(color_view);
         self.offscreen_color_texture = Some(color_texture);
         self.offscreen_depth_view = Some(depth_view);
         self.offscreen_depth_texture = Some(depth_texture);
+        self.post_color_view = Some(post_color_view);
+        self.post_color_texture = Some(post_color_texture);
+        self.bloom_ping_view = Some(bloom_ping_view);
+        self.bloom_ping_texture = Some(bloom_ping_texture);
+        self.bloom_pong_view = Some(bloom_pong_view);
+        self.bloom_pong_texture = Some(bloom_pong_texture);
 
         self.update_dof_bind_group();
+        self.update_bloom_uniforms();
+        self.update_bloom_bind_groups();
     }
 
     fn update_dof_bind_group(&mut self) {
@@ -896,6 +1108,153 @@ impl App {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::TextureView(depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        }));
+    }
+
+    fn update_bloom_uniforms(&mut self) {
+        let (Some(queue), Some(config)) = (self.queue.as_ref(), self.config.as_ref()) else {
+            return;
+        };
+
+        let width = config.width.max(1);
+        let height = config.height.max(1);
+        let bloom_width = (config.width / 2).max(1);
+        let bloom_height = (config.height / 2).max(1);
+
+        if let Some(buffer) = self.bloom_extract_uniform_buffer.as_ref() {
+            let data = self.build_bloom_extract_uniforms(width, height);
+            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[data]));
+        }
+
+        if let Some(buffer) = self.bloom_blur_horizontal_uniform_buffer.as_ref() {
+            let data = self.build_bloom_blur_uniforms(bloom_width, bloom_height, [1.0, 0.0]);
+            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[data]));
+        }
+
+        if let Some(buffer) = self.bloom_blur_vertical_uniform_buffer.as_ref() {
+            let data = self.build_bloom_blur_uniforms(bloom_width, bloom_height, [0.0, 1.0]);
+            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[data]));
+        }
+
+        if let Some(buffer) = self.composite_uniform_buffer.as_ref() {
+            let data = self.build_composite_uniforms();
+            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[data]));
+        }
+    }
+
+    fn update_bloom_bind_groups(&mut self) {
+        let (
+            Some(device),
+            Some(extract_layout),
+            Some(blur_layout),
+            Some(composite_layout),
+            Some(sampler),
+            Some(post_color_view),
+            Some(bloom_ping_view),
+            Some(bloom_pong_view),
+            Some(extract_buffer),
+            Some(blur_horizontal_buffer),
+            Some(blur_vertical_buffer),
+            Some(composite_buffer),
+        ) = (
+            self.device.as_ref(),
+            self.bloom_extract_bind_group_layout.as_ref(),
+            self.bloom_blur_bind_group_layout.as_ref(),
+            self.composite_bind_group_layout.as_ref(),
+            self.post_sampler.as_ref(),
+            self.post_color_view.as_ref(),
+            self.bloom_ping_view.as_ref(),
+            self.bloom_pong_view.as_ref(),
+            self.bloom_extract_uniform_buffer.as_ref(),
+            self.bloom_blur_horizontal_uniform_buffer.as_ref(),
+            self.bloom_blur_vertical_uniform_buffer.as_ref(),
+            self.composite_uniform_buffer.as_ref(),
+        )
+        else {
+            return;
+        };
+
+        self.bloom_extract_bind_group =
+            Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Bloom Extract Bind Group"),
+                layout: extract_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: extract_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(post_color_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                ],
+            }));
+
+        self.bloom_blur_horizontal_bind_group =
+            Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Bloom Blur Horizontal Bind Group"),
+                layout: blur_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: blur_horizontal_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(bloom_ping_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                ],
+            }));
+
+        self.bloom_blur_vertical_bind_group =
+            Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Bloom Blur Vertical Bind Group"),
+                layout: blur_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: blur_vertical_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(bloom_pong_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                ],
+            }));
+
+        self.composite_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Composite Bind Group"),
+            layout: composite_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: composite_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(post_color_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(bloom_ping_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -1206,6 +1565,308 @@ impl App {
             ..Default::default()
         });
 
+        let bloom_extract_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Bloom Extract Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../shaders/bloom_extract.wgsl").into(),
+            ),
+        });
+
+        let bloom_blur_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Bloom Blur Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/bloom_blur.wgsl").into()),
+        });
+
+        let composite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Composite Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../shaders/post_composite.wgsl").into(),
+            ),
+        });
+
+        let bloom_extract_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Bloom Extract Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let bloom_blur_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Bloom Blur Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let composite_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Composite Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let bloom_extract_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Bloom Extract Pipeline Layout"),
+                bind_group_layouts: &[&bloom_extract_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        let bloom_blur_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Bloom Blur Pipeline Layout"),
+                bind_group_layouts: &[&bloom_blur_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        let composite_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Composite Pipeline Layout"),
+                bind_group_layouts: &[&composite_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        let bloom_extract_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Bloom Extract Pipeline"),
+                layout: Some(&bloom_extract_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &bloom_extract_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &bloom_extract_shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview: None,
+                cache: None,
+            });
+
+        let bloom_blur_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Bloom Blur Pipeline"),
+            layout: Some(&bloom_blur_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &bloom_blur_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &bloom_blur_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
+
+        let composite_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Composite Pipeline"),
+            layout: Some(&composite_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &composite_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &composite_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
+
+        let bloom_extract_uniforms =
+            self.build_bloom_extract_uniforms(config.width.max(1), config.height.max(1));
+        let bloom_extract_uniform_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Bloom Extract Uniform Buffer"),
+                contents: bytemuck::cast_slice(&[bloom_extract_uniforms]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+
+        let bloom_width = (config.width / 2).max(1);
+        let bloom_height = (config.height / 2).max(1);
+
+        let bloom_blur_horizontal_uniforms =
+            self.build_bloom_blur_uniforms(bloom_width, bloom_height, [1.0, 0.0]);
+        let bloom_blur_horizontal_uniform_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Bloom Blur Horizontal Uniform Buffer"),
+                contents: bytemuck::cast_slice(&[bloom_blur_horizontal_uniforms]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+
+        let bloom_blur_vertical_uniforms =
+            self.build_bloom_blur_uniforms(bloom_width, bloom_height, [0.0, 1.0]);
+        let bloom_blur_vertical_uniform_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Bloom Blur Vertical Uniform Buffer"),
+                contents: bytemuck::cast_slice(&[bloom_blur_vertical_uniforms]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+
+        let composite_uniforms = self.build_composite_uniforms();
+        let composite_uniform_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Composite Uniform Buffer"),
+                contents: bytemuck::cast_slice(&[composite_uniforms]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+
         // Create uniform buffer with proper size for Uniforms struct
         let uniforms = Uniforms {
             mvp: [[0.0; 4]; 4], // Will be filled in render()
@@ -1215,7 +1876,7 @@ impl App {
             _padding2: 0.0,
             ambient_color: [0.3, 0.35, 0.45],
             time_of_day: 0.5,
-            _padding3: [0.0; 4],
+            _padding3: [0.0; 8],
         };
 
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1245,6 +1906,20 @@ impl App {
         self.dof_uniform_buffer = Some(dof_uniform_buffer);
         self.post_sampler = Some(post_sampler);
         self.dof_bind_group = None;
+        self.bloom_extract_pipeline = Some(bloom_extract_pipeline);
+        self.bloom_blur_pipeline = Some(bloom_blur_pipeline);
+        self.composite_pipeline = Some(composite_pipeline);
+        self.bloom_extract_bind_group_layout = Some(bloom_extract_bind_group_layout);
+        self.bloom_blur_bind_group_layout = Some(bloom_blur_bind_group_layout);
+        self.composite_bind_group_layout = Some(composite_bind_group_layout);
+        self.bloom_extract_uniform_buffer = Some(bloom_extract_uniform_buffer);
+        self.bloom_blur_horizontal_uniform_buffer = Some(bloom_blur_horizontal_uniform_buffer);
+        self.bloom_blur_vertical_uniform_buffer = Some(bloom_blur_vertical_uniform_buffer);
+        self.composite_uniform_buffer = Some(composite_uniform_buffer);
+        self.bloom_extract_bind_group = None;
+        self.bloom_blur_horizontal_bind_group = None;
+        self.bloom_blur_vertical_bind_group = None;
+        self.composite_bind_group = None;
 
         self.window = Some(window);
         self.surface = Some(surface);
@@ -1566,7 +2241,7 @@ impl App {
             _padding2: 0.0,
             ambient_color,
             time_of_day: self.time_of_day,
-            _padding3: [0.0; 4],
+            _padding3: [0.0; 8],
         };
 
         queue.write_buffer(
@@ -1654,10 +2329,21 @@ impl App {
             self.update_dof_bind_group();
         }
 
-        if let (Some(dof_pipeline), Some(dof_bind_group), Some(dof_buffer)) = (
+        self.update_bloom_uniforms();
+
+        if self.composite_bind_group.is_none()
+            || self.bloom_extract_bind_group.is_none()
+            || self.bloom_blur_horizontal_bind_group.is_none()
+            || self.bloom_blur_vertical_bind_group.is_none()
+        {
+            self.update_bloom_bind_groups();
+        }
+
+        if let (Some(dof_pipeline), Some(dof_bind_group), Some(dof_buffer), Some(post_color_view)) = (
             self.dof_pipeline.as_ref(),
             self.dof_bind_group.as_ref(),
             self.dof_uniform_buffer.as_ref(),
+            self.post_color_view.as_ref(),
         ) {
             let blur_strength = if self.dof_enabled {
                 self.dof_settings.blur_strength
@@ -1670,7 +2356,7 @@ impl App {
             let mut post_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("DoF Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: post_color_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -1687,6 +2373,113 @@ impl App {
             post_pass.draw(0..3, 0..1);
         } else {
             eprintln!("DoF resources unavailable; skipping post-process!");
+        }
+
+        if self.bloom_enabled {
+            if let (
+                Some(bloom_extract_pipeline),
+                Some(bloom_extract_bind_group),
+                Some(bloom_ping_view),
+            ) = (
+                self.bloom_extract_pipeline.as_ref(),
+                self.bloom_extract_bind_group.as_ref(),
+                self.bloom_ping_view.as_ref(),
+            ) {
+                let mut extract_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Bloom Extract Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: bloom_ping_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                extract_pass.set_pipeline(bloom_extract_pipeline);
+                extract_pass.set_bind_group(0, bloom_extract_bind_group, &[]);
+                extract_pass.draw(0..3, 0..1);
+            }
+
+            if let (Some(bloom_blur_pipeline), Some(horizontal_bind_group), Some(bloom_pong_view)) = (
+                self.bloom_blur_pipeline.as_ref(),
+                self.bloom_blur_horizontal_bind_group.as_ref(),
+                self.bloom_pong_view.as_ref(),
+            ) {
+                let mut blur_pass_h = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Bloom Blur Horizontal Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: bloom_pong_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                blur_pass_h.set_pipeline(bloom_blur_pipeline);
+                blur_pass_h.set_bind_group(0, horizontal_bind_group, &[]);
+                blur_pass_h.draw(0..3, 0..1);
+            }
+
+            if let (Some(bloom_blur_pipeline), Some(vertical_bind_group), Some(bloom_ping_view)) = (
+                self.bloom_blur_pipeline.as_ref(),
+                self.bloom_blur_vertical_bind_group.as_ref(),
+                self.bloom_ping_view.as_ref(),
+            ) {
+                let mut blur_pass_v = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Bloom Blur Vertical Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: bloom_ping_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                blur_pass_v.set_pipeline(bloom_blur_pipeline);
+                blur_pass_v.set_bind_group(0, vertical_bind_group, &[]);
+                blur_pass_v.draw(0..3, 0..1);
+            }
+        }
+
+        if let (Some(composite_pipeline), Some(composite_bind_group)) = (
+            self.composite_pipeline.as_ref(),
+            self.composite_bind_group.as_ref(),
+        ) {
+            let mut composite_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Composite Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            composite_pass.set_pipeline(composite_pipeline);
+            composite_pass.set_bind_group(0, composite_bind_group, &[]);
+            composite_pass.draw(0..3, 0..1);
+        } else {
+            eprintln!("Composite resources unavailable; skipping final pass!");
         }
 
         queue.submit(std::iter::once(encoder.finish()));
