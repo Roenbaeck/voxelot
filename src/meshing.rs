@@ -29,11 +29,15 @@ pub struct ChunkMesh {
 pub fn generate_chunk_mesh(chunk: &Chunk) -> ChunkMesh {
     // 3 axes: 0=x, 1=y, 2=z
     let mut mesh = ChunkMesh::default();
-    
+
     // Debug: count voxels
     let voxel_count = chunk.iter().count();
     let first_voxel = chunk.iter().next();
-    mesh_debug!("DEBUG generate_chunk_mesh: {} voxels, first={:?}", voxel_count, first_voxel);
+    mesh_debug!(
+        "DEBUG generate_chunk_mesh: {} voxels, first={:?}",
+        voxel_count,
+        first_voxel
+    );
 
     // Helper to get voxel type at (x,y,z)
     let get_type = |x: i32, y: i32, z: i32| -> Option<u8> {
@@ -51,12 +55,13 @@ pub fn generate_chunk_mesh(chunk: &Chunk) -> ChunkMesh {
             1 => (0, 2),
             _ => (0, 1),
         };
-        
-    let axis_name = ["X", "Y", "Z"][axis];
-    let mut faces_this_axis = 0;
+
+        let axis_name = ["X", "Y", "Z"][axis];
+        let mut faces_this_axis = 0;
 
         // Iterate slices along the main axis
-        for d in 0..=16 { // note: d == 16 handles the outer boundary
+        for d in 0..=16 {
+            // note: d == 16 handles the outer boundary
             // Mask width/height along u and v axes
             let mut mask: [i32; 16 * 16] = [0; 16 * 16];
 
@@ -77,8 +82,8 @@ pub fn generate_chunk_mesh(chunk: &Chunk) -> ChunkMesh {
 
                     // We create a face when one side is solid and the other isn't, or materials differ
                     let face_type = match (t_a, t_b) {
-                        (Some(ta), None) => ta as i32,      // Solid on 'a' side, empty on 'b' side: positive face at d
-                        (None, Some(tb)) => -(tb as i32),   // Empty on 'a' side, solid on 'b' side: negative face at d-1
+                        (Some(ta), None) => ta as i32, // Solid on 'a' side, empty on 'b' side: positive face at d
+                        (None, Some(tb)) => -(tb as i32), // Empty on 'a' side, solid on 'b' side: negative face at d-1
                         (Some(ta), Some(tb)) if ta != tb => ta as i32, // boundary between different types
                         _ => 0,
                     };
@@ -102,7 +107,9 @@ pub fn generate_chunk_mesh(chunk: &Chunk) -> ChunkMesh {
                     let mut width = 1;
                     while u_start + width < 16 {
                         let idx = ((u_start + width) * 16 + v_start) as usize;
-                        if mask[idx] != t { break; }
+                        if mask[idx] != t {
+                            break;
+                        }
                         width += 1;
                     }
 
@@ -111,15 +118,16 @@ pub fn generate_chunk_mesh(chunk: &Chunk) -> ChunkMesh {
                     'outer: while v_start + height < 16 {
                         for du in 0..width {
                             let idx = ((u_start + du) * 16 + (v_start + height)) as usize;
-                            if mask[idx] != t { break 'outer; }
+                            if mask[idx] != t {
+                                break 'outer;
+                            }
                         }
                         height += 1;
                     }
 
                     // Emit this rectangle
                     emit_quad(
-                        &mut mesh, axis, d, u_axis, v_axis,
-                        u_start, v_start, width, height, t,
+                        &mut mesh, axis, d, u_axis, v_axis, u_start, v_start, width, height, t,
                     );
                     faces_this_axis += 1;
 
@@ -134,8 +142,8 @@ pub fn generate_chunk_mesh(chunk: &Chunk) -> ChunkMesh {
                 }
                 v_start += 1;
             }
-    }
-    mesh_debug!("  {} axis: {} faces", axis_name, faces_this_axis);
+        }
+        mesh_debug!("  {} axis: {} faces", axis_name, faces_this_axis);
     }
 
     mesh
@@ -153,7 +161,9 @@ fn emit_quad(
     dv: i32,
     face_type: i32,
 ) {
-    if face_type == 0 { return; }
+    if face_type == 0 {
+        return;
+    }
 
     // Determine face orientation and material
     let positive = face_type > 0;
@@ -199,10 +209,26 @@ fn emit_quad(
 
     let base_index = mesh.vertices.len() as u32;
     mesh.vertices.extend_from_slice(&[
-        MeshVertex { position: p0, normal, color },
-        MeshVertex { position: p1, normal, color },
-        MeshVertex { position: p2, normal, color },
-        MeshVertex { position: p3, normal, color },
+        MeshVertex {
+            position: p0,
+            normal,
+            color,
+        },
+        MeshVertex {
+            position: p1,
+            normal,
+            color,
+        },
+        MeshVertex {
+            position: p2,
+            normal,
+            color,
+        },
+        MeshVertex {
+            position: p3,
+            normal,
+            color,
+        },
     ]);
 
     // Two triangles with winding order dependent on face orientation
@@ -211,25 +237,41 @@ fn emit_quad(
     if axis == 1 {
         if positive {
             mesh.indices.extend_from_slice(&[
-                base_index, base_index + 1, base_index + 2,
-                base_index, base_index + 2, base_index + 3,
+                base_index,
+                base_index + 1,
+                base_index + 2,
+                base_index,
+                base_index + 2,
+                base_index + 3,
             ]);
         } else {
             mesh.indices.extend_from_slice(&[
-                base_index, base_index + 3, base_index + 2,
-                base_index, base_index + 2, base_index + 1,
+                base_index,
+                base_index + 3,
+                base_index + 2,
+                base_index,
+                base_index + 2,
+                base_index + 1,
             ]);
         }
     } else {
         if positive {
             mesh.indices.extend_from_slice(&[
-                base_index, base_index + 3, base_index + 2,
-                base_index, base_index + 2, base_index + 1,
+                base_index,
+                base_index + 3,
+                base_index + 2,
+                base_index,
+                base_index + 2,
+                base_index + 1,
             ]);
         } else {
             mesh.indices.extend_from_slice(&[
-                base_index, base_index + 1, base_index + 2,
-                base_index, base_index + 2, base_index + 3,
+                base_index,
+                base_index + 1,
+                base_index + 2,
+                base_index,
+                base_index + 2,
+                base_index + 3,
             ]);
         }
     }

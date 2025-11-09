@@ -7,10 +7,10 @@
 //! - LOD support
 //! - Instanced rendering
 
+use glam::{Mat4, Vec3};
 use std::sync::Arc;
 use std::time::Instant;
 use wgpu::util::DeviceExt;
-use glam::{Mat4, Vec3};
 use winit::{
     application::ApplicationHandler,
     event::*,
@@ -19,9 +19,9 @@ use winit::{
     window::{Window, WindowAttributes},
 };
 
-use voxelot::{World, WorldPos, Camera, VisibilityCache, RenderConfig};
-use voxelot::generate_chunk_mesh;
 use std::collections::{HashMap, HashSet, VecDeque};
+use voxelot::generate_chunk_mesh;
+use voxelot::{Camera, RenderConfig, VisibilityCache, World, WorldPos};
 
 macro_rules! viewer_debug {
     ($($arg:tt)*) => {
@@ -41,8 +41,8 @@ const CONFIG_FILE: &str = "render_config.txt";
 struct VoxelInstanceRaw {
     position: [f32; 3],
     voxel_type: u32,
-    scale: f32,              // Scale factor (1.0 = 1x1x1, 16.0 = 16x16x16 chunk)
-    custom_color: [f32; 4],  // RGBA custom color (if custom_color.a > 0, use this instead of voxel_type)
+    scale: f32,             // Scale factor (1.0 = 1x1x1, 16.0 = 16x16x16 chunk)
+    custom_color: [f32; 4], // RGBA custom color (if custom_color.a > 0, use this instead of voxel_type)
 }
 
 #[repr(C)]
@@ -64,60 +64,178 @@ struct CubeVertex {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
-    mvp: [[f32; 4]; 4],           // 64 bytes
-    sun_direction: [f32; 3],      // 12 bytes
-    fog_density: f32,             // 4 bytes (was _padding1)
-    sun_color: [f32; 3],          // 12 bytes  
-    _padding2: f32,               // 4 bytes
-    ambient_color: [f32; 3],      // 12 bytes
-    time_of_day: f32,             // 4 bytes
+    mvp: [[f32; 4]; 4],      // 64 bytes
+    sun_direction: [f32; 3], // 12 bytes
+    fog_density: f32,        // 4 bytes (was _padding1)
+    sun_color: [f32; 3],     // 12 bytes
+    _padding2: f32,          // 4 bytes
+    ambient_color: [f32; 3], // 12 bytes
+    time_of_day: f32,        // 4 bytes
     // Total: 112 bytes (needs padding to 128 for alignment)
-    _padding3: [f32; 4],          // 16 bytes padding
+    _padding3: [f32; 4], // 16 bytes padding
 }
+
+/// Depth-of-field runtime settings (CPU-side convenience)
+#[derive(Copy, Clone, Debug)]
+struct DoFSettings {
+    focal_distance: f32,
+    focal_range: f32,
+    blur_strength: f32,
+}
+
+const DOF_UNIFORM_FLOATS: usize = 12;
 
 const CUBE_VERTICES: &[CubeVertex] = &[
     // Front face
-    CubeVertex { position: [0.0, 0.0, 1.0], normal: [0.0, 0.0, 1.0] },
-    CubeVertex { position: [1.0, 0.0, 1.0], normal: [0.0, 0.0, 1.0] },
-    CubeVertex { position: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 1.0] },
-    CubeVertex { position: [0.0, 0.0, 1.0], normal: [0.0, 0.0, 1.0] },
-    CubeVertex { position: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 1.0] },
-    CubeVertex { position: [0.0, 1.0, 1.0], normal: [0.0, 0.0, 1.0] },
+    CubeVertex {
+        position: [0.0, 0.0, 1.0],
+        normal: [0.0, 0.0, 1.0],
+    },
+    CubeVertex {
+        position: [1.0, 0.0, 1.0],
+        normal: [0.0, 0.0, 1.0],
+    },
+    CubeVertex {
+        position: [1.0, 1.0, 1.0],
+        normal: [0.0, 0.0, 1.0],
+    },
+    CubeVertex {
+        position: [0.0, 0.0, 1.0],
+        normal: [0.0, 0.0, 1.0],
+    },
+    CubeVertex {
+        position: [1.0, 1.0, 1.0],
+        normal: [0.0, 0.0, 1.0],
+    },
+    CubeVertex {
+        position: [0.0, 1.0, 1.0],
+        normal: [0.0, 0.0, 1.0],
+    },
     // Back face
-    CubeVertex { position: [1.0, 0.0, 0.0], normal: [0.0, 0.0, -1.0] },
-    CubeVertex { position: [0.0, 0.0, 0.0], normal: [0.0, 0.0, -1.0] },
-    CubeVertex { position: [0.0, 1.0, 0.0], normal: [0.0, 0.0, -1.0] },
-    CubeVertex { position: [1.0, 0.0, 0.0], normal: [0.0, 0.0, -1.0] },
-    CubeVertex { position: [0.0, 1.0, 0.0], normal: [0.0, 0.0, -1.0] },
-    CubeVertex { position: [1.0, 1.0, 0.0], normal: [0.0, 0.0, -1.0] },
+    CubeVertex {
+        position: [1.0, 0.0, 0.0],
+        normal: [0.0, 0.0, -1.0],
+    },
+    CubeVertex {
+        position: [0.0, 0.0, 0.0],
+        normal: [0.0, 0.0, -1.0],
+    },
+    CubeVertex {
+        position: [0.0, 1.0, 0.0],
+        normal: [0.0, 0.0, -1.0],
+    },
+    CubeVertex {
+        position: [1.0, 0.0, 0.0],
+        normal: [0.0, 0.0, -1.0],
+    },
+    CubeVertex {
+        position: [0.0, 1.0, 0.0],
+        normal: [0.0, 0.0, -1.0],
+    },
+    CubeVertex {
+        position: [1.0, 1.0, 0.0],
+        normal: [0.0, 0.0, -1.0],
+    },
     // Top face
-    CubeVertex { position: [0.0, 1.0, 0.0], normal: [0.0, 1.0, 0.0] },
-    CubeVertex { position: [0.0, 1.0, 1.0], normal: [0.0, 1.0, 0.0] },
-    CubeVertex { position: [1.0, 1.0, 1.0], normal: [0.0, 1.0, 0.0] },
-    CubeVertex { position: [0.0, 1.0, 0.0], normal: [0.0, 1.0, 0.0] },
-    CubeVertex { position: [1.0, 1.0, 1.0], normal: [0.0, 1.0, 0.0] },
-    CubeVertex { position: [1.0, 1.0, 0.0], normal: [0.0, 1.0, 0.0] },
+    CubeVertex {
+        position: [0.0, 1.0, 0.0],
+        normal: [0.0, 1.0, 0.0],
+    },
+    CubeVertex {
+        position: [0.0, 1.0, 1.0],
+        normal: [0.0, 1.0, 0.0],
+    },
+    CubeVertex {
+        position: [1.0, 1.0, 1.0],
+        normal: [0.0, 1.0, 0.0],
+    },
+    CubeVertex {
+        position: [0.0, 1.0, 0.0],
+        normal: [0.0, 1.0, 0.0],
+    },
+    CubeVertex {
+        position: [1.0, 1.0, 1.0],
+        normal: [0.0, 1.0, 0.0],
+    },
+    CubeVertex {
+        position: [1.0, 1.0, 0.0],
+        normal: [0.0, 1.0, 0.0],
+    },
     // Bottom face
-    CubeVertex { position: [0.0, 0.0, 1.0], normal: [0.0, -1.0, 0.0] },
-    CubeVertex { position: [0.0, 0.0, 0.0], normal: [0.0, -1.0, 0.0] },
-    CubeVertex { position: [1.0, 0.0, 0.0], normal: [0.0, -1.0, 0.0] },
-    CubeVertex { position: [0.0, 0.0, 1.0], normal: [0.0, -1.0, 0.0] },
-    CubeVertex { position: [1.0, 0.0, 0.0], normal: [0.0, -1.0, 0.0] },
-    CubeVertex { position: [1.0, 0.0, 1.0], normal: [0.0, -1.0, 0.0] },
+    CubeVertex {
+        position: [0.0, 0.0, 1.0],
+        normal: [0.0, -1.0, 0.0],
+    },
+    CubeVertex {
+        position: [0.0, 0.0, 0.0],
+        normal: [0.0, -1.0, 0.0],
+    },
+    CubeVertex {
+        position: [1.0, 0.0, 0.0],
+        normal: [0.0, -1.0, 0.0],
+    },
+    CubeVertex {
+        position: [0.0, 0.0, 1.0],
+        normal: [0.0, -1.0, 0.0],
+    },
+    CubeVertex {
+        position: [1.0, 0.0, 0.0],
+        normal: [0.0, -1.0, 0.0],
+    },
+    CubeVertex {
+        position: [1.0, 0.0, 1.0],
+        normal: [0.0, -1.0, 0.0],
+    },
     // Right face
-    CubeVertex { position: [1.0, 0.0, 1.0], normal: [1.0, 0.0, 0.0] },
-    CubeVertex { position: [1.0, 0.0, 0.0], normal: [1.0, 0.0, 0.0] },
-    CubeVertex { position: [1.0, 1.0, 0.0], normal: [1.0, 0.0, 0.0] },
-    CubeVertex { position: [1.0, 0.0, 1.0], normal: [1.0, 0.0, 0.0] },
-    CubeVertex { position: [1.0, 1.0, 0.0], normal: [1.0, 0.0, 0.0] },
-    CubeVertex { position: [1.0, 1.0, 1.0], normal: [1.0, 0.0, 0.0] },
+    CubeVertex {
+        position: [1.0, 0.0, 1.0],
+        normal: [1.0, 0.0, 0.0],
+    },
+    CubeVertex {
+        position: [1.0, 0.0, 0.0],
+        normal: [1.0, 0.0, 0.0],
+    },
+    CubeVertex {
+        position: [1.0, 1.0, 0.0],
+        normal: [1.0, 0.0, 0.0],
+    },
+    CubeVertex {
+        position: [1.0, 0.0, 1.0],
+        normal: [1.0, 0.0, 0.0],
+    },
+    CubeVertex {
+        position: [1.0, 1.0, 0.0],
+        normal: [1.0, 0.0, 0.0],
+    },
+    CubeVertex {
+        position: [1.0, 1.0, 1.0],
+        normal: [1.0, 0.0, 0.0],
+    },
     // Left face
-    CubeVertex { position: [0.0, 0.0, 0.0], normal: [-1.0, 0.0, 0.0] },
-    CubeVertex { position: [0.0, 0.0, 1.0], normal: [-1.0, 0.0, 0.0] },
-    CubeVertex { position: [0.0, 1.0, 1.0], normal: [-1.0, 0.0, 0.0] },
-    CubeVertex { position: [0.0, 0.0, 0.0], normal: [-1.0, 0.0, 0.0] },
-    CubeVertex { position: [0.0, 1.0, 1.0], normal: [-1.0, 0.0, 0.0] },
-    CubeVertex { position: [0.0, 1.0, 0.0], normal: [-1.0, 0.0, 0.0] },
+    CubeVertex {
+        position: [0.0, 0.0, 0.0],
+        normal: [-1.0, 0.0, 0.0],
+    },
+    CubeVertex {
+        position: [0.0, 0.0, 1.0],
+        normal: [-1.0, 0.0, 0.0],
+    },
+    CubeVertex {
+        position: [0.0, 1.0, 1.0],
+        normal: [-1.0, 0.0, 0.0],
+    },
+    CubeVertex {
+        position: [0.0, 0.0, 0.0],
+        normal: [-1.0, 0.0, 0.0],
+    },
+    CubeVertex {
+        position: [0.0, 1.0, 1.0],
+        normal: [-1.0, 0.0, 0.0],
+    },
+    CubeVertex {
+        position: [0.0, 1.0, 0.0],
+        normal: [-1.0, 0.0, 0.0],
+    },
 ];
 
 /// Camera controller for 6DOF movement
@@ -144,16 +262,19 @@ struct CameraController {
 impl CameraController {
     const MIN_SPEED_MULTIPLIER: f32 = 0.05;
     const MAX_SPEED_MULTIPLIER: f32 = 25.0;
-    const ROTATION_SPEED: f32 = std::f32::consts::PI / 2.0 ; // radians per second
+    const ROTATION_SPEED: f32 = std::f32::consts::PI / 2.0; // radians per second
 
     fn new(position: [f32; 3]) -> Self {
         // Load config from file or use defaults
         let config = RenderConfig::load_or_default(CONFIG_FILE);
         println!("Loaded render config:");
-        println!("  LOD subdivide distance: {}", config.lod_subdivide_distance);
+        println!(
+            "  LOD subdivide distance: {}",
+            config.lod_subdivide_distance
+        );
         println!("  Far plane: {}", config.far_plane);
         println!("  FOV: {}°", config.fov_degrees);
-        
+
         let mut this = Self {
             camera: Camera::with_config(position, [0.0, 0.0, -1.0], [0.0, 1.0, 0.0], config),
             base_speed: 10.0,
@@ -190,11 +311,13 @@ impl CameraController {
             KeyCode::ArrowLeft => self.rotate_left = pressed,
             KeyCode::ArrowRight => self.rotate_right = pressed,
             KeyCode::Minus if pressed => {
-                self.speed_multiplier = (self.speed_multiplier * 0.8).max(Self::MIN_SPEED_MULTIPLIER);
+                self.speed_multiplier =
+                    (self.speed_multiplier * 0.8).max(Self::MIN_SPEED_MULTIPLIER);
                 println!("Camera speed multiplier: {:.2}", self.speed_multiplier);
             }
             KeyCode::Equal if pressed => {
-                self.speed_multiplier = (self.speed_multiplier * 1.25).min(Self::MAX_SPEED_MULTIPLIER);
+                self.speed_multiplier =
+                    (self.speed_multiplier * 1.25).min(Self::MAX_SPEED_MULTIPLIER);
                 println!("Camera speed multiplier: {:.2}", self.speed_multiplier);
             }
             KeyCode::Digit0 if pressed => {
@@ -203,12 +326,20 @@ impl CameraController {
             }
             // Runtime config adjustments (only on key press, not release)
             KeyCode::KeyQ if pressed => {
-                self.camera.config.lod_subdivide_distance = (self.camera.config.lod_subdivide_distance - 50.0).max(50.0);
-                println!("LOD subdivide distance: {:.0}", self.camera.config.lod_subdivide_distance);
+                self.camera.config.lod_subdivide_distance =
+                    (self.camera.config.lod_subdivide_distance - 50.0).max(50.0);
+                println!(
+                    "LOD subdivide distance: {:.0}",
+                    self.camera.config.lod_subdivide_distance
+                );
             }
             KeyCode::KeyE if pressed => {
-                self.camera.config.lod_subdivide_distance = (self.camera.config.lod_subdivide_distance + 50.0).min(2000.0);
-                println!("LOD subdivide distance: {:.0}", self.camera.config.lod_subdivide_distance);
+                self.camera.config.lod_subdivide_distance =
+                    (self.camera.config.lod_subdivide_distance + 50.0).min(2000.0);
+                println!(
+                    "LOD subdivide distance: {:.0}",
+                    self.camera.config.lod_subdivide_distance
+                );
             }
             KeyCode::KeyZ if pressed => {
                 self.camera.config.far_plane = (self.camera.config.far_plane - 500.0).max(1000.0);
@@ -230,7 +361,10 @@ impl CameraController {
         self.yaw += delta_x as f32 * self.sensitivity;
         self.pitch -= delta_y as f32 * self.sensitivity;
         // Clamp pitch
-        self.pitch = self.pitch.clamp(-std::f32::consts::FRAC_PI_2 + 0.1, std::f32::consts::FRAC_PI_2 - 0.1);
+        self.pitch = self.pitch.clamp(
+            -std::f32::consts::FRAC_PI_2 + 0.1,
+            std::f32::consts::FRAC_PI_2 - 0.1,
+        );
         self.update_camera_vectors();
     }
 
@@ -259,7 +393,10 @@ impl CameraController {
         }
 
         if self.rotate_left || self.rotate_right || self.rotate_up || self.rotate_down {
-            self.pitch = self.pitch.clamp(-std::f32::consts::FRAC_PI_2 + 0.1, std::f32::consts::FRAC_PI_2 - 0.1);
+            self.pitch = self.pitch.clamp(
+                -std::f32::consts::FRAC_PI_2 + 0.1,
+                std::f32::consts::FRAC_PI_2 - 0.1,
+            );
             self.update_camera_vectors();
         }
 
@@ -295,7 +432,9 @@ impl CameraController {
         }
 
         // Normalize velocity
-        let len = (velocity[0] * velocity[0] + velocity[1] * velocity[1] + velocity[2] * velocity[2]).sqrt();
+        let len =
+            (velocity[0] * velocity[0] + velocity[1] * velocity[1] + velocity[2] * velocity[2])
+                .sqrt();
         if len > 0.001 {
             velocity[0] /= len;
             velocity[1] /= len;
@@ -344,7 +483,7 @@ struct App {
     // Mesh cache: per-leaf-chunk mesh GPU buffers
     mesh_cache: HashMap<(i64, i64, i64), (wgpu::Buffer, wgpu::Buffer, u32)>, // (vbuf, ibuf, index_count)
     instance_capacity: usize,
-    
+
     world: World,
     camera_controller: CameraController,
     visibility_cache: VisibilityCache,
@@ -353,23 +492,36 @@ struct App {
     last_frame: Instant,
     frame_count: u64,
     last_fps_print: Instant,
-    
+
     mouse_pressed: bool,
     last_mouse_pos: Option<(f64, f64)>,
-    
+
     // Lighting state
     time_of_day: f32,
     fog_density: f32,
-    
+
     // LOD state
     lod_distance: f32,
+
+    // Post-processing state
+    dof_pipeline: Option<wgpu::RenderPipeline>,
+    dof_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    dof_bind_group: Option<wgpu::BindGroup>,
+    dof_uniform_buffer: Option<wgpu::Buffer>,
+    post_sampler: Option<wgpu::Sampler>,
+    offscreen_color_texture: Option<wgpu::Texture>,
+    offscreen_color_view: Option<wgpu::TextureView>,
+    offscreen_depth_texture: Option<wgpu::Texture>,
+    offscreen_depth_view: Option<wgpu::TextureView>,
+    dof_settings: DoFSettings,
+    dof_enabled: bool,
 }
 
 impl App {
     fn new() -> Self {
         // Create world with test data (depth 3 = 4,096 units)
         let mut world = World::new(3);
-        
+
         println!("Creating world (size: {} units)...", world.world_size());
 
         let mut initial_camera = if cfg!(feature = "test-block-world") {
@@ -404,13 +556,28 @@ impl App {
                 let test_pos = WorldPos::new(50, 10, 50);
                 viewer_debug!("Checking world structure around test block...");
                 if let Some(vtype) = world.get(test_pos) {
-                    viewer_debug!("  Voxel at ({},{},{}) = type {}", test_pos.x, test_pos.y, test_pos.z, vtype);
+                    viewer_debug!(
+                        "  Voxel at ({},{},{}) = type {}",
+                        test_pos.x,
+                        test_pos.y,
+                        test_pos.z,
+                        vtype
+                    );
                 }
                 if let Some(depth) = world.depth_at(test_pos) {
-                    viewer_debug!("  Depth at this position: {} (0 = Solid, 1+ = Chunk with N levels below)", depth);
+                    viewer_debug!(
+                        "  Depth at this position: {} (0 = Solid, 1+ = Chunk with N levels below)",
+                        depth
+                    );
                 }
-                let chunk_origin = WorldPos::new(test_pos.x & !15, test_pos.y & !15, test_pos.z & !15);
-                viewer_debug!("  Expected leaf chunk origin: ({},{},{})", chunk_origin.x, chunk_origin.y, chunk_origin.z);
+                let chunk_origin =
+                    WorldPos::new(test_pos.x & !15, test_pos.y & !15, test_pos.z & !15);
+                viewer_debug!(
+                    "  Expected leaf chunk origin: ({},{},{})",
+                    chunk_origin.x,
+                    chunk_origin.y,
+                    chunk_origin.z
+                );
                 if let Some(chunk) = world.get_leaf_chunk_at_origin(chunk_origin) {
                     viewer_debug!("  ✓ Found leaf chunk with {} voxels", chunk.iter().count());
                 } else {
@@ -459,7 +626,10 @@ impl App {
                     }
                 }
                 Err(e) => {
-                    println!("Failed to load osm_voxels.txt: {}. Using fallback world generation.", e);
+                    println!(
+                        "Failed to load osm_voxels.txt: {}. Using fallback world generation.",
+                        e
+                    );
 
                     for x in 0..100 {
                         for z in 0..100 {
@@ -499,7 +669,7 @@ impl App {
         println!("Fog Density: F/G (decrease/increase)");
         println!("Quit: ESC");
         println!("================\n");
-        
+
         Self {
             window: None,
             surface: None,
@@ -524,12 +694,27 @@ impl App {
             last_fps_print: Instant::now(),
             mouse_pressed: false,
             last_mouse_pos: None,
-            time_of_day: 0.5, // Start at noon
+            time_of_day: 0.5,    // Start at noon
             fog_density: 0.0015, // Default fog density
             lod_distance: 800.0, // Default LOD render distance
+            dof_pipeline: None,
+            dof_bind_group_layout: None,
+            dof_bind_group: None,
+            dof_uniform_buffer: None,
+            post_sampler: None,
+            offscreen_color_texture: None,
+            offscreen_color_view: None,
+            offscreen_depth_texture: None,
+            offscreen_depth_view: None,
+            dof_settings: DoFSettings {
+                focal_distance: 120.0,
+                focal_range: 40.0,
+                blur_strength: 0.7,
+            },
+            dof_enabled: true,
         }
     }
-    
+
     fn save_config(&self) {
         if let Err(e) = self.camera_controller.camera.config.save(CONFIG_FILE) {
             eprintln!("Failed to save config: {}", e);
@@ -537,7 +722,17 @@ impl App {
             println!("Saved render config to {}", CONFIG_FILE);
         }
     }
-    
+
+    fn pack_dof_uniforms(&self, blur_strength: f32) -> [f32; DOF_UNIFORM_FLOATS] {
+        let mut data = [0.0_f32; DOF_UNIFORM_FLOATS];
+        data[0] = self.dof_settings.focal_distance;
+        data[1] = self.dof_settings.focal_range;
+        data[2] = blur_strength;
+        data[3] = self.camera_controller.camera.near;
+        data[4] = self.camera_controller.camera.far;
+        data
+    }
+
     fn process_lighting_key(&mut self, key: KeyCode) {
         match key {
             KeyCode::KeyT => {
@@ -574,19 +769,151 @@ impl App {
                 self.camera_controller.camera.config.lod_render_distance = self.lod_distance;
                 println!("LOD distance: {:.0} units", self.lod_distance);
             }
+            KeyCode::Comma => {
+                self.dof_settings.focal_distance =
+                    (self.dof_settings.focal_distance - 10.0).max(10.0);
+                println!(
+                    "DoF focal distance: {:.1}",
+                    self.dof_settings.focal_distance
+                );
+            }
+            KeyCode::Period => {
+                self.dof_settings.focal_distance =
+                    (self.dof_settings.focal_distance + 10.0).min(5000.0);
+                println!(
+                    "DoF focal distance: {:.1}",
+                    self.dof_settings.focal_distance
+                );
+            }
+            KeyCode::BracketLeft => {
+                self.dof_settings.focal_range = (self.dof_settings.focal_range - 5.0).max(5.0);
+                println!("DoF focal range: {:.1}", self.dof_settings.focal_range);
+            }
+            KeyCode::BracketRight => {
+                self.dof_settings.focal_range = (self.dof_settings.focal_range + 5.0).min(500.0);
+                println!("DoF focal range: {:.1}", self.dof_settings.focal_range);
+            }
+            KeyCode::Semicolon => {
+                self.dof_settings.blur_strength = (self.dof_settings.blur_strength - 0.1).max(0.0);
+                println!("DoF blur strength: {:.2}", self.dof_settings.blur_strength);
+            }
+            KeyCode::Quote => {
+                self.dof_settings.blur_strength = (self.dof_settings.blur_strength + 0.1).min(1.0);
+                println!("DoF blur strength: {:.2}", self.dof_settings.blur_strength);
+            }
+            KeyCode::Slash => {
+                self.dof_enabled = !self.dof_enabled;
+                println!(
+                    "DoF {}",
+                    if self.dof_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+            }
             _ => {}
         }
     }
-    
+
+    fn recreate_offscreen_targets(&mut self) {
+        let (Some(device), Some(config)) = (self.device.as_ref(), self.config.as_ref()) else {
+            return;
+        };
+
+        let color_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Offscreen Color Texture"),
+            size: wgpu::Extent3d {
+                width: config.width,
+                height: config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Offscreen Depth Texture"),
+            size: wgpu::Extent3d {
+                width: config.width,
+                height: config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        self.offscreen_color_view = Some(color_view);
+        self.offscreen_color_texture = Some(color_texture);
+        self.offscreen_depth_view = Some(depth_view);
+        self.offscreen_depth_texture = Some(depth_texture);
+
+        self.update_dof_bind_group();
+    }
+
+    fn update_dof_bind_group(&mut self) {
+        let (
+            Some(device),
+            Some(layout),
+            Some(color_view),
+            Some(depth_view),
+            Some(sampler),
+            Some(ubo),
+        ) = (
+            self.device.as_ref(),
+            self.dof_bind_group_layout.as_ref(),
+            self.offscreen_color_view.as_ref(),
+            self.offscreen_depth_view.as_ref(),
+            self.post_sampler.as_ref(),
+            self.dof_uniform_buffer.as_ref(),
+        )
+        else {
+            return;
+        };
+
+        self.dof_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("DoF Bind Group"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: ubo.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(color_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        }));
+    }
+
     async fn init_wgpu(&mut self, window: Arc<Window>) {
         let size = window.inner_size();
-        
+
         // Create instance
         let instance = wgpu::Instance::default();
-        
+
         // Create surface
         let surface = instance.create_surface(window.clone()).unwrap();
-        
+
         // Request adapter
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -596,13 +923,13 @@ impl App {
             })
             .await
             .unwrap();
-        
+
         // Request device
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor::default())
             .await
             .unwrap();
-        
+
         // Configure surface
         let surface_caps = surface.get_capabilities(&adapter);
         let surface_format = surface_caps
@@ -611,7 +938,7 @@ impl App {
             .find(|f| f.is_srgb())
             .copied()
             .unwrap_or(surface_caps.formats[0]);
-        
+
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
@@ -622,39 +949,37 @@ impl App {
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
-        
+
         surface.configure(&device, &config);
-        
+
         // Create shader
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Voxel Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/voxel.wgsl").into()),
         });
-        
+
         // Create bind group layout for uniforms
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Uniform Bind Group Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
                 },
-            ],
+                count: None,
+            }],
         });
-        
+
         // Create pipeline layout
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
             bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
-        
+
         // Create instanced-cube render pipeline
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Render Pipeline"),
@@ -671,7 +996,8 @@ impl App {
                     },
                     // Slot 1: Per-instance data (position, type, scale, custom_color)
                     wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<VoxelInstanceRaw>() as wgpu::BufferAddress,
+                        array_stride: std::mem::size_of::<VoxelInstanceRaw>()
+                            as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Instance,
                         attributes: &wgpu::vertex_attr_array![
                             0 => Float32x3,  // position
@@ -679,7 +1005,7 @@ impl App {
                             2 => Float32,    // scale
                             3 => Float32x4   // custom_color (RGBA)
                         ],
-                    }
+                    },
                 ],
                 compilation_options: Default::default(),
             },
@@ -768,7 +1094,118 @@ impl App {
             multiview: None,
             cache: None,
         });
-        
+
+        // Depth-of-field post-processing resources
+        let initial_dof = self.pack_dof_uniforms(self.dof_settings.blur_strength);
+        let dof_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("DoF Uniform Buffer"),
+            contents: bytemuck::cast_slice(&initial_dof),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let dof_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("DoF Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/dof_blur.wgsl").into()),
+        });
+
+        let dof_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("DoF Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let dof_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("DoF Pipeline Layout"),
+            bind_group_layouts: &[&dof_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let dof_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("DoF Pipeline"),
+            layout: Some(&dof_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &dof_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &dof_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
+
+        let post_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("DoF Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
         // Create uniform buffer with proper size for Uniforms struct
         let uniforms = Uniforms {
             mvp: [[0.0; 4]; 4], // Will be filled in render()
@@ -780,62 +1217,69 @@ impl App {
             time_of_day: 0.5,
             _padding3: [0.0; 4],
         };
-        
+
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Uniform Buffer"),
             contents: bytemuck::cast_slice(&[uniforms]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        
+
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Uniform Bind Group"),
             layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buffer.as_entire_binding(),
-                },
-            ],
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
         });
-        
+
         // Create cube vertex buffer with positions and normals
         let cube_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Cube Vertex Buffer"),
             contents: bytemuck::cast_slice(CUBE_VERTICES),
             usage: wgpu::BufferUsages::VERTEX,
         });
-        
+
+        self.dof_pipeline = Some(dof_pipeline);
+        self.dof_bind_group_layout = Some(dof_bind_group_layout);
+        self.dof_uniform_buffer = Some(dof_uniform_buffer);
+        self.post_sampler = Some(post_sampler);
+        self.dof_bind_group = None;
+
         self.window = Some(window);
         self.surface = Some(surface);
         self.device = Some(device);
         self.queue = Some(queue);
         self.config = Some(config);
-    self.render_pipeline = Some(render_pipeline);
-    self.mesh_pipeline = Some(mesh_pipeline);
+        self.render_pipeline = Some(render_pipeline);
+        self.mesh_pipeline = Some(mesh_pipeline);
         self.uniform_buffer = Some(uniform_buffer);
         self.bind_group = Some(bind_group);
         self.cube_vertex_buffer = Some(cube_vertex_buffer);
-        
-    viewer_debug!("DEBUG: mesh_pipeline created successfully");
+
+        self.recreate_offscreen_targets();
+
+        viewer_debug!("DEBUG: mesh_pipeline created successfully");
         println!("wgpu initialized");
     }
-    
+
     fn render(&mut self) {
-        let device = self.device.as_ref().unwrap();
-        let queue = self.queue.as_ref().unwrap();
-        let surface = self.surface.as_ref().unwrap();
-        let config = self.config.as_ref().unwrap();
-        
+        let device = self.device.as_ref().unwrap().clone();
+        let queue = self.queue.as_ref().unwrap().clone();
+        let config = self.config.as_ref().unwrap().clone();
+
         // Update camera
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
-        
+
         self.camera_controller.update(dt);
-        
+
         // Cull visible voxels using cached visibility
         let cull_start = Instant::now();
-        let visible = self.visibility_cache.update(&self.camera_controller.camera, &self.world);
+        let visible = self
+            .visibility_cache
+            .update(&self.camera_controller.camera, &self.world);
         let cull_time = cull_start.elapsed();
 
         let grouping_start = Instant::now();
@@ -850,7 +1294,7 @@ impl App {
 
         let mesh_start = Instant::now();
         // Build mesh for any chunk present (near leaf chunk), and mark those chunks for drawing
-        let mut mesh_keys: HashSet<(i64,i64,i64)> = HashSet::new();
+        let mut mesh_keys: HashSet<(i64, i64, i64)> = HashSet::new();
         let mut new_meshes_created = 0;
         let mut chunks_not_found = 0;
         let mut missing_chunks: HashSet<(i64, i64, i64)> = HashSet::new();
@@ -875,7 +1319,10 @@ impl App {
             };
             self.pending_chunk_set.remove(&key);
 
-            match self.world.get_leaf_chunk_at_origin(WorldPos::new(key.0, key.1, key.2)) {
+            match self
+                .world
+                .get_leaf_chunk_at_origin(WorldPos::new(key.0, key.1, key.2))
+            {
                 Some(chunk) => {
                     let mesh = generate_chunk_mesh(chunk);
                     if mesh.indices.is_empty() {
@@ -892,14 +1339,21 @@ impl App {
                         for (i, v) in mesh.vertices.iter().enumerate() {
                             viewer_debug!(
                                 "  vertex {}: pos=[{:.1},{:.1},{:.1}] normal=[{:.1},{:.1},{:.1}]",
-                                i, v.position[0], v.position[1], v.position[2],
-                                v.normal[0], v.normal[1], v.normal[2]
+                                i,
+                                v.position[0],
+                                v.position[1],
+                                v.position[2],
+                                v.normal[0],
+                                v.normal[1],
+                                v.normal[2]
                             );
                         }
                     }
 
-                    let vb_data: Vec<MeshVertexRaw> = mesh.vertices.iter().map(|v| {
-                        MeshVertexRaw {
+                    let vb_data: Vec<MeshVertexRaw> = mesh
+                        .vertices
+                        .iter()
+                        .map(|v| MeshVertexRaw {
                             position: [
                                 v.position[0] + key.0 as f32,
                                 v.position[1] + key.1 as f32,
@@ -907,8 +1361,8 @@ impl App {
                             ],
                             normal: v.normal,
                             color: v.color,
-                        }
-                    }).collect();
+                        })
+                        .collect();
                     let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some("Chunk Mesh Vertex Buffer"),
                         contents: bytemuck::cast_slice(&vb_data),
@@ -921,9 +1375,14 @@ impl App {
                     });
                     viewer_debug!(
                         "Created mesh for chunk ({},{},{}): {} vertices, {} triangles",
-                        key.0, key.1, key.2, mesh.vertices.len(), mesh.indices.len() / 3
+                        key.0,
+                        key.1,
+                        key.2,
+                        mesh.vertices.len(),
+                        mesh.indices.len() / 3
                     );
-                    self.mesh_cache.insert(key, (vbuf, ibuf, mesh.indices.len() as u32));
+                    self.mesh_cache
+                        .insert(key, (vbuf, ibuf, mesh.indices.len() as u32));
                     new_meshes_created += 1;
 
                     if leaf_chunks.contains(&key) {
@@ -939,7 +1398,7 @@ impl App {
             processed_meshes += 1;
         }
         let mesh_time = mesh_start.elapsed();
-        
+
         if chunks_not_found > 0 && self.frame_count == 0 {
             println!(
                 "Warning: {} out of {} potential chunks not found (OSM voxels are not in subdivided chunks)",
@@ -974,7 +1433,11 @@ impl App {
                 };
 
                 VoxelInstanceRaw {
-                    position: [v.position[0] as f32, v.position[1] as f32, v.position[2] as f32],
+                    position: [
+                        v.position[0] as f32,
+                        v.position[1] as f32,
+                        v.position[2] as f32,
+                    ],
                     voxel_type: v.voxel_type as u32,
                     scale: v.scale as f32,
                     custom_color: custom_color_f32,
@@ -998,10 +1461,10 @@ impl App {
         if instances.is_empty() && !has_meshes_to_draw {
             return; // Nothing to render at all
         }
-        
+
         if self.instance_capacity < instances.len() {
             self.instance_capacity = instances.len().next_power_of_two();
-            
+
             if let Some(old_buffer) = self.instance_buffer.take() {
                 old_buffer.destroy();
             }
@@ -1016,11 +1479,19 @@ impl App {
 
         // Write data to the buffer (only if we have instances)
         if !instances.is_empty() {
-            queue.write_buffer(self.instance_buffer.as_ref().unwrap(), 0, bytemuck::cast_slice(&instances));
+            queue.write_buffer(
+                self.instance_buffer.as_ref().unwrap(),
+                0,
+                bytemuck::cast_slice(&instances),
+            );
         }
-        
+
         // Get surface texture
-        let output = match surface.get_current_texture() {
+        let output_result = {
+            let surface = self.surface.as_ref().unwrap();
+            surface.get_current_texture()
+        };
+        let output = match output_result {
             Ok(texture) => texture,
             Err(e) => {
                 eprintln!("Surface error: {:?}", e);
@@ -1028,7 +1499,10 @@ impl App {
                 match e {
                     wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => {
                         // Recreate surface
-                        surface.configure(device, config);
+                        if let Some(surface) = self.surface.as_ref() {
+                            surface.configure(&device, &config);
+                        }
+                        self.recreate_offscreen_targets();
                     }
                     wgpu::SurfaceError::OutOfMemory => {
                         eprintln!("Out of memory!");
@@ -1044,53 +1518,34 @@ impl App {
                 return;
             }
         };
-        
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        
-        // Create depth texture
-        let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Depth Texture"),
-            size: wgpu::Extent3d {
-                width: config.width,
-                height: config.height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        
-        let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
         // Create MVP matrix using glam (column-major, right-handed)
         let aspect = config.width as f32 / config.height as f32;
-        let projection = Mat4::perspective_rh(self.camera_controller.camera.fov, aspect, 0.1, 1000.0);
+        let projection = Mat4::perspective_rh(
+            self.camera_controller.camera.fov,
+            aspect,
+            self.camera_controller.camera.near,
+            self.camera_controller.camera.far,
+        );
         let eye = Vec3::from(self.camera_controller.camera.position);
         let center = eye + Vec3::from(self.camera_controller.camera.forward) * 100.0; // look far ahead
         let up = Vec3::from(self.camera_controller.camera.up);
         let view_mat = Mat4::look_at_rh(eye, center, up);
         // Convert from OpenGL-style NDC (glam) to wgpu's 0..1 depth range
         const OPENGL_TO_WGPU_MATRIX: Mat4 = Mat4::from_cols_array(&[
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 0.5, 0.0,
-            0.0, 0.0, 0.5, 1.0,
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5, 1.0,
         ]);
         let mvp = OPENGL_TO_WGPU_MATRIX * projection * view_mat;
         let mvp_cols: [[f32; 4]; 4] = mvp.to_cols_array_2d();
-        
+
         // Calculate lighting based on time of day
         let time_angle = self.time_of_day * std::f32::consts::TAU; // 0..2π
         let sun_height = time_angle.sin();
-        let sun_direction = [
-            time_angle.cos() * 0.5,
-            sun_height,
-            0.3,
-        ];
-        
+        let sun_direction = [time_angle.cos() * 0.5, sun_height, 0.3];
+
         let (sun_color, ambient_color) = if self.time_of_day < 0.25 || self.time_of_day > 0.75 {
             // Night - moon (cool blue)
             ([0.3, 0.3, 0.5], [0.05, 0.05, 0.15])
@@ -1101,7 +1556,7 @@ impl App {
             // Day - bright yellow sun, blue sky ambient
             ([1.0, 0.95, 0.8], [0.3, 0.35, 0.45])
         };
-        
+
         // Update uniforms with MVP and lighting data
         let uniforms = Uniforms {
             mvp: mvp_cols,
@@ -1113,25 +1568,38 @@ impl App {
             time_of_day: self.time_of_day,
             _padding3: [0.0; 4],
         };
-        
-        queue.write_buffer(self.uniform_buffer.as_ref().unwrap(), 0, bytemuck::cast_slice(&[uniforms]));
-        
+
+        queue.write_buffer(
+            self.uniform_buffer.as_ref().unwrap(),
+            0,
+            bytemuck::cast_slice(&[uniforms]),
+        );
+
         // Create command encoder
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Render Encoder"),
         });
-        
+
+        let offscreen_color_view = self
+            .offscreen_color_view
+            .as_ref()
+            .expect("offscreen color view missing");
+        let offscreen_depth_view = self
+            .offscreen_depth_view
+            .as_ref()
+            .expect("offscreen depth view missing");
+
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
+                label: Some("Scene Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: offscreen_color_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 0.1,
                             g: 0.2,
-                            b: 0.3,  // Dark blue background
+                            b: 0.3,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -1139,7 +1607,7 @@ impl App {
                     depth_slice: None,
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &depth_view,
+                    view: offscreen_depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Store,
@@ -1149,7 +1617,7 @@ impl App {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            
+
             // Draw meshed chunks first
             if has_meshes_to_draw {
                 render_pass.set_pipeline(self.mesh_pipeline.as_ref().unwrap());
@@ -1181,10 +1649,49 @@ impl App {
                 render_pass.draw(0..36, 0..instances.len() as u32); // 36 vertices for a cube
             }
         }
-        
+
+        if self.dof_bind_group.is_none() {
+            self.update_dof_bind_group();
+        }
+
+        if let (Some(dof_pipeline), Some(dof_bind_group), Some(dof_buffer)) = (
+            self.dof_pipeline.as_ref(),
+            self.dof_bind_group.as_ref(),
+            self.dof_uniform_buffer.as_ref(),
+        ) {
+            let blur_strength = if self.dof_enabled {
+                self.dof_settings.blur_strength
+            } else {
+                0.0
+            };
+            let gpu_uniforms = self.pack_dof_uniforms(blur_strength);
+            queue.write_buffer(dof_buffer, 0, bytemuck::cast_slice(&gpu_uniforms));
+
+            let mut post_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("DoF Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            post_pass.set_pipeline(dof_pipeline);
+            post_pass.set_bind_group(0, dof_bind_group, &[]);
+            post_pass.draw(0..3, 0..1);
+        } else {
+            eprintln!("DoF resources unavailable; skipping post-process!");
+        }
+
         queue.submit(std::iter::once(encoder.finish()));
         output.present();
-        
+
         // Stats
         self.frame_count += 1;
         if now.duration_since(self.last_fps_print).as_secs() >= 1 {
@@ -1214,21 +1721,26 @@ impl ApplicationHandler for App {
             let window_attrs = WindowAttributes::default()
                 .with_title("Hierarchical Voxel Viewer")
                 .with_inner_size(winit::dpi::PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
-            
+
             let window = Arc::new(event_loop.create_window(window_attrs).unwrap());
-            
+
             pollster::block_on(self.init_wgpu(window));
         }
     }
-    
+
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         // Continuously update and render
         if let Some(window) = &self.window {
             window.request_redraw();
         }
     }
-    
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _window_id: winit::window::WindowId, event: WindowEvent) {
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
         match event {
             WindowEvent::CloseRequested => {
                 println!("Close requested");
@@ -1236,16 +1748,17 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::KeyboardInput {
-                event: KeyEvent {
-                    physical_key: PhysicalKey::Code(key),
-                    state,
-                    ..
-                },
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(key),
+                        state,
+                        ..
+                    },
                 ..
             } => {
                 let pressed = state == ElementState::Pressed;
                 self.camera_controller.process_keyboard(key, pressed);
-                
+
                 // Handle lighting controls on key press only
                 if pressed {
                     self.process_lighting_key(key);
@@ -1256,7 +1769,11 @@ impl ApplicationHandler for App {
                     event_loop.exit();
                 }
             }
-            WindowEvent::MouseInput { state, button: MouseButton::Right, .. } => {
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Right,
+                ..
+            } => {
                 self.mouse_pressed = state == ElementState::Pressed;
                 if !self.mouse_pressed {
                     self.last_mouse_pos = None;
@@ -1274,17 +1791,30 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Resized(new_size) => {
                 if new_size.width > 0 && new_size.height > 0 {
-                    if let (Some(config), Some(surface), Some(device)) = 
-                        (&mut self.config, &self.surface, &self.device) {
+                    if let Some(config) = self.config.as_mut() {
                         config.width = new_size.width;
                         config.height = new_size.height;
-                        surface.configure(device, config);
-
-                        // Update camera aspect and frustum for culling
-                        self.camera_controller.camera.aspect = config.width as f32 / config.height as f32;
-                        let cam = &self.camera_controller.camera;
-                        self.camera_controller.camera.update(cam.position, cam.forward, cam.up);
                     }
+
+                    if let (Some(surface), Some(device), Some(config)) = (
+                        self.surface.as_ref(),
+                        self.device.as_ref(),
+                        self.config.as_ref(),
+                    ) {
+                        surface.configure(device, config);
+                    }
+
+                    self.recreate_offscreen_targets();
+
+                    if let Some(config) = self.config.as_ref() {
+                        self.camera_controller.camera.aspect =
+                            config.width as f32 / config.height as f32;
+                    }
+
+                    let cam = &self.camera_controller.camera;
+                    self.camera_controller
+                        .camera
+                        .update(cam.position, cam.forward, cam.up);
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -1300,7 +1830,7 @@ impl ApplicationHandler for App {
 
 fn main() {
     env_logger::init();
-    
+
     println!("Hierarchical Voxel Viewer");
     println!("=========================");
     println!("Controls:");
@@ -1309,10 +1839,10 @@ fn main() {
     println!("  Arrow Keys - Rotate (Left/Right yaw, Up/Down pitch)");
     println!("  Right Mouse - Look around");
     println!("  ESC - Quit\n");
-    
+
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
-    
+
     let mut app = App::new();
     event_loop.run_app(&mut app).unwrap();
 }
