@@ -48,8 +48,16 @@ See `VOXEL_GENERATOR_REVAMP.md` for detailed architecture and roadmap.
 
 **Movement:**
 - `WASD` - Move forward/left/backward/right
-- `Arrow Up/Down` - Move up/down
-- `Right Mouse + Drag` - Look around
+- `Space` / `Shift` - Move up/down
+- `Right Mouse + Drag` - Free-look
+
+**Rotation:**
+- `Arrow Left/Right` - Yaw left/right
+- `Arrow Up/Down` - Pitch up/down
+
+**Speed Tuning:**
+- `-` / `+` - Decrease/increase camera speed multiplier
+- `0` - Reset camera speed multiplier
 
 **Runtime Configuration:**
 - `Q` / `E` - Decrease/increase camera LOD subdivide distance

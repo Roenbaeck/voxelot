@@ -123,7 +123,8 @@ const CUBE_VERTICES: &[CubeVertex] = &[
 /// Camera controller for 6DOF movement
 struct CameraController {
     camera: Camera,
-    speed: f32,
+    base_speed: f32,
+    speed_multiplier: f32,
     sensitivity: f32,
     yaw: f32,
     pitch: f32,
@@ -134,9 +135,17 @@ struct CameraController {
     right: bool,
     up: bool,
     down: bool,
+    rotate_left: bool,
+    rotate_right: bool,
+    rotate_up: bool,
+    rotate_down: bool,
 }
 
 impl CameraController {
+    const MIN_SPEED_MULTIPLIER: f32 = 0.05;
+    const MAX_SPEED_MULTIPLIER: f32 = 25.0;
+    const ROTATION_SPEED: f32 = std::f32::consts::PI / 2.0 ; // radians per second
+
     fn new(position: [f32; 3]) -> Self {
         // Load config from file or use defaults
         let config = RenderConfig::load_or_default(CONFIG_FILE);
@@ -147,7 +156,8 @@ impl CameraController {
         
         let mut this = Self {
             camera: Camera::with_config(position, [0.0, 0.0, -1.0], [0.0, 1.0, 0.0], config),
-            speed: 10.0,
+            base_speed: 10.0,
+            speed_multiplier: 1.0,
             sensitivity: 0.002,
             yaw: -std::f32::consts::FRAC_PI_2,
             pitch: -0.3, // look slightly downward by default
@@ -157,6 +167,10 @@ impl CameraController {
             right: false,
             up: false,
             down: false,
+            rotate_left: false,
+            rotate_right: false,
+            rotate_up: false,
+            rotate_down: false,
         };
         // Initialize forward/up vectors from yaw/pitch immediately
         this.update_camera_vectors();
@@ -169,8 +183,24 @@ impl CameraController {
             KeyCode::KeyS => self.backward = pressed,
             KeyCode::KeyA => self.left = pressed,
             KeyCode::KeyD => self.right = pressed,
-            KeyCode::ArrowUp => self.up = pressed,
-            KeyCode::ArrowDown => self.down = pressed,
+            KeyCode::Space => self.up = pressed,
+            KeyCode::ShiftLeft | KeyCode::ShiftRight => self.down = pressed,
+            KeyCode::ArrowUp => self.rotate_up = pressed,
+            KeyCode::ArrowDown => self.rotate_down = pressed,
+            KeyCode::ArrowLeft => self.rotate_left = pressed,
+            KeyCode::ArrowRight => self.rotate_right = pressed,
+            KeyCode::Minus if pressed => {
+                self.speed_multiplier = (self.speed_multiplier * 0.8).max(Self::MIN_SPEED_MULTIPLIER);
+                println!("Camera speed multiplier: {:.2}", self.speed_multiplier);
+            }
+            KeyCode::Equal if pressed => {
+                self.speed_multiplier = (self.speed_multiplier * 1.25).min(Self::MAX_SPEED_MULTIPLIER);
+                println!("Camera speed multiplier: {:.2}", self.speed_multiplier);
+            }
+            KeyCode::Digit0 if pressed => {
+                self.speed_multiplier = 1.0;
+                println!("Camera speed multiplier reset to 1.00");
+            }
             // Runtime config adjustments (only on key press, not release)
             KeyCode::KeyQ if pressed => {
                 self.camera.config.lod_subdivide_distance = (self.camera.config.lod_subdivide_distance - 50.0).max(50.0);
@@ -215,6 +245,24 @@ impl CameraController {
     }
 
     fn update(&mut self, dt: f32) {
+        if self.rotate_left {
+            self.yaw -= Self::ROTATION_SPEED * dt;
+        }
+        if self.rotate_right {
+            self.yaw += Self::ROTATION_SPEED * dt;
+        }
+        if self.rotate_up {
+            self.pitch += Self::ROTATION_SPEED * dt;
+        }
+        if self.rotate_down {
+            self.pitch -= Self::ROTATION_SPEED * dt;
+        }
+
+        if self.rotate_left || self.rotate_right || self.rotate_up || self.rotate_down {
+            self.pitch = self.pitch.clamp(-std::f32::consts::FRAC_PI_2 + 0.1, std::f32::consts::FRAC_PI_2 - 0.1);
+            self.update_camera_vectors();
+        }
+
         let mut velocity = [0.0, 0.0, 0.0];
         let forward = self.camera.forward;
         let right = self.camera.right();
@@ -255,14 +303,28 @@ impl CameraController {
         }
 
         // Apply movement
+        let dynamic_speed = self.base_speed * self.speed_multiplier * self.distance_speed_scale();
         let pos = self.camera.position;
         self.camera.position = [
-            pos[0] + velocity[0] * self.speed * dt,
-            pos[1] + velocity[1] * self.speed * dt,
-            pos[2] + velocity[2] * self.speed * dt,
+            pos[0] + velocity[0] * dynamic_speed * dt,
+            pos[1] + velocity[1] * dynamic_speed * dt,
+            pos[2] + velocity[2] * dynamic_speed * dt,
         ];
 
         self.update_camera_vectors();
+    }
+
+    fn distance_speed_scale(&self) -> f32 {
+        // Bump movement speed as the camera gets farther from the origin or higher above the terrain.
+        // ln_1p keeps growth gentle close to the ground while still allowing high-altitude flyovers.
+        let pos = self.camera.position;
+        let horizontal = (pos[0] * pos[0] + pos[2] * pos[2]).sqrt();
+        let altitude = pos[1].abs();
+
+        let horizontal_scale = (horizontal / 250.0).ln_1p() + 1.0;
+        let altitude_scale = (altitude / 50.0).ln_1p() + 1.0;
+
+        horizontal_scale.max(altitude_scale).clamp(1.0, 12.0)
     }
 }
 
@@ -402,8 +464,10 @@ impl App {
         };
 
         println!("\n=== Controls ===");
-        println!("Movement: WASD + Arrow Up/Down (up/down)");
+        println!("Movement: WASD + Space/Shift (up/down)");
         println!("Look: Right Mouse + drag");
+        println!("Rotate: Arrow Keys (Left/Right yaw, Up/Down pitch)");
+        println!("Camera Speed: -/+ (decrease/increase multiplier), 0 reset");
         println!("Camera LOD Distance: Q/E (decrease/increase)");
         println!("Draw Distance: Z/C (decrease/increase)");
         println!("Chunk LOD Distance: K/L (decrease/increase)");
@@ -1168,6 +1232,7 @@ fn main() {
     println!("Controls:");
     println!("  WASD - Move");
     println!("  Space/Shift - Up/Down");
+    println!("  Arrow Keys - Rotate (Left/Right yaw, Up/Down pitch)");
     println!("  Right Mouse - Look around");
     println!("  ESC - Quit\n");
     
