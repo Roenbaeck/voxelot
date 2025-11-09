@@ -2,6 +2,8 @@
 
 A high-performance sparse voxel engine using hierarchical chunks with LOD and Roaring Bitmaps.
 
+![Voxelot viewer screenshot](voxelot.png)
+
 ## Features
 
 - **Hierarchical LOD**: Automatic subdivision and merging based on camera distance
