@@ -3,6 +3,12 @@ name = "voxelot"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+viewer-debug = []
+mesh-debug = []
+test-block-world = []
+
 [dependencies]
 croaring = "2"
 fxhash = "0.2"

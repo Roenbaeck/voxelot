@@ -15,7 +15,13 @@ struct Uniforms {
 var<uniform> uniforms: Uniforms;
 
 
-struct VertexOutput {
+struct VertexOutputInstanced {
+    @builtin(position) position: vec4<f32>,
+    @location(0) color: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+};
+
+struct VertexOutputMesh {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec3<f32>,
     @location(1) normal: vec3<f32>,
@@ -94,8 +100,8 @@ fn vs_main(
     @location(3) instance_custom_color: vec4<f32>,
     @location(4) vertex_position: vec3<f32>,
     @location(5) vertex_normal: vec3<f32>,
-) -> VertexOutput {
-    var output: VertexOutput;
+) -> VertexOutputInstanced {
+    var output: VertexOutputInstanced;
     
     // Scale the vertex position, then add to instance position
     let scaled_vertex_pos = vertex_position * instance_scale;
@@ -116,7 +122,7 @@ fn vs_main(
 }
 
 @fragment
-fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+fn fs_main(input: VertexOutputInstanced) -> @location(0) vec4<f32> {
     // Global sun/moon lighting from uniforms
     let sun_dir = normalize(uniforms.sun_direction);
     
@@ -139,5 +145,34 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let fog_factor = 1.0 - exp(-uniforms.fog_density * distance);
     let final_color = mix(color, fog_color, fog_factor * 0.5);
     
+    return vec4<f32>(final_color, 1.0);
+}
+
+// Mesh pipeline entry points -------------------------------------------------
+@vertex
+fn vs_mesh(
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) color: vec4<f32>,
+) -> VertexOutputMesh {
+    var out: VertexOutputMesh;
+    out.position = uniforms.mvp * vec4<f32>(position, 1.0);
+    out.normal = normal;
+    out.color = color.rgb;
+    return out;
+}
+
+@fragment
+fn fs_mesh(input: VertexOutputMesh) -> @location(0) vec4<f32> {
+    let sun_dir = normalize(uniforms.sun_direction);
+    let diffuse = max(dot(input.normal, sun_dir), 0.0);
+    let sun_contribution = diffuse * uniforms.sun_color;
+    let ambient = uniforms.ambient_color;
+    let lighting = ambient + sun_contribution;
+    let color = input.color * lighting;
+    let fog_color = vec3<f32>(0.7, 0.8, 0.9);
+    let distance = length(input.position.xyz);
+    let fog_factor = 1.0 - exp(-uniforms.fog_density * distance);
+    let final_color = mix(color, fog_color, fog_factor * 0.5);
     return vec4<f32>(final_color, 1.0);
 }

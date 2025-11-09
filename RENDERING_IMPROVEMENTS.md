@@ -10,12 +10,12 @@
 - **Parallel Culling**: Rayon-based parallel chunk processing
 - **Occlusion Culling**: Front-to-back traversal with visibility caching
 - **Backface Culling**: GPU-level culling enabled (`cull_mode: Some(wgpu::Face::Back)`)
+- **Greedy Meshing**: Leaf-chunk quads merged and cached (feature-gated debug logging available)
 - **Proper Shader Uniforms**: 128-byte aligned uniform buffer with lighting parameters
 - **Dynamic Time of Day**: Keyboard-controlled day/night cycle (T key) with realistic color transitions
 - **Keyboard Controls**: International layout-friendly (arrow keys, alpha keys only)
 
 ### ❌ Not Yet Implemented
-- **Greedy Meshing**: Still drawing 36 vertices per voxel
 - **Neighbor-Based Face Culling**: Drawing all 6 faces even when occluded
 - **Depth of Field Post-Process**: No DoF shader exists yet
 - **Mesh Caching**: Regenerating geometry every frame
@@ -26,9 +26,10 @@
 ## Priority Performance Improvements (Highest Impact First)
 
 ### 1. 🚀 **Greedy Meshing** (10-100x vertex reduction)
+**Status**: ✅ Completed — per-leaf chunks now generate cached greedy meshes via `meshing.rs::generate_chunk_mesh`, and the viewer uploads the merged quads to GPU buffers.  
 **Impact**: HUGE - reduces vertices by 90%+ for solid regions  
 **Complexity**: Medium  
-**Note**: **Do this FIRST** - it inherently includes neighbor culling and produces far fewer faces to manage
+**Note**: Remaining opportunities include refining cache eviction and inter-chunk face deduping.
 
 Merge adjacent voxel faces into larger quads. Instead of 6 faces per voxel, create one merged face for entire runs. This algorithm naturally only creates faces where needed (at chunk boundaries and air interfaces), so it combines both greedy meshing AND neighbor-based face culling in one pass.
 

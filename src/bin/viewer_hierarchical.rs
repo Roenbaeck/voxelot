@@ -20,6 +20,16 @@ use winit::{
 };
 
 use voxelot::{World, WorldPos, Camera, VisibilityCache, RenderConfig};
+use voxelot::generate_chunk_mesh;
+use std::collections::{HashMap, HashSet};
+
+macro_rules! viewer_debug {
+    ($($arg:tt)*) => {
+        if cfg!(feature = "viewer-debug") {
+            eprintln!($($arg)*);
+        }
+    };
+}
 
 const WINDOW_WIDTH: u32 = 1280;
 const WINDOW_HEIGHT: u32 = 720;
@@ -33,6 +43,14 @@ struct VoxelInstanceRaw {
     voxel_type: u32,
     scale: f32,              // Scale factor (1.0 = 1x1x1, 16.0 = 16x16x16 chunk)
     custom_color: [f32; 4],  // RGBA custom color (if custom_color.a > 0, use this instead of voxel_type)
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct MeshVertexRaw {
+    position: [f32; 3],
+    normal: [f32; 3],
+    color: [f32; 4],
 }
 
 #[repr(C)]
@@ -256,10 +274,13 @@ struct App {
     queue: Option<wgpu::Queue>,
     config: Option<wgpu::SurfaceConfiguration>,
     render_pipeline: Option<wgpu::RenderPipeline>,
+    mesh_pipeline: Option<wgpu::RenderPipeline>,
     uniform_buffer: Option<wgpu::Buffer>,
     bind_group: Option<wgpu::BindGroup>,
     cube_vertex_buffer: Option<wgpu::Buffer>,
     instance_buffer: Option<wgpu::Buffer>,
+    // Mesh cache: per-leaf-chunk mesh GPU buffers
+    mesh_cache: HashMap<(i64, i64, i64), (wgpu::Buffer, wgpu::Buffer, u32)>, // (vbuf, ibuf, index_count)
     instance_capacity: usize,
     
     world: World,
@@ -285,69 +306,101 @@ impl App {
         // Create world with test data (depth 3 = 4,096 units)
         let mut world = World::new(3);
         
-        println!("Creating test world (size: {} units)...", world.world_size());
-        
-        // Load OSM voxel data
-        println!("Loading OSM voxel data...");
-        match std::fs::read_to_string("osm_voxels.txt") {
-            Ok(content) => {
-                let mut voxel_count = 0;
-                for line in content.lines() {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() == 4 {
-                        if let (Ok(x), Ok(y), Ok(z), Ok(voxel_type)) = (
-                            parts[0].parse::<i64>(),
-                            parts[1].parse::<i64>(),
-                            parts[2].parse::<i64>(),
-                            parts[3].parse::<u8>(),
-                        ) {
-                            world.set(WorldPos::new(x, y, z), voxel_type);
-                            voxel_count += 1;
-                        }
+        println!("Creating world (size: {} units)...", world.world_size());
+
+        if cfg!(feature = "test-block-world") {
+            viewer_debug!("Creating test block: 3x5x7 voxels at (50,10,50)");
+            let mut count = 0;
+            for x in 0..3 {
+                for y in 0..5 {
+                    for z in 0..7 {
+                        world.set(WorldPos::new(50 + x, 10 + y, 50 + z), 2);
+                        count += 1;
                     }
                 }
-                println!("Loaded {} voxels from OSM data", voxel_count);
             }
-            Err(e) => {
-                println!("Failed to load osm_voxels.txt: {}. Using fallback world generation.", e);
-                // Fallback: simple ground plane
-                for x in 0..100 {
-                    for z in 0..100 {
-                        if (x + z) % 3 == 0 {
-                            world.set(WorldPos::new(x, 0, z), 1);
-                        }
+            viewer_debug!("Test block created: {} voxels", count);
+
+            if cfg!(feature = "viewer-debug") {
+                viewer_debug!("Verifying voxels for test block:");
+                for (x, y, z) in [(50, 10, 50), (51, 11, 51), (52, 14, 56)] {
+                    if let Some(vtype) = world.get(WorldPos::new(x, y, z)) {
+                        viewer_debug!("  ({},{},{}) = type {}", x, y, z, vtype);
+                    } else {
+                        viewer_debug!("  ({},{},{}) = NONE!", x, y, z);
                     }
                 }
-                
-                // Fallback: some towers
-                for i in 0..5 {
-                    let x = 30 + i * 20;
-                    for y in 1..=(10 + i * 3) {
-                        world.set(WorldPos::new(x, y, 50), 2);
+
+                let test_pos = WorldPos::new(50, 10, 50);
+                viewer_debug!("Checking world structure around test block...");
+                if let Some(vtype) = world.get(test_pos) {
+                    viewer_debug!("  Voxel at ({},{},{}) = type {}", test_pos.x, test_pos.y, test_pos.z, vtype);
+                }
+                if let Some(depth) = world.depth_at(test_pos) {
+                    viewer_debug!("  Depth at this position: {} (0 = Solid, 1+ = Chunk with N levels below)", depth);
+                }
+                let chunk_origin = WorldPos::new(test_pos.x & !15, test_pos.y & !15, test_pos.z & !15);
+                viewer_debug!("  Expected leaf chunk origin: ({},{},{})", chunk_origin.x, chunk_origin.y, chunk_origin.z);
+                if let Some(chunk) = world.get_leaf_chunk_at_origin(chunk_origin) {
+                    viewer_debug!("  ✓ Found leaf chunk with {} voxels", chunk.iter().count());
+                } else {
+                    viewer_debug!("  ✗ Leaf chunk not found");
+                }
+            }
+        } else {
+            println!("Loading OSM voxel data...");
+            match std::fs::read_to_string("osm_voxels.txt") {
+                Ok(content) => {
+                    let mut voxel_count = 0;
+                    for line in content.lines() {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() == 4 {
+                            if let (Ok(x), Ok(y), Ok(z), Ok(voxel_type)) = (
+                                parts[0].parse::<i64>(),
+                                parts[1].parse::<i64>(),
+                                parts[2].parse::<i64>(),
+                                parts[3].parse::<u8>(),
+                            ) {
+                                world.set(WorldPos::new(x, y, z), voxel_type);
+                                voxel_count += 1;
+                            }
+                        }
+                    }
+                    println!("Loaded {} voxels from OSM data", voxel_count);
+                }
+                Err(e) => {
+                    println!("Failed to load osm_voxels.txt: {}. Using fallback world generation.", e);
+
+                    for x in 0..100 {
+                        for z in 0..100 {
+                            if (x + z) % 3 == 0 {
+                                world.set(WorldPos::new(x, 0, z), 1);
+                            }
+                        }
+                    }
+
+                    for i in 0..5 {
+                        let x = 30 + i * 20;
+                        for y in 1..=(10 + i * 3) {
+                            world.set(WorldPos::new(x, y, 50), 2);
+                        }
                     }
                 }
             }
         }
-        
-        // Scattered structures
-        for i in 0..10 {
-            let angle = i as f32 * std::f32::consts::PI * 2.0 / 10.0;
-            let radius = 30.0;
-            let x = (angle.cos() * radius) as i64;
-            let z = (angle.sin() * radius) as i64;
-            
-            for y in 0..5 {
-                world.set(WorldPos::new(x, y, z), 3 + (i % 3) as u8);
-            }
-        }
-        
+
         println!("World created with voxels");
-        
-        // Update LOD metadata for all chunks (for distance-based rendering)
+
         println!("Updating LOD metadata...");
         world.update_all_lod_metadata();
         println!("LOD metadata updated");
-        
+
+        let camera_position = if cfg!(feature = "test-block-world") {
+            [50.0, 15.0, 65.0]
+        } else {
+            [680.0, 50.0, 670.0]
+        };
+
         println!("\n=== Controls ===");
         println!("Movement: WASD + Arrow Up/Down (up/down)");
         println!("Look: Right Mouse + drag");
@@ -366,13 +419,15 @@ impl App {
             queue: None,
             config: None,
             render_pipeline: None,
+            mesh_pipeline: None,
             uniform_buffer: None,
             bind_group: None,
             cube_vertex_buffer: None,
             instance_buffer: None,
+            mesh_cache: HashMap::new(),
             instance_capacity: 0,
             world,
-            camera_controller: CameraController::new([980.0, 50.0, 970.0]),
+            camera_controller: CameraController::new(camera_position),
             visibility_cache: VisibilityCache::new(),
             last_frame: Instant::now(),
             frame_count: 0,
@@ -510,7 +565,7 @@ impl App {
             push_constant_ranges: &[],
         });
         
-        // Create render pipeline
+        // Create instanced-cube render pipeline
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Render Pipeline"),
             layout: Some(&pipeline_layout),
@@ -572,6 +627,57 @@ impl App {
             multiview: None,
             cache: None,
         });
+
+        // Create mesh pipeline (non-instanced, per-vertex position/normal/color)
+        let mesh_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Mesh Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_mesh"),
+                buffers: &[
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<MeshVertexRaw>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4],
+                    }
+                ],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_mesh"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
         
         // Create uniform buffer with proper size for Uniforms struct
         let uniforms = Uniforms {
@@ -614,11 +720,13 @@ impl App {
         self.device = Some(device);
         self.queue = Some(queue);
         self.config = Some(config);
-        self.render_pipeline = Some(render_pipeline);
+    self.render_pipeline = Some(render_pipeline);
+    self.mesh_pipeline = Some(mesh_pipeline);
         self.uniform_buffer = Some(uniform_buffer);
         self.bind_group = Some(bind_group);
         self.cube_vertex_buffer = Some(cube_vertex_buffer);
         
+    viewer_debug!("DEBUG: mesh_pipeline created successfully");
         println!("wgpu initialized");
     }
     
@@ -640,9 +748,99 @@ impl App {
         let visible = self.visibility_cache.update(&self.camera_controller.camera, &self.world);
         let cull_time = cull_start.elapsed();
         
-        // Convert to GPU instances
+        // Group scale==1 voxels by leaf chunk origin (x&!15,y&!15,z&!15)
+        let mut leaf_groups: HashMap<(i64,i64,i64), usize> = HashMap::new();
+        for v in &visible {
+            if v.scale == 1 {
+                let key = (v.position[0] & !15, v.position[1] & !15, v.position[2] & !15);
+                *leaf_groups.entry(key).or_insert(0) += 1;
+            }
+        }
+
+        // Build mesh for any group present (near leaf chunk), and mark those voxels for removal
+        let mut mesh_keys: HashSet<(i64,i64,i64)> = HashSet::new();
+        let mut new_meshes_created = 0;
+        let mut chunks_not_found = 0;
+        for (&key, &_count) in leaf_groups.iter() {
+            // Ensure mesh in cache
+            if !self.mesh_cache.contains_key(&key) {
+                if let Some(chunk) = self.world.get_leaf_chunk_at_origin(WorldPos::new(key.0, key.1, key.2)) {
+                    let mesh = generate_chunk_mesh(chunk);
+                    if !mesh.indices.is_empty() {
+                        // DEBUG: Print info for first mesh
+                        if new_meshes_created == 0 {
+                            let num_voxels = chunk.iter().count();
+                            viewer_debug!(
+                                "DEBUG first mesh at ({},{},{}): {} voxels in chunk, {} vertices, {} triangles",
+                                key.0, key.1, key.2, num_voxels, mesh.vertices.len(), mesh.indices.len() / 3
+                            );
+                            // Print ALL vertices to verify the mesh structure
+                            for (i, v) in mesh.vertices.iter().enumerate() {
+                                viewer_debug!(
+                                    "  vertex {}: pos=[{:.1},{:.1},{:.1}] normal=[{:.1},{:.1},{:.1}]",
+                                    i, v.position[0], v.position[1], v.position[2],
+                                    v.normal[0], v.normal[1], v.normal[2]
+                                );
+                            }
+                        }
+                        
+                        // Upload to GPU with offset to world coordinates
+                        let vb_data: Vec<MeshVertexRaw> = mesh.vertices.iter().map(|v| {
+                            MeshVertexRaw {
+                                position: [
+                                    v.position[0] + key.0 as f32,
+                                    v.position[1] + key.1 as f32,
+                                    v.position[2] + key.2 as f32,
+                                ],
+                                normal: v.normal,
+                                color: v.color,
+                            }
+                        }).collect();
+                        let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("Chunk Mesh Vertex Buffer"),
+                            contents: bytemuck::cast_slice(&vb_data),
+                            usage: wgpu::BufferUsages::VERTEX,
+                        });
+                        let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("Chunk Mesh Index Buffer"),
+                            contents: bytemuck::cast_slice(&mesh.indices),
+                            usage: wgpu::BufferUsages::INDEX,
+                        });
+                        viewer_debug!(
+                            "Created mesh for chunk ({},{},{}): {} vertices, {} triangles",
+                            key.0, key.1, key.2, mesh.vertices.len(), mesh.indices.len() / 3
+                        );
+                        self.mesh_cache.insert(key, (vbuf, ibuf, mesh.indices.len() as u32));
+                        mesh_keys.insert(key);  // Only mark for filtering if mesh was created
+                        new_meshes_created += 1;
+                    }
+                } else {
+                    chunks_not_found += 1;
+                }
+            } else {
+                mesh_keys.insert(key);  // Mesh exists in cache, mark for filtering
+            }
+        }
+        
+        if chunks_not_found > 0 && self.frame_count == 0 {
+            println!("Warning: {} out of {} potential chunks not found (OSM voxels are not in subdivided chunks)", 
+                chunks_not_found, leaf_groups.len());
+        }
+        
+        if cfg!(feature = "viewer-debug") && self.frame_count % 60 == 0 {
+            let filtered_instances = visible.iter().filter(|v| {
+                !(v.scale == 1 && mesh_keys.contains(&(v.position[0] & !15, v.position[1] & !15, v.position[2] & !15)))
+            }).count();
+            viewer_debug!(
+                "Mesh stats: {} cached meshes, {} new this frame, {} potential chunks, {} instances after filtering",
+                self.mesh_cache.len(), new_meshes_created, leaf_groups.len(), filtered_instances
+            );
+        }
+
+        // Convert remaining instances (exclude those belonging to meshed chunks)
         let instances: Vec<VoxelInstanceRaw> = visible
             .iter()
+            .filter(|v| !(v.scale == 1 && mesh_keys.contains(&(v.position[0] & !15, v.position[1] & !15, v.position[2] & !15))))
             .map(|v| {
                 let custom_color_f32 = if let Some(rgba) = v.custom_color {
                     [
@@ -664,9 +862,10 @@ impl App {
             })
             .collect();
         
-        // Update or create instance buffer
-        if instances.is_empty() {
-            return; // Nothing to render
+        // Update or create instance buffer (we might still render meshes even if instances is empty)
+        let has_meshes_to_draw = !mesh_keys.is_empty();
+        if instances.is_empty() && !has_meshes_to_draw {
+            return; // Nothing to render at all
         }
         
         if self.instance_capacity < instances.len() {
@@ -685,8 +884,10 @@ impl App {
             }));
         }
 
-        // Write data to the buffer
-        queue.write_buffer(self.instance_buffer.as_ref().unwrap(), 0, bytemuck::cast_slice(&instances));
+        // Write data to the buffer (only if we have instances)
+        if !instances.is_empty() {
+            queue.write_buffer(self.instance_buffer.as_ref().unwrap(), 0, bytemuck::cast_slice(&instances));
+        }
         
         // Get surface texture
         let output = match surface.get_current_texture() {
@@ -819,11 +1020,36 @@ impl App {
                 occlusion_query_set: None,
             });
             
+            // Draw meshed chunks first
+            if has_meshes_to_draw {
+                render_pass.set_pipeline(self.mesh_pipeline.as_ref().unwrap());
+                render_pass.set_bind_group(0, self.bind_group.as_ref().unwrap(), &[]);
+                let mut drawn_meshes = 0;
+                for (&key, (vbuf, ibuf, index_count)) in &self.mesh_cache {
+                    // Only draw meshes that are in view this frame
+                    if mesh_keys.contains(&key) {
+                        render_pass.set_vertex_buffer(0, vbuf.slice(..));
+                        render_pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                        render_pass.draw_indexed(0..*index_count, 0, 0..1);
+                        drawn_meshes += 1;
+                    }
+                }
+                if cfg!(feature = "viewer-debug") && self.frame_count == 0 {
+                    viewer_debug!(
+                        "DEBUG: Drew {} meshes (has_meshes_to_draw={}, mesh_keys.len()={}, mesh_cache.len()={})",
+                        drawn_meshes, has_meshes_to_draw, mesh_keys.len(), self.mesh_cache.len()
+                    );
+                }
+            }
+
+            // Draw remaining instanced cubes
             render_pass.set_pipeline(self.render_pipeline.as_ref().unwrap());
             render_pass.set_bind_group(0, self.bind_group.as_ref().unwrap(), &[]);
             render_pass.set_vertex_buffer(0, self.cube_vertex_buffer.as_ref().unwrap().slice(..));
-            render_pass.set_vertex_buffer(1, self.instance_buffer.as_ref().unwrap().slice(..));
-            render_pass.draw(0..36, 0..instances.len() as u32); // 36 vertices for a cube
+            if !instances.is_empty() {
+                render_pass.set_vertex_buffer(1, self.instance_buffer.as_ref().unwrap().slice(..));
+                render_pass.draw(0..36, 0..instances.len() as u32); // 36 vertices for a cube
+            }
         }
         
         queue.submit(std::iter::once(encoder.finish()));

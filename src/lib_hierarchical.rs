@@ -463,6 +463,83 @@ impl World {
             chunk_size: 16,
         }
     }
+
+    /// Get a reference to the 16x16x16 leaf chunk located at the given world origin (must be aligned to 16).
+    /// Returns None if that position isn't a subdivided chunk.
+    pub fn get_leaf_chunk_at_origin(&self, origin: WorldPos) -> Option<&Chunk> {
+        // Ensure alignment (optional safety)
+        if (origin.x & 15) != 0 || (origin.y & 15) != 0 || (origin.z & 15) != 0 {
+            return None;
+        }
+        
+        if self.hierarchy_depth == 1 {
+            // Special case: root is the leaf chunk
+            return Some(&self.root);
+        }
+        
+        let path = self.position_to_path(origin).ok()?;
+        // Navigate to the parent of the leaf chunk level (depth-2)
+        let parent = self.navigate_to(&path, self.hierarchy_depth as usize - 2)?;
+        // The leaf chunk is at position path[depth-2] in that parent
+        let &(x, y, z) = &path[self.hierarchy_depth as usize - 2];
+        match parent.get(x, y, z)? {
+            Voxel::Chunk(c) => Some(c),
+            _ => None,
+        }
+    }
+    
+    /// Subdivide a 16×16×16 region into a chunk structure
+    /// This collects all existing voxels in the region and organizes them into a chunk
+    /// If the parent position doesn't exist yet, it will be created
+    pub fn subdivide_region(&mut self, origin: WorldPos) -> Result<(), &'static str> {
+        // Ensure alignment
+        let aligned_x = origin.x & !15;
+        let aligned_y = origin.y & !15;
+        let aligned_z = origin.z & !15;
+        
+        // Collect all voxels in this 16×16×16 region
+        let mut voxel_data = Vec::new();
+        for dx in 0..16 {
+            for dy in 0..16 {
+                for dz in 0..16 {
+                    let pos = WorldPos::new(aligned_x + dx, aligned_y + dy, aligned_z + dz);
+                    if let Some(vtype) = self.get(pos) {
+                        voxel_data.push((dx as u8, dy as u8, dz as u8, vtype));
+                    }
+                }
+            }
+        }
+        
+        if voxel_data.is_empty() {
+            return Err("No voxels in region");
+        }
+        
+        // Navigate to parent that should contain this region
+        let path = self.position_to_path(WorldPos::new(aligned_x, aligned_y, aligned_z))?;
+        
+        // Remove all individual voxels in this region
+        for dx in 0..16 {
+            for dy in 0..16 {
+                for dz in 0..16 {
+                    let pos = WorldPos::new(aligned_x + dx, aligned_y + dy, aligned_z + dz);
+                    let _ = self.remove(pos); // Ignore errors
+                }
+            }
+        }
+        
+        // Create a new chunk with the collected voxels
+        let mut chunk = Chunk::new();
+        for (x, y, z, vtype) in voxel_data {
+            chunk.set(x, y, z, vtype);
+        }
+        
+        // Set the chunk at the parent position
+        let parent = self.navigate_to_mut(&path, self.hierarchy_depth as usize - 1);
+        let &(x, y, z) = path.last().ok_or("Invalid path")?;
+        parent.set_chunk(x, y, z, chunk);
+        
+        Ok(())
+    }
     
     /// Get the world size (units per side)
     pub fn world_size(&self) -> u64 {
@@ -571,12 +648,41 @@ impl World {
             Err(_) => return, // Out of bounds, silently ignore
         };
         
-        // Navigate to the parent chunk, creating as needed
-        let parent = self.navigate_to_mut(&path, self.hierarchy_depth as usize - 1);
+        let depth = self.hierarchy_depth as usize;
         
-        // Set the leaf voxel
-        let &(x, y, z) = path.last().unwrap();
-        parent.set(x, y, z, voxel_type);
+        if depth == 1 {
+            // Special case: single-level world, root IS the leaf chunk
+            let &(x, y, z) = path.last().unwrap();
+            self.root.set(x, y, z, voxel_type);
+            return;
+        }
+        
+        // Navigate to the "grandparent" level (one above the leaf chunk level)
+        let grandparent = self.navigate_to_mut(&path, depth - 2);
+        
+        // Ensure the leaf chunk exists at path[depth-2]
+        let &(lx, ly, lz) = &path[depth - 2];
+        let idx = Chunk::flat_index(lx, ly, lz);
+        
+        // Check if we need to create or replace with a chunk
+        let needs_chunk = if grandparent.presence.contains(idx) {
+            let rank = grandparent.presence.rank(idx) as usize;
+            !matches!(&grandparent.voxels[rank - 1], Voxel::Chunk(_))
+        } else {
+            true
+        };
+        
+        if needs_chunk {
+            // Create the leaf chunk (this will replace any existing Solid voxel)
+            grandparent.set_chunk(lx, ly, lz, Chunk::new());
+        }
+        
+        // Now get the leaf chunk and set the voxel in it
+        let rank = grandparent.presence.rank(idx) as usize;
+        if let Voxel::Chunk(leaf_chunk) = &mut grandparent.voxels[rank - 1] {
+            let &(x, y, z) = path.last().unwrap();
+            leaf_chunk.set(x, y, z, voxel_type);
+        }
     }
     
     /// Remove a voxel at world position
