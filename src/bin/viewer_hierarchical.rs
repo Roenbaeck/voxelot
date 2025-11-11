@@ -21,7 +21,8 @@ use winit::{
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use voxelot::generate_chunk_mesh;
-use voxelot::{Camera, RenderConfig, VisibilityCache, World, WorldPos};
+use voxelot::{cull_visible_voxels_parallel, Camera, RenderConfig, World, WorldPos};
+use sysinfo::{Pid, ProcessExt, System, SystemExt};
 
 macro_rules! viewer_debug {
     ($($arg:tt)*) => {
@@ -35,6 +36,7 @@ const WINDOW_WIDTH: u32 = 1280;
 const WINDOW_HEIGHT: u32 = 720;
 const CONFIG_FILE: &str = "render_config.txt";
 const GPU_CULL_WORKGROUP_SIZE: u32 = 64;
+const DEFAULT_MESH_CACHE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Voxel instance data for GPU
 #[repr(C)]
@@ -85,6 +87,22 @@ struct MeshVertexRaw {
 struct CubeVertex {
     position: [f32; 3],
     normal: [f32; 3],
+}
+
+/// GPU buffers and bookkeeping for a meshed chunk
+struct MeshCacheEntry {
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    index_count: u32,
+    vertex_bytes: u64,
+    index_bytes: u64,
+    last_used_frame: u64,
+}
+
+impl MeshCacheEntry {
+    fn total_bytes(&self) -> u64 {
+        self.vertex_bytes + self.index_bytes
+    }
 }
 
 /// Uniforms for shader (matches shader layout exactly)
@@ -559,8 +577,11 @@ struct App {
     gpu_input_capacity: usize,
     gpu_readback_buffer: Option<wgpu::Buffer>,
     gpu_readback_capacity: usize,
-    // Mesh cache: per-leaf-chunk mesh GPU buffers
-    mesh_cache: HashMap<(i64, i64, i64), (wgpu::Buffer, wgpu::Buffer, u32)>, // (vbuf, ibuf, index_count)
+    // Mesh cache: per-leaf-chunk mesh GPU buffers and metadata
+    mesh_cache: HashMap<(i64, i64, i64), MeshCacheEntry>,
+    mesh_cache_bytes: u64,
+    system_info: System,
+    process_pid: Pid,
     instance_capacity: usize,
     cull_pipeline: Option<wgpu::ComputePipeline>,
     cull_bind_group_layout: Option<wgpu::BindGroupLayout>,
@@ -569,11 +590,11 @@ struct App {
 
     world: World,
     camera_controller: CameraController,
-    visibility_cache: VisibilityCache,
     pending_chunk_meshes: VecDeque<(i64, i64, i64)>,
     pending_chunk_set: HashSet<(i64, i64, i64)>,
     last_frame: Instant,
     frame_count: u64,
+    frame_index: u64,
     last_fps_print: Instant,
 
     mouse_pressed: bool,
@@ -632,6 +653,10 @@ struct App {
 
 impl App {
     fn new() -> Self {
+        let mut system_info = System::new();
+        let process_pid = Pid::from(std::process::id() as usize);
+        system_info.refresh_process(process_pid);
+
         // Create world with test data (depth 3 = 4,096 units)
         let mut world = World::new(3);
 
@@ -802,6 +827,9 @@ impl App {
             gpu_readback_buffer: None,
             gpu_readback_capacity: 0,
             mesh_cache: HashMap::new(),
+            mesh_cache_bytes: 0,
+            system_info,
+            process_pid,
             instance_capacity: 0,
             cull_pipeline: None,
             cull_bind_group_layout: None,
@@ -809,11 +837,11 @@ impl App {
             cull_params_buffer: None,
             world,
             camera_controller: CameraController::new(initial_camera),
-            visibility_cache: VisibilityCache::new(),
             pending_chunk_meshes: VecDeque::new(),
             pending_chunk_set: HashSet::new(),
             last_frame: Instant::now(),
             frame_count: 0,
+            frame_index: 0,
             last_fps_print: Instant::now(),
             mouse_pressed: false,
             last_mouse_pos: None,
@@ -1561,6 +1589,52 @@ impl App {
                 },
             ],
         }));
+    }
+
+    fn mesh_cache_byte_budget(&self) -> u64 {
+        DEFAULT_MESH_CACHE_BUDGET_BYTES
+    }
+
+    fn evict_mesh_cache(&mut self) {
+        let budget = self.mesh_cache_byte_budget();
+        if self.mesh_cache_bytes <= budget {
+            return;
+        }
+
+        let mut entries: Vec<_> = self
+            .mesh_cache
+            .iter()
+            .map(|(key, entry)| (*key, entry.last_used_frame))
+            .collect();
+        entries.sort_by(|a, b| a.1.cmp(&b.1));
+
+        let mut freed_bytes = 0u64;
+        let mut evicted = 0usize;
+
+        for (key, _) in entries {
+            if self.mesh_cache_bytes <= budget {
+                break;
+            }
+
+            if let Some(entry) = self.mesh_cache.remove(&key) {
+                let entry_bytes = entry.total_bytes();
+                entry.vertex_buffer.destroy();
+                entry.index_buffer.destroy();
+                self.mesh_cache_bytes = self.mesh_cache_bytes.saturating_sub(entry_bytes);
+                freed_bytes += entry_bytes;
+                evicted += 1;
+            }
+        }
+
+        if cfg!(feature = "viewer-debug") && evicted > 0 {
+            viewer_debug!(
+                "Mesh cache eviction: freed {:.2} MiB across {} entries (budget {:.2} MiB, now {:.2} MiB)",
+                freed_bytes as f64 / (1024.0 * 1024.0),
+                evicted,
+                budget as f64 / (1024.0 * 1024.0),
+                self.mesh_cache_bytes as f64 / (1024.0 * 1024.0)
+            );
+        }
     }
 
     fn run_gpu_culling(
@@ -2527,14 +2601,16 @@ impl App {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
+    self.frame_index = self.frame_index.wrapping_add(1);
 
         self.camera_controller.update(dt);
 
-        // Cull visible voxels using cached visibility
+        // Gather candidate voxels for GPU culling using CPU hierarchy traversal
         let cull_start = Instant::now();
-        let visible = self
-            .visibility_cache
-            .update(&self.camera_controller.camera, &self.world);
+        let visible = cull_visible_voxels_parallel(
+            &self.world,
+            &self.camera_controller.camera,
+        );
         let cull_time = cull_start.elapsed();
 
         let gpu_inputs: Vec<GpuInstanceInput> = visible
@@ -2686,6 +2762,10 @@ impl App {
                         contents: bytemuck::cast_slice(&mesh.indices),
                         usage: wgpu::BufferUsages::INDEX,
                     });
+                    let vertex_bytes =
+                        (vb_data.len() * std::mem::size_of::<MeshVertexRaw>()) as u64;
+                    let index_bytes =
+                        (mesh.indices.len() * std::mem::size_of::<u32>()) as u64;
                     viewer_debug!(
                         "Created mesh for chunk ({},{},{}): {} vertices, {} triangles",
                         key.0,
@@ -2694,8 +2774,19 @@ impl App {
                         mesh.vertices.len(),
                         mesh.indices.len() / 3
                     );
-                    self.mesh_cache
-                        .insert(key, (vbuf, ibuf, mesh.indices.len() as u32));
+                    let entry = MeshCacheEntry {
+                        vertex_buffer: vbuf,
+                        index_buffer: ibuf,
+                        index_count: mesh.indices.len() as u32,
+                        vertex_bytes,
+                        index_bytes,
+                        last_used_frame: self.frame_index,
+                    };
+                    self.mesh_cache.insert(
+                        key,
+                        entry,
+                    );
+                    self.mesh_cache_bytes += vertex_bytes + index_bytes;
                     new_meshes_created += 1;
 
                     if leaf_chunks.contains(&key) {
@@ -2711,6 +2802,10 @@ impl App {
             processed_meshes += 1;
         }
         let mesh_time = mesh_start.elapsed();
+
+        if self.mesh_cache_bytes > self.mesh_cache_byte_budget() {
+            self.evict_mesh_cache();
+        }
 
         if chunks_not_found > 0 && self.frame_count == 0 {
             println!(
@@ -2994,12 +3089,15 @@ impl App {
                 render_pass.set_pipeline(self.mesh_pipeline.as_ref().unwrap());
                 render_pass.set_bind_group(0, self.bind_group.as_ref().unwrap(), &[]);
                 let mut drawn_meshes = 0;
-                for (&key, (vbuf, ibuf, index_count)) in &self.mesh_cache {
-                    // Only draw meshes that are in view this frame
-                    if draw_mesh_keys.contains(&key) {
-                        render_pass.set_vertex_buffer(0, vbuf.slice(..));
-                        render_pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                        render_pass.draw_indexed(0..*index_count, 0, 0..1);
+                for key in draw_mesh_keys.iter() {
+                    if let Some(entry) = self.mesh_cache.get_mut(key) {
+                        render_pass.set_vertex_buffer(0, entry.vertex_buffer.slice(..));
+                        render_pass.set_index_buffer(
+                            entry.index_buffer.slice(..),
+                            wgpu::IndexFormat::Uint32,
+                        );
+                        render_pass.draw_indexed(0..entry.index_count, 0, 0..1);
+                        entry.last_used_frame = self.frame_index;
                         drawn_meshes += 1;
                     }
                 }
@@ -3243,14 +3341,25 @@ impl App {
         self.frame_count += 1;
         if now.duration_since(self.last_fps_print).as_secs() >= 1 {
             let total_visible = visible.len();
+            let mesh_cache_mib = self.mesh_cache_bytes as f64 / (1024.0 * 1024.0);
+            let mesh_budget_mib = self.mesh_cache_byte_budget() as f64 / (1024.0 * 1024.0);
+            self.system_info.refresh_process(self.process_pid);
+            let process_mem_mib = self
+                .system_info
+                .process(self.process_pid)
+                .map(|p| p.memory() as f64 / (1024.0 * 1024.0))
+                .unwrap_or(0.0);
             println!(
-                "FPS: {}, Visible items: {}, Leaf chunks: {}, Meshed chunks: {}, Pending: {}, Fallback: {}, Cull: {:.2}ms, Group: {:.2}ms, Mesh: {:.2}ms, Instances: {:.2}ms",
+                "FPS: {}, Visible items: {}, Leaf chunks: {}, Meshed chunks: {}, Pending: {}, Fallback: {}, Mesh cache: {:.1}/{:.1} MiB, Process: {:.1} MiB, Cull: {:.2}ms, Group: {:.2}ms, Mesh: {:.2}ms, Instances: {:.2}ms",
                 self.frame_count,
                 total_visible,
                 leaf_chunks.len(),
                 draw_mesh_keys.len(),
                 self.pending_chunk_meshes.len(),
                 missing_chunks.len(),
+                mesh_cache_mib,
+                mesh_budget_mib,
+                process_mem_mib,
                 cull_time.as_secs_f64() * 1000.0,
                 grouping_time.as_secs_f64() * 1000.0,
                 mesh_time.as_secs_f64() * 1000.0,
