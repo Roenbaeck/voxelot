@@ -60,13 +60,25 @@ fn linearize_depth(depth: f32) -> f32 {
 
 fn calculate_coc(linear_depth: f32) -> f32 {
     let distance_from_focal = abs(linear_depth - dof_uniforms.focal_distance);
-    if distance_from_focal < dof_uniforms.focal_range {
+    let focus_band = dof_uniforms.focal_range * 4.0;
+    if distance_from_focal < focus_band {
         return 0.0;
     }
     let focal_norm = max(dof_uniforms.focal_distance, 1e-3);
-    let softness = max(dof_uniforms.focal_range * 1.6, focal_norm * 0.25);
-    let base = clamp((distance_from_focal - dof_uniforms.focal_range) / (softness + 1.0), 0.0, 3.0);
-    let base_coc = pow(base, 1.35);
+    let softness = max(focus_band * 0.8, focal_norm * 0.25);
+    let base = clamp((distance_from_focal - focus_band) / (softness + 1.0), 0.0, 6.0);
+    let linear_cap = 1.25;
+    let linear_scale = 0.26;
+    var base_coc = base * linear_scale;
+
+    if (base > linear_cap) {
+        let exp_input = base - linear_cap;
+        let exp_curve = 1.0 - exp(-exp_input * 0.8);
+        let exp_gain = 0.75 + base * 0.32;
+        let offset = linear_cap * linear_scale;
+        base_coc = offset + exp_curve * exp_gain;
+    }
+
     let far_distance = max(linear_depth - dof_uniforms.focal_distance, 0.0);
     let far_ratio = clamp(far_distance / (focal_norm * 0.65 + 25.0), 0.0, 4.0);
     let far_boost = 1.0 + far_ratio * 2.4 + far_ratio * far_ratio * 1.2;

@@ -34,6 +34,7 @@ macro_rules! viewer_debug {
 const WINDOW_WIDTH: u32 = 1280;
 const WINDOW_HEIGHT: u32 = 720;
 const CONFIG_FILE: &str = "render_config.txt";
+const GPU_CULL_WORKGROUP_SIZE: u32 = 64;
 
 /// Voxel instance data for GPU
 #[repr(C)]
@@ -43,6 +44,32 @@ struct VoxelInstanceRaw {
     voxel_type: u32,
     scale: f32,             // Scale factor (1.0 = 1x1x1, 16.0 = 16x16x16 chunk)
     custom_color: [f32; 4], // RGBA custom color (if custom_color.a > 0, use this instead of voxel_type)
+}
+
+/// Input layout for GPU culling compute pass (std430-friendly)
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuInstanceInput {
+    position: [f32; 3],
+    scale: f32,
+    custom_color: [f32; 4],
+    voxel_type: u32,
+    flags: u32,
+    _padding: [u32; 2],
+}
+
+/// Parameters consumed by the GPU culling compute shader
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuCullParams {
+    camera_position: [f32; 3],
+    candidate_count: u32,
+    camera_forward: [f32; 3],
+    _pad0: u32,
+    near_plane: f32,
+    far_plane: f32,
+    lod_render_distance: f32,
+    _pad1: f32,
 }
 
 #[repr(C)]
@@ -528,9 +555,15 @@ struct App {
     bind_group: Option<wgpu::BindGroup>,
     cube_vertex_buffer: Option<wgpu::Buffer>,
     instance_buffer: Option<wgpu::Buffer>,
+    gpu_input_buffer: Option<wgpu::Buffer>,
+    gpu_input_capacity: usize,
     // Mesh cache: per-leaf-chunk mesh GPU buffers
     mesh_cache: HashMap<(i64, i64, i64), (wgpu::Buffer, wgpu::Buffer, u32)>, // (vbuf, ibuf, index_count)
     instance_capacity: usize,
+    cull_pipeline: Option<wgpu::ComputePipeline>,
+    cull_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    cull_bind_group: Option<wgpu::BindGroup>,
+    cull_params_buffer: Option<wgpu::Buffer>,
 
     world: World,
     camera_controller: CameraController,
@@ -762,8 +795,14 @@ impl App {
             bind_group: None,
             cube_vertex_buffer: None,
             instance_buffer: None,
+            gpu_input_buffer: None,
+            gpu_input_capacity: 0,
             mesh_cache: HashMap::new(),
             instance_capacity: 0,
+            cull_pipeline: None,
+            cull_bind_group_layout: None,
+            cull_bind_group: None,
+            cull_params_buffer: None,
             world,
             camera_controller: CameraController::new(initial_camera),
             visibility_cache: VisibilityCache::new(),
@@ -1325,116 +1364,180 @@ impl App {
     }
 
     fn update_bloom_bind_groups(&mut self) {
-        let (
-            Some(device),
-            Some(extract_layout),
-            Some(blur_layout),
-            Some(composite_layout),
-            Some(sampler),
-            Some(post_color_view),
-            Some(bloom_ping_view),
-            Some(bloom_pong_view),
-            Some(extract_buffer),
-            Some(blur_horizontal_buffer),
-            Some(blur_vertical_buffer),
-            Some(composite_buffer),
-        ) = (
+        if self.post_color_view.is_none()
+            || self.bloom_ping_view.is_none()
+            || self.bloom_pong_view.is_none()
+        {
+            return;
+        }
+
+        let (Some(device), Some(extract_layout), Some(blur_layout), Some(composite_layout)) = (
             self.device.as_ref(),
             self.bloom_extract_bind_group_layout.as_ref(),
             self.bloom_blur_bind_group_layout.as_ref(),
             self.composite_bind_group_layout.as_ref(),
-            self.post_sampler.as_ref(),
-            self.post_color_view.as_ref(),
-            self.bloom_ping_view.as_ref(),
-            self.bloom_pong_view.as_ref(),
-            self.bloom_extract_uniform_buffer.as_ref(),
-            self.bloom_blur_horizontal_uniform_buffer.as_ref(),
-            self.bloom_blur_vertical_uniform_buffer.as_ref(),
-            self.composite_uniform_buffer.as_ref(),
-        )
-        else {
+        ) else {
             return;
         };
 
-        self.bloom_extract_bind_group =
-            Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Bloom Extract Bind Group"),
-                layout: extract_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: extract_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(post_color_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(sampler),
-                    },
-                ],
+        let Some(post_view) = self.post_color_view.as_ref() else {
+            return;
+        };
+        let Some(bloom_ping_view) = self.bloom_ping_view.as_ref() else {
+            return;
+        };
+        let Some(bloom_pong_view) = self.bloom_pong_view.as_ref() else {
+            return;
+        };
+
+        if let (Some(ubo), Some(sampler), Some(blur_horizontal_ubo), Some(blur_vertical_ubo)) = (
+            self.bloom_extract_uniform_buffer.as_ref(),
+            self.post_sampler.as_ref(),
+            self.bloom_blur_horizontal_uniform_buffer.as_ref(),
+            self.bloom_blur_vertical_uniform_buffer.as_ref(),
+        ) {
+            self.bloom_extract_bind_group =
+                Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Bloom Extract Bind Group"),
+                    layout: extract_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: ubo.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(post_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(sampler),
+                        },
+                    ],
+                }));
+
+            self.bloom_blur_horizontal_bind_group =
+                Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Bloom Blur Horizontal Bind Group"),
+                    layout: blur_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: blur_horizontal_ubo.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(bloom_ping_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(sampler),
+                        },
+                    ],
+                }));
+
+            self.bloom_blur_vertical_bind_group =
+                Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Bloom Blur Vertical Bind Group"),
+                    layout: blur_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: blur_vertical_ubo.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(bloom_pong_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(sampler),
+                        },
+                    ],
+                }));
+        }
+
+        if let (Some(composite_ubo), Some(sampler)) = (
+            self.composite_uniform_buffer.as_ref(),
+            self.post_sampler.as_ref(),
+        ) {
+            self.composite_bind_group =
+                Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Composite Bind Group"),
+                    layout: composite_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: composite_ubo.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(post_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(bloom_ping_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::Sampler(sampler),
+                        },
+                    ],
+                }));
+        }
+    }
+
+    fn ensure_gpu_input_buffer(&mut self, device: &wgpu::Device, required: usize) {
+        if required == 0 {
+            return;
+        }
+
+        let needed_capacity = required.next_power_of_two();
+        if self.gpu_input_capacity < needed_capacity || self.gpu_input_buffer.is_none() {
+            if let Some(old_buffer) = self.gpu_input_buffer.take() {
+                old_buffer.destroy();
+            }
+
+            self.gpu_input_capacity = needed_capacity;
+            self.gpu_input_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("GPU Instance Input Buffer"),
+                size: (self.gpu_input_capacity * std::mem::size_of::<GpuInstanceInput>()) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
             }));
 
-        self.bloom_blur_horizontal_bind_group =
-            Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Bloom Blur Horizontal Bind Group"),
-                layout: blur_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: blur_horizontal_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(bloom_ping_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(sampler),
-                    },
-                ],
-            }));
+            self.cull_bind_group = None; // Force rebuild with new buffer
+        }
+    }
 
-        self.bloom_blur_vertical_bind_group =
-            Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Bloom Blur Vertical Bind Group"),
-                layout: blur_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: blur_vertical_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(bloom_pong_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(sampler),
-                    },
-                ],
-            }));
+    fn ensure_cull_bind_group(&mut self, device: &wgpu::Device) {
+        if self.cull_bind_group.is_some() {
+            return;
+        }
 
-        self.composite_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Composite Bind Group"),
-            layout: composite_layout,
+        let (Some(layout), Some(input_buffer), Some(params_buffer)) = (
+            self.cull_bind_group_layout.as_ref(),
+            self.gpu_input_buffer.as_ref(),
+            self.cull_params_buffer.as_ref(),
+        ) else {
+            return;
+        };
+
+        self.cull_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("GPU Cull Bind Group"),
+            layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: composite_buffer.as_entire_binding(),
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: input_buffer,
+                        offset: 0,
+                        size: None,
+                    }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(post_color_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(bloom_ping_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::Sampler(sampler),
+                    resource: params_buffer.as_entire_binding(),
                 },
             ],
         }));
@@ -2195,12 +2298,81 @@ impl App {
             }],
         });
 
+        let cull_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("GPU Cull Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/gpu_cull.wgsl").into()),
+        });
+
+        let cull_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("GPU Cull Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let cull_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("GPU Cull Pipeline Layout"),
+            bind_group_layouts: &[&cull_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let cull_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("GPU Cull Pipeline"),
+            layout: Some(&cull_pipeline_layout),
+            module: &cull_shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let cull_params_init = GpuCullParams {
+            camera_position: [0.0; 3],
+            candidate_count: 0,
+            camera_forward: [0.0, 0.0, -1.0],
+            _pad0: 0,
+            near_plane: 0.1,
+            far_plane: 1000.0,
+            lod_render_distance: 1000.0,
+            _pad1: 0.0,
+        };
+
+        let cull_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("GPU Cull Params Buffer"),
+            contents: bytemuck::bytes_of(&cull_params_init),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
         // Create cube vertex buffer with positions and normals
         let cube_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Cube Vertex Buffer"),
             contents: bytemuck::cast_slice(CUBE_VERTICES),
             usage: wgpu::BufferUsages::VERTEX,
         });
+
+        self.cull_pipeline = Some(cull_pipeline);
+        self.cull_bind_group_layout = Some(cull_bind_group_layout);
+        self.cull_params_buffer = Some(cull_params_buffer);
+        self.cull_bind_group = None;
 
         self.dof_pipeline = Some(dof_pipeline);
         self.dof_bind_group_layout = Some(dof_bind_group_layout);
@@ -2265,6 +2437,64 @@ impl App {
             .visibility_cache
             .update(&self.camera_controller.camera, &self.world);
         let cull_time = cull_start.elapsed();
+
+        let gpu_inputs: Vec<GpuInstanceInput> = visible
+            .iter()
+            .map(|v| {
+                let custom_color_f32 = if let Some(rgba) = v.custom_color {
+                    [
+                        rgba[0] as f32 / 255.0,
+                        rgba[1] as f32 / 255.0,
+                        rgba[2] as f32 / 255.0,
+                        rgba[3] as f32 / 255.0,
+                    ]
+                } else if v.is_leaf_chunk {
+                    [0.4, 0.4, 0.45, 0.6]
+                } else {
+                    [0.0, 0.0, 0.0, 0.0]
+                };
+
+                GpuInstanceInput {
+                    position: [
+                        v.position[0] as f32,
+                        v.position[1] as f32,
+                        v.position[2] as f32,
+                    ],
+                    scale: v.scale as f32,
+                    custom_color: custom_color_f32,
+                    voxel_type: v.voxel_type as u32,
+                    flags: 0,
+                    _padding: [0; 2],
+                }
+            })
+            .collect();
+
+        let gpu_candidate_count = gpu_inputs.len();
+
+        if gpu_candidate_count > 0 {
+            self.ensure_gpu_input_buffer(&device, gpu_candidate_count);
+            if let Some(buffer) = self.gpu_input_buffer.as_ref() {
+                queue.write_buffer(buffer, 0, bytemuck::cast_slice(&gpu_inputs));
+            }
+        }
+
+        if let Some(params_buffer) = self.cull_params_buffer.as_ref() {
+            let gpu_params = GpuCullParams {
+                camera_position: self.camera_controller.camera.position,
+                candidate_count: gpu_candidate_count as u32,
+                camera_forward: self.camera_controller.camera.forward,
+                _pad0: 0,
+                near_plane: self.camera_controller.camera.near,
+                far_plane: self.camera_controller.camera.far,
+                lod_render_distance: self.lod_distance,
+                _pad1: 0.0,
+            };
+            queue.write_buffer(params_buffer, 0, bytemuck::bytes_of(&gpu_params));
+        }
+
+        if gpu_candidate_count > 0 {
+            self.ensure_cull_bind_group(&device);
+        }
 
         let grouping_start = Instant::now();
         // Collect unique leaf chunk origins flagged by the culler
@@ -2563,6 +2793,22 @@ impl App {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Render Encoder"),
         });
+
+        if gpu_candidate_count > 0 {
+            if let (Some(cull_pipeline), Some(cull_bind_group)) =
+                (self.cull_pipeline.as_ref(), self.cull_bind_group.as_ref())
+            {
+                let dispatch_x = ((gpu_candidate_count as u32) + GPU_CULL_WORKGROUP_SIZE - 1)
+                    / GPU_CULL_WORKGROUP_SIZE;
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("GPU Cull Pass"),
+                    timestamp_writes: None,
+                });
+                compute_pass.set_pipeline(cull_pipeline);
+                compute_pass.set_bind_group(0, cull_bind_group, &[]);
+                compute_pass.dispatch_workgroups(dispatch_x, 1, 1);
+            }
+        }
 
         let offscreen_color_view = self
             .offscreen_color_view
