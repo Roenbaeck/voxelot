@@ -557,6 +557,8 @@ struct App {
     instance_buffer: Option<wgpu::Buffer>,
     gpu_input_buffer: Option<wgpu::Buffer>,
     gpu_input_capacity: usize,
+    gpu_readback_buffer: Option<wgpu::Buffer>,
+    gpu_readback_capacity: usize,
     // Mesh cache: per-leaf-chunk mesh GPU buffers
     mesh_cache: HashMap<(i64, i64, i64), (wgpu::Buffer, wgpu::Buffer, u32)>, // (vbuf, ibuf, index_count)
     instance_capacity: usize,
@@ -797,6 +799,8 @@ impl App {
             instance_buffer: None,
             gpu_input_buffer: None,
             gpu_input_capacity: 0,
+            gpu_readback_buffer: None,
+            gpu_readback_capacity: 0,
             mesh_cache: HashMap::new(),
             instance_capacity: 0,
             cull_pipeline: None,
@@ -1502,11 +1506,27 @@ impl App {
             self.gpu_input_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("GPU Instance Input Buffer"),
                 size: (self.gpu_input_capacity * std::mem::size_of::<GpuInstanceInput>()) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             }));
 
             self.cull_bind_group = None; // Force rebuild with new buffer
+        }
+
+        if self.gpu_readback_capacity < needed_capacity || self.gpu_readback_buffer.is_none() {
+            if let Some(old_buffer) = self.gpu_readback_buffer.take() {
+                old_buffer.destroy();
+            }
+
+            self.gpu_readback_capacity = needed_capacity;
+            self.gpu_readback_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("GPU Cull Readback Buffer"),
+                size: (self.gpu_readback_capacity * std::mem::size_of::<GpuInstanceInput>()) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
         }
     }
 
@@ -1541,6 +1561,85 @@ impl App {
                 },
             ],
         }));
+    }
+
+    fn run_gpu_culling(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        candidate_count: usize,
+    ) -> Option<Vec<GpuInstanceInput>> {
+        if candidate_count == 0 {
+            return Some(Vec::new());
+        }
+
+        let (Some(cull_pipeline), Some(cull_bind_group), Some(input_buffer), Some(readback_buffer)) = (
+            self.cull_pipeline.as_ref(),
+            self.cull_bind_group.as_ref(),
+            self.gpu_input_buffer.as_ref(),
+            self.gpu_readback_buffer.as_ref(),
+        ) else {
+            return None;
+        };
+
+        let byte_len = (candidate_count * std::mem::size_of::<GpuInstanceInput>()) as u64;
+        if byte_len == 0 {
+            return Some(Vec::new());
+        }
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("GPU Cull Encoder"),
+        });
+
+        let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("GPU Cull Pass"),
+            timestamp_writes: None,
+        });
+        compute_pass.set_pipeline(cull_pipeline);
+        compute_pass.set_bind_group(0, cull_bind_group, &[]);
+        let dispatch_x =
+            ((candidate_count as u32) + GPU_CULL_WORKGROUP_SIZE - 1) / GPU_CULL_WORKGROUP_SIZE;
+        compute_pass.dispatch_workgroups(dispatch_x, 1, 1);
+        drop(compute_pass);
+
+        encoder.copy_buffer_to_buffer(input_buffer, 0, readback_buffer, 0, byte_len);
+
+        queue.submit(std::iter::once(encoder.finish()));
+        if !device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map(|status| status.wait_finished())
+            .unwrap_or(false)
+        {
+            return None;
+        }
+
+        let slice = readback_buffer.slice(0..byte_len);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = sender.send(res);
+        });
+
+        if !device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map(|status| status.wait_finished())
+            .unwrap_or(false)
+        {
+            return None;
+        }
+
+        match receiver.recv() {
+            Ok(Ok(())) => {}
+            _ => return None,
+        }
+
+        let data = slice.get_mapped_range();
+        let inputs: &[GpuInstanceInput] = bytemuck::cast_slice(&data);
+        let mut result = Vec::with_capacity(candidate_count);
+        result.extend_from_slice(&inputs[..candidate_count]);
+        drop(data);
+        readback_buffer.unmap();
+
+        Some(result)
     }
 
     async fn init_wgpu(&mut self, window: Arc<Window>) {
@@ -2508,14 +2607,14 @@ impl App {
 
         let mesh_start = Instant::now();
         // Build mesh for any chunk present (near leaf chunk), and mark those chunks for drawing
-        let mut mesh_keys: HashSet<(i64, i64, i64)> = HashSet::new();
+        let mut cpu_mesh_keys: HashSet<(i64, i64, i64)> = HashSet::new();
         let mut new_meshes_created = 0;
         let mut chunks_not_found = 0;
         let mut missing_chunks: HashSet<(i64, i64, i64)> = HashSet::new();
 
         for &key in &leaf_chunks {
             if self.mesh_cache.contains_key(&key) {
-                mesh_keys.insert(key);
+                cpu_mesh_keys.insert(key);
             } else {
                 missing_chunks.insert(key);
                 if !self.pending_chunk_set.contains(&key) {
@@ -2600,7 +2699,7 @@ impl App {
                     new_meshes_created += 1;
 
                     if leaf_chunks.contains(&key) {
-                        mesh_keys.insert(key);
+                        cpu_mesh_keys.insert(key);
                         missing_chunks.remove(&key);
                     }
                 }
@@ -2621,43 +2720,79 @@ impl App {
             );
         }
 
+        let gpu_results = if gpu_candidate_count > 0 {
+            self.run_gpu_culling(&device, &queue, gpu_candidate_count)
+        } else {
+            Some(Vec::new())
+        };
+
         // Convert remaining instances (exclude those belonging to meshed chunks)
         let instance_start = Instant::now();
-        let instances: Vec<VoxelInstanceRaw> = visible
-            .iter()
-            .filter(|v| {
-                if v.is_leaf_chunk {
-                    !mesh_keys.contains(&(v.position[0], v.position[1], v.position[2]))
-                } else {
-                    true
-                }
-            })
-            .map(|v| {
-                let custom_color_f32 = if let Some(rgba) = v.custom_color {
-                    [
-                        rgba[0] as f32 / 255.0,
-                        rgba[1] as f32 / 255.0,
-                        rgba[2] as f32 / 255.0,
-                        rgba[3] as f32 / 255.0,
-                    ]
-                } else if v.is_leaf_chunk {
-                    [0.4, 0.4, 0.45, 0.6]
-                } else {
-                    [0.0, 0.0, 0.0, 0.0] // Alpha = 0 means use voxel_type color
-                };
+        let (instances, draw_mesh_keys) = if let Some(mapped_inputs) = gpu_results {
+            let mut mesh_selection: HashSet<(i64, i64, i64)> = HashSet::new();
+            let mut out: Vec<VoxelInstanceRaw> = Vec::new();
 
-                VoxelInstanceRaw {
-                    position: [
-                        v.position[0] as f32,
-                        v.position[1] as f32,
-                        v.position[2] as f32,
-                    ],
-                    voxel_type: v.voxel_type as u32,
-                    scale: v.scale as f32,
-                    custom_color: custom_color_f32,
+            for (input, v) in mapped_inputs.iter().zip(visible.iter()) {
+                if input.flags == 0 {
+                    continue;
                 }
-            })
-            .collect();
+
+                if v.is_leaf_chunk {
+                    let key = (v.position[0], v.position[1], v.position[2]);
+                    if cpu_mesh_keys.contains(&key) {
+                        mesh_selection.insert(key);
+                        continue;
+                    }
+                }
+
+                out.push(VoxelInstanceRaw {
+                    position: input.position,
+                    voxel_type: input.voxel_type,
+                    scale: input.scale,
+                    custom_color: input.custom_color,
+                });
+            }
+
+            (out, mesh_selection)
+        } else {
+            let fallback_instances: Vec<VoxelInstanceRaw> = visible
+                .iter()
+                .filter(|v| {
+                    if v.is_leaf_chunk {
+                        !cpu_mesh_keys.contains(&(v.position[0], v.position[1], v.position[2]))
+                    } else {
+                        true
+                    }
+                })
+                .map(|v| {
+                    let custom_color_f32 = if let Some(rgba) = v.custom_color {
+                        [
+                            rgba[0] as f32 / 255.0,
+                            rgba[1] as f32 / 255.0,
+                            rgba[2] as f32 / 255.0,
+                            rgba[3] as f32 / 255.0,
+                        ]
+                    } else if v.is_leaf_chunk {
+                        [0.4, 0.4, 0.45, 0.6]
+                    } else {
+                        [0.0, 0.0, 0.0, 0.0]
+                    };
+
+                    VoxelInstanceRaw {
+                        position: [
+                            v.position[0] as f32,
+                            v.position[1] as f32,
+                            v.position[2] as f32,
+                        ],
+                        voxel_type: v.voxel_type as u32,
+                        scale: v.scale as f32,
+                        custom_color: custom_color_f32,
+                    }
+                })
+                .collect();
+
+            (fallback_instances, cpu_mesh_keys.clone())
+        };
         let instance_time = instance_start.elapsed();
 
         if cfg!(feature = "viewer-debug") && self.frame_count % 60 == 0 {
@@ -2669,9 +2804,15 @@ impl App {
                 self.pending_chunk_meshes.len(),
                 instances.len()
             );
+            viewer_debug!(
+                "GPU cull: candidates {} -> draw meshes {} -> instanced {}",
+                gpu_candidate_count,
+                draw_mesh_keys.len(),
+                instances.len()
+            );
         }
 
-        let has_meshes_to_draw = !mesh_keys.is_empty();
+        let has_meshes_to_draw = !draw_mesh_keys.is_empty();
         if instances.is_empty() && !has_meshes_to_draw {
             return; // Nothing to render at all
         }
@@ -2855,7 +2996,7 @@ impl App {
                 let mut drawn_meshes = 0;
                 for (&key, (vbuf, ibuf, index_count)) in &self.mesh_cache {
                     // Only draw meshes that are in view this frame
-                    if mesh_keys.contains(&key) {
+                    if draw_mesh_keys.contains(&key) {
                         render_pass.set_vertex_buffer(0, vbuf.slice(..));
                         render_pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
                         render_pass.draw_indexed(0..*index_count, 0, 0..1);
@@ -2865,7 +3006,7 @@ impl App {
                 if cfg!(feature = "viewer-debug") && self.frame_count == 0 {
                     viewer_debug!(
                         "DEBUG: Drew {} meshes (has_meshes_to_draw={}, mesh_keys.len()={}, mesh_cache.len()={})",
-                        drawn_meshes, has_meshes_to_draw, mesh_keys.len(), self.mesh_cache.len()
+                        drawn_meshes, has_meshes_to_draw, draw_mesh_keys.len(), self.mesh_cache.len()
                     );
                 }
             }
@@ -3107,7 +3248,7 @@ impl App {
                 self.frame_count,
                 total_visible,
                 leaf_chunks.len(),
-                mesh_keys.len(),
+                draw_mesh_keys.len(),
                 self.pending_chunk_meshes.len(),
                 missing_chunks.len(),
                 cull_time.as_secs_f64() * 1000.0,
