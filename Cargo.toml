@@ -22,6 +22,7 @@ pollster = "0.4.0"
 bytemuck = { version = "1.13", features = ["derive"] }
 env_logger = "0.11.8"
 sysinfo = "0.29"
+crossbeam-channel = "0.5"
 
 [dev-dependencies]
 anyhow = "1"

@@ -7,6 +7,7 @@
 //! - LOD support
 //! - Instanced rendering
 
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use glam::{Mat4, Vec3};
 use std::sync::Arc;
 use std::time::Instant;
@@ -22,8 +23,8 @@ use winit::{
 use std::collections::{HashMap, HashSet, VecDeque};
 use sysinfo::{Pid, ProcessExt, System, SystemExt};
 use voxelot::{
-    cull_visible_voxels_parallel, generate_chunk_mesh, Camera, Chunk, Palette, RenderConfig,
-    Voxel, VoxelInstance, World, WorldPos,
+    cull_visible_voxels_parallel, generate_chunk_mesh, Camera, Chunk, ChunkMesh, Palette,
+    RenderConfig, Voxel, VoxelInstance, World, WorldPos,
 };
 
 macro_rules! viewer_debug {
@@ -113,6 +114,19 @@ impl MeshCacheEntry {
     fn total_bytes(&self) -> u64 {
         self.vertex_bytes + self.index_bytes
     }
+}
+
+#[derive(Debug)]
+struct MeshJob {
+    key: (i64, i64, i64),
+    chunk: Chunk,
+}
+
+#[derive(Debug)]
+struct MeshResult {
+    key: (i64, i64, i64),
+    mesh: ChunkMesh,
+    voxel_count: u32,
 }
 
 /// Uniforms for shader (matches shader layout exactly)
@@ -604,6 +618,15 @@ struct App {
     camera_controller: CameraController,
     pending_chunk_meshes: VecDeque<(i64, i64, i64)>,
     pending_chunk_set: HashSet<(i64, i64, i64)>,
+    mesh_job_tx: Sender<MeshJob>,
+    mesh_result_rx: Receiver<MeshResult>,
+    mesh_worker_count: usize,
+    mesh_jobs_in_flight: usize,
+    ready_chunk_meshes: VecDeque<MeshResult>,
+    mesh_upload_limit: usize,
+    mesh_upload_baseline: usize,
+    mesh_upload_max: usize,
+    mesh_upload_adjust_timer: f32,
     last_frame: Instant,
     frame_count: u64,
     frame_index: u64,
@@ -801,9 +824,48 @@ impl App {
             }
         }
 
-    println!("World created with voxels");
+        println!("World created with voxels");
 
-    let palette = Palette::load("palette.txt");
+        let palette = Palette::load("palette.txt");
+        let (mesh_job_tx, mesh_job_rx) = unbounded::<MeshJob>();
+        let (mesh_result_tx, mesh_result_rx) = unbounded::<MeshResult>();
+
+        let available_workers = std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(2))
+            .unwrap_or(1)
+            .max(1);
+        let mesh_worker_count = available_workers.min(6);
+
+        for worker_index in 0..mesh_worker_count {
+            let job_rx = mesh_job_rx.clone();
+            let result_tx = mesh_result_tx.clone();
+            let palette_clone = palette.clone();
+            std::thread::Builder::new()
+                .name(format!("mesh-worker-{}", worker_index))
+                .spawn(move || {
+                    for job in job_rx.iter() {
+                        let MeshJob { key, chunk } = job;
+                        let mesh = generate_chunk_mesh(&chunk, &palette_clone);
+                        if result_tx
+                            .send(MeshResult {
+                                key,
+                                mesh,
+                                voxel_count: chunk.voxel_count,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+                .expect("failed to spawn mesh worker");
+        }
+
+        drop(mesh_result_tx);
+        drop(mesh_job_rx);
+
+        let mesh_upload_baseline = 4usize;
+        let mesh_upload_max = (mesh_worker_count * 4).max(mesh_upload_baseline * 2);
 
         println!("Updating LOD metadata...");
         world.update_all_lod_metadata();
@@ -852,6 +914,15 @@ impl App {
             cull_params_buffer: None,
             world,
             palette,
+            mesh_job_tx,
+            mesh_result_rx,
+            mesh_worker_count,
+            mesh_jobs_in_flight: 0,
+            ready_chunk_meshes: VecDeque::new(),
+            mesh_upload_limit: mesh_upload_baseline,
+            mesh_upload_baseline,
+            mesh_upload_max,
+            mesh_upload_adjust_timer: 0.0,
             camera_controller: CameraController::new(initial_camera),
             pending_chunk_meshes: VecDeque::new(),
             pending_chunk_set: HashSet::new(),
@@ -1611,6 +1682,50 @@ impl App {
         DEFAULT_MESH_CACHE_BUDGET_BYTES
     }
 
+    fn max_inflight_jobs(&self) -> usize {
+        let workers = self.mesh_worker_count.max(1);
+        workers * 2 + self.mesh_upload_limit
+    }
+
+    fn adjust_mesh_upload_budget(&mut self, dt: f32, fps: f32) {
+        const TARGET_FPS: f32 = 60.0;
+        const LOWER_MULTIPLIER: f32 = 0.75;
+        const UPPER_MULTIPLIER: f32 = 0.95;
+
+        if !fps.is_finite() {
+            return;
+        }
+
+        self.mesh_upload_adjust_timer += dt;
+        if self.mesh_upload_adjust_timer < 0.5 {
+            return;
+        }
+        self.mesh_upload_adjust_timer = 0.0;
+
+        let mut new_limit = self.mesh_upload_limit;
+        if fps < TARGET_FPS * LOWER_MULTIPLIER {
+            new_limit = (self.mesh_upload_limit + 1).min(self.mesh_upload_max);
+        } else if fps > TARGET_FPS * UPPER_MULTIPLIER {
+            if self.mesh_upload_limit > self.mesh_upload_baseline {
+                new_limit = self.mesh_upload_limit - 1;
+            }
+        } else if self.mesh_upload_limit > self.mesh_upload_baseline {
+            new_limit = self.mesh_upload_limit - 1;
+        } else if self.mesh_upload_limit < self.mesh_upload_baseline {
+            new_limit = self.mesh_upload_limit + 1;
+        }
+
+        if new_limit != self.mesh_upload_limit {
+            viewer_debug!(
+                "Mesh upload limit adjusted: {} -> {} (fps {:.1})",
+                self.mesh_upload_limit,
+                new_limit,
+                fps
+            );
+            self.mesh_upload_limit = new_limit;
+        }
+    }
+
     fn evict_mesh_cache(&mut self) {
         let budget = self.mesh_cache_byte_budget();
         if self.mesh_cache_bytes <= budget {
@@ -1688,7 +1803,7 @@ impl App {
                 .world
                 .get_leaf_chunk_at_origin(WorldPos::new(key.0, key.1, key.2))?;
             let mut instances = Vec::with_capacity(chunk.voxel_count as usize);
-            Self::collect_chunk_surface_voxels(chunk, key, &mut instances);
+            Self::collect_chunk_surface_voxels(chunk, key, &self.palette, &mut instances);
             self.fallback_chunk_instances.insert(key, instances);
         }
         self.fallback_chunk_instances
@@ -1699,6 +1814,7 @@ impl App {
     fn collect_chunk_surface_voxels(
         chunk: &Chunk,
         origin: (i64, i64, i64),
+        palette: &Palette,
         out: &mut Vec<VoxelInstanceRaw>,
     ) {
         for ((lx, ly, lz), voxel) in chunk.iter() {
@@ -1711,16 +1827,17 @@ impl App {
             match voxel {
                 Voxel::Solid(voxel_type) => {
                     if Self::voxel_has_exposed_face(chunk, lx, ly, lz) {
+                        let color = palette.color(*voxel_type as u32);
                         out.push(VoxelInstanceRaw {
                             position: [world_pos.0 as f32, world_pos.1 as f32, world_pos.2 as f32],
                             voxel_type: *voxel_type as u32,
                             scale: 1.0,
-                            custom_color: [0.0, 0.0, 0.0, 0.0],
+                            custom_color: color,
                         });
                     }
                 }
                 Voxel::Chunk(sub_chunk) => {
-                    Self::collect_chunk_surface_voxels(sub_chunk, world_pos, out);
+                    Self::collect_chunk_surface_voxels(sub_chunk, world_pos, palette, out);
                 }
             }
         }
@@ -2713,6 +2830,9 @@ impl App {
         self.last_frame = now;
         self.frame_index = self.frame_index.wrapping_add(1);
 
+    let fps = if dt > 0.0 { 1.0 / dt } else { f32::INFINITY };
+    self.adjust_mesh_upload_budget(dt, fps);
+
         self.camera_controller.update(dt);
 
         // Gather candidate voxels for GPU culling using CPU hierarchy traversal
@@ -2807,103 +2927,138 @@ impl App {
             }
         }
 
-        const MAX_MESHES_PER_FRAME: usize = 4;
-        let mut processed_meshes = 0;
-        while processed_meshes < MAX_MESHES_PER_FRAME {
+        while let Ok(result) = self.mesh_result_rx.try_recv() {
+            self.ready_chunk_meshes.push_back(result);
+            if self.mesh_jobs_in_flight > 0 {
+                self.mesh_jobs_in_flight -= 1;
+            }
+        }
+
+        let max_inflight = self.max_inflight_jobs();
+        while self.mesh_jobs_in_flight < max_inflight {
             let Some(key) = self.pending_chunk_meshes.pop_front() else {
                 break;
             };
-            self.pending_chunk_set.remove(&key);
 
             match self
                 .world
                 .get_leaf_chunk_at_origin(WorldPos::new(key.0, key.1, key.2))
             {
                 Some(chunk) => {
-                    let mesh = generate_chunk_mesh(chunk, &self.palette);
-                    if mesh.indices.is_empty() {
-                        processed_meshes += 1;
-                        continue;
-                    }
-
-                    if new_meshes_created == 0 {
-                        let num_voxels = chunk.iter().count();
-                        viewer_debug!(
-                            "DEBUG first mesh at ({},{},{}): {} voxels in chunk, {} vertices, {} triangles",
-                            key.0, key.1, key.2, num_voxels, mesh.vertices.len(), mesh.indices.len() / 3
-                        );
-                        for (i, v) in mesh.vertices.iter().enumerate() {
-                            viewer_debug!(
-                                "  vertex {}: pos=[{:.1},{:.1},{:.1}] normal=[{:.1},{:.1},{:.1}]",
-                                i,
-                                v.position[0],
-                                v.position[1],
-                                v.position[2],
-                                v.normal[0],
-                                v.normal[1],
-                                v.normal[2]
-                            );
-                        }
-                    }
-
-                    let vb_data: Vec<MeshVertexRaw> = mesh
-                        .vertices
-                        .iter()
-                        .map(|v| MeshVertexRaw {
-                            position: [
-                                v.position[0] + key.0 as f32,
-                                v.position[1] + key.1 as f32,
-                                v.position[2] + key.2 as f32,
-                            ],
-                            normal: v.normal,
-                            color: v.color,
+                    if self
+                        .mesh_job_tx
+                        .send(MeshJob {
+                            key,
+                            chunk: chunk.clone(),
                         })
-                        .collect();
-                    let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("Chunk Mesh Vertex Buffer"),
-                        contents: bytemuck::cast_slice(&vb_data),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    });
-                    let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("Chunk Mesh Index Buffer"),
-                        contents: bytemuck::cast_slice(&mesh.indices),
-                        usage: wgpu::BufferUsages::INDEX,
-                    });
-                    let vertex_bytes =
-                        (vb_data.len() * std::mem::size_of::<MeshVertexRaw>()) as u64;
-                    let index_bytes = (mesh.indices.len() * std::mem::size_of::<u32>()) as u64;
-                    viewer_debug!(
-                        "Created mesh for chunk ({},{},{}): {} vertices, {} triangles",
-                        key.0,
-                        key.1,
-                        key.2,
-                        mesh.vertices.len(),
-                        mesh.indices.len() / 3
-                    );
-                    let entry = MeshCacheEntry {
-                        vertex_buffer: vbuf,
-                        index_buffer: ibuf,
-                        index_count: mesh.indices.len() as u32,
-                        vertex_bytes,
-                        index_bytes,
-                        last_used_frame: self.frame_index,
-                    };
-                    self.mesh_cache.insert(key, entry);
-                    self.mesh_cache_bytes += vertex_bytes + index_bytes;
-                    self.fallback_chunk_instances.remove(&key);
-                    new_meshes_created += 1;
-
-                    if leaf_chunks.contains(&key) {
-                        cpu_mesh_keys.insert(key);
-                        missing_chunks.remove(&key);
+                        .is_ok()
+                    {
+                        self.mesh_jobs_in_flight += 1;
+                    } else {
+                        self.pending_chunk_meshes.push_front(key);
+                        self.pending_chunk_set.remove(&key);
+                        break;
                     }
                 }
                 None => {
+                    self.pending_chunk_set.remove(&key);
                     chunks_not_found += 1;
                 }
             }
+        }
 
+        let mut processed_meshes = 0;
+        while processed_meshes < self.mesh_upload_limit {
+            let Some(result) = self.ready_chunk_meshes.pop_front() else {
+                break;
+            };
+
+            let MeshResult {
+                key,
+                mesh,
+                voxel_count,
+            } = result;
+            self.pending_chunk_set.remove(&key);
             processed_meshes += 1;
+
+            if mesh.indices.is_empty() {
+                continue;
+            }
+
+            if new_meshes_created == 0 {
+                viewer_debug!(
+                    "DEBUG first mesh at ({},{},{}): {} voxels in chunk, {} vertices, {} triangles",
+                    key.0,
+                    key.1,
+                    key.2,
+                    voxel_count,
+                    mesh.vertices.len(),
+                    mesh.indices.len() / 3
+                );
+                for (i, v) in mesh.vertices.iter().enumerate() {
+                    viewer_debug!(
+                        "  vertex {}: pos=[{:.1},{:.1},{:.1}] normal=[{:.1},{:.1},{:.1}]",
+                        i,
+                        v.position[0],
+                        v.position[1],
+                        v.position[2],
+                        v.normal[0],
+                        v.normal[1],
+                        v.normal[2]
+                    );
+                }
+            }
+
+            let vb_data: Vec<MeshVertexRaw> = mesh
+                .vertices
+                .iter()
+                .map(|v| MeshVertexRaw {
+                    position: [
+                        v.position[0] + key.0 as f32,
+                        v.position[1] + key.1 as f32,
+                        v.position[2] + key.2 as f32,
+                    ],
+                    normal: v.normal,
+                    color: v.color,
+                })
+                .collect();
+            let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Chunk Mesh Vertex Buffer"),
+                contents: bytemuck::cast_slice(&vb_data),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Chunk Mesh Index Buffer"),
+                contents: bytemuck::cast_slice(&mesh.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            let vertex_bytes = (vb_data.len() * std::mem::size_of::<MeshVertexRaw>()) as u64;
+            let index_bytes = (mesh.indices.len() * std::mem::size_of::<u32>()) as u64;
+            viewer_debug!(
+                "Created mesh for chunk ({},{},{}): {} vertices, {} triangles",
+                key.0,
+                key.1,
+                key.2,
+                mesh.vertices.len(),
+                mesh.indices.len() / 3
+            );
+            let entry = MeshCacheEntry {
+                vertex_buffer: vbuf,
+                index_buffer: ibuf,
+                index_count: mesh.indices.len() as u32,
+                vertex_bytes,
+                index_bytes,
+                last_used_frame: self.frame_index,
+            };
+            self.mesh_cache.insert(key, entry);
+            self.mesh_cache_bytes += vertex_bytes + index_bytes;
+            self.fallback_chunk_instances.remove(&key);
+            new_meshes_created += 1;
+
+            if leaf_chunks.contains(&key) {
+                cpu_mesh_keys.insert(key);
+                missing_chunks.remove(&key);
+            }
         }
         let mesh_time = mesh_start.elapsed();
 
@@ -2985,11 +3140,14 @@ impl App {
 
         if cfg!(feature = "viewer-debug") && self.frame_count % 60 == 0 {
             viewer_debug!(
-                "Mesh stats: {} cached meshes, {} new this frame, {} potential chunks, pending {}, fallback instances {}",
+                "Mesh stats: {} cached meshes, {} new this frame, {} potential chunks, pending {}, ready {}, inflight {}, upload_limit {}, fallback instances {}",
                 self.mesh_cache.len(),
                 new_meshes_created,
                 leaf_chunks.len(),
                 self.pending_chunk_meshes.len(),
+                self.ready_chunk_meshes.len(),
+                self.mesh_jobs_in_flight,
+                self.mesh_upload_limit,
                 instances.len()
             );
             viewer_debug!(
