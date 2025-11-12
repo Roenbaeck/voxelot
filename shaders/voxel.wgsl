@@ -19,12 +19,14 @@ struct VertexOutputInstanced {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec3<f32>,
     @location(1) normal: vec3<f32>,
+    @location(2) emissive: vec4<f32>,
 };
 
 struct VertexOutputMesh {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec3<f32>,
     @location(1) normal: vec3<f32>,
+    @location(2) emissive: vec4<f32>,
 };
 
 // Cube vertices (36 vertices for 6 faces)
@@ -100,6 +102,7 @@ fn vs_main(
     @location(3) instance_custom_color: vec4<f32>,
     @location(4) vertex_position: vec3<f32>,
     @location(5) vertex_normal: vec3<f32>,
+    @location(6) instance_emissive: vec4<f32>,
 ) -> VertexOutputInstanced {
     var output: VertexOutputInstanced;
     
@@ -117,6 +120,8 @@ fn vs_main(
     } else {
         output.color = get_voxel_color(instance_voxel_type);
     }
+
+    output.emissive = instance_emissive;
     
     return output;
 }
@@ -137,7 +142,8 @@ fn fs_main(input: VertexOutputInstanced) -> @location(0) vec4<f32> {
     let lighting = ambient + sun_contribution;
     
     // Apply lighting to voxel color
-    let color = input.color * lighting;
+    let emissive = input.emissive.rgb * input.emissive.a;
+    let color = input.color * lighting + emissive;
     
     // Atmospheric fog with dynamic density from uniforms
     let fog_color = vec3<f32>(0.7, 0.8, 0.9); // Light blue sky
@@ -154,11 +160,13 @@ fn vs_mesh(
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) color: vec4<f32>,
+    @location(3) emissive: vec4<f32>,
 ) -> VertexOutputMesh {
     var out: VertexOutputMesh;
     out.position = uniforms.mvp * vec4<f32>(position, 1.0);
     out.normal = normal;
     out.color = color.rgb;
+    out.emissive = emissive;
     return out;
 }
 
@@ -169,7 +177,8 @@ fn fs_mesh(input: VertexOutputMesh) -> @location(0) vec4<f32> {
     let sun_contribution = diffuse * uniforms.sun_color;
     let ambient = uniforms.ambient_color;
     let lighting = ambient + sun_contribution;
-    let color = input.color * lighting;
+    let emissive = input.emissive.rgb * input.emissive.a;
+    let color = input.color * lighting + emissive;
     let fog_color = vec3<f32>(0.7, 0.8, 0.9);
     let distance = length(input.position.xyz);
     let fog_factor = 1.0 - exp(-uniforms.fog_density * distance);

@@ -10,6 +10,8 @@
 
 use croaring::Bitmap;
 
+use crate::palette::Palette;
+
 /// Voxel type identifier
 pub type VoxelType = u8;
 
@@ -76,6 +78,18 @@ pub struct Chunk {
     /// LOD metadata: Average RGBA color for distance rendering
     /// Alpha represents occupancy (0 = empty, 255 = fully dense)
     pub average_color: [u8; 4],
+
+    /// Sum of emissive RGB (intensity-weighted) for voxels in this chunk
+    pub emissive_sum: [f32; 3],
+
+    /// Total emissive intensity across voxels in this chunk
+    pub emissive_power: f32,
+
+    /// Count of voxels contributing emissive light
+    pub emissive_voxels: u32,
+
+    /// Ratio of solid voxels to total slots (0.0..=1.0)
+    pub solid_ratio: f32,
 }
 
 impl Chunk {
@@ -89,6 +103,10 @@ impl Chunk {
             voxels: Vec::new(),
             voxel_count: 0,
             average_color: [0, 0, 0, 0], // Empty chunk = transparent
+            emissive_sum: [0.0, 0.0, 0.0],
+            emissive_power: 0.0,
+            emissive_voxels: 0,
+            solid_ratio: 0.0,
         }
     }
 
@@ -240,42 +258,55 @@ impl Chunk {
         self.presence.is_empty()
     }
 
-    /// Update LOD metadata: voxel_count and average_color
-    /// Should be called after modifying chunk contents
-    pub fn update_lod_metadata(&mut self) {
-        const TOTAL_SLOTS: u32 = 16 * 16 * 16; // 4096
+    /// Update LOD metadata using palette material properties for this chunk.
+    /// Should be called after modifying chunk contents.
+    pub fn update_lod_metadata(&mut self, palette: &Palette) {
+        const TOTAL_SLOTS: f32 = (16 * 16 * 16) as f32; // 4096
 
-        let mut color_sum = [0u32; 4]; // RGBA
+        let mut albedo_sum = [0.0f32; 4];
+        let mut emissive_sum = [0.0f32; 3];
+        let mut emissive_power = 0.0f32;
+        let mut emissive_voxels = 0u32;
         let mut solid_count = 0u32;
 
-        // Sum colors of all solid voxels
         for voxel in &self.voxels {
             if let Voxel::Solid(voxel_type) = voxel {
-                let rgba = voxel_type_to_rgba(*voxel_type);
-                color_sum[0] += rgba[0] as u32;
-                color_sum[1] += rgba[1] as u32;
-                color_sum[2] += rgba[2] as u32;
-                color_sum[3] += rgba[3] as u32;
+                let material = palette.material(*voxel_type as u32);
+                albedo_sum[0] += material.albedo[0];
+                albedo_sum[1] += material.albedo[1];
+                albedo_sum[2] += material.albedo[2];
+                albedo_sum[3] += material.albedo[3];
                 solid_count += 1;
+
+                if material.emissive_intensity > 0.0 {
+                    let intensity = material.emissive_intensity;
+                    emissive_sum[0] += material.emissive[0] * intensity;
+                    emissive_sum[1] += material.emissive[1] * intensity;
+                    emissive_sum[2] += material.emissive[2] * intensity;
+                    emissive_power += intensity;
+                    emissive_voxels += 1;
+                }
             }
-            // Note: Voxel::Chunk is not counted as solid for LOD purposes
-            // When rendering, subdivided chunks will recursively update their own LOD
         }
 
         self.voxel_count = solid_count;
+        self.solid_ratio = solid_count as f32 / TOTAL_SLOTS;
 
-        // Average across ALL slots (including empty ones)
-        // This makes sparse chunks naturally transparent (low alpha)
         if solid_count > 0 {
+            let occupancy_scale = 255.0 / TOTAL_SLOTS;
             self.average_color = [
-                (color_sum[0] / TOTAL_SLOTS) as u8,
-                (color_sum[1] / TOTAL_SLOTS) as u8,
-                (color_sum[2] / TOTAL_SLOTS) as u8,
-                (color_sum[3] / TOTAL_SLOTS) as u8,
+                (albedo_sum[0] * occupancy_scale).clamp(0.0, 255.0) as u8,
+                (albedo_sum[1] * occupancy_scale).clamp(0.0, 255.0) as u8,
+                (albedo_sum[2] * occupancy_scale).clamp(0.0, 255.0) as u8,
+                (albedo_sum[3] * occupancy_scale).clamp(0.0, 255.0) as u8,
             ];
         } else {
-            self.average_color = [0, 0, 0, 0]; // Empty = transparent
+            self.average_color = [0, 0, 0, 0];
         }
+
+        self.emissive_sum = emissive_sum;
+        self.emissive_power = emissive_power;
+        self.emissive_voxels = emissive_voxels;
     }
 
     /// Iterator over all voxel positions
@@ -749,22 +780,23 @@ impl World {
     }
 
     /// Update LOD metadata for all chunks recursively (call after world generation)
-    /// This walks through the entire hierarchy and updates voxel_count and average_color
-    pub fn update_all_lod_metadata(&mut self) {
-        Self::update_chunk_lod_recursive(&mut self.root);
+    /// This walks through the entire hierarchy and updates voxel_count, average_color,
+    /// and emissive aggregates using the provided palette.
+    pub fn update_all_lod_metadata(&mut self, palette: &Palette) {
+        Self::update_chunk_lod_recursive(&mut self.root, palette);
     }
 
     /// Recursive helper to update LOD metadata bottom-up
-    fn update_chunk_lod_recursive(chunk: &mut Chunk) {
+    fn update_chunk_lod_recursive(chunk: &mut Chunk, palette: &Palette) {
         // First, recursively update all sub-chunks
         for voxel in &mut chunk.voxels {
             if let Voxel::Chunk(sub_chunk) = voxel {
-                Self::update_chunk_lod_recursive(sub_chunk);
+                Self::update_chunk_lod_recursive(sub_chunk, palette);
             }
         }
 
         // Then update this chunk's metadata
-        chunk.update_lod_metadata();
+        chunk.update_lod_metadata(palette);
     }
 }
 

@@ -2327,4 +2327,274 @@ So:
 - For straightforward tilt-shift DoF and bloom:
   - You’re already fully compatible; just implement them
 
-  
+---
+  What's the smartest way to achieve lighting and shadows given this structure?
+---
+Love this question; this is where your structure really pays off.
+
+You’ve built:
+
+- A hierarchical, uniform 16³ chunk tree.
+- Sparse + indexed (Roaring/bitmasks).
+- Per-chunk aggregates (`voxel_count`, `average_color`).
+- A GPU-mappable representation (with `ChunkId` etc. as we outlined).
+
+That is almost exactly what modern “smart” voxel lighting structures want.
+
+I’ll give you a practical, layered answer:
+
+1) A solid baseline: direct lighting + shadows that fit your structure today
+2) Smarter: how to use the hierarchy for fast shadowing and soft shadows
+3) Global-ish lighting: GI/GTAO/ambient using your chunks as a voxel probe volume
+4) Concrete recommendations/constraints
+
+1. Baseline: direct lighting + shadows (pragmatic starting point)
+
+If you need something robust and shippable:
+
+- Use your voxel world as the geometry source.
+- Shadowing via classic raster or simple voxel ray tests.
+
+Recommended baseline:
+
+- Direct lighting:
+  - For each visible fragment:
+    - Get `VoxelType` → material (albedo, roughness, emissive, etc).
+    - Evaluate direct lights (directional/sun + a few punctuals) with standard BRDF.
+
+- Directional light shadows:
+  - Easiest: classic shadow map from rasterized voxel mesh.
+  - You can:
+    - Mesh once from your voxel world (GPU compute from `GpuChunk`/`GpuVoxel`).
+    - Render that mesh into a shadow map.
+  - Or:
+    - Raycast through your voxel structure in light space (see section 2) for a pure-voxel shadow test.
+
+- Point/spot light shadows:
+  - Start with:
+    - No shadows, or
+    - Shadow cubemaps from meshed voxels if needed.
+
+This baseline is:
+- Simple.
+- High quality (if meshing is decent).
+- Lets you focus on getting materials/pipeline right.
+
+Your structure supports meshing nicely:
+- You already know which surfaces are exposed via per-chunk voxel queries.
+- A compute shader can generate meshes chunk-by-chunk from your GPU buffers.
+
+2. Smarter: voxel-accelerated shadows using your hierarchy
+
+Once you’re comfortable, you can lean on the hierarchy instead of meshes, especially for:
+
+- Sun shadows
+- Soft shadows
+- Large-scale occlusion
+
+Key idea:
+
+- For each shadow query (point in world, direction to light):
+  - Traverse your chunk tree along the ray.
+  - Use per-chunk occupancy to early-out.
+  - Optionally sample at multiple resolutions for soft falloff.
+
+A. Coarse-to-fine shadow test (directional light)
+
+For a point P and light direction L (e.g. sun):
+
+- March along ray:
+  - At each step:
+    - Identify which chunk you are in at each hierarchy level.
+    - At coarse levels:
+      - If chunk `voxel_count == 0`: skip ahead.
+      - If chunk is fully solid or very dense:
+        - Immediately mark as in shadow.
+      - Else:
+        - Descend or continue stepping at finer resolution.
+
+With your data:
+
+- Use `px, py, pz`:
+  - Quickly see if direction’s path hits any occupied coordinates.
+- Use `voxel_count`:
+  - As density for probabilistic soft shadows:
+    - High count along path → darker penumbra.
+- Use `average_color`:
+  - For colored occlusion or transmissive-ish materials.
+
+This can run:
+
+- In a compute shader for a shadow buffer.
+- Or on CPU for select samples (e.g. cascaded probes).
+
+B. Hybrid approach (smart and practical):
+
+- Use cascaded shadow maps for the sun (classic).
+- Enhance or replace distant cascades with:
+  - Voxel shadowing from your chunk hierarchy:
+    - Much cheaper at huge scales.
+    - Stable across LOD.
+- For close-up detail:
+  - Either mesh-based shadow maps (high res).
+  - Or fine-grained voxel ray tests inside leaf chunks.
+
+This uses your structure where it’s strong:
+- Coarse/distant.
+- Huge environments.
+- Doesn’t require perfectly watertight meshes.
+
+3. Global illumination / ambient: where your setup shines
+
+You basically already have a sparse voxel GI volume:
+
+- Hierarchical grid.
+- Per-node occupancy and average color.
+- GPU-readable layout.
+
+You can implement a lightweight but convincing GI in stages.
+
+A. Voxel-based ambient occlusion (fast, high impact)
+
+Use your hierarchy to compute SSAO-like effects without sampling only the depth buffer.
+
+For each visible point:
+
+- Sample several directions in hemisphere.
+- For each:
+  - March a short distance in voxel space using your chunk data (coarse steps).
+  - If you hit solid voxels quickly:
+    - Increase occlusion.
+- This:
+  - Is chunk/hierarchy-based.
+  - More stable than pure depth SSAO.
+  - Naturally respects large occluders.
+
+Implementation sketch (GPU):
+
+- From pixel: reconstruct world position and normal.
+- For each sample direction:
+  - Convert to voxel/chunk coordinates.
+  - Step:
+    - At coarse levels using `voxel_count`/`px/py/pz` to see if space is filled.
+    - Only dive deeper near the surface if needed.
+
+B. One-bounce voxel cone tracing (approximated, using your metadata)
+
+You can do a cheap version without a full-blown SVO:
+
+- Treat each chunk’s:
+  - `average_color` as its irradiance/radiance.
+  - `voxel_count / 4096` as opacity/density.
+
+For each pixel:
+
+- Cast a few wide cones into scene (in hemisphere).
+- Traverse hierarchy:
+
+  - At each chunk:
+    - If cone footprint at that distance is larger than chunk size:
+      - Stop descending.
+      - Accumulate `average_color` attenuated by density and distance.
+    - Else:
+      - Descend into children if present.
+
+This gives you:
+
+- Soft, view-dependent indirect light.
+- Coarse but coherent global illumination.
+- Fully consistent with your voxel data and LOD.
+
+It maps perfectly onto your uniform 16³ hierarchy and `GpuChunk` layout.
+
+C. Emissive voxels and bloom-ready GI
+
+Because you’ll likely:
+
+- Tag emissive materials (neon signs, windows, etc.).
+
+You can:
+
+- Build a “light volume” by:
+  - For each chunk:
+    - Compute average emissive color.
+  - Use that in cone tracing for bounced light.
+- Bloom:
+  - Already uses bright pixels.
+- GI:
+  - Uses the same emissive data but spatially integrated via hierarchy.
+
+4. Concrete design recommendations
+
+To make lighting and shadows “smart” with your structure, I’d suggest:
+
+1) Material system
+
+Extend `VoxelType` → material table with:
+
+- `albedo` (linear space)
+- `emissive` (HDR)
+- `opacity/coverage`
+- `flags`:
+  - `LIGHT_SOURCE`, `CASTS_SHADOW`, `TRANSLUCENT`, `NO_GI`, etc.
+
+This is essential:
+- It lets shadows/GI discriminate between air, rock, glass, neon, etc.
+
+2) Chunk-level aggregates per material class
+
+You already have:
+
+- `average_color`
+- `voxel_count`
+
+Consider adding or deriving:
+
+- `emissive_sum` or `emissive_avg`
+- `solid_voxel_count`
+- Maybe:
+  - `has_emissive`
+  - `has_transparent`
+
+Those let you:
+
+- Early-out cones in empty chunks.
+- Quickly skip non-emissive regions.
+- Treat dense, uniform chunks as solid blockers in shadow rays.
+
+3) Choose a primary technique stack
+
+A smart, realistic combo for your engine:
+
+- Direct lighting:
+  - Forward+ or clustered shading using your voxel-derived geometry.
+- Sun shadows:
+  - Cascaded shadow maps for near/mid.
+  - Optional voxel shadowing (hierarchical test) for far and soft penumbra.
+- AO:
+  - Hybrid:
+    - Screen-space AO + voxel-occlusion correction using hierarchy (for large-scale occlusion).
+- GI (optional, scalable):
+  - Start small:
+    - Voxel-based ambient term from chunk averages.
+  - Then:
+    - Add limited cone tracing for 1-bounce diffuse in key directions.
+- Bloom:
+  - Pure screen-space, driven by emissive materials.
+- DoF / tilt-shift:
+  - Screen-space blur with depth and material-aware rules.
+
+4) What not to do (yet)
+
+- Don’t jump straight to full “real-time path traced SVO GI”:
+  - Your structure can go there, but it’ll explode complexity.
+- Don’t over-fragment chunks:
+  - Lighting loves coherence. Use merge heuristics to keep large uniform regions.
+
+If you’d like, next I can:
+
+- Sketch:
+  - A concrete sun-shadow query function using the hierarchy (CPU or GPU).
+  - A minimal cone-tracing GI shader that uses `GpuChunk`/`average_color`.
+  - Or a material table layout + how to integrate it into your current voxel pipeline.
+

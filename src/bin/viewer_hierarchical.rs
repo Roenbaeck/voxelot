@@ -57,6 +57,7 @@ struct VoxelInstanceRaw {
     voxel_type: u32,
     scale: f32,             // Scale factor (1.0 = 1x1x1, 16.0 = 16x16x16 chunk)
     custom_color: [f32; 4], // RGBA custom color (if custom_color.a > 0, use this instead of voxel_type)
+    emissive: [f32; 4],
 }
 
 /// Input layout for GPU culling compute pass (std430-friendly)
@@ -91,6 +92,7 @@ struct MeshVertexRaw {
     position: [f32; 3],
     normal: [f32; 3],
     color: [f32; 4],
+    emissive: [f32; 4],
 }
 
 #[repr(C)]
@@ -114,6 +116,20 @@ impl MeshCacheEntry {
     fn total_bytes(&self) -> u64 {
         self.vertex_bytes + self.index_bytes
     }
+}
+
+#[derive(Clone, Debug)]
+struct ChunkEmitterWorld {
+    position: [f32; 3],
+    color: [f32; 3],
+    intensity: f32,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveLight {
+    position: [f32; 3],
+    color: [f32; 3],
+    intensity: f32,
 }
 
 #[derive(Debug)]
@@ -605,6 +621,8 @@ struct App {
     mesh_cache: HashMap<(i64, i64, i64), MeshCacheEntry>,
     mesh_cache_bytes: u64,
     fallback_chunk_instances: HashMap<(i64, i64, i64), Vec<VoxelInstanceRaw>>,
+    chunk_emitters: HashMap<(i64, i64, i64), Vec<ChunkEmitterWorld>>,
+    active_emitters: Vec<ActiveLight>,
     system_info: System,
     process_pid: Pid,
     instance_capacity: usize,
@@ -867,8 +885,8 @@ impl App {
         let mesh_upload_baseline = 4usize;
         let mesh_upload_max = (mesh_worker_count * 4).max(mesh_upload_baseline * 2);
 
-        println!("Updating LOD metadata...");
-        world.update_all_lod_metadata();
+    println!("Updating LOD metadata...");
+    world.update_all_lod_metadata(&palette);
         println!("LOD metadata updated");
 
         println!("\n=== Controls ===");
@@ -905,6 +923,8 @@ impl App {
             mesh_cache: HashMap::new(),
             mesh_cache_bytes: 0,
             fallback_chunk_instances: HashMap::new(),
+            chunk_emitters: HashMap::new(),
+            active_emitters: Vec::new(),
             system_info,
             process_pid,
             instance_capacity: 0,
@@ -1752,6 +1772,7 @@ impl App {
                 entry.vertex_buffer.destroy();
                 entry.index_buffer.destroy();
                 self.mesh_cache_bytes = self.mesh_cache_bytes.saturating_sub(entry_bytes);
+                self.chunk_emitters.remove(&key);
                 freed_bytes += entry_bytes;
                 evicted += 1;
             }
@@ -1768,7 +1789,7 @@ impl App {
         }
     }
 
-    fn voxel_to_raw(v: &VoxelInstance) -> VoxelInstanceRaw {
+    fn voxel_to_raw(v: &VoxelInstance, palette: &Palette) -> VoxelInstanceRaw {
         let custom_color_f32 = if let Some(rgba) = v.custom_color {
             [
                 rgba[0] as f32 / 255.0,
@@ -1782,6 +1803,12 @@ impl App {
             [0.0, 0.0, 0.0, 0.0]
         };
 
+        let (emissive_rgb, emissive_intensity) = if v.custom_color.is_some() {
+            ([0.0, 0.0, 0.0], 0.0)
+        } else {
+            palette.emissive(v.voxel_type as u32)
+        };
+
         VoxelInstanceRaw {
             position: [
                 v.position[0] as f32,
@@ -1791,6 +1818,12 @@ impl App {
             voxel_type: v.voxel_type as u32,
             scale: v.scale as f32,
             custom_color: custom_color_f32,
+            emissive: [
+                emissive_rgb[0],
+                emissive_rgb[1],
+                emissive_rgb[2],
+                emissive_intensity,
+            ],
         }
     }
 
@@ -1827,12 +1860,18 @@ impl App {
             match voxel {
                 Voxel::Solid(voxel_type) => {
                     if Self::voxel_has_exposed_face(chunk, lx, ly, lz) {
-                        let color = palette.color(*voxel_type as u32);
+                        let material = palette.material(*voxel_type as u32);
                         out.push(VoxelInstanceRaw {
                             position: [world_pos.0 as f32, world_pos.1 as f32, world_pos.2 as f32],
                             voxel_type: *voxel_type as u32,
                             scale: 1.0,
-                            custom_color: color,
+                            custom_color: material.albedo,
+                            emissive: [
+                                material.emissive[0],
+                                material.emissive[1],
+                                material.emissive[2],
+                                material.emissive_intensity,
+                            ],
                         });
                     }
                 }
@@ -2041,7 +2080,8 @@ impl App {
                             0 => Float32x3,  // position
                             1 => Uint32,     // voxel_type
                             2 => Float32,    // scale
-                            3 => Float32x4   // custom_color (RGBA)
+                            3 => Float32x4,  // custom_color (RGBA)
+                            6 => Float32x4   // emissive (RGB + intensity)
                         ],
                     },
                 ],
@@ -2093,7 +2133,12 @@ impl App {
                     wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<MeshVertexRaw>() as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4],
+                        attributes: &wgpu::vertex_attr_array![
+                            0 => Float32x3,
+                            1 => Float32x3,
+                            2 => Float32x4,
+                            3 => Float32x4
+                        ],
                     }
                 ],
                 compilation_options: Default::default(),
@@ -2962,6 +3007,7 @@ impl App {
                 }
                 None => {
                     self.pending_chunk_set.remove(&key);
+                    self.chunk_emitters.remove(&key);
                     chunks_not_found += 1;
                 }
             }
@@ -2980,6 +3026,29 @@ impl App {
             } = result;
             self.pending_chunk_set.remove(&key);
             processed_meshes += 1;
+
+            if mesh.emitters.is_empty() {
+                self.chunk_emitters.remove(&key);
+            } else {
+                let world_emitters: Vec<ChunkEmitterWorld> = mesh
+                    .emitters
+                    .iter()
+                    .map(|emitter| ChunkEmitterWorld {
+                        position: [
+                            key.0 as f32 + emitter.position[0],
+                            key.1 as f32 + emitter.position[1],
+                            key.2 as f32 + emitter.position[2],
+                        ],
+                        color: emitter.color,
+                        intensity: emitter.intensity,
+                    })
+                    .collect();
+                if world_emitters.is_empty() {
+                    self.chunk_emitters.remove(&key);
+                } else {
+                    self.chunk_emitters.insert(key, world_emitters);
+                }
+            }
 
             if mesh.indices.is_empty() {
                 continue;
@@ -3020,6 +3089,7 @@ impl App {
                     ],
                     normal: v.normal,
                     color: v.color,
+                    emissive: v.emissive,
                 })
                 .collect();
             let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -3101,16 +3171,28 @@ impl App {
                     if let Some(fallback) = self.fallback_instances_for_chunk(key) {
                         out.extend_from_slice(fallback);
                     } else {
-                        out.push(Self::voxel_to_raw(v));
+                        out.push(Self::voxel_to_raw(v, &self.palette));
                     }
                     continue;
                 }
+
+                let (emissive_rgb, emissive_intensity) = if input.custom_color[3] > 0.0 {
+                    ([0.0, 0.0, 0.0], 0.0)
+                } else {
+                    self.palette.emissive(input.voxel_type)
+                };
 
                 out.push(VoxelInstanceRaw {
                     position: input.position,
                     voxel_type: input.voxel_type,
                     scale: input.scale,
                     custom_color: input.custom_color,
+                    emissive: [
+                        emissive_rgb[0],
+                        emissive_rgb[1],
+                        emissive_rgb[2],
+                        emissive_intensity,
+                    ],
                 });
             }
 
@@ -3127,10 +3209,10 @@ impl App {
                     if let Some(fallback) = self.fallback_instances_for_chunk(key) {
                         out.extend_from_slice(fallback);
                     } else {
-                        out.push(Self::voxel_to_raw(v));
+                        out.push(Self::voxel_to_raw(v, &self.palette));
                     }
                 } else {
-                    out.push(Self::voxel_to_raw(v));
+                    out.push(Self::voxel_to_raw(v, &self.palette));
                 }
             }
 
@@ -3138,9 +3220,25 @@ impl App {
         };
         let instance_time = instance_start.elapsed();
 
+        self.active_emitters.clear();
+        for key in &draw_mesh_keys {
+            if let Some(emitters) = self.chunk_emitters.get(key) {
+                self.active_emitters.extend(emitters.iter().map(|emitter| ActiveLight {
+                    position: emitter.position,
+                    color: emitter.color,
+                    intensity: emitter.intensity,
+                }));
+            }
+        }
+
         if cfg!(feature = "viewer-debug") && self.frame_count % 60 == 0 {
+            let total_emitters: usize = self
+                .chunk_emitters
+                .values()
+                .map(|list| list.len())
+                .sum();
             viewer_debug!(
-                "Mesh stats: {} cached meshes, {} new this frame, {} potential chunks, pending {}, ready {}, inflight {}, upload_limit {}, fallback instances {}",
+                "Mesh stats: {} cached meshes, {} new this frame, {} potential chunks, pending {}, ready {}, inflight {}, upload_limit {}, fallback instances {}, emitters {} (active {})",
                 self.mesh_cache.len(),
                 new_meshes_created,
                 leaf_chunks.len(),
@@ -3148,7 +3246,9 @@ impl App {
                 self.ready_chunk_meshes.len(),
                 self.mesh_jobs_in_flight,
                 self.mesh_upload_limit,
-                instances.len()
+                instances.len(),
+                total_emitters,
+                self.active_emitters.len()
             );
             viewer_debug!(
                 "GPU cull: candidates {} -> draw meshes {} -> instanced {}",

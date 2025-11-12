@@ -1,6 +1,6 @@
 //! Greedy meshing for bottom-level chunks (16x16x16)
 
-use crate::lib_hierarchical::Chunk;
+use crate::lib_hierarchical::{Chunk, Voxel};
 use crate::palette::Palette;
 
 macro_rules! mesh_debug {
@@ -16,6 +16,14 @@ pub struct MeshVertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
     pub color: [f32; 4],
+    pub emissive: [f32; 4],
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct ChunkEmitter {
+    pub position: [f32; 3],
+    pub color: [f32; 3],
+    pub intensity: f32,
 }
 
 /// Mesh output for a chunk
@@ -23,6 +31,7 @@ pub struct MeshVertex {
 pub struct ChunkMesh {
     pub vertices: Vec<MeshVertex>,
     pub indices: Vec<u32>,
+    pub emitters: Vec<ChunkEmitter>,
 }
 
 /// Generate a greedy mesh for a 16x16x16 chunk.
@@ -39,6 +48,24 @@ pub fn generate_chunk_mesh(chunk: &Chunk, palette: &Palette) -> ChunkMesh {
         voxel_count,
         first_voxel
     );
+
+    // Capture all emissive voxels (center positions within the chunk)
+    for ((x, y, z), voxel) in chunk.iter() {
+        if let Voxel::Solid(voxel_type) = voxel {
+            let (emissive_color, emissive_intensity) = palette.emissive(*voxel_type as u32);
+            let has_emission = emissive_intensity > 0.0
+                && (emissive_color[0] > 0.0
+                    || emissive_color[1] > 0.0
+                    || emissive_color[2] > 0.0);
+            if has_emission {
+                mesh.emitters.push(ChunkEmitter {
+                    position: [x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5],
+                    color: emissive_color,
+                    intensity: emissive_intensity,
+                });
+            }
+        }
+    }
 
     // Helper to get voxel type at (x,y,z)
     let get_type = |x: i32, y: i32, z: i32| -> Option<u8> {
@@ -198,8 +225,15 @@ fn emit_quad(
     let mut normal = [0.0f32; 3];
     normal[axis] = if positive { -1.0 } else { 1.0 };
 
-    // Color from palette (per-voxel RGBA)
-    let color = palette.color(mat as u32);
+    // Color and emissive data from palette
+    let material = palette.material(mat as u32);
+    let color = material.albedo;
+    let emissive = [
+        material.emissive[0],
+        material.emissive[1],
+        material.emissive[2],
+        material.emissive_intensity,
+    ];
 
     // Four corners (in voxel space), convert to f32
     let p0 = [base[0] as f32, base[1] as f32, base[2] as f32];
@@ -225,21 +259,25 @@ fn emit_quad(
             position: p0,
             normal,
             color,
+            emissive,
         },
         MeshVertex {
             position: p1,
             normal,
             color,
+            emissive,
         },
         MeshVertex {
             position: p2,
             normal,
             color,
+            emissive,
         },
         MeshVertex {
             position: p3,
             normal,
             color,
+            emissive,
         },
     ]);
 

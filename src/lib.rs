@@ -11,5 +11,5 @@ pub use culling::{
     get_visible_chunks, Camera, ChunkRenderInfo, RenderConfig, VisibilityCache, VoxelInstance,
 };
 pub use lib_hierarchical::{Chunk, Voxel, VoxelType, World, WorldPos};
-pub use meshing::{generate_chunk_mesh, ChunkMesh, MeshVertex};
+pub use meshing::{generate_chunk_mesh, ChunkEmitter, ChunkMesh, MeshVertex};
 pub use palette::Palette;
