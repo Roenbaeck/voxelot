@@ -152,6 +152,15 @@ struct MeshResult {
     voxel_count: u32,
 }
 
+/// Light probe for emissive indirect lighting
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct LightProbe {
+    position: [f32; 3],
+    _pad0: f32,
+    color_power: [f32; 4], // RGB from emissive_sum, A = emissive_power
+}
+
 /// Uniforms for shader (matches shader layout exactly)
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -164,6 +173,10 @@ struct Uniforms {
     sun_color_pad: [f32; 4],             // xyz = sun color
     ambient_color_pad: [f32; 4],         // xyz = ambient color
     shadow_texel_size_pad: [f32; 4],     // xy = 1 / shadow map size
+    light_probe_count: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 /// Depth-of-field runtime settings (CPU-side convenience)
@@ -671,6 +684,8 @@ struct App {
     time_of_day: f32,
     time_paused: bool,
     fog_density: f32,
+    light_probe_buffer: Option<wgpu::Buffer>,
+    light_probe_capacity: usize,
 
     // LOD state
     lod_distance: f32,
@@ -979,6 +994,8 @@ impl App {
             time_of_day: 0.5,    // Start at noon
             time_paused: false,  // Time cycle starts running
             fog_density: 0.0015, // Default fog density
+            light_probe_buffer: None,
+            light_probe_capacity: 0,
             lod_distance: 800.0, // Default LOD render distance
             dof_pipeline: None,
             dof_bind_group_layout: None,
@@ -1390,12 +1407,14 @@ impl App {
             Some(uniform_buffer),
             Some(shadow_view),
             Some(shadow_sampler),
+            Some(light_probe_buffer),
         ) = (
             self.device.as_ref(),
             self.main_bind_group_layout.as_ref(),
             self.uniform_buffer.as_ref(),
             self.shadow_view.as_ref(),
             self.shadow_sampler.as_ref(),
+            self.light_probe_buffer.as_ref(),
         )
         else {
             return;
@@ -1416,6 +1435,10 @@ impl App {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(shadow_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: light_probe_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -2210,6 +2233,16 @@ impl App {
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -3001,12 +3034,32 @@ impl App {
             sun_color_pad: [1.0, 0.95, 0.8, 0.0],
             ambient_color_pad: [0.3, 0.35, 0.45, 0.0],
             shadow_texel_size_pad: [shadow_texel, shadow_texel, 0.0, 0.0],
+            light_probe_count: 0,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
 
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Uniform Buffer"),
             contents: bytemuck::cast_slice(&[uniforms]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Create light probe buffer (start with capacity for 64 probes)
+        let light_probe_capacity = 64;
+        let empty_probes = vec![
+            LightProbe {
+                position: [0.0; 3],
+                _pad0: 0.0,
+                color_power: [0.0; 4],
+            };
+            light_probe_capacity
+        ];
+        let light_probe_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Light Probe Buffer"),
+            contents: bytemuck::cast_slice(&empty_probes),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
         let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -3135,6 +3188,8 @@ impl App {
         self.shadow_pipeline = Some(shadow_pipeline);
         self.shadow_mesh_pipeline = Some(shadow_mesh_pipeline);
         self.uniform_buffer = Some(uniform_buffer);
+        self.light_probe_buffer = Some(light_probe_buffer);
+        self.light_probe_capacity = light_probe_capacity;
         self.main_bind_group_layout = Some(main_bind_group_layout);
         self.shadow_bind_group_layout = Some(shadow_bind_group_layout);
         self.shadow_sampler = Some(shadow_sampler);
@@ -3869,6 +3924,91 @@ impl App {
         };
         let shadow_texel = 1.0 / self.shadow_map_size as f32;
 
+        // Collect light probes from nearby emissive chunks
+        let mut light_probes: Vec<LightProbe> = Vec::new();
+        const MAX_LIGHT_PROBES: usize = 32;
+        const LIGHT_RADIUS_SQ: f32 = 48.0 * 48.0; // Only consider chunks within 48 units (3 chunks)
+        const MIN_EMISSIVE_POWER: f32 = 0.5; // Ignore weak emitters
+
+        // Collect emitters from chunks with cached meshes
+        for (chunk_key, emitters) in &self.chunk_emitters {
+            if light_probes.len() >= MAX_LIGHT_PROBES {
+                break;
+            }
+
+            // Check if chunk is reasonably close to camera
+            let chunk_center = [
+                chunk_key.0 as f32 + 8.0,
+                chunk_key.1 as f32 + 8.0,
+                chunk_key.2 as f32 + 8.0,
+            ];
+            let dx = chunk_center[0] - camera_pos[0];
+            let dy = chunk_center[1] - camera_pos[1];
+            let dz = chunk_center[2] - camera_pos[2];
+            let dist_sq = dx * dx + dy * dy + dz * dz;
+
+            if dist_sq > LIGHT_RADIUS_SQ {
+                continue;
+            }
+
+            // Aggregate all emitters in this chunk into one light probe
+            let mut total_color = [0.0f32; 3];
+            let mut total_power = 0.0f32;
+
+            for emitter in emitters {
+                total_color[0] += emitter.color[0] * emitter.intensity;
+                total_color[1] += emitter.color[1] * emitter.intensity;
+                total_color[2] += emitter.color[2] * emitter.intensity;
+                total_power += emitter.intensity;
+            }
+
+            if total_power > MIN_EMISSIVE_POWER {
+                light_probes.push(LightProbe {
+                    position: chunk_center,
+                    _pad0: 0.0,
+                    color_power: [total_color[0], total_color[1], total_color[2], total_power],
+                });
+            }
+        }
+
+        // Sort by distance and keep only nearest probes
+        light_probes.sort_by(|a, b| {
+            let dist_a_sq = (a.position[0] - camera_pos[0]).powi(2)
+                + (a.position[1] - camera_pos[1]).powi(2)
+                + (a.position[2] - camera_pos[2]).powi(2);
+            let dist_b_sq = (b.position[0] - camera_pos[0]).powi(2)
+                + (b.position[1] - camera_pos[1]).powi(2)
+                + (b.position[2] - camera_pos[2]).powi(2);
+            dist_a_sq.partial_cmp(&dist_b_sq).unwrap()
+        });
+        light_probes.truncate(MAX_LIGHT_PROBES);
+
+        // Upload light probes to GPU
+        if !light_probes.is_empty() {
+            // Ensure we have enough capacity
+            if light_probes.len() > self.light_probe_capacity {
+                // Recreate buffer with more capacity
+                self.light_probe_capacity = (light_probes.len() * 2).max(64);
+                let new_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Light Probe Buffer"),
+                    size: (self.light_probe_capacity * std::mem::size_of::<LightProbe>())
+                        as wgpu::BufferAddress,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.light_probe_buffer = Some(new_buffer);
+                self.bind_group = None; // Force bind group recreation
+            }
+
+            queue.write_buffer(
+                self.light_probe_buffer.as_ref().unwrap(),
+                0,
+                bytemuck::cast_slice(&light_probes),
+            );
+        }
+
+        let light_probe_count = light_probes.len() as u32;
+
         // Update uniforms with MVP and lighting data
         let uniforms = Uniforms {
             mvp: mvp_cols,
@@ -3884,6 +4024,10 @@ impl App {
             sun_color_pad: [sun_color[0], sun_color[1], sun_color[2], 0.0],
             ambient_color_pad: [ambient_color[0], ambient_color[1], ambient_color[2], 0.0],
             shadow_texel_size_pad: [shadow_texel, shadow_texel, 0.0, 0.0],
+            light_probe_count,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
 
         queue.write_buffer(

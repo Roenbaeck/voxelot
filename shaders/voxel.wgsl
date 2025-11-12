@@ -9,11 +9,22 @@ struct Uniforms {
     sun_color_pad: vec4<f32>,
     ambient_color_pad: vec4<f32>,
     shadow_texel_size_pad: vec4<f32>,
+    light_probe_count: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+struct LightProbe {
+    position: vec3<f32>,
+    _pad0: f32,
+    color_power: vec4<f32>,  // RGB color from emissive_sum, A = emissive_power
 }
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 @group(0) @binding(1) var shadow_map: texture_depth_2d;
 @group(0) @binding(2) var shadow_sampler: sampler_comparison;
+@group(0) @binding(3) var<storage, read> light_probes: array<LightProbe>;
 
 
 struct VertexOutputInstanced {
@@ -22,6 +33,7 @@ struct VertexOutputInstanced {
     @location(1) normal: vec3<f32>,
     @location(2) emissive: vec4<f32>,
     @location(3) light_space_pos: vec4<f32>,
+    @location(4) world_pos: vec3<f32>,
 }
 
 struct VertexOutputMesh {
@@ -30,6 +42,7 @@ struct VertexOutputMesh {
     @location(1) normal: vec3<f32>,
     @location(2) emissive: vec4<f32>,
     @location(3) light_space_pos: vec4<f32>,
+    @location(4) world_pos: vec3<f32>,
 }
 
 struct ShadowVertexOutput {
@@ -118,6 +131,7 @@ fn vs_main(
     let world_pos = vec4<f32>(instance_position + scaled_vertex_pos, 1.0);
     output.position = uniforms.mvp * world_pos;
     output.light_space_pos = uniforms.sun_view_proj * world_pos;
+    output.world_pos = world_pos.xyz;
     
     // Use the per-vertex normal from the buffer
     output.normal = vertex_normal;
@@ -143,7 +157,22 @@ fn fs_main(input: VertexOutputInstanced) -> @location(0) vec4<f32> {
     let shadow_visibility = mix(1.0, base_shadow, shadow_strength);
     let sun_contribution = diffuse * uniforms.sun_color_pad.xyz * shadow_visibility;
     let ambient = uniforms.ambient_color_pad.xyz;
-    let lighting = ambient + sun_contribution;
+    
+    // Sample light probes for indirect emissive lighting
+    var indirect_light = vec3<f32>(0.0, 0.0, 0.0);
+    for (var i = 0u; i < uniforms.light_probe_count; i++) {
+        let probe = light_probes[i];
+        let to_light = probe.position - input.world_pos;
+        let dist_sq = dot(to_light, to_light);
+        // Very localized lighting: cubic falloff for rapid distance dropoff
+        let dist = sqrt(dist_sq);
+        let attenuation = (probe.color_power.a * 0.02) / max(dist_sq * dist, 64.0);
+        indirect_light += probe.color_power.rgb * attenuation;
+    }
+    // Keep it subtle - max 10% brightness from emissive lights
+    indirect_light = min(indirect_light, vec3<f32>(0.1, 0.1, 0.1));
+    
+    let lighting = ambient + sun_contribution + indirect_light;
     let color = input.color * lighting;
 
     let fog_color = vec3<f32>(0.7, 0.8, 0.9);
@@ -170,6 +199,7 @@ fn vs_mesh(
     let world_pos = vec4<f32>(position, 1.0);
     out.position = uniforms.mvp * world_pos;
     out.light_space_pos = uniforms.sun_view_proj * world_pos;
+    out.world_pos = world_pos.xyz;
     out.normal = normal;
     out.color = color.rgb;
     out.emissive = emissive;
@@ -185,7 +215,22 @@ fn fs_mesh(input: VertexOutputMesh) -> @location(0) vec4<f32> {
     let shadow_visibility = mix(1.0, base_shadow, shadow_strength);
     let sun_contribution = diffuse * uniforms.sun_color_pad.xyz * shadow_visibility;
     let ambient = uniforms.ambient_color_pad.xyz;
-    let lighting = ambient + sun_contribution;
+    
+    // Sample light probes for indirect emissive lighting
+    var indirect_light = vec3<f32>(0.0, 0.0, 0.0);
+    for (var i = 0u; i < uniforms.light_probe_count; i++) {
+        let probe = light_probes[i];
+        let to_light = probe.position - input.world_pos;
+        let dist_sq = dot(to_light, to_light);
+        // Very localized lighting: cubic falloff for rapid distance dropoff
+        let dist = sqrt(dist_sq);
+        let attenuation = (probe.color_power.a * 0.02) / max(dist_sq * dist, 64.0);
+        indirect_light += probe.color_power.rgb * attenuation;
+    }
+    // Keep it subtle - max 10% brightness from emissive lights
+    indirect_light = min(indirect_light, vec3<f32>(0.1, 0.1, 0.1));
+    
+    let lighting = ambient + sun_contribution + indirect_light;
     let color = input.color * lighting;
     let fog_color = vec3<f32>(0.7, 0.8, 0.9);
     let distance = length(input.position.xyz);
