@@ -20,9 +20,11 @@ use winit::{
 };
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use voxelot::generate_chunk_mesh;
-use voxelot::{cull_visible_voxels_parallel, Camera, RenderConfig, World, WorldPos};
 use sysinfo::{Pid, ProcessExt, System, SystemExt};
+use voxelot::{
+    cull_visible_voxels_parallel, generate_chunk_mesh, Camera, Chunk, Palette, RenderConfig,
+    Voxel, VoxelInstance, World, WorldPos,
+};
 
 macro_rules! viewer_debug {
     ($($arg:tt)*) => {
@@ -37,6 +39,14 @@ const WINDOW_HEIGHT: u32 = 720;
 const CONFIG_FILE: &str = "render_config.txt";
 const GPU_CULL_WORKGROUP_SIZE: u32 = 64;
 const DEFAULT_MESH_CACHE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+const NEIGHBOR_OFFSETS: [(i32, i32, i32); 6] = [
+    (1, 0, 0),
+    (-1, 0, 0),
+    (0, 1, 0),
+    (0, -1, 0),
+    (0, 0, 1),
+    (0, 0, -1),
+];
 
 /// Voxel instance data for GPU
 #[repr(C)]
@@ -580,6 +590,7 @@ struct App {
     // Mesh cache: per-leaf-chunk mesh GPU buffers and metadata
     mesh_cache: HashMap<(i64, i64, i64), MeshCacheEntry>,
     mesh_cache_bytes: u64,
+    fallback_chunk_instances: HashMap<(i64, i64, i64), Vec<VoxelInstanceRaw>>,
     system_info: System,
     process_pid: Pid,
     instance_capacity: usize,
@@ -589,6 +600,7 @@ struct App {
     cull_params_buffer: Option<wgpu::Buffer>,
 
     world: World,
+    palette: Palette,
     camera_controller: CameraController,
     pending_chunk_meshes: VecDeque<(i64, i64, i64)>,
     pending_chunk_set: HashSet<(i64, i64, i64)>,
@@ -789,7 +801,9 @@ impl App {
             }
         }
 
-        println!("World created with voxels");
+    println!("World created with voxels");
+
+    let palette = Palette::load("palette.txt");
 
         println!("Updating LOD metadata...");
         world.update_all_lod_metadata();
@@ -828,6 +842,7 @@ impl App {
             gpu_readback_capacity: 0,
             mesh_cache: HashMap::new(),
             mesh_cache_bytes: 0,
+            fallback_chunk_instances: HashMap::new(),
             system_info,
             process_pid,
             instance_capacity: 0,
@@ -836,6 +851,7 @@ impl App {
             cull_bind_group: None,
             cull_params_buffer: None,
             world,
+            palette,
             camera_controller: CameraController::new(initial_camera),
             pending_chunk_meshes: VecDeque::new(),
             pending_chunk_set: HashSet::new(),
@@ -1635,6 +1651,100 @@ impl App {
                 self.mesh_cache_bytes as f64 / (1024.0 * 1024.0)
             );
         }
+    }
+
+    fn voxel_to_raw(v: &VoxelInstance) -> VoxelInstanceRaw {
+        let custom_color_f32 = if let Some(rgba) = v.custom_color {
+            [
+                rgba[0] as f32 / 255.0,
+                rgba[1] as f32 / 255.0,
+                rgba[2] as f32 / 255.0,
+                rgba[3] as f32 / 255.0,
+            ]
+        } else if v.is_leaf_chunk {
+            [0.4, 0.4, 0.45, 0.6]
+        } else {
+            [0.0, 0.0, 0.0, 0.0]
+        };
+
+        VoxelInstanceRaw {
+            position: [
+                v.position[0] as f32,
+                v.position[1] as f32,
+                v.position[2] as f32,
+            ],
+            voxel_type: v.voxel_type as u32,
+            scale: v.scale as f32,
+            custom_color: custom_color_f32,
+        }
+    }
+
+    fn fallback_instances_for_chunk(
+        &mut self,
+        key: (i64, i64, i64),
+    ) -> Option<&[VoxelInstanceRaw]> {
+        if !self.fallback_chunk_instances.contains_key(&key) {
+            let chunk = self
+                .world
+                .get_leaf_chunk_at_origin(WorldPos::new(key.0, key.1, key.2))?;
+            let mut instances = Vec::with_capacity(chunk.voxel_count as usize);
+            Self::collect_chunk_surface_voxels(chunk, key, &mut instances);
+            self.fallback_chunk_instances.insert(key, instances);
+        }
+        self.fallback_chunk_instances
+            .get(&key)
+            .map(|instances| instances.as_slice())
+    }
+
+    fn collect_chunk_surface_voxels(
+        chunk: &Chunk,
+        origin: (i64, i64, i64),
+        out: &mut Vec<VoxelInstanceRaw>,
+    ) {
+        for ((lx, ly, lz), voxel) in chunk.iter() {
+            let world_pos = (
+                origin.0 + lx as i64,
+                origin.1 + ly as i64,
+                origin.2 + lz as i64,
+            );
+
+            match voxel {
+                Voxel::Solid(voxel_type) => {
+                    if Self::voxel_has_exposed_face(chunk, lx, ly, lz) {
+                        out.push(VoxelInstanceRaw {
+                            position: [world_pos.0 as f32, world_pos.1 as f32, world_pos.2 as f32],
+                            voxel_type: *voxel_type as u32,
+                            scale: 1.0,
+                            custom_color: [0.0, 0.0, 0.0, 0.0],
+                        });
+                    }
+                }
+                Voxel::Chunk(sub_chunk) => {
+                    Self::collect_chunk_surface_voxels(sub_chunk, world_pos, out);
+                }
+            }
+        }
+    }
+
+    fn voxel_has_exposed_face(chunk: &Chunk, x: u8, y: u8, z: u8) -> bool {
+        for (dx, dy, dz) in NEIGHBOR_OFFSETS {
+            let nx = x as i32 + dx;
+            let ny = y as i32 + dy;
+            let nz = z as i32 + dz;
+
+            if nx < 0 || nx >= 16 || ny < 0 || ny >= 16 || nz < 0 || nz >= 16 {
+                return true;
+            }
+
+            let nx_u = nx as u8;
+            let ny_u = ny as u8;
+            let nz_u = nz as u8;
+            if !chunk.contains(nx_u, ny_u, nz_u) {
+                return true;
+            }
+        }
+
+        false
     }
 
     fn run_gpu_culling(
@@ -2601,16 +2711,13 @@ impl App {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
-    self.frame_index = self.frame_index.wrapping_add(1);
+        self.frame_index = self.frame_index.wrapping_add(1);
 
         self.camera_controller.update(dt);
 
         // Gather candidate voxels for GPU culling using CPU hierarchy traversal
         let cull_start = Instant::now();
-        let visible = cull_visible_voxels_parallel(
-            &self.world,
-            &self.camera_controller.camera,
-        );
+        let visible = cull_visible_voxels_parallel(&self.world, &self.camera_controller.camera);
         let cull_time = cull_start.elapsed();
 
         let gpu_inputs: Vec<GpuInstanceInput> = visible
@@ -2713,7 +2820,7 @@ impl App {
                 .get_leaf_chunk_at_origin(WorldPos::new(key.0, key.1, key.2))
             {
                 Some(chunk) => {
-                    let mesh = generate_chunk_mesh(chunk);
+                    let mesh = generate_chunk_mesh(chunk, &self.palette);
                     if mesh.indices.is_empty() {
                         processed_meshes += 1;
                         continue;
@@ -2764,8 +2871,7 @@ impl App {
                     });
                     let vertex_bytes =
                         (vb_data.len() * std::mem::size_of::<MeshVertexRaw>()) as u64;
-                    let index_bytes =
-                        (mesh.indices.len() * std::mem::size_of::<u32>()) as u64;
+                    let index_bytes = (mesh.indices.len() * std::mem::size_of::<u32>()) as u64;
                     viewer_debug!(
                         "Created mesh for chunk ({},{},{}): {} vertices, {} triangles",
                         key.0,
@@ -2782,11 +2888,9 @@ impl App {
                         index_bytes,
                         last_used_frame: self.frame_index,
                     };
-                    self.mesh_cache.insert(
-                        key,
-                        entry,
-                    );
+                    self.mesh_cache.insert(key, entry);
                     self.mesh_cache_bytes += vertex_bytes + index_bytes;
+                    self.fallback_chunk_instances.remove(&key);
                     new_meshes_created += 1;
 
                     if leaf_chunks.contains(&key) {
@@ -2838,6 +2942,13 @@ impl App {
                         mesh_selection.insert(key);
                         continue;
                     }
+
+                    if let Some(fallback) = self.fallback_instances_for_chunk(key) {
+                        out.extend_from_slice(fallback);
+                    } else {
+                        out.push(Self::voxel_to_raw(v));
+                    }
+                    continue;
                 }
 
                 out.push(VoxelInstanceRaw {
@@ -2850,43 +2961,25 @@ impl App {
 
             (out, mesh_selection)
         } else {
-            let fallback_instances: Vec<VoxelInstanceRaw> = visible
-                .iter()
-                .filter(|v| {
-                    if v.is_leaf_chunk {
-                        !cpu_mesh_keys.contains(&(v.position[0], v.position[1], v.position[2]))
-                    } else {
-                        true
+            let mut out: Vec<VoxelInstanceRaw> = Vec::new();
+            for v in &visible {
+                if v.is_leaf_chunk {
+                    let key = (v.position[0], v.position[1], v.position[2]);
+                    if cpu_mesh_keys.contains(&key) {
+                        continue;
                     }
-                })
-                .map(|v| {
-                    let custom_color_f32 = if let Some(rgba) = v.custom_color {
-                        [
-                            rgba[0] as f32 / 255.0,
-                            rgba[1] as f32 / 255.0,
-                            rgba[2] as f32 / 255.0,
-                            rgba[3] as f32 / 255.0,
-                        ]
-                    } else if v.is_leaf_chunk {
-                        [0.4, 0.4, 0.45, 0.6]
+
+                    if let Some(fallback) = self.fallback_instances_for_chunk(key) {
+                        out.extend_from_slice(fallback);
                     } else {
-                        [0.0, 0.0, 0.0, 0.0]
-                    };
-
-                    VoxelInstanceRaw {
-                        position: [
-                            v.position[0] as f32,
-                            v.position[1] as f32,
-                            v.position[2] as f32,
-                        ],
-                        voxel_type: v.voxel_type as u32,
-                        scale: v.scale as f32,
-                        custom_color: custom_color_f32,
+                        out.push(Self::voxel_to_raw(v));
                     }
-                })
-                .collect();
+                } else {
+                    out.push(Self::voxel_to_raw(v));
+                }
+            }
 
-            (fallback_instances, cpu_mesh_keys.clone())
+            (out, cpu_mesh_keys.clone())
         };
         let instance_time = instance_start.elapsed();
 

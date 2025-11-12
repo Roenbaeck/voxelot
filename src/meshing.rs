@@ -1,6 +1,7 @@
 //! Greedy meshing for bottom-level chunks (16x16x16)
 
 use crate::lib_hierarchical::Chunk;
+use crate::palette::Palette;
 
 macro_rules! mesh_debug {
     ($($arg:tt)*) => {
@@ -26,7 +27,7 @@ pub struct ChunkMesh {
 
 /// Generate a greedy mesh for a 16x16x16 chunk.
 /// Merges coplanar faces with identical voxel types into larger quads.
-pub fn generate_chunk_mesh(chunk: &Chunk) -> ChunkMesh {
+pub fn generate_chunk_mesh(chunk: &Chunk, palette: &Palette) -> ChunkMesh {
     // 3 axes: 0=x, 1=y, 2=z
     let mut mesh = ChunkMesh::default();
 
@@ -127,7 +128,17 @@ pub fn generate_chunk_mesh(chunk: &Chunk) -> ChunkMesh {
 
                     // Emit this rectangle
                     emit_quad(
-                        &mut mesh, axis, d, u_axis, v_axis, u_start, v_start, width, height, t,
+                        &mut mesh,
+                        palette,
+                        axis,
+                        d,
+                        u_axis,
+                        v_axis,
+                        u_start,
+                        v_start,
+                        width,
+                        height,
+                        t,
                     );
                     faces_this_axis += 1;
 
@@ -151,6 +162,7 @@ pub fn generate_chunk_mesh(chunk: &Chunk) -> ChunkMesh {
 
 fn emit_quad(
     mesh: &mut ChunkMesh,
+    palette: &Palette,
     axis: usize,
     d: i32,
     u_axis: usize,
@@ -186,8 +198,8 @@ fn emit_quad(
     let mut normal = [0.0f32; 3];
     normal[axis] = if positive { -1.0 } else { 1.0 };
 
-    // Color from material (simple mapping; alpha=1)
-    let color = material_to_rgba(mat);
+    // Color from palette (per-voxel RGBA)
+    let color = palette.color(mat as u32);
 
     // Four corners (in voxel space), convert to f32
     let p0 = [base[0] as f32, base[1] as f32, base[2] as f32];
@@ -275,18 +287,4 @@ fn emit_quad(
             ]);
         }
     }
-}
-
-fn material_to_rgba(t: u8) -> [f32; 4] {
-    let (r, g, b) = match t {
-        1 => (0.3, 0.7, 0.3),
-        2 => (0.7, 0.3, 0.3),
-        3 => (0.3, 0.3, 0.7),
-        4 => (0.7, 0.7, 0.3),
-        5 => (0.7, 0.3, 0.7),
-        6 => (0.3, 0.7, 0.7),
-        7 => (0.5, 0.5, 0.5),
-        _ => (1.0, 1.0, 1.0),
-    };
-    [r, g, b, 1.0]
 }
