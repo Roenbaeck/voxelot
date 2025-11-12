@@ -40,6 +40,12 @@ const WINDOW_HEIGHT: u32 = 720;
 const CONFIG_FILE: &str = "render_config.txt";
 const GPU_CULL_WORKGROUP_SIZE: u32 = 64;
 const DEFAULT_MESH_CACHE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+const SHADOW_MAP_SIZE: u32 = 4096;
+const SHADOW_FRUSTUM_EXTENT_MIN: f32 = 150.0;
+const SHADOW_FRUSTUM_EXTENT_MAX: f32 = 600.0;
+const SHADOW_DISTANCE_MULTIPLIER: f32 = 2.5;
+const SHADOW_BIAS: f32 = 0.001;
+const SHADOW_STRENGTH_MULTIPLIER: f32 = 1.75;
 const NEIGHBOR_OFFSETS: [(i32, i32, i32); 6] = [
     (1, 0, 0),
     (-1, 0, 0),
@@ -125,6 +131,7 @@ struct ChunkEmitterWorld {
     intensity: f32,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct ActiveLight {
     position: [f32; 3],
@@ -149,15 +156,14 @@ struct MeshResult {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
-    mvp: [[f32; 4]; 4],      // 64 bytes
-    sun_direction: [f32; 3], // 12 bytes
-    fog_density: f32,        // 4 bytes (was _padding1)
-    sun_color: [f32; 3],     // 12 bytes
-    _padding2: f32,          // 4 bytes
-    ambient_color: [f32; 3], // 12 bytes
-    time_of_day: f32,        // 4 bytes
-    // Total prior to padding: 112 bytes. Add 32 bytes tail padding (2 vec4 slots)
-    _padding3: [f32; 8], // 32 bytes padding to satisfy 144-byte uniform expectations
+    mvp: [[f32; 4]; 4],                  // 64 bytes
+    sun_view_proj: [[f32; 4]; 4],        // 64 bytes
+    camera_shadow_strength: [f32; 4],    // xyz = camera position, w = shadow strength
+    sun_direction_shadow_bias: [f32; 4], // xyz = sun dir, w = shadow bias
+    fog_time_pad: [f32; 4],              // x = fog density, y = time of day
+    sun_color_pad: [f32; 4],             // xyz = sun color
+    ambient_color_pad: [f32; 4],         // xyz = ambient color
+    shadow_texel_size_pad: [f32; 4],     // xy = 1 / shadow map size
 }
 
 /// Depth-of-field runtime settings (CPU-side convenience)
@@ -609,10 +615,18 @@ struct App {
     config: Option<wgpu::SurfaceConfiguration>,
     render_pipeline: Option<wgpu::RenderPipeline>,
     mesh_pipeline: Option<wgpu::RenderPipeline>,
+    shadow_pipeline: Option<wgpu::RenderPipeline>,
+    shadow_mesh_pipeline: Option<wgpu::RenderPipeline>,
     uniform_buffer: Option<wgpu::Buffer>,
     bind_group: Option<wgpu::BindGroup>,
+    shadow_bind_group: Option<wgpu::BindGroup>,
+    main_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    shadow_bind_group_layout: Option<wgpu::BindGroupLayout>,
     cube_vertex_buffer: Option<wgpu::Buffer>,
     instance_buffer: Option<wgpu::Buffer>,
+    shadow_texture: Option<wgpu::Texture>,
+    shadow_view: Option<wgpu::TextureView>,
+    shadow_sampler: Option<wgpu::Sampler>,
     gpu_input_buffer: Option<wgpu::Buffer>,
     gpu_input_capacity: usize,
     gpu_readback_buffer: Option<wgpu::Buffer>,
@@ -702,6 +716,7 @@ struct App {
     dof_enabled: bool,
     bloom_settings: BloomSettings,
     bloom_enabled: bool,
+    shadow_map_size: u32,
 }
 
 impl App {
@@ -885,8 +900,8 @@ impl App {
         let mesh_upload_baseline = 4usize;
         let mesh_upload_max = (mesh_worker_count * 4).max(mesh_upload_baseline * 2);
 
-    println!("Updating LOD metadata...");
-    world.update_all_lod_metadata(&palette);
+        println!("Updating LOD metadata...");
+        world.update_all_lod_metadata(&palette);
         println!("LOD metadata updated");
 
         println!("\n=== Controls ===");
@@ -912,10 +927,18 @@ impl App {
             config: None,
             render_pipeline: None,
             mesh_pipeline: None,
+            shadow_pipeline: None,
+            shadow_mesh_pipeline: None,
             uniform_buffer: None,
             bind_group: None,
+            shadow_bind_group: None,
+            main_bind_group_layout: None,
+            shadow_bind_group_layout: None,
             cube_vertex_buffer: None,
             instance_buffer: None,
+            shadow_texture: None,
+            shadow_view: None,
+            shadow_sampler: None,
             gpu_input_buffer: None,
             gpu_input_capacity: 0,
             gpu_readback_buffer: None,
@@ -997,7 +1020,7 @@ impl App {
                 focal_range: 16.0,
                 blur_strength: 1.6,
             },
-            dof_enabled: true,
+            dof_enabled: false,
             bloom_settings: BloomSettings {
                 threshold: 0.7,
                 knee: 0.6,
@@ -1008,6 +1031,7 @@ impl App {
                 blur_radius: 3.8,
             },
             bloom_enabled: true,
+            shadow_map_size: SHADOW_MAP_SIZE,
         }
     }
 
@@ -1081,16 +1105,21 @@ impl App {
     fn process_lighting_key(&mut self, key: KeyCode) {
         match key {
             KeyCode::KeyT => {
-                // Cycle through time of day: noon -> sunset -> night -> sunrise -> noon
-                self.time_of_day = (self.time_of_day + 0.25) % 1.0;
-                let time_name = match (self.time_of_day * 4.0) as u32 {
-                    0 => "Midnight",
-                    1 => "Sunrise",
-                    2 => "Noon",
-                    3 => "Sunset",
-                    _ => "Unknown",
+                // Report current time of day (auto-cycles now)
+                let phase = if self.time_of_day < 0.125 {
+                    "Midnight→Dawn"
+                } else if self.time_of_day < 0.25 {
+                    "Dawn→Sunrise"
+                } else if self.time_of_day < 0.5 {
+                    "Sunrise→Noon"
+                } else if self.time_of_day < 0.75 {
+                    "Noon→Sunset"
+                } else if self.time_of_day < 0.875 {
+                    "Sunset→Dusk"
+                } else {
+                    "Dusk→Midnight"
                 };
-                println!("Time of day: {} ({:.2})", time_name, self.time_of_day);
+                println!("Time of day: {:.3} ({})", self.time_of_day, phase);
             }
             KeyCode::KeyF => {
                 // Decrease fog density
@@ -1292,6 +1321,98 @@ impl App {
         self.update_dof_smooth_bind_groups();
         self.update_bloom_uniforms();
         self.update_bloom_bind_groups();
+    }
+
+    fn recreate_shadow_map(&mut self) {
+        let Some(device) = self.device.as_ref() else {
+            return;
+        };
+        if self.shadow_sampler.is_none() {
+            return;
+        }
+
+        let extent = wgpu::Extent3d {
+            width: self.shadow_map_size,
+            height: self.shadow_map_size,
+            depth_or_array_layers: 1,
+        };
+
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Shadow Map"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        self.shadow_texture = Some(texture);
+        self.shadow_view = Some(view);
+        self.update_main_bind_group();
+    }
+
+    fn update_shadow_bind_group(&mut self) {
+        let (Some(device), Some(layout), Some(uniform_buffer)) = (
+            self.device.as_ref(),
+            self.shadow_bind_group_layout.as_ref(),
+            self.uniform_buffer.as_ref(),
+        ) else {
+            return;
+        };
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Shadow Uniform Bind Group"),
+            layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+        });
+
+        self.shadow_bind_group = Some(bind_group);
+    }
+
+    fn update_main_bind_group(&mut self) {
+        let (
+            Some(device),
+            Some(layout),
+            Some(uniform_buffer),
+            Some(shadow_view),
+            Some(shadow_sampler),
+        ) = (
+            self.device.as_ref(),
+            self.main_bind_group_layout.as_ref(),
+            self.uniform_buffer.as_ref(),
+            self.shadow_view.as_ref(),
+            self.shadow_sampler.as_ref(),
+        )
+        else {
+            return;
+        };
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Main Uniform Bind Group"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(shadow_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(shadow_sampler),
+                },
+            ],
+        });
+
+        self.bind_group = Some(bind_group);
     }
 
     fn update_dof_bind_group(&mut self) {
@@ -2035,27 +2156,68 @@ impl App {
             source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/voxel.wgsl").into()),
         });
 
-        // Create bind group layout for uniforms
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Uniform Bind Group Layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
+        // Create bind group layouts
+        let shadow_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Shadow Bind Group Layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
 
-        // Create pipeline layout
+        let main_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Main Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                        count: None,
+                    },
+                ],
+            });
+
+        // Create pipeline layouts
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
+            bind_group_layouts: &[&main_bind_group_layout],
             push_constant_ranges: &[],
         });
+
+        let shadow_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Shadow Pipeline Layout"),
+                bind_group_layouts: &[&shadow_bind_group_layout],
+                push_constant_ranges: &[],
+            });
 
         // Create instanced-cube render pipeline
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -2129,18 +2291,16 @@ impl App {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_mesh"),
-                buffers: &[
-                    wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<MeshVertexRaw>() as wgpu::BufferAddress,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![
-                            0 => Float32x3,
-                            1 => Float32x3,
-                            2 => Float32x4,
-                            3 => Float32x4
-                        ],
-                    }
-                ],
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<MeshVertexRaw>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![
+                        0 => Float32x3,
+                        1 => Float32x3,
+                        2 => Float32x4,
+                        3 => Float32x4
+                    ],
+                }],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -2168,6 +2328,112 @@ impl App {
                 depth_compare: wgpu::CompareFunction::Less,
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
+
+        // Create shadow pipelines (depth-only)
+        let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Shadow Pipeline"),
+            layout: Some(&shadow_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_shadow_instanced"),
+                buffers: &[
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<CubeVertex>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![4 => Float32x3, 5 => Float32x3],
+                    },
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<VoxelInstanceRaw>()
+                            as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &wgpu::vertex_attr_array![
+                            0 => Float32x3,
+                            1 => Uint32,
+                            2 => Float32,
+                            3 => Float32x4,
+                            6 => Float32x4
+                        ],
+                    },
+                ],
+                compilation_options: Default::default(),
+            },
+            fragment: None,
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState {
+                    constant: 2,
+                    slope_scale: 2.0,
+                    clamp: 0.0,
+                },
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
+
+        let shadow_mesh_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Shadow Mesh Pipeline"),
+            layout: Some(&shadow_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_shadow_mesh"),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<MeshVertexRaw>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![
+                        0 => Float32x3,
+                        1 => Float32x3,
+                        2 => Float32x4,
+                        3 => Float32x4
+                    ],
+                }],
+                compilation_options: Default::default(),
+            },
+            fragment: None,
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState {
+                    constant: 2,
+                    slope_scale: 2.0,
+                    clamp: 0.0,
+                },
             }),
             multisample: wgpu::MultisampleState {
                 count: 1,
@@ -2717,15 +2983,16 @@ impl App {
             });
 
         // Create uniform buffer with proper size for Uniforms struct
+        let shadow_texel = 1.0 / self.shadow_map_size as f32;
         let uniforms = Uniforms {
-            mvp: [[0.0; 4]; 4], // Will be filled in render()
-            sun_direction: [0.5, 1.0, 0.3],
-            fog_density: 0.0015,
-            sun_color: [1.0, 0.95, 0.8],
-            _padding2: 0.0,
-            ambient_color: [0.3, 0.35, 0.45],
-            time_of_day: 0.5,
-            _padding3: [0.0; 8],
+            mvp: [[0.0; 4]; 4],
+            sun_view_proj: [[0.0; 4]; 4],
+            camera_shadow_strength: [0.0, 0.0, 0.0, 1.0],
+            sun_direction_shadow_bias: [0.5, 1.0, 0.3, SHADOW_BIAS],
+            fog_time_pad: [0.0015, 0.5, 0.0, 0.0],
+            sun_color_pad: [1.0, 0.95, 0.8, 0.0],
+            ambient_color_pad: [0.3, 0.35, 0.45, 0.0],
+            shadow_texel_size_pad: [shadow_texel, shadow_texel, 0.0, 0.0],
         };
 
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -2734,13 +3001,16 @@ impl App {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Uniform Bind Group"),
-            layout: &bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
+        let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Shadow Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            ..Default::default()
         });
 
         let cull_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -2854,9 +3124,16 @@ impl App {
         self.config = Some(config);
         self.render_pipeline = Some(render_pipeline);
         self.mesh_pipeline = Some(mesh_pipeline);
+        self.shadow_pipeline = Some(shadow_pipeline);
+        self.shadow_mesh_pipeline = Some(shadow_mesh_pipeline);
         self.uniform_buffer = Some(uniform_buffer);
-        self.bind_group = Some(bind_group);
+        self.main_bind_group_layout = Some(main_bind_group_layout);
+        self.shadow_bind_group_layout = Some(shadow_bind_group_layout);
+        self.shadow_sampler = Some(shadow_sampler);
         self.cube_vertex_buffer = Some(cube_vertex_buffer);
+
+        self.update_shadow_bind_group();
+        self.recreate_shadow_map();
 
         self.recreate_offscreen_targets();
 
@@ -2875,8 +3152,11 @@ impl App {
         self.last_frame = now;
         self.frame_index = self.frame_index.wrapping_add(1);
 
-    let fps = if dt > 0.0 { 1.0 / dt } else { f32::INFINITY };
-    self.adjust_mesh_upload_budget(dt, fps);
+        let fps = if dt > 0.0 { 1.0 / dt } else { f32::INFINITY };
+        self.adjust_mesh_upload_budget(dt, fps);
+
+        // Auto-advance time of day: full cycle in 120 seconds (60s sun, 60s moon)
+        self.time_of_day = (self.time_of_day + dt / 120.0) % 1.0;
 
         self.camera_controller.update(dt);
 
@@ -3223,20 +3503,17 @@ impl App {
         self.active_emitters.clear();
         for key in &draw_mesh_keys {
             if let Some(emitters) = self.chunk_emitters.get(key) {
-                self.active_emitters.extend(emitters.iter().map(|emitter| ActiveLight {
-                    position: emitter.position,
-                    color: emitter.color,
-                    intensity: emitter.intensity,
-                }));
+                self.active_emitters
+                    .extend(emitters.iter().map(|emitter| ActiveLight {
+                        position: emitter.position,
+                        color: emitter.color,
+                        intensity: emitter.intensity,
+                    }));
             }
         }
 
         if cfg!(feature = "viewer-debug") && self.frame_count % 60 == 0 {
-            let total_emitters: usize = self
-                .chunk_emitters
-                .values()
-                .map(|list| list.len())
-                .sum();
+            let total_emitters: usize = self.chunk_emitters.values().map(|list| list.len()).sum();
             viewer_debug!(
                 "Mesh stats: {} cached meshes, {} new this frame, {} potential chunks, pending {}, ready {}, inflight {}, upload_limit {}, fallback instances {}, emitters {} (active {})",
                 self.mesh_cache.len(),
@@ -3343,31 +3620,285 @@ impl App {
         let mvp_cols: [[f32; 4]; 4] = mvp.to_cols_array_2d();
 
         // Calculate lighting based on time of day
-        let time_angle = self.time_of_day * std::f32::consts::TAU; // 0..2π
+        // Offset the solar angle so that time_of_day ≈0.25 aligns with sunrise; trig handles wrapping
+        let time_angle = (self.time_of_day - 0.25) * std::f32::consts::TAU;
         let sun_height = time_angle.sin();
-        let sun_direction = [time_angle.cos() * 0.5, sun_height, 0.3];
+        // Sun moves in an arc: horizontal component (cos) and vertical (sin)
+        // Use full range for horizontal to get proper shadow directions
+        let sun_direction = [time_angle.cos(), sun_height, 0.2];
 
-        let (sun_color, ambient_color) = if self.time_of_day < 0.25 || self.time_of_day > 0.75 {
-            // Night - moon (cool blue)
-            ([0.3, 0.3, 0.5], [0.05, 0.05, 0.15])
-        } else if self.time_of_day < 0.35 || self.time_of_day > 0.65 {
-            // Sunrise/sunset - warm orange/red
-            ([1.0, 0.6, 0.3], [0.3, 0.2, 0.2])
-        } else {
-            // Day - bright yellow sun, blue sky ambient
-            ([1.0, 0.95, 0.8], [0.3, 0.35, 0.45])
+        // Smooth color transitions based on time of day
+        let (sun_color, ambient_color) = {
+            // Define key times and colors
+            // Midnight is at 0.0, darkest point
+            let midnight_moon = [0.15, 0.18, 0.25];
+            let midnight_ambient = [0.02, 0.025, 0.05];
+            // Dusk/dawn has some light
+            let twilight_moon = [0.35, 0.35, 0.5];
+            let twilight_ambient = [0.08, 0.08, 0.15];
+            let sunrise_sun = [1.0, 0.6, 0.3];
+            let sunrise_ambient = [0.3, 0.2, 0.2];
+            let day_sun = [1.0, 0.95, 0.8];
+            let day_ambient = [0.3, 0.35, 0.45];
+            
+            // Interpolate between color phases
+            let t = self.time_of_day;
+            if t < 0.125 {
+                // Midnight to twilight (0.0 -> 0.125)
+                let factor = t / 0.125;
+                let sun = [
+                    midnight_moon[0] + (twilight_moon[0] - midnight_moon[0]) * factor,
+                    midnight_moon[1] + (twilight_moon[1] - midnight_moon[1]) * factor,
+                    midnight_moon[2] + (twilight_moon[2] - midnight_moon[2]) * factor,
+                ];
+                let ambient = [
+                    midnight_ambient[0] + (twilight_ambient[0] - midnight_ambient[0]) * factor,
+                    midnight_ambient[1] + (twilight_ambient[1] - midnight_ambient[1]) * factor,
+                    midnight_ambient[2] + (twilight_ambient[2] - midnight_ambient[2]) * factor,
+                ];
+                (sun, ambient)
+            } else if t < 0.25 {
+                // Twilight to sunrise (0.125 -> 0.25)
+                let factor = (t - 0.125) / 0.125;
+                let sun = [
+                    twilight_moon[0] + (sunrise_sun[0] - twilight_moon[0]) * factor,
+                    twilight_moon[1] + (sunrise_sun[1] - twilight_moon[1]) * factor,
+                    twilight_moon[2] + (sunrise_sun[2] - twilight_moon[2]) * factor,
+                ];
+                let ambient = [
+                    twilight_ambient[0] + (sunrise_ambient[0] - twilight_ambient[0]) * factor,
+                    twilight_ambient[1] + (sunrise_ambient[1] - twilight_ambient[1]) * factor,
+                    twilight_ambient[2] + (sunrise_ambient[2] - twilight_ambient[2]) * factor,
+                ];
+                (sun, ambient)
+            } else if t < 0.5 {
+                // Sunrise to day (0.25 -> 0.5)
+                let factor = (t - 0.25) / 0.25;
+                let sun = [
+                    sunrise_sun[0] + (day_sun[0] - sunrise_sun[0]) * factor,
+                    sunrise_sun[1] + (day_sun[1] - sunrise_sun[1]) * factor,
+                    sunrise_sun[2] + (day_sun[2] - sunrise_sun[2]) * factor,
+                ];
+                let ambient = [
+                    sunrise_ambient[0] + (day_ambient[0] - sunrise_ambient[0]) * factor,
+                    sunrise_ambient[1] + (day_ambient[1] - sunrise_ambient[1]) * factor,
+                    sunrise_ambient[2] + (day_ambient[2] - sunrise_ambient[2]) * factor,
+                ];
+                (sun, ambient)
+            } else if t < 0.75 {
+                // Day to sunset (0.5 -> 0.75)
+                let factor = (t - 0.5) / 0.25;
+                let sun = [
+                    day_sun[0] + (sunrise_sun[0] - day_sun[0]) * factor,
+                    day_sun[1] + (sunrise_sun[1] - day_sun[1]) * factor,
+                    day_sun[2] + (sunrise_sun[2] - day_sun[2]) * factor,
+                ];
+                let ambient = [
+                    day_ambient[0] + (sunrise_ambient[0] - day_ambient[0]) * factor,
+                    day_ambient[1] + (sunrise_ambient[1] - day_ambient[1]) * factor,
+                    day_ambient[2] + (sunrise_ambient[2] - day_ambient[2]) * factor,
+                ];
+                (sun, ambient)
+            } else if t < 0.875 {
+                // Sunset to twilight (0.75 -> 0.875)
+                let factor = (t - 0.75) / 0.125;
+                let sun = [
+                    sunrise_sun[0] + (twilight_moon[0] - sunrise_sun[0]) * factor,
+                    sunrise_sun[1] + (twilight_moon[1] - sunrise_sun[1]) * factor,
+                    sunrise_sun[2] + (twilight_moon[2] - sunrise_sun[2]) * factor,
+                ];
+                let ambient = [
+                    sunrise_ambient[0] + (twilight_ambient[0] - sunrise_ambient[0]) * factor,
+                    sunrise_ambient[1] + (twilight_ambient[1] - sunrise_ambient[1]) * factor,
+                    sunrise_ambient[2] + (twilight_ambient[2] - sunrise_ambient[2]) * factor,
+                ];
+                (sun, ambient)
+            } else {
+                // Twilight to midnight (0.875 -> 1.0)
+                let factor = (t - 0.875) / 0.125;
+                let sun = [
+                    twilight_moon[0] + (midnight_moon[0] - twilight_moon[0]) * factor,
+                    twilight_moon[1] + (midnight_moon[1] - twilight_moon[1]) * factor,
+                    twilight_moon[2] + (midnight_moon[2] - twilight_moon[2]) * factor,
+                ];
+                let ambient = [
+                    twilight_ambient[0] + (midnight_ambient[0] - twilight_ambient[0]) * factor,
+                    twilight_ambient[1] + (midnight_ambient[1] - twilight_ambient[1]) * factor,
+                    twilight_ambient[2] + (midnight_ambient[2] - twilight_ambient[2]) * factor,
+                ];
+                (sun, ambient)
+            }
         };
+
+        let sun_direction_vec_raw = Vec3::from_array(sun_direction);
+        let sun_direction_vec = if sun_direction_vec_raw.length_squared() > 0.0001 {
+            sun_direction_vec_raw.normalize()
+        } else {
+            Vec3::Y
+        };
+        let camera_pos = self.camera_controller.camera.position;
+        let camera_pos_vec = Vec3::from(camera_pos);
+
+        let shadow_extent =
+            (self.lod_distance * 0.35).clamp(SHADOW_FRUSTUM_EXTENT_MIN, SHADOW_FRUSTUM_EXTENT_MAX);
+        let shadow_distance = shadow_extent * SHADOW_DISTANCE_MULTIPLIER;
+        let mut light_up = Vec3::Y;
+        if sun_direction_vec.dot(light_up).abs() > 0.9 {
+            light_up = Vec3::X;
+        }
+        let light_target = camera_pos_vec;
+        let light_position = light_target + sun_direction_vec * shadow_distance.max(1.0);
+        let light_view = Mat4::look_at_rh(light_position, light_target, light_up);
+
+        let camera_forward_vec = Vec3::from(self.camera_controller.camera.forward).normalize();
+        let mut camera_up_vec = Vec3::from(self.camera_controller.camera.up);
+        if camera_up_vec.length_squared() < 1e-4 {
+            camera_up_vec = Vec3::Y;
+        }
+        camera_up_vec = camera_up_vec.normalize();
+        let camera_right_vec = camera_forward_vec.cross(camera_up_vec).normalize();
+        let camera_up_vec = camera_right_vec.cross(camera_forward_vec).normalize();
+
+        let frustum_near = self.camera_controller.camera.near.max(0.1);
+        let frustum_far = shadow_extent.min(self.camera_controller.camera.far);
+        let tan_half_fov = (self.camera_controller.camera.fov * 0.5).tan();
+        let near_height = 2.0 * tan_half_fov * frustum_near;
+        let near_width = near_height * aspect;
+        let far_height = 2.0 * tan_half_fov * frustum_far;
+        let far_width = far_height * aspect;
+
+        let near_center = camera_pos_vec + camera_forward_vec * frustum_near;
+        let far_center = camera_pos_vec + camera_forward_vec * frustum_far;
+
+        let near_up_vec = camera_up_vec * (near_height * 0.5);
+        let near_right_vec = camera_right_vec * (near_width * 0.5);
+        let far_up_vec = camera_up_vec * (far_height * 0.5);
+        let far_right_vec = camera_right_vec * (far_width * 0.5);
+
+        let frustum_corners = [
+            near_center - near_right_vec + near_up_vec,
+            near_center + near_right_vec + near_up_vec,
+            near_center + near_right_vec - near_up_vec,
+            near_center - near_right_vec - near_up_vec,
+            far_center - far_right_vec + far_up_vec,
+            far_center + far_right_vec + far_up_vec,
+            far_center + far_right_vec - far_up_vec,
+            far_center - far_right_vec - far_up_vec,
+        ];
+
+        let mut bounds_min = Vec3::splat(f32::INFINITY);
+        let mut bounds_max = Vec3::splat(f32::NEG_INFINITY);
+        for corner in frustum_corners.iter() {
+            let corner_ls = (light_view * corner.extend(1.0)).truncate();
+            bounds_min = bounds_min.min(corner_ls);
+            bounds_max = bounds_max.max(corner_ls);
+        }
+
+        let xy_padding = 15.0;
+        bounds_min.x -= xy_padding;
+        bounds_min.y -= xy_padding;
+        bounds_max.x += xy_padding;
+        bounds_max.y += xy_padding;
+
+        let z_padding = 25.0;
+        let mut near_plane = (-bounds_max.z).max(0.1);
+        let mut far_plane = (-bounds_min.z).max(near_plane + 10.0);
+        near_plane = (near_plane - z_padding).max(0.1);
+        far_plane += z_padding;
+        if far_plane <= near_plane + 1.0 {
+            far_plane = near_plane + 1.0;
+        }
+
+        // Stabilize shadow map by snapping to texel-aligned grid
+        // This prevents sub-pixel jitter when camera moves
+        let width = bounds_max.x - bounds_min.x;
+        let height = bounds_max.y - bounds_min.y;
+        let texel_size_x = width / self.shadow_map_size as f32;
+        let texel_size_y = height / self.shadow_map_size as f32;
+        
+        bounds_min.x = (bounds_min.x / texel_size_x).floor() * texel_size_x;
+        bounds_min.y = (bounds_min.y / texel_size_y).floor() * texel_size_y;
+        bounds_max.x = (bounds_max.x / texel_size_x).ceil() * texel_size_x;
+        bounds_max.y = (bounds_max.y / texel_size_y).ceil() * texel_size_y;
+
+        let light_proj = Mat4::orthographic_rh(
+            bounds_min.x,
+            bounds_max.x,
+            bounds_min.y,
+            bounds_max.y,
+            near_plane,
+            far_plane,
+        );
+        let sun_view_proj = OPENGL_TO_WGPU_MATRIX * light_proj * light_view;
+        let sun_view_proj_cols: [[f32; 4]; 4] = sun_view_proj.to_cols_array_2d();
+
+        // Shadow strength based on sun/moon position
+        // During day (sun_height > 0): full sun shadows
+        // During night (sun_height < 0): weaker moon shadows (moon opposite to sun)
+        // Transition smoothly at horizon
+        let shadow_strength = if sun_height >= -0.1 {
+            // Sun is up or near horizon - full strength sun shadows
+            let base_strength = ((sun_height + 0.1) / 0.1).clamp(0.0, 1.0);
+            (base_strength * SHADOW_STRENGTH_MULTIPLIER).min(1.0)
+        } else {
+            // Moon shadows at night - moon is opposite the sun (so -sun_height tells us moon height)
+            // Moon shadow strength varies: strongest at midnight (when moon is highest)
+            let moon_height = -sun_height; // Moon is on opposite side
+            let moon_strength = if moon_height > 0.1 {
+                // Moon is well above horizon - cast visible shadows
+                // Peak at midnight (sun_height ≈ -1.0, so moon_height ≈ 1.0)
+                let moon_factor = (moon_height - 0.1).clamp(0.0, 0.9) / 0.9;
+                // Moon shadows are weaker but visible: 40-70% strength
+                0.4 + moon_factor * 0.3
+            } else {
+                // Moon near horizon - fade to no shadows
+                let fade = (moon_height + 0.1).clamp(0.0, 0.1) / 0.1;
+                fade * 0.4
+            };
+            moon_strength
+        };
+        let shadow_texel = 1.0 / self.shadow_map_size as f32;
+
+        // Print time/shadow info every second for debugging
+        if self.frame_count % 60 == 0 {
+            let phase = if self.time_of_day < 0.125 {
+                "Midnight→Dawn"
+            } else if self.time_of_day < 0.25 {
+                "Dawn→Sunrise"
+            } else if self.time_of_day < 0.5 {
+                "Sunrise→Noon"
+            } else if self.time_of_day < 0.75 {
+                "Noon→Sunset"
+            } else if self.time_of_day < 0.875 {
+                "Sunset→Dusk"
+            } else {
+                "Dusk→Midnight"
+            };
+            println!(
+                "Time: {:.3} ({}), SunH: {:.2}, MoonH: {:.2}, Shadow: {:.2}",
+                self.time_of_day,
+                phase,
+                sun_height,
+                -sun_height,
+                shadow_strength
+            );
+        }
 
         // Update uniforms with MVP and lighting data
         let uniforms = Uniforms {
             mvp: mvp_cols,
-            sun_direction,
-            fog_density: self.fog_density,
-            sun_color,
-            _padding2: 0.0,
-            ambient_color,
-            time_of_day: self.time_of_day,
-            _padding3: [0.0; 8],
+            sun_view_proj: sun_view_proj_cols,
+            camera_shadow_strength: [camera_pos[0], camera_pos[1], camera_pos[2], shadow_strength],
+            sun_direction_shadow_bias: [
+                sun_direction_vec.x,
+                sun_direction_vec.y,
+                sun_direction_vec.z,
+                SHADOW_BIAS,
+            ],
+            fog_time_pad: [self.fog_density, self.time_of_day, 0.0, 0.0],
+            sun_color_pad: [sun_color[0], sun_color[1], sun_color[2], 0.0],
+            ambient_color_pad: [ambient_color[0], ambient_color[1], ambient_color[2], 0.0],
+            shadow_texel_size_pad: [shadow_texel, shadow_texel, 0.0, 0.0],
         };
 
         queue.write_buffer(
@@ -3375,6 +3906,16 @@ impl App {
             0,
             bytemuck::cast_slice(&[uniforms]),
         );
+
+        if self.shadow_view.is_none() {
+            self.recreate_shadow_map();
+        }
+        if self.shadow_bind_group.is_none() {
+            self.update_shadow_bind_group();
+        }
+        if self.bind_group.is_none() {
+            self.update_main_bind_group();
+        }
 
         // Create command encoder
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -3394,6 +3935,57 @@ impl App {
                 compute_pass.set_pipeline(cull_pipeline);
                 compute_pass.set_bind_group(0, cull_bind_group, &[]);
                 compute_pass.dispatch_workgroups(dispatch_x, 1, 1);
+            }
+        }
+
+        if let (
+            Some(shadow_view),
+            Some(shadow_pipeline),
+            Some(shadow_mesh_pipeline),
+            Some(shadow_bind_group),
+        ) = (
+            self.shadow_view.as_ref(),
+            self.shadow_pipeline.as_ref(),
+            self.shadow_mesh_pipeline.as_ref(),
+            self.shadow_bind_group.as_ref(),
+        ) {
+            let mut shadow_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Shadow Pass"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: shadow_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            if has_meshes_to_draw {
+                shadow_pass.set_pipeline(shadow_mesh_pipeline);
+                shadow_pass.set_bind_group(0, shadow_bind_group, &[]);
+                for key in draw_mesh_keys.iter() {
+                    if let Some(entry) = self.mesh_cache.get_mut(key) {
+                        shadow_pass.set_vertex_buffer(0, entry.vertex_buffer.slice(..));
+                        shadow_pass.set_index_buffer(
+                            entry.index_buffer.slice(..),
+                            wgpu::IndexFormat::Uint32,
+                        );
+                        shadow_pass.draw_indexed(0..entry.index_count, 0, 0..1);
+                    }
+                }
+            }
+
+            if !instances.is_empty() {
+                shadow_pass.set_pipeline(shadow_pipeline);
+                shadow_pass.set_bind_group(0, shadow_bind_group, &[]);
+                shadow_pass
+                    .set_vertex_buffer(0, self.cube_vertex_buffer.as_ref().unwrap().slice(..));
+                shadow_pass.set_vertex_buffer(1, self.instance_buffer.as_ref().unwrap().slice(..));
+                shadow_pass.draw(0..36, 0..instances.len() as u32);
             }
         }
 

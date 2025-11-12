@@ -54,9 +54,7 @@ pub fn generate_chunk_mesh(chunk: &Chunk, palette: &Palette) -> ChunkMesh {
         if let Voxel::Solid(voxel_type) = voxel {
             let (emissive_color, emissive_intensity) = palette.emissive(*voxel_type as u32);
             let has_emission = emissive_intensity > 0.0
-                && (emissive_color[0] > 0.0
-                    || emissive_color[1] > 0.0
-                    || emissive_color[2] > 0.0);
+                && (emissive_color[0] > 0.0 || emissive_color[1] > 0.0 || emissive_color[2] > 0.0);
             if has_emission {
                 mesh.emitters.push(ChunkEmitter {
                     position: [x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5],
@@ -155,17 +153,8 @@ pub fn generate_chunk_mesh(chunk: &Chunk, palette: &Palette) -> ChunkMesh {
 
                     // Emit this rectangle
                     emit_quad(
-                        &mut mesh,
-                        palette,
-                        axis,
-                        d,
-                        u_axis,
-                        v_axis,
-                        u_start,
-                        v_start,
-                        width,
-                        height,
-                        t,
+                        &mut mesh, palette, axis, d, u_axis, v_axis, u_start, v_start, width,
+                        height, t,
                     );
                     faces_this_axis += 1;
 

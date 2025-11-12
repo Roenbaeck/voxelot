@@ -1,18 +1,19 @@
 // Voxel rendering shader for hierarchical chunks with global lighting
 
 struct Uniforms {
-    mvp: mat4x4<f32>,           // 64 bytes
-    sun_direction: vec3<f32>,   // 12 bytes - Direction TO the sun (normalized)
-    fog_density: f32,           // 4 bytes - Fog density (was _padding1)
-    sun_color: vec3<f32>,       // 12 bytes - Sun color (e.g., warm yellow)
-    _padding2: f32,             // 4 bytes
-    ambient_color: vec3<f32>,   // 12 bytes - Ambient/sky color
-    time_of_day: f32,           // 4 bytes - 0.0 = midnight, 0.5 = noon, 1.0 = midnight
-    // _padding3: vec4<f32> in Rust (16 bytes) - shader doesn't need to declare trailing padding
-};
+    mvp: mat4x4<f32>,
+    sun_view_proj: mat4x4<f32>,
+    camera_shadow_strength: vec4<f32>,
+    sun_direction_shadow_bias: vec4<f32>,
+    fog_time_pad: vec4<f32>,
+    sun_color_pad: vec4<f32>,
+    ambient_color_pad: vec4<f32>,
+    shadow_texel_size_pad: vec4<f32>,
+}
 
-@group(0) @binding(0)
-var<uniform> uniforms: Uniforms;
+@group(0) @binding(0) var<uniform> uniforms: Uniforms;
+@group(0) @binding(1) var shadow_map: texture_depth_2d;
+@group(0) @binding(2) var shadow_sampler: sampler_comparison;
 
 
 struct VertexOutputInstanced {
@@ -20,14 +21,20 @@ struct VertexOutputInstanced {
     @location(0) color: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) emissive: vec4<f32>,
-};
+    @location(3) light_space_pos: vec4<f32>,
+}
 
 struct VertexOutputMesh {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) emissive: vec4<f32>,
-};
+    @location(3) light_space_pos: vec4<f32>,
+}
+
+struct ShadowVertexOutput {
+    @builtin(position) position: vec4<f32>,
+}
 
 // Cube vertices (36 vertices for 6 faces)
 const CUBE_VERTICES: array<vec3<f32>, 36> = array<vec3<f32>, 36>(
@@ -110,6 +117,7 @@ fn vs_main(
     let scaled_vertex_pos = vertex_position * instance_scale;
     let world_pos = vec4<f32>(instance_position + scaled_vertex_pos, 1.0);
     output.position = uniforms.mvp * world_pos;
+    output.light_space_pos = uniforms.sun_view_proj * world_pos;
     
     // Use the per-vertex normal from the buffer
     output.normal = vertex_normal;
@@ -128,29 +136,22 @@ fn vs_main(
 
 @fragment
 fn fs_main(input: VertexOutputInstanced) -> @location(0) vec4<f32> {
-    // Global sun/moon lighting from uniforms
-    let sun_dir = normalize(uniforms.sun_direction);
-    
-    // Diffuse lighting from sun
+    let sun_dir = normalize(uniforms.sun_direction_shadow_bias.xyz);
     let diffuse = max(dot(input.normal, sun_dir), 0.0);
-    let sun_contribution = diffuse * uniforms.sun_color;
-    
-    // Ambient lighting (sky/moonlight)
-    let ambient = uniforms.ambient_color;
-    
-    // Combine lighting
+    let base_shadow = compute_shadow(input.light_space_pos, input.normal, sun_dir);
+    let shadow_strength = uniforms.camera_shadow_strength.w;
+    let shadow_visibility = mix(1.0, base_shadow, shadow_strength);
+    let sun_contribution = diffuse * uniforms.sun_color_pad.xyz * shadow_visibility;
+    let ambient = uniforms.ambient_color_pad.xyz;
     let lighting = ambient + sun_contribution;
-    
-    // Apply lighting to voxel color
     let emissive = input.emissive.rgb * input.emissive.a;
     let color = input.color * lighting + emissive;
-    
-    // Atmospheric fog with dynamic density from uniforms
-    let fog_color = vec3<f32>(0.7, 0.8, 0.9); // Light blue sky
+
+    let fog_color = vec3<f32>(0.7, 0.8, 0.9);
     let distance = length(input.position.xyz);
-    let fog_factor = 1.0 - exp(-uniforms.fog_density * distance);
+    let fog_factor = 1.0 - exp(-uniforms.fog_time_pad.x * distance);
     let final_color = mix(color, fog_color, fog_factor * 0.5);
-    
+
     return vec4<f32>(final_color, 1.0);
 }
 
@@ -163,7 +164,9 @@ fn vs_mesh(
     @location(3) emissive: vec4<f32>,
 ) -> VertexOutputMesh {
     var out: VertexOutputMesh;
-    out.position = uniforms.mvp * vec4<f32>(position, 1.0);
+    let world_pos = vec4<f32>(position, 1.0);
+    out.position = uniforms.mvp * world_pos;
+    out.light_space_pos = uniforms.sun_view_proj * world_pos;
     out.normal = normal;
     out.color = color.rgb;
     out.emissive = emissive;
@@ -172,16 +175,79 @@ fn vs_mesh(
 
 @fragment
 fn fs_mesh(input: VertexOutputMesh) -> @location(0) vec4<f32> {
-    let sun_dir = normalize(uniforms.sun_direction);
+    let sun_dir = normalize(uniforms.sun_direction_shadow_bias.xyz);
     let diffuse = max(dot(input.normal, sun_dir), 0.0);
-    let sun_contribution = diffuse * uniforms.sun_color;
-    let ambient = uniforms.ambient_color;
+    let base_shadow = compute_shadow(input.light_space_pos, input.normal, sun_dir);
+    let shadow_strength = uniforms.camera_shadow_strength.w;
+    let shadow_visibility = mix(1.0, base_shadow, shadow_strength);
+    let sun_contribution = diffuse * uniforms.sun_color_pad.xyz * shadow_visibility;
+    let ambient = uniforms.ambient_color_pad.xyz;
     let lighting = ambient + sun_contribution;
     let emissive = input.emissive.rgb * input.emissive.a;
     let color = input.color * lighting + emissive;
     let fog_color = vec3<f32>(0.7, 0.8, 0.9);
     let distance = length(input.position.xyz);
-    let fog_factor = 1.0 - exp(-uniforms.fog_density * distance);
+    let fog_factor = 1.0 - exp(-uniforms.fog_time_pad.x * distance);
     let final_color = mix(color, fog_color, fog_factor * 0.5);
     return vec4<f32>(final_color, 1.0);
+}
+
+fn compute_shadow(light_space_pos: vec4<f32>, normal: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
+    if (light_space_pos.w <= 0.0) {
+        return 1.0;
+    }
+
+    let proj_coords = light_space_pos.xyz / light_space_pos.w;
+    let uv = vec2<f32>(proj_coords.x * 0.5 + 0.5, 0.5 - proj_coords.y * 0.5);
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+        return 1.0;
+    }
+
+    let depth = clamp(proj_coords.z, 0.0, 1.0);
+    let base_bias = uniforms.sun_direction_shadow_bias.w;
+    let ndotl = max(dot(normal, sun_dir), 0.0);
+    // Slope bias: more bias when surface is at grazing angle to light
+    let slope_bias = (1.0 - ndotl) * 0.002;
+    // Texel bias: prevent self-shadowing artifacts
+    let texel_bias = max(uniforms.shadow_texel_size_pad.x, uniforms.shadow_texel_size_pad.y) * 0.5;
+    let depth_ref = clamp(depth - (base_bias + slope_bias + texel_bias), 0.0, 1.0);
+    
+    // 2x2 PCF (Percentage Closer Filtering) for smoother shadow edges
+    let texel_size = vec2<f32>(uniforms.shadow_texel_size_pad.x, uniforms.shadow_texel_size_pad.y);
+    var shadow = 0.0;
+    let offset = texel_size * 0.5;
+    shadow += textureSampleCompare(shadow_map, shadow_sampler, uv + vec2(-offset.x, -offset.y), depth_ref);
+    shadow += textureSampleCompare(shadow_map, shadow_sampler, uv + vec2(offset.x, -offset.y), depth_ref);
+    shadow += textureSampleCompare(shadow_map, shadow_sampler, uv + vec2(-offset.x, offset.y), depth_ref);
+    shadow += textureSampleCompare(shadow_map, shadow_sampler, uv + vec2(offset.x, offset.y), depth_ref);
+    return shadow * 0.25;
+}
+
+@vertex
+fn vs_shadow_instanced(
+    @location(0) instance_position: vec3<f32>,
+    @location(1) _instance_voxel_type: u32,
+    @location(2) instance_scale: f32,
+    @location(3) _instance_custom_color: vec4<f32>,
+    @location(4) vertex_position: vec3<f32>,
+    @location(5) _vertex_normal: vec3<f32>,
+    @location(6) _instance_emissive: vec4<f32>,
+) -> ShadowVertexOutput {
+    var output: ShadowVertexOutput;
+    let scaled_vertex_pos = vertex_position * instance_scale;
+    let world_pos = vec4<f32>(instance_position + scaled_vertex_pos, 1.0);
+    output.position = uniforms.sun_view_proj * world_pos;
+    return output;
+}
+
+@vertex
+fn vs_shadow_mesh(
+    @location(0) position: vec3<f32>,
+    @location(1) _normal: vec3<f32>,
+    @location(2) _color: vec4<f32>,
+    @location(3) _emissive: vec4<f32>,
+) -> ShadowVertexOutput {
+    var output: ShadowVertexOutput;
+    output.position = uniforms.sun_view_proj * vec4<f32>(position, 1.0);
+    return output;
 }
