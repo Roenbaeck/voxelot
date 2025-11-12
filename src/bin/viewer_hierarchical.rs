@@ -1020,7 +1020,7 @@ impl App {
                 focal_range: 16.0,
                 blur_strength: 1.6,
             },
-            dof_enabled: false,
+            dof_enabled: true,
             bloom_settings: BloomSettings {
                 threshold: 0.7,
                 knee: 0.6,
