@@ -669,6 +669,7 @@ struct App {
 
     // Lighting state
     time_of_day: f32,
+    time_paused: bool,
     fog_density: f32,
 
     // LOD state
@@ -976,6 +977,7 @@ impl App {
             mouse_pressed: false,
             last_mouse_pos: None,
             time_of_day: 0.5,    // Start at noon
+            time_paused: false,  // Time cycle starts running
             fog_density: 0.0015, // Default fog density
             lod_distance: 800.0, // Default LOD render distance
             dof_pipeline: None,
@@ -1105,7 +1107,8 @@ impl App {
     fn process_lighting_key(&mut self, key: KeyCode) {
         match key {
             KeyCode::KeyT => {
-                // Report current time of day (auto-cycles now)
+                // Toggle time pause
+                self.time_paused = !self.time_paused;
                 let phase = if self.time_of_day < 0.125 {
                     "Midnight→Dawn"
                 } else if self.time_of_day < 0.25 {
@@ -1119,7 +1122,12 @@ impl App {
                 } else {
                     "Dusk→Midnight"
                 };
-                println!("Time of day: {:.3} ({})", self.time_of_day, phase);
+                println!(
+                    "Time {} at {:.3} ({})",
+                    if self.time_paused { "paused" } else { "resumed" },
+                    self.time_of_day,
+                    phase
+                );
             }
             KeyCode::KeyF => {
                 // Decrease fog density
@@ -3156,7 +3164,9 @@ impl App {
         self.adjust_mesh_upload_budget(dt, fps);
 
         // Auto-advance time of day: full cycle in 120 seconds (60s sun, 60s moon)
-        self.time_of_day = (self.time_of_day + dt / 120.0) % 1.0;
+        if !self.time_paused {
+            self.time_of_day = (self.time_of_day + dt / 120.0) % 1.0;
+        }
 
         self.camera_controller.update(dt);
 
@@ -3858,31 +3868,6 @@ impl App {
             moon_strength
         };
         let shadow_texel = 1.0 / self.shadow_map_size as f32;
-
-        // Print time/shadow info every second for debugging
-        if self.frame_count % 60 == 0 {
-            let phase = if self.time_of_day < 0.125 {
-                "Midnight→Dawn"
-            } else if self.time_of_day < 0.25 {
-                "Dawn→Sunrise"
-            } else if self.time_of_day < 0.5 {
-                "Sunrise→Noon"
-            } else if self.time_of_day < 0.75 {
-                "Noon→Sunset"
-            } else if self.time_of_day < 0.875 {
-                "Sunset→Dusk"
-            } else {
-                "Dusk→Midnight"
-            };
-            println!(
-                "Time: {:.3} ({}), SunH: {:.2}, MoonH: {:.2}, Shadow: {:.2}",
-                self.time_of_day,
-                phase,
-                sun_height,
-                -sun_height,
-                shadow_strength
-            );
-        }
 
         // Update uniforms with MVP and lighting data
         let uniforms = Uniforms {

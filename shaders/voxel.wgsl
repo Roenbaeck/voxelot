@@ -144,13 +144,16 @@ fn fs_main(input: VertexOutputInstanced) -> @location(0) vec4<f32> {
     let sun_contribution = diffuse * uniforms.sun_color_pad.xyz * shadow_visibility;
     let ambient = uniforms.ambient_color_pad.xyz;
     let lighting = ambient + sun_contribution;
-    let emissive = input.emissive.rgb * input.emissive.a;
-    let color = input.color * lighting + emissive;
+    let color = input.color * lighting;
 
     let fog_color = vec3<f32>(0.7, 0.8, 0.9);
     let distance = length(input.position.xyz);
     let fog_factor = 1.0 - exp(-uniforms.fog_time_pad.x * distance);
-    let final_color = mix(color, fog_color, fog_factor * 0.5);
+    let fogged_color = mix(color, fog_color, fog_factor * 0.5);
+    
+    // Add emissive after fog so it stays bright
+    let emissive = input.emissive.rgb * input.emissive.a;
+    let final_color = fogged_color + emissive;
 
     return vec4<f32>(final_color, 1.0);
 }
@@ -183,12 +186,15 @@ fn fs_mesh(input: VertexOutputMesh) -> @location(0) vec4<f32> {
     let sun_contribution = diffuse * uniforms.sun_color_pad.xyz * shadow_visibility;
     let ambient = uniforms.ambient_color_pad.xyz;
     let lighting = ambient + sun_contribution;
-    let emissive = input.emissive.rgb * input.emissive.a;
-    let color = input.color * lighting + emissive;
+    let color = input.color * lighting;
     let fog_color = vec3<f32>(0.7, 0.8, 0.9);
     let distance = length(input.position.xyz);
     let fog_factor = 1.0 - exp(-uniforms.fog_time_pad.x * distance);
-    let final_color = mix(color, fog_color, fog_factor * 0.5);
+    let fogged_color = mix(color, fog_color, fog_factor * 0.5);
+    
+    // Add emissive after fog so it stays bright
+    let emissive = input.emissive.rgb * input.emissive.a;
+    let final_color = fogged_color + emissive;
     return vec4<f32>(final_color, 1.0);
 }
 
