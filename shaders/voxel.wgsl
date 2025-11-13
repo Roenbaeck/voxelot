@@ -181,7 +181,12 @@ fn fs_main(input: VertexOutputInstanced) -> @location(0) vec4<f32> {
     indirect_light = min(indirect_light, vec3<f32>(0.1, 0.1, 0.1));
     
     let lighting = ambient + sun_contribution + moon_light + indirect_light;
-    let color = input.color * lighting;
+    
+    // For emissive surfaces, reduce lighting influence to prevent over-brightening
+    // Emissive surfaces should show their base color + emission, not lit base color + emission
+    let emissive_strength = input.emissive.a;
+    let lighting_multiplier = mix(1.0, 0.3, emissive_strength);
+    let color = input.color * (lighting * lighting_multiplier);
 
     let fog_color = vec3<f32>(0.7, 0.8, 0.9);
     let distance = length(input.position.xyz);
@@ -189,7 +194,7 @@ fn fs_main(input: VertexOutputInstanced) -> @location(0) vec4<f32> {
     let fogged_color = mix(color, fog_color, fog_factor * 0.5);
     
     // Add emissive after fog so it stays bright
-    let emissive = input.emissive.rgb * input.emissive.a;
+    let emissive = input.emissive.rgb * emissive_strength;
     let final_color = fogged_color + emissive;
 
     return vec4<f32>(final_color, 1.0);
@@ -244,14 +249,20 @@ fn fs_mesh(input: VertexOutputMesh) -> @location(0) vec4<f32> {
     indirect_light = min(indirect_light, vec3<f32>(0.1, 0.1, 0.1));
     
     let lighting = ambient + sun_contribution + moon_light + indirect_light;
-    let color = input.color * lighting;
+    
+    // For emissive surfaces, reduce lighting influence to prevent over-brightening
+    // Emissive surfaces should show their base color + emission, not lit base color + emission
+    let emissive_strength = input.emissive.a;
+    let lighting_multiplier = mix(1.0, 0.3, emissive_strength);
+    let color = input.color * (lighting * lighting_multiplier);
+    
     let fog_color = vec3<f32>(0.7, 0.8, 0.9);
     let distance = length(input.position.xyz);
     let fog_factor = 1.0 - exp(-uniforms.fog_time_pad.x * distance);
     let fogged_color = mix(color, fog_color, fog_factor * 0.5);
     
     // Add emissive after fog so it stays bright
-    let emissive = input.emissive.rgb * input.emissive.a;
+    let emissive = input.emissive.rgb * emissive_strength;
     let final_color = fogged_color + emissive;
     return vec4<f32>(final_color, 1.0);
 }
