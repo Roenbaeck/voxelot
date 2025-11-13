@@ -739,6 +739,9 @@ impl App {
         let process_pid = Pid::from(std::process::id() as usize);
         system_info.refresh_process(process_pid);
 
+        // Load configuration
+        let app_config = voxelot::Config::load_or_default(CONFIG_FILE);
+
         let mut initial_camera;
         let mut world;
 
@@ -800,11 +803,9 @@ impl App {
                 }
             }
         } else {
-            // Load configuration
-            let app_config = voxelot::Config::load_or_default(CONFIG_FILE);
             initial_camera = app_config.world.camera_position;
             
-            println!("Loading voxel data...");
+            println!("Loading voxel data from {}...", app_config.world.file);
             // Load octree format from configured path
             match std::fs::File::open(&app_config.world.file) {
                 Ok(file) => {
@@ -865,7 +866,8 @@ impl App {
 
         println!("World created with voxels");
 
-        let palette = Palette::load("palette.txt");
+        println!("Loading palette from {}...", app_config.world.palette);
+        let palette = Palette::load(&app_config.world.palette);
         let (mesh_job_tx, mesh_job_rx) = unbounded::<MeshJob>();
         let (mesh_result_tx, mesh_result_rx) = unbounded::<MeshResult>();
 
