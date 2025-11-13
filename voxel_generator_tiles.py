@@ -567,18 +567,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--center-lon", type=float, default=-73.9855, help="Center longitude in degrees")
     parser.add_argument("--center-lat", type=float, default=40.7580, help="Center latitude in degrees")
     parser.add_argument("--zoom", type=int, default=15, help="Web Mercator zoom level")
-    parser.add_argument("--radius", type=int, default=1, help="Tile radius around center (Manhattan distance)")
+    parser.add_argument("--radius", type=int, default=2, help="Tile radius around center (Manhattan distance)")
     parser.add_argument("--voxels-per-tile", type=int, default=256, help="Voxel resolution along X/Z per tile")
     parser.add_argument("--meters-per-voxel", type=float, default=1.5, help="World scale mapping for voxel height")
     parser.add_argument("--max-height-voxels", type=int, default=256, help="Clamp voxelized height to this many voxels")
     parser.add_argument("--seed", type=int, default=2024, help="Deterministic seed controlling procedural content")
-    parser.add_argument("--output-prefix", type=str, default="osm_voxels", help="Base filename for outputs")
+    parser.add_argument("--output-name", type=str, default="world_2", help="Base filename for outputs (without extension)")
+    parser.add_argument("--format", type=str, choices=["txt", "oct", "both"], default="oct", 
+                        help="Output format: txt (text), oct (binary octree), or both")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
 
+    print(f"Generating world with radius {args.radius} (8x larger than radius 1)...")
     results = generate_area(
         args.center_lon,
         args.center_lat,
@@ -590,15 +593,74 @@ def main() -> None:
         seed=args.seed,
     )
 
-    ascii_path = Path(f"{args.output_prefix}.txt")
-    with ascii_path.open("w") as f:
+    # Calculate world bounds
+    min_x = min_z = float('inf')
+    max_x = max_z = float('-inf')
+    max_y = 0
+    
+    for r in results:
+        tile_offset_x = (r.tile.x - results[0].tile.x) * r.voxel_resolution
+        tile_offset_z = (r.tile.y - results[0].tile.y) * r.voxel_resolution
+        for v in r.voxels:
+            x = tile_offset_x + v.x
+            z = tile_offset_z + v.z
+            min_x = min(min_x, x)
+            max_x = max(max_x, x)
+            min_z = min(min_z, z)
+            max_z = max(max_z, z)
+            max_y = max(max_y, v.y)
+    
+    total_voxels = sum(len(r.voxels) for r in results)
+    print(f"World bounds: X[{int(min_x)}, {int(max_x)}], Y[0, {int(max_y)}], Z[{int(min_z)}, {int(max_z)}]")
+    print(f"Total voxels: {total_voxels}")
+    
+    # Write text format if requested
+    if args.format in ["txt", "both"]:
+        ascii_path = Path(f"{args.output_name}.txt")
+        print(f"Writing text format to {ascii_path}...")
+        with ascii_path.open("w") as f:
+            for r in results:
+                tile_offset_x = (r.tile.x - results[0].tile.x) * r.voxel_resolution
+                tile_offset_z = (r.tile.y - results[0].tile.y) * r.voxel_resolution
+                for v in r.voxels:
+                    voxel_type = v.material_index + 1
+                    f.write(f"{tile_offset_x + v.x} {v.y} {tile_offset_z + v.z} {voxel_type}\n")
+        print(f"Wrote text format: {ascii_path}")
+    
+    # Write octree format if requested
+    if args.format in ["oct", "both"]:
+        from octree_writer import OctreeWorld, calculate_required_depth
+        
+        oct_path = Path(f"{args.output_name}.oct")
+        print(f"Writing octree format to {oct_path}...")
+        
+        # Calculate required depth
+        max_coord = int(max(max_x, max_y, max_z))
+        depth = calculate_required_depth(max_coord)
+        print(f"Calculated required depth: {depth} (world size: {16**depth}³)")
+        
+        # Create world and add voxels
+        world = OctreeWorld(depth)
+        voxel_count = 0
         for r in results:
             tile_offset_x = (r.tile.x - results[0].tile.x) * r.voxel_resolution
             tile_offset_z = (r.tile.y - results[0].tile.y) * r.voxel_resolution
             for v in r.voxels:
+                x = tile_offset_x + v.x
+                z = tile_offset_z + v.z
                 voxel_type = v.material_index + 1
-                f.write(f"{tile_offset_x + v.x} {v.y} {tile_offset_z + v.z} {voxel_type}\n")
+                world.set(int(x), int(v.y), int(z), voxel_type)
+                voxel_count += 1
+                if voxel_count % 100000 == 0:
+                    print(f"  Processed {voxel_count}/{total_voxels} voxels...")
+        
+        world.save(str(oct_path))
+        
+        import os
+        file_size = os.path.getsize(oct_path)
+        print(f"Octree file size: {file_size / 1024 / 1024:.1f} MB")
 
+    # Save metadata
     meta = {
         "world": {
             "center_lon": args.center_lon,
@@ -609,6 +671,19 @@ def main() -> None:
             "voxel_resolution": args.voxels_per_tile,
             "meters_per_voxel": args.meters_per_voxel,
             "max_height_voxels": args.max_height_voxels,
+            "bounds": {
+                "min_x": int(min_x),
+                "max_x": int(max_x),
+                "min_y": 0,
+                "max_y": int(max_y),
+                "min_z": int(min_z),
+                "max_z": int(max_z),
+            },
+            "camera_position": [
+                int((min_x + max_x) / 2),
+                int(max_y + 50),
+                int((min_z + max_z) / 2),
+            ],
         },
         "tiles": [
             {
@@ -622,11 +697,8 @@ def main() -> None:
         ],
     }
 
-    meta_path = Path(f"{args.output_prefix}_meta.json")
+    meta_path = Path(f"{args.output_name}_meta.json")
     meta_path.write_text(json.dumps(meta, indent=2))
-
-    total_voxels = sum(len(r.voxels) for r in results)
-    print(f"Wrote {total_voxels} voxels across {len(results)} tiles to {ascii_path}")
     print(f"Metadata saved to {meta_path}")
 
 

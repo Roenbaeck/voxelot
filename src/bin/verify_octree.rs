@@ -1,13 +1,17 @@
 //! Verify octree file by sampling voxels
 
+use std::env;
 use std::fs::File;
 use std::io::BufReader;
 use voxelot::{load_world, WorldPos};
 
 fn main() -> std::io::Result<()> {
-    println!("Verifying osm_voxels.oct...\n");
+    let args: Vec<String> = env::args().collect();
+    let filename = args.get(1).map(String::as_str).unwrap_or("world_1.oct");
     
-    let file = File::open("osm_voxels.oct")?;
+    println!("Verifying {}...\n", filename);
+    
+    let file = File::open(filename)?;
     let mut reader = BufReader::new(file);
     let world = load_world(&mut reader)?;
     

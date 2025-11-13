@@ -741,18 +741,13 @@ impl App {
         let process_pid = Pid::from(std::process::id() as usize);
         system_info.refresh_process(process_pid);
 
-        // Create world with test data (depth 3 = 4,096 units)
-        let mut world = World::new(3);
-
-        println!("Creating world (size: {} units)...", world.world_size());
-
-        let mut initial_camera = if cfg!(feature = "test-block-world") {
-            [50.0, 15.0, 65.0]
-        } else {
-            [680.0, 50.0, 670.0]
-        };
+        let mut initial_camera;
+        let mut world;
 
         if cfg!(feature = "test-block-world") {
+            // Create test world (depth 3 = 4,096 units)
+            world = World::new(3);
+            initial_camera = [50.0, 15.0, 65.0];
             viewer_debug!("Creating test block: 3x5x7 voxels at (50,10,50)");
             let mut count = 0;
             for x in 0..3 {
@@ -826,6 +821,7 @@ impl App {
                             println!("Failed to load {}: {}", app_config.world.file, e);
                             println!("Using fallback world generation.");
 
+                            world = World::new(3);
                             for x in 0..100 {
                                 for z in 0..100 {
                                     if (x + z) % 3 == 0 {
@@ -848,6 +844,7 @@ impl App {
                 Err(_) => {
                     println!("{} not found. Using fallback world generation.", app_config.world.file);
 
+                    world = World::new(3);
                     for x in 0..100 {
                         for z in 0..100 {
                             if (x + z) % 3 == 0 {
