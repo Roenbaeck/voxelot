@@ -591,6 +591,11 @@ impl World {
         self.hierarchy_depth
     }
 
+    /// Count all voxels in the world
+    pub fn count(&self) -> u64 {
+        self.root.count()
+    }
+
     /// Convert world position to a path through the hierarchy
     /// Returns a Vec of (x, y, z) tuples, one for each level from root to leaf
     fn position_to_path(&self, pos: WorldPos) -> Result<Vec<(u8, u8, u8)>, &'static str> {

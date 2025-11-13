@@ -37,7 +37,7 @@ macro_rules! viewer_debug {
 
 const WINDOW_WIDTH: u32 = 1280;
 const WINDOW_HEIGHT: u32 = 720;
-const CONFIG_FILE: &str = "render_config.txt";
+const CONFIG_FILE: &str = "config.toml";
 const GPU_CULL_WORKGROUP_SIZE: u32 = 64;
 const DEFAULT_MESH_CACHE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 const SHADOW_MAP_SIZE: u32 = 4096;
@@ -807,51 +807,46 @@ impl App {
                 }
             }
         } else {
-            println!("Loading OSM voxel data...");
-            match std::fs::read_to_string("osm_voxels.txt") {
-                Ok(content) => {
-                    let mut voxel_count = 0;
-                    let mut min_x = i64::MAX;
-                    let mut max_x = i64::MIN;
-                    let mut min_y = i64::MAX;
-                    let mut max_y = i64::MIN;
-                    let mut min_z = i64::MAX;
-                    let mut max_z = i64::MIN;
-                    for line in content.lines() {
-                        let parts: Vec<&str> = line.split_whitespace().collect();
-                        if parts.len() == 4 {
-                            if let (Ok(x), Ok(y), Ok(z), Ok(voxel_type)) = (
-                                parts[0].parse::<i64>(),
-                                parts[1].parse::<i64>(),
-                                parts[2].parse::<i64>(),
-                                parts[3].parse::<u8>(),
-                            ) {
-                                world.set(WorldPos::new(x, y, z), voxel_type);
-                                voxel_count += 1;
-                                min_x = min_x.min(x);
-                                max_x = max_x.max(x);
-                                min_y = min_y.min(y);
-                                max_y = max_y.max(y);
-                                min_z = min_z.min(z);
-                                max_z = max_z.max(z);
+            // Load configuration
+            let app_config = voxelot::Config::load_or_default(CONFIG_FILE);
+            initial_camera = app_config.world.camera_position;
+            
+            println!("Loading voxel data...");
+            // Load octree format from configured path
+            match std::fs::File::open(&app_config.world.file) {
+                Ok(file) => {
+                    use std::io::BufReader;
+                    match voxelot::load_world(&mut BufReader::new(file)) {
+                        Ok(loaded_world) => {
+                            world = loaded_world;
+                            println!("Loaded world from {} (depth {})", 
+                                     app_config.world.file, world.hierarchy_depth());
+                        }
+                        Err(e) => {
+                            println!("Failed to load {}: {}", app_config.world.file, e);
+                            println!("Using fallback world generation.");
+
+                            for x in 0..100 {
+                                for z in 0..100 {
+                                    if (x + z) % 3 == 0 {
+                                        world.set(WorldPos::new(x, 0, z), 1);
+                                    }
+                                }
                             }
+
+                            for i in 0..5 {
+                                let x = 30 + i * 20;
+                                for y in 1..=(10 + i * 3) {
+                                    world.set(WorldPos::new(x, y, 50), 2);
+                                }
+                            }
+
+                            initial_camera = [60.0, 40.0, 120.0];
                         }
                     }
-                    println!("Loaded {} voxels from OSM data", voxel_count);
-
-                    if voxel_count > 0 {
-                        let center_x = (min_x + max_x) as f32 * 0.5;
-                        let center_z = (min_z + max_z) as f32 * 0.5;
-                        // Hover above the tallest structure with a bit of headroom
-                        let eye_height = (max_y + 30).max(40) as f32;
-                        initial_camera = [center_x, eye_height, center_z];
-                    }
                 }
-                Err(e) => {
-                    println!(
-                        "Failed to load osm_voxels.txt: {}. Using fallback world generation.",
-                        e
-                    );
+                Err(_) => {
+                    println!("{} not found. Using fallback world generation.", app_config.world.file);
 
                     for x in 0..100 {
                         for z in 0..100 {
@@ -3898,29 +3893,27 @@ impl App {
         let sun_view_proj_cols: [[f32; 4]; 4] = sun_view_proj.to_cols_array_2d();
 
         // Shadow strength based on sun/moon position
-        // During day (sun_height > 0): full sun shadows
-        // During night (sun_height < 0): weaker moon shadows (moon opposite to sun)
-        // Transition smoothly at horizon
-        let shadow_strength = if sun_height >= -0.1 {
-            // Sun is up or near horizon - full strength sun shadows
-            let base_strength = ((sun_height + 0.1) / 0.1).clamp(0.0, 1.0);
-            (base_strength * SHADOW_STRENGTH_MULTIPLIER).min(1.0)
+        // Smooth continuous transition between sun and moon shadows
+        // No discontinuities at horizon crossing
+        let shadow_strength = if sun_height > 0.0 {
+            // Sun is above horizon - full strength sun shadows
+            // Fade in from horizon to avoid sudden appearance
+            let fade_in = (sun_height / 0.2).clamp(0.0, 1.0);
+            (fade_in * SHADOW_STRENGTH_MULTIPLIER).min(1.0)
         } else {
-            // Moon shadows at night - moon is opposite the sun (so -sun_height tells us moon height)
-            // Moon shadow strength varies: strongest at midnight (when moon is highest)
+            // Sun is below horizon - use moon shadows
             let moon_height = -sun_height; // Moon is on opposite side
-            let moon_strength = if moon_height > 0.1 {
-                // Moon is well above horizon - cast visible shadows
-                // Peak at midnight (sun_height ≈ -1.0, so moon_height ≈ 1.0)
-                let moon_factor = (moon_height - 0.1).clamp(0.0, 0.9) / 0.9;
-                // Moon shadows are weaker but visible: 40-70% strength
-                0.4 + moon_factor * 0.3
-            } else {
-                // Moon near horizon - fade to no shadows
-                let fade = (moon_height + 0.1).clamp(0.0, 0.1) / 0.1;
+            // Continuous transition: moon shadows gradually appear as moon rises
+            if moon_height < 0.2 {
+                // Moon just rising - fade in moon shadows gradually
+                let fade = (moon_height / 0.2).clamp(0.0, 1.0);
                 fade * 0.4
-            };
-            moon_strength
+            } else {
+                // Moon well above horizon - stronger shadows at midnight
+                let moon_factor = ((moon_height - 0.2) / 0.8).clamp(0.0, 1.0);
+                // Moon shadows: 40-70% strength, peaking at midnight
+                0.4 + moon_factor * 0.3
+            }
         };
         let shadow_texel = 1.0 / self.shadow_map_size as f32;
 

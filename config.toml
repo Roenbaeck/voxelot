@@ -1,0 +1,8 @@
+# Voxelot Render Configuration
+# Adjust these values and restart the viewer to apply changes
+
+lod_subdivide_distance = 500
+lod_merge_distance = 1000
+far_plane = 5000
+fov_degrees = 70
+near_plane = 0.1

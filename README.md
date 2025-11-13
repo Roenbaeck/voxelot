@@ -36,13 +36,22 @@ Two generators are now provided:
 1. `osm_voxel_generator.py` – legacy one-shot Overpass query producing a coarse static dump `osm_voxels.txt`.
 2. `voxel_generator_tiles.py` – new dry-coded tile-based prototype (no external deps yet) that rasterizes synthetic building footprints per Web Mercator tile and writes the viewer-ready `osm_voxels.txt` plus `osm_voxels_meta.json`.
 
+**File Format:** Voxel data is stored in a compact binary octree format (`.oct` files). The default world is `world_1.oct`. Use the converter tool to process text format data:
+
+```bash
+# Convert osm_voxels.txt to world_1.oct (6x compression)
+cargo run --release --bin convert_osm_format
+```
+
+**Configuration:** The viewer uses `config.toml` for all settings including world file path, camera position, rendering options, and visual effects. Edit this file to customize your experience.
+
 Planned evolution of the tile generator:
 - Replace synthetic footprints with real vector tile (MVT) decoding.
 - Add height inference heuristics (already stubbed) and roof shape variants.
 - Introduce per-tile material palettes & compressed binary output.
 - Hook into streaming residency so tiles load/unload around the camera.
 
-Output compatibility: Both generators currently emit ASCII lines `x y z voxel_type` so the existing Rust ingestion path can remain unchanged while the pipeline is upgraded. The meta JSON documents tile stats for tooling.
+Output compatibility: Both generators currently emit ASCII lines `x y z voxel_type` which can then be converted to the efficient binary format. The meta JSON documents tile stats for tooling.
 
 See `VOXEL_GENERATOR_REVAMP.md` for detailed architecture and roadmap.
 
