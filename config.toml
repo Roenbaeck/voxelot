@@ -1,8 +1,31 @@
-# Voxelot Render Configuration
-# Adjust these values and restart the viewer to apply changes
+# Voxelot Configuration
+# Updated to reference world file in worlds/ directory.
 
+[world]
+file = "worlds/world_1.oct"  # moved from root
+camera_position = [320.0, 100.0, 320.0]
+
+[rendering]
 lod_subdivide_distance = 500
 lod_merge_distance = 1000
+chunk_lod_distance = 800
 far_plane = 5000
 fov_degrees = 70
 near_plane = 0.1
+camera_speed_multiplier = 1.0
+
+[atmosphere]
+fog_density = 0.0005
+time_of_day = 0.5
+
+[effects]
+depth_of_field = false
+dof_focus_distance = 200.0
+dof_blur_size = 2.0
+bloom = true
+bloom_threshold = 0.8
+bloom_intensity = 0.3
+
+[debug]
+show_fps = true
+show_chunk_stats = true

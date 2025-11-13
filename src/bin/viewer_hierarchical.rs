@@ -37,7 +37,7 @@ macro_rules! viewer_debug {
 
 const WINDOW_WIDTH: u32 = 1280;
 const WINDOW_HEIGHT: u32 = 720;
-const CONFIG_FILE: &str = "config.toml";
+const CONFIG_FILE: &str = "config.toml"; // Unified TOML configuration only
 const GPU_CULL_WORKGROUP_SIZE: u32 = 64;
 const DEFAULT_MESH_CACHE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 const SHADOW_MAP_SIZE: u32 = 4096;
@@ -418,24 +418,21 @@ impl CameraController {
     const MAX_SPEED_MULTIPLIER: f32 = 25.0;
     const ROTATION_SPEED: f32 = std::f32::consts::PI / 2.0; // radians per second
 
-    fn new(position: [f32; 3]) -> Self {
-        // Load config from file or use defaults
-        let config = RenderConfig::load_or_default(CONFIG_FILE);
-        println!("Loaded render config:");
-        println!(
-            "  LOD subdivide distance: {}",
-            config.lod_subdivide_distance
-        );
-        println!("  Far plane: {}", config.far_plane);
-        println!("  FOV: {}°", config.fov_degrees);
+    fn new(position: [f32; 3], render_cfg: &voxelot::config::RenderingConfig) -> Self {
+        let rc = RenderConfig::from_rendering(render_cfg);
+        println!("Loaded rendering config (TOML):");
+        println!("  LOD subdivide distance: {}", rc.lod_subdivide_distance);
+        println!("  LOD merge distance: {}", rc.lod_merge_distance);
+        println!("  Far plane: {}", rc.far_plane);
+        println!("  FOV: {}°", rc.fov_degrees);
 
         let mut this = Self {
-            camera: Camera::with_config(position, [0.0, 0.0, -1.0], [0.0, 1.0, 0.0], config),
+            camera: Camera::with_config(position, [0.0, 0.0, -1.0], [0.0, 1.0, 0.0], rc),
             base_speed: 10.0,
-            speed_multiplier: 1.0,
+            speed_multiplier: render_cfg.camera_speed_multiplier.max(0.01),
             sensitivity: 0.002,
             yaw: -std::f32::consts::FRAC_PI_2,
-            pitch: -0.3, // look slightly downward by default
+            pitch: -0.3,
             forward: false,
             backward: false,
             left: false,
@@ -447,7 +444,6 @@ impl CameraController {
             rotate_up: false,
             rotate_down: false,
         };
-        // Initialize forward/up vectors from yaw/pitch immediately
         this.update_camera_vectors();
         this
     }
@@ -976,7 +972,11 @@ impl App {
             mesh_upload_baseline,
             mesh_upload_max,
             mesh_upload_adjust_timer: 0.0,
-            camera_controller: CameraController::new(initial_camera),
+            // Load unified TOML config once and feed rendering section into camera controller
+            camera_controller: {
+                let full_cfg = voxelot::Config::load_or_default(CONFIG_FILE);
+                CameraController::new(initial_camera, &full_cfg.rendering)
+            },
             pending_chunk_meshes: VecDeque::new(),
             pending_chunk_set: HashSet::new(),
             last_frame: Instant::now(),
@@ -1049,10 +1049,28 @@ impl App {
     }
 
     fn save_config(&self) {
-        if let Err(e) = self.camera_controller.camera.config.save(CONFIG_FILE) {
-            eprintln!("Failed to save config: {}", e);
+        // Persist full TOML config using unified Config (camera speed multiplier retained)
+        // We read existing file, update rendering subsection relevant fields, then save.
+        if let Ok(mut full_cfg) = voxelot::Config::load(CONFIG_FILE) {
+            full_cfg.rendering.lod_subdivide_distance = self.camera_controller.camera.config.lod_subdivide_distance;
+            full_cfg.rendering.lod_merge_distance = self.camera_controller.camera.config.lod_merge_distance;
+            full_cfg.rendering.chunk_lod_distance = self.camera_controller.camera.config.lod_render_distance;
+            full_cfg.rendering.fov_degrees = self.camera_controller.camera.config.fov_degrees;
+            full_cfg.rendering.near_plane = self.camera_controller.camera.config.near_plane;
+            full_cfg.rendering.far_plane = self.camera_controller.camera.config.far_plane;
+            full_cfg.rendering.camera_speed_multiplier = self.camera_controller.speed_multiplier;
+            if let Err(e) = full_cfg.save(CONFIG_FILE) {
+                eprintln!("Failed to save unified config: {}", e);
+            } else {
+                println!("Saved unified TOML config to {}", CONFIG_FILE);
+            }
         } else {
-            println!("Saved render config to {}", CONFIG_FILE);
+            eprintln!("Warning: could not load existing TOML config for update; creating default.");
+            let mut full_cfg = voxelot::Config::default();
+            full_cfg.rendering.lod_subdivide_distance = self.camera_controller.camera.config.lod_subdivide_distance;
+            if let Err(e) = full_cfg.save(CONFIG_FILE) {
+                eprintln!("Failed to write default unified config: {}", e);
+            }
         }
     }
 

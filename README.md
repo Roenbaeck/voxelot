@@ -103,7 +103,17 @@ Regenerate the default New York sample world with:
   - Runtime adjustable with K/L keys for performance tuning
 - **Chunk Mesh Streaming**: Greedy-meshed leaf chunks stream in gradually with a fallback preview so camera motion stays stutter-free even when new data appears
 
-Configuration is saved to `render_config.txt` and automatically loaded on startup. You can edit this file directly to change render settings without recompiling.
+Configuration is now unified and saved in structured TOML `config.toml` with tables:
+
+```
+[world]        # world file path, initial camera position
+[rendering]    # LOD distances, camera planes, FOV, speed multiplier
+[atmosphere]   # fog density, time_of_day
+[effects]      # bloom, depth of field parameters
+[debug]        # debug overlay toggles
+```
+
+Only this TOML format is supported; legacy flat key=value config has been removed.
 
 ### Architecture
 
