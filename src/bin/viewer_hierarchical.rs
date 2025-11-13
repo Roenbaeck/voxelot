@@ -173,6 +173,8 @@ struct Uniforms {
     sun_color_pad: [f32; 4],             // xyz = sun color
     ambient_color_pad: [f32; 4],         // xyz = ambient color
     shadow_texel_size_pad: [f32; 4],     // xy = 1 / shadow map size
+    moon_direction_intensity: [f32; 4],  // xyz = moon dir, w = intensity scalar
+    moon_color_pad: [f32; 4],            // xyz = moon color
     light_probe_count: u32,
     _pad0: u32,
     _pad1: u32,
@@ -3026,6 +3028,8 @@ impl App {
             sun_color_pad: [1.0, 0.95, 0.8, 0.0],
             ambient_color_pad: [0.3, 0.35, 0.45, 0.0],
             shadow_texel_size_pad: [shadow_texel, shadow_texel, 0.0, 0.0],
+            moon_direction_intensity: [ -0.5, -1.0, -0.3, 0.2], // initial opposite dim moon
+            moon_color_pad: [0.2, 0.25, 0.35, 0.0],
             light_probe_count: 0,
             _pad0: 0,
             _pad1: 0,
@@ -4000,6 +4004,37 @@ impl App {
         let light_probe_count = light_probes.len() as u32;
 
         // Update uniforms with MVP and lighting data
+        // Dual light parameters ---------------------------------------------------
+        // Moon direction is opposite the sun. Intensity ramps when sun below horizon.
+        let moon_direction_vec = -sun_direction_vec;
+        let moon_height = (-sun_height).max(0.0);
+        // Base moon intensity is low when sun up, increases at night.
+        let moon_intensity = if sun_height > 0.0 {
+            // Daytime: faint moon, almost invisible
+            (0.05 * (1.0 - sun_height.clamp(0.0, 1.0))).clamp(0.0, 0.05)
+        } else {
+            // Night: ramp from horizon to zenith
+            let ramp = (moon_height / 1.0).clamp(0.0, 1.0);
+            // Slight boost near midnight
+            let midnight_boost = (moon_height - 0.3).max(0.0) * 0.15;
+            (0.25 * ramp + midnight_boost).clamp(0.02, 0.4)
+        };
+
+        // Derive moon color: cooler at night, slight warm tint near twilight
+        let moon_color = if sun_height > 0.0 {
+            [0.35, 0.38, 0.45]
+        } else {
+            // Interpolate twilight -> deep night palette
+            let cool_night = [0.18, 0.20, 0.30];
+            let twilight = [0.30, 0.33, 0.42];
+            let f = (moon_height / 1.0).clamp(0.0, 1.0);
+            [
+                twilight[0] + (cool_night[0] - twilight[0]) * f,
+                twilight[1] + (cool_night[1] - twilight[1]) * f,
+                twilight[2] + (cool_night[2] - twilight[2]) * f,
+            ]
+        };
+
         let uniforms = Uniforms {
             mvp: mvp_cols,
             sun_view_proj: sun_view_proj_cols,
@@ -4014,6 +4049,13 @@ impl App {
             sun_color_pad: [sun_color[0], sun_color[1], sun_color[2], 0.0],
             ambient_color_pad: [ambient_color[0], ambient_color[1], ambient_color[2], 0.0],
             shadow_texel_size_pad: [shadow_texel, shadow_texel, 0.0, 0.0],
+            moon_direction_intensity: [
+                moon_direction_vec.x,
+                moon_direction_vec.y,
+                moon_direction_vec.z,
+                moon_intensity,
+            ],
+            moon_color_pad: [moon_color[0], moon_color[1], moon_color[2], 0.0],
             light_probe_count,
             _pad0: 0,
             _pad1: 0,
