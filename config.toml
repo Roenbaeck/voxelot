@@ -1,5 +1,5 @@
 [world]
-file = "worlds/world_1.oct"
+file = "worlds/world_2.oct"
 palette = "worlds/palette.txt"
 camera_position = [
     320.0,

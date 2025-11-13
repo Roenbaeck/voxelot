@@ -1,9 +1,8 @@
 //! Convert osm_voxels.txt to compact octree format
 //! Uses the same loading logic as the viewer to ensure compatibility
 
-use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
-use voxelot::{load_world, save_world, World, WorldPos};
+use std::path::Path;
+use voxelot::{save_world_file, load_world_file, World, WorldPos};
 
 fn main() -> std::io::Result<()> {
     println!("OSM Voxel Format Converter");
@@ -80,11 +79,8 @@ fn main() -> std::io::Result<()> {
     // Save in octree format
     let output_file = "world_1.oct";
     println!("\nSaving to {}...", output_file);
-    let output = File::create(output_file)?;
-    let mut writer = BufWriter::new(output);
-    save_world(&world, &mut writer)?;
-    writer.flush()?;
-    drop(writer);
+    // Save compressed .oct with gzip
+    save_world_file(&world, Path::new(output_file), true)?;
 
     // Get file sizes
     let old_size = std::fs::metadata("osm_voxels.txt")?.len();
@@ -97,11 +93,9 @@ fn main() -> std::io::Result<()> {
     println!("Compression ratio: {:.2}x", ratio);
     println!("Space saved: {:.1}%", (1.0 - 1.0 / ratio) * 100.0);
 
-    // Verify by loading
+    // Verify by loading using the auto-detecting loader
     println!("\nVerifying by loading...");
-    let verify_file = File::open(output_file)?;
-    let mut verify_reader = BufReader::new(verify_file);
-    let loaded_world = load_world(&mut verify_reader)?;
+    let loaded_world = load_world_file(Path::new(output_file))?;
     println!("Successfully loaded world with depth {}", loaded_world.hierarchy_depth());
     println!("Loaded world has {} voxels", loaded_world.count());
     

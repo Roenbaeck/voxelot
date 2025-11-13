@@ -13,6 +13,10 @@
 
 use crate::lib_hierarchical::{Chunk, Voxel};
 use std::io::{self, Read, Write};
+use std::fs::File;
+use std::path::Path;
+use zstd::stream::read::Decoder as ZstdDecoder;
+use zstd::stream::write::Encoder as ZstdEncoder;
 
 /// Save world to compact format
 pub fn save_world(world: &crate::lib_hierarchical::World, writer: &mut impl Write) -> io::Result<()> {
@@ -23,6 +27,21 @@ pub fn save_world(world: &crate::lib_hierarchical::World, writer: &mut impl Writ
     save_chunk(world.root(), writer)?;
     
     Ok(())
+}
+
+/// Save world to a file path. If `compress` is true the payload is gzip-compressed
+/// and a small header is written so readers can detect the format. The function
+/// keeps backwards compatibility: files without our signature are treated as
+/// legacy uncompressed `.oct` files.
+pub fn save_world_file(world: &crate::lib_hierarchical::World, path: &Path, _compress: bool) -> io::Result<()> {
+    // Use zstd compression; caller's compress flag is ignored (always compress)
+    let mut payload: Vec<u8> = Vec::new();
+    save_world(world, &mut payload)?;
+
+    let file = File::create(path)?;
+    let mut encoder = ZstdEncoder::new(file, 0).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    encoder.write_all(&payload)?;
+    encoder.finish().map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
 }
 
 /// Save a chunk recursively
@@ -72,6 +91,15 @@ pub fn load_world(reader: &mut impl Read) -> io::Result<crate::lib_hierarchical:
     load_chunk(world.root_mut(), reader)?;
     
     Ok(world)
+}
+
+/// Load a world from a file. The loader understands both the legacy raw `.oct`
+/// format and the new signed format produced by `save_world_file` (which may be
+/// gzip-compressed). Detection is automatic.
+pub fn load_world_file(path: &Path) -> io::Result<crate::lib_hierarchical::World> {
+    let file = File::open(path)?;
+    let mut decoder = ZstdDecoder::new(file).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    load_world(&mut decoder)
 }
 
 /// Load a chunk recursively

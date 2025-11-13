@@ -15,5 +15,5 @@ pub use culling::{
 };
 pub use lib_hierarchical::{Chunk, Voxel, VoxelType, World, WorldPos};
 pub use meshing::{generate_chunk_mesh, ChunkEmitter, ChunkMesh, MeshVertex};
-pub use octree_format::{load_world, save_world};
+pub use octree_format::{load_world, save_world, load_world_file, save_world_file};
 pub use palette::Palette;

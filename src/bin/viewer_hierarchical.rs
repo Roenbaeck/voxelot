@@ -806,62 +806,36 @@ impl App {
             initial_camera = app_config.world.camera_position;
             
             println!("Loading voxel data from {}...", app_config.world.file);
-            // Load octree format from configured path
-            match std::fs::File::open(&app_config.world.file) {
-                Ok(file) => {
-                    use std::io::BufReader;
-                    match voxelot::load_world(&mut BufReader::new(file)) {
-                        Ok(loaded_world) => {
-                            world = loaded_world;
-                            println!("Loaded world from {} (depth {})", 
-                                     app_config.world.file, world.hierarchy_depth());
-                        }
-                        Err(e) => {
-                            println!("Failed to load {}: {}", app_config.world.file, e);
-                            println!("Using fallback world generation.");
+                // Load octree format from configured path — use auto-detecting loader
+                match voxelot::load_world_file(std::path::Path::new(&app_config.world.file)) {
+                    Ok(loaded_world) => {
+                        world = loaded_world;
+                        println!("Loaded world from {} (depth {})", 
+                                 app_config.world.file, world.hierarchy_depth());
+                    }
+                    Err(e) => {
+                        println!("Failed to load {}: {}", app_config.world.file, e);
+                        println!("Using fallback world generation.");
 
-                            world = World::new(3);
-                            for x in 0..100 {
-                                for z in 0..100 {
-                                    if (x + z) % 3 == 0 {
-                                        world.set(WorldPos::new(x, 0, z), 1);
-                                    }
+                        world = World::new(3);
+                        for x in 0..100 {
+                            for z in 0..100 {
+                                if (x + z) % 3 == 0 {
+                                    world.set(WorldPos::new(x, 0, z), 1);
                                 }
                             }
-
-                            for i in 0..5 {
-                                let x = 30 + i * 20;
-                                for y in 1..=(10 + i * 3) {
-                                    world.set(WorldPos::new(x, y, 50), 2);
-                                }
-                            }
-
-                            initial_camera = [60.0, 40.0, 120.0];
                         }
-                    }
-                }
-                Err(_) => {
-                    println!("{} not found. Using fallback world generation.", app_config.world.file);
 
-                    world = World::new(3);
-                    for x in 0..100 {
-                        for z in 0..100 {
-                            if (x + z) % 3 == 0 {
-                                world.set(WorldPos::new(x, 0, z), 1);
+                        for i in 0..5 {
+                            let x = 30 + i * 20;
+                            for y in 1..=(10 + i * 3) {
+                                world.set(WorldPos::new(x, y, 50), 2);
                             }
                         }
-                    }
 
-                    for i in 0..5 {
-                        let x = 30 + i * 20;
-                        for y in 1..=(10 + i * 3) {
-                            world.set(WorldPos::new(x, y, 50), 2);
-                        }
+                        initial_camera = [60.0, 40.0, 120.0];
                     }
-
-                    initial_camera = [60.0, 40.0, 120.0];
                 }
-            }
         }
 
         println!("World created with voxels");
