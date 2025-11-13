@@ -37,7 +37,7 @@ macro_rules! viewer_debug {
 
 const WINDOW_WIDTH: u32 = 1280;
 const WINDOW_HEIGHT: u32 = 720;
-const CONFIG_FILE: &str = "config.toml";
+const CONFIG_FILE: &str = "config.toml"; // Unified TOML configuration only
 const GPU_CULL_WORKGROUP_SIZE: u32 = 64;
 const DEFAULT_MESH_CACHE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 const SHADOW_MAP_SIZE: u32 = 4096;
@@ -173,6 +173,8 @@ struct Uniforms {
     sun_color_pad: [f32; 4],             // xyz = sun color
     ambient_color_pad: [f32; 4],         // xyz = ambient color
     shadow_texel_size_pad: [f32; 4],     // xy = 1 / shadow map size
+    moon_direction_intensity: [f32; 4],  // xyz = moon dir, w = intensity scalar
+    moon_color_pad: [f32; 4],            // xyz = moon color
     light_probe_count: u32,
     _pad0: u32,
     _pad1: u32,
@@ -416,24 +418,21 @@ impl CameraController {
     const MAX_SPEED_MULTIPLIER: f32 = 25.0;
     const ROTATION_SPEED: f32 = std::f32::consts::PI / 2.0; // radians per second
 
-    fn new(position: [f32; 3]) -> Self {
-        // Load config from file or use defaults
-        let config = RenderConfig::load_or_default(CONFIG_FILE);
-        println!("Loaded render config:");
-        println!(
-            "  LOD subdivide distance: {}",
-            config.lod_subdivide_distance
-        );
-        println!("  Far plane: {}", config.far_plane);
-        println!("  FOV: {}°", config.fov_degrees);
+    fn new(position: [f32; 3], render_cfg: &voxelot::config::RenderingConfig) -> Self {
+        let rc = RenderConfig::from_rendering(render_cfg);
+        println!("Loaded rendering config (TOML):");
+        println!("  LOD subdivide distance: {}", rc.lod_subdivide_distance);
+        println!("  LOD merge distance: {}", rc.lod_merge_distance);
+        println!("  Far plane: {}", rc.far_plane);
+        println!("  FOV: {}°", rc.fov_degrees);
 
         let mut this = Self {
-            camera: Camera::with_config(position, [0.0, 0.0, -1.0], [0.0, 1.0, 0.0], config),
+            camera: Camera::with_config(position, [0.0, 0.0, -1.0], [0.0, 1.0, 0.0], rc),
             base_speed: 10.0,
-            speed_multiplier: 1.0,
+            speed_multiplier: render_cfg.camera_speed_multiplier.max(0.01),
             sensitivity: 0.002,
             yaw: -std::f32::consts::FRAC_PI_2,
-            pitch: -0.3, // look slightly downward by default
+            pitch: -0.3,
             forward: false,
             backward: false,
             left: false,
@@ -445,7 +444,6 @@ impl CameraController {
             rotate_up: false,
             rotate_down: false,
         };
-        // Initialize forward/up vectors from yaw/pitch immediately
         this.update_camera_vectors();
         this
     }
@@ -741,6 +739,9 @@ impl App {
         let process_pid = Pid::from(std::process::id() as usize);
         system_info.refresh_process(process_pid);
 
+        // Load configuration
+        let app_config = voxelot::Config::load_or_default(CONFIG_FILE);
+
         let mut initial_camera;
         let mut world;
 
@@ -802,11 +803,9 @@ impl App {
                 }
             }
         } else {
-            // Load configuration
-            let app_config = voxelot::Config::load_or_default(CONFIG_FILE);
             initial_camera = app_config.world.camera_position;
             
-            println!("Loading voxel data...");
+            println!("Loading voxel data from {}...", app_config.world.file);
             // Load octree format from configured path
             match std::fs::File::open(&app_config.world.file) {
                 Ok(file) => {
@@ -867,7 +866,8 @@ impl App {
 
         println!("World created with voxels");
 
-        let palette = Palette::load("palette.txt");
+        println!("Loading palette from {}...", app_config.world.palette);
+        let palette = Palette::load(&app_config.world.palette);
         let (mesh_job_tx, mesh_job_rx) = unbounded::<MeshJob>();
         let (mesh_result_tx, mesh_result_rx) = unbounded::<MeshResult>();
 
@@ -974,7 +974,11 @@ impl App {
             mesh_upload_baseline,
             mesh_upload_max,
             mesh_upload_adjust_timer: 0.0,
-            camera_controller: CameraController::new(initial_camera),
+            // Load unified TOML config once and feed rendering section into camera controller
+            camera_controller: {
+                let full_cfg = voxelot::Config::load_or_default(CONFIG_FILE);
+                CameraController::new(initial_camera, &full_cfg.rendering)
+            },
             pending_chunk_meshes: VecDeque::new(),
             pending_chunk_set: HashSet::new(),
             last_frame: Instant::now(),
@@ -1047,10 +1051,28 @@ impl App {
     }
 
     fn save_config(&self) {
-        if let Err(e) = self.camera_controller.camera.config.save(CONFIG_FILE) {
-            eprintln!("Failed to save config: {}", e);
+        // Persist full TOML config using unified Config (camera speed multiplier retained)
+        // We read existing file, update rendering subsection relevant fields, then save.
+        if let Ok(mut full_cfg) = voxelot::Config::load(CONFIG_FILE) {
+            full_cfg.rendering.lod_subdivide_distance = self.camera_controller.camera.config.lod_subdivide_distance;
+            full_cfg.rendering.lod_merge_distance = self.camera_controller.camera.config.lod_merge_distance;
+            full_cfg.rendering.chunk_lod_distance = self.camera_controller.camera.config.lod_render_distance;
+            full_cfg.rendering.fov_degrees = self.camera_controller.camera.config.fov_degrees;
+            full_cfg.rendering.near_plane = self.camera_controller.camera.config.near_plane;
+            full_cfg.rendering.far_plane = self.camera_controller.camera.config.far_plane;
+            full_cfg.rendering.camera_speed_multiplier = self.camera_controller.speed_multiplier;
+            if let Err(e) = full_cfg.save(CONFIG_FILE) {
+                eprintln!("Failed to save unified config: {}", e);
+            } else {
+                println!("Saved unified TOML config to {}", CONFIG_FILE);
+            }
         } else {
-            println!("Saved render config to {}", CONFIG_FILE);
+            eprintln!("Warning: could not load existing TOML config for update; creating default.");
+            let mut full_cfg = voxelot::Config::default();
+            full_cfg.rendering.lod_subdivide_distance = self.camera_controller.camera.config.lod_subdivide_distance;
+            if let Err(e) = full_cfg.save(CONFIG_FILE) {
+                eprintln!("Failed to write default unified config: {}", e);
+            }
         }
     }
 
@@ -3026,6 +3048,8 @@ impl App {
             sun_color_pad: [1.0, 0.95, 0.8, 0.0],
             ambient_color_pad: [0.3, 0.35, 0.45, 0.0],
             shadow_texel_size_pad: [shadow_texel, shadow_texel, 0.0, 0.0],
+            moon_direction_intensity: [ -0.5, -1.0, -0.3, 0.2], // initial opposite dim moon
+            moon_color_pad: [0.2, 0.25, 0.35, 0.0],
             light_probe_count: 0,
             _pad0: 0,
             _pad1: 0,
@@ -4000,6 +4024,37 @@ impl App {
         let light_probe_count = light_probes.len() as u32;
 
         // Update uniforms with MVP and lighting data
+        // Dual light parameters ---------------------------------------------------
+        // Moon direction is opposite the sun. Intensity ramps when sun below horizon.
+        let moon_direction_vec = -sun_direction_vec;
+        let moon_height = (-sun_height).max(0.0);
+        // Base moon intensity is low when sun up, increases at night.
+        let moon_intensity = if sun_height > 0.0 {
+            // Daytime: faint moon, almost invisible
+            (0.05 * (1.0 - sun_height.clamp(0.0, 1.0))).clamp(0.0, 0.05)
+        } else {
+            // Night: ramp from horizon to zenith
+            let ramp = (moon_height / 1.0).clamp(0.0, 1.0);
+            // Slight boost near midnight
+            let midnight_boost = (moon_height - 0.3).max(0.0) * 0.15;
+            (0.25 * ramp + midnight_boost).clamp(0.02, 0.4)
+        };
+
+        // Derive moon color: cooler at night, slight warm tint near twilight
+        let moon_color = if sun_height > 0.0 {
+            [0.35, 0.38, 0.45]
+        } else {
+            // Interpolate twilight -> deep night palette
+            let cool_night = [0.18, 0.20, 0.30];
+            let twilight = [0.30, 0.33, 0.42];
+            let f = (moon_height / 1.0).clamp(0.0, 1.0);
+            [
+                twilight[0] + (cool_night[0] - twilight[0]) * f,
+                twilight[1] + (cool_night[1] - twilight[1]) * f,
+                twilight[2] + (cool_night[2] - twilight[2]) * f,
+            ]
+        };
+
         let uniforms = Uniforms {
             mvp: mvp_cols,
             sun_view_proj: sun_view_proj_cols,
@@ -4014,6 +4069,13 @@ impl App {
             sun_color_pad: [sun_color[0], sun_color[1], sun_color[2], 0.0],
             ambient_color_pad: [ambient_color[0], ambient_color[1], ambient_color[2], 0.0],
             shadow_texel_size_pad: [shadow_texel, shadow_texel, 0.0, 0.0],
+            moon_direction_intensity: [
+                moon_direction_vec.x,
+                moon_direction_vec.y,
+                moon_direction_vec.z,
+                moon_intensity,
+            ],
+            moon_color_pad: [moon_color[0], moon_color[1], moon_color[2], 0.0],
             light_probe_count,
             _pad0: 0,
             _pad1: 0,

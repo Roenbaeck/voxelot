@@ -9,6 +9,9 @@ struct Uniforms {
     sun_color_pad: vec4<f32>,
     ambient_color_pad: vec4<f32>,
     shadow_texel_size_pad: vec4<f32>,
+    // New dual-light additions (moon has no shadow map; intensity in w)
+    moon_direction_intensity: vec4<f32>,
+    moon_color_pad: vec4<f32>,
     light_probe_count: u32,
     _pad0: u32,
     _pad1: u32,
@@ -151,12 +154,17 @@ fn vs_main(
 @fragment
 fn fs_main(input: VertexOutputInstanced) -> @location(0) vec4<f32> {
     let sun_dir = normalize(uniforms.sun_direction_shadow_bias.xyz);
-    let diffuse = max(dot(input.normal, sun_dir), 0.0);
+    let sun_diffuse = max(dot(input.normal, sun_dir), 0.0);
     let base_shadow = compute_shadow(input.light_space_pos, input.normal, sun_dir);
     let shadow_strength = uniforms.camera_shadow_strength.w;
     let shadow_visibility = mix(1.0, base_shadow, shadow_strength);
-    let sun_contribution = diffuse * uniforms.sun_color_pad.xyz * shadow_visibility;
+    let sun_contribution = sun_diffuse * uniforms.sun_color_pad.xyz * shadow_visibility;
     let ambient = uniforms.ambient_color_pad.xyz;
+
+    // Moon light (no shadows yet) -------------------------------------------------
+    let moon_dir = normalize(uniforms.moon_direction_intensity.xyz);
+    let moon_diffuse = max(dot(input.normal, moon_dir), 0.0);
+    let moon_light = moon_diffuse * uniforms.moon_color_pad.xyz * uniforms.moon_direction_intensity.w;
     
     // Sample light probes for indirect emissive lighting
     var indirect_light = vec3<f32>(0.0, 0.0, 0.0);
@@ -172,7 +180,7 @@ fn fs_main(input: VertexOutputInstanced) -> @location(0) vec4<f32> {
     // Keep it subtle - max 10% brightness from emissive lights
     indirect_light = min(indirect_light, vec3<f32>(0.1, 0.1, 0.1));
     
-    let lighting = ambient + sun_contribution + indirect_light;
+    let lighting = ambient + sun_contribution + moon_light + indirect_light;
     let color = input.color * lighting;
 
     let fog_color = vec3<f32>(0.7, 0.8, 0.9);
@@ -209,12 +217,17 @@ fn vs_mesh(
 @fragment
 fn fs_mesh(input: VertexOutputMesh) -> @location(0) vec4<f32> {
     let sun_dir = normalize(uniforms.sun_direction_shadow_bias.xyz);
-    let diffuse = max(dot(input.normal, sun_dir), 0.0);
+    let sun_diffuse = max(dot(input.normal, sun_dir), 0.0);
     let base_shadow = compute_shadow(input.light_space_pos, input.normal, sun_dir);
     let shadow_strength = uniforms.camera_shadow_strength.w;
     let shadow_visibility = mix(1.0, base_shadow, shadow_strength);
-    let sun_contribution = diffuse * uniforms.sun_color_pad.xyz * shadow_visibility;
+    let sun_contribution = sun_diffuse * uniforms.sun_color_pad.xyz * shadow_visibility;
     let ambient = uniforms.ambient_color_pad.xyz;
+
+    // Moon light (no shadows yet)
+    let moon_dir = normalize(uniforms.moon_direction_intensity.xyz);
+    let moon_diffuse = max(dot(input.normal, moon_dir), 0.0);
+    let moon_light = moon_diffuse * uniforms.moon_color_pad.xyz * uniforms.moon_direction_intensity.w;
     
     // Sample light probes for indirect emissive lighting
     var indirect_light = vec3<f32>(0.0, 0.0, 0.0);
@@ -230,7 +243,7 @@ fn fs_mesh(input: VertexOutputMesh) -> @location(0) vec4<f32> {
     // Keep it subtle - max 10% brightness from emissive lights
     indirect_light = min(indirect_light, vec3<f32>(0.1, 0.1, 0.1));
     
-    let lighting = ambient + sun_contribution + indirect_light;
+    let lighting = ambient + sun_contribution + moon_light + indirect_light;
     let color = input.color * lighting;
     let fog_color = vec3<f32>(0.7, 0.8, 0.9);
     let distance = length(input.position.xyz);

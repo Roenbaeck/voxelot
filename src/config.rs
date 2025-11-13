@@ -22,6 +22,8 @@ pub struct Config {
 pub struct WorldConfig {
     #[serde(default = "default_world_file")]
     pub file: String,
+    #[serde(default = "default_palette_file")]
+    pub palette: String,
     #[serde(default = "default_camera_position")]
     pub camera_position: [f32; 3],
 }
@@ -79,6 +81,10 @@ pub struct DebugConfig {
 // Default values
 fn default_world_file() -> String {
     "world_1.oct".to_string()
+}
+
+fn default_palette_file() -> String {
+    "worlds/palette.txt".to_string()
 }
 
 fn default_camera_position() -> [f32; 3] {
@@ -150,6 +156,7 @@ impl Default for WorldConfig {
     fn default() -> Self {
         Self {
             file: default_world_file(),
+            palette: default_palette_file(),
             camera_position: default_camera_position(),
         }
     }

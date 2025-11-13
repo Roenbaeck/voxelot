@@ -5,23 +5,20 @@ use std::collections::HashMap;
 
 /// Runtime configuration for rendering and LOD
 #[derive(Debug, Clone)]
+/// Legacy render config replaced by unified TOML config (`Config.rendering`).
+/// Keep a minimal struct so existing code compiles; construct only from `RenderingConfig`.
 pub struct RenderConfig {
-    /// Subdivide chunks if closer than this distance
     pub lod_subdivide_distance: f32,
-    /// Merge chunks if farther than this distance
     pub lod_merge_distance: f32,
-    /// Render distant chunks as simplified blocks beyond this distance
     pub lod_render_distance: f32,
-    /// Camera far plane distance
     pub far_plane: f32,
-    /// Camera field of view in degrees
     pub fov_degrees: f32,
-    /// Camera near plane distance
     pub near_plane: f32,
 }
 
 impl Default for RenderConfig {
     fn default() -> Self {
+        // Fallback values if TOML not yet loaded; should be replaced by `RenderingConfig` data.
         Self {
             lod_subdivide_distance: 500.0,
             lod_merge_distance: 1000.0,
@@ -34,57 +31,16 @@ impl Default for RenderConfig {
 }
 
 impl RenderConfig {
-    /// Load configuration from a file, or return default if file doesn't exist
-    pub fn load_or_default(path: &str) -> Self {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|s| Self::from_string(&s))
-            .unwrap_or_default()
-    }
-
-    /// Parse configuration from a string
-    pub fn from_string(s: &str) -> Option<Self> {
-        let mut config = Self::default();
-        for line in s.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Some((key, value)) = line.split_once('=') {
-                let key = key.trim();
-                let value = value.trim();
-                match key {
-                    "lod_subdivide_distance" => {
-                        config.lod_subdivide_distance = value.parse().ok()?
-                    }
-                    "lod_merge_distance" => config.lod_merge_distance = value.parse().ok()?,
-                    "far_plane" => config.far_plane = value.parse().ok()?,
-                    "fov_degrees" => config.fov_degrees = value.parse().ok()?,
-                    "near_plane" => config.near_plane = value.parse().ok()?,
-                    _ => {}
-                }
-            }
+    /// Construct from unified TOML `RenderingConfig` (serde-loaded).
+    pub fn from_rendering(cfg: &crate::config::RenderingConfig) -> Self {
+        Self {
+            lod_subdivide_distance: cfg.lod_subdivide_distance,
+            lod_merge_distance: cfg.lod_merge_distance,
+            lod_render_distance: cfg.chunk_lod_distance,
+            far_plane: cfg.far_plane,
+            fov_degrees: cfg.fov_degrees,
+            near_plane: cfg.near_plane,
         }
-        Some(config)
-    }
-
-    /// Save configuration to a file
-    pub fn save(&self, path: &str) -> std::io::Result<()> {
-        let content = format!(
-            "# Voxelot Render Configuration\n\
-             # Adjust these values and restart the viewer to apply changes\n\n\
-             lod_subdivide_distance = {}\n\
-             lod_merge_distance = {}\n\
-             far_plane = {}\n\
-             fov_degrees = {}\n\
-             near_plane = {}\n",
-            self.lod_subdivide_distance,
-            self.lod_merge_distance,
-            self.far_plane,
-            self.fov_degrees,
-            self.near_plane
-        );
-        std::fs::write(path, content)
     }
 }
 
@@ -304,7 +260,7 @@ pub struct Camera {
 
 impl Camera {
     pub fn new(position: [f32; 3], forward: [f32; 3], up: [f32; 3]) -> Self {
-        Self::with_config(position, forward, up, RenderConfig::default())
+    Self::with_config(position, forward, up, RenderConfig::default())
     }
 
     pub fn with_config(
@@ -872,7 +828,7 @@ mod tests {
         assert!(!visible_close.is_empty(), "Should see voxels when close");
 
         // Camera very far - with default config (500 units), should still see if within that range
-        let mut config = RenderConfig::default();
+    let mut config = RenderConfig::default();
         config.lod_subdivide_distance = 10.0; // Set very low for testing
 
         let camera_far = Camera::with_config(
