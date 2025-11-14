@@ -174,11 +174,16 @@ fn fs_main(input: VertexOutputInstanced) -> @location(0) vec4<f32> {
         let dist_sq = dot(to_light, to_light);
         // Very localized lighting: cubic falloff for rapid distance dropoff
         let dist = sqrt(dist_sq);
-        let attenuation = (probe.color_power.a * 0.02) / max(dist_sq * dist, 64.0);
-        indirect_light += probe.color_power.rgb * attenuation;
+        let attenuation = (probe.color_power.a * 0.01) / max(dist_sq * dist, 128.0);
+        
+        // Normalize the probe color to prevent oversaturated color bleeding
+        let probe_brightness = max(probe.color_power.r, max(probe.color_power.g, probe.color_power.b));
+        let normalized_color = probe.color_power.rgb / max(probe_brightness, 1.0);
+        
+        indirect_light += normalized_color * attenuation;
     }
-    // Keep it subtle - max 10% brightness from emissive lights
-    indirect_light = min(indirect_light, vec3<f32>(0.1, 0.1, 0.1));
+    // Keep it very subtle - max 3% brightness from emissive lights
+    indirect_light = min(indirect_light, vec3<f32>(0.03, 0.03, 0.03));
     
     let lighting = ambient + sun_contribution + moon_light + indirect_light;
     
@@ -244,11 +249,16 @@ fn fs_mesh(input: VertexOutputMesh) -> @location(0) vec4<f32> {
         let dist_sq = dot(to_light, to_light);
         // Very localized lighting: cubic falloff for rapid distance dropoff
         let dist = sqrt(dist_sq);
-        let attenuation = (probe.color_power.a * 0.02) / max(dist_sq * dist, 64.0);
-        indirect_light += probe.color_power.rgb * attenuation;
+        let attenuation = (probe.color_power.a * 0.01) / max(dist_sq * dist, 128.0);
+        
+        // Normalize the probe color to prevent oversaturated color bleeding
+        let probe_brightness = max(probe.color_power.r, max(probe.color_power.g, probe.color_power.b));
+        let normalized_color = probe.color_power.rgb / max(probe_brightness, 1.0);
+        
+        indirect_light += normalized_color * attenuation;
     }
-    // Keep it subtle - max 10% brightness from emissive lights
-    indirect_light = min(indirect_light, vec3<f32>(0.1, 0.1, 0.1));
+    // Keep it very subtle - max 3% brightness from emissive lights
+    indirect_light = min(indirect_light, vec3<f32>(0.03, 0.03, 0.03));
     
     let lighting = ambient + sun_contribution + moon_light + indirect_light;
     
