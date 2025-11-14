@@ -38,7 +38,13 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let source = textureSample(source_texture, linear_sampler, uv);
     let fused = textureSample(dof_fused_texture, linear_sampler, uv);
     let coc_norm = fused.a; // normalized CoC magnitude from fused pass
-    let strength = smoothstep(0.01, 0.5, coc_norm);
+    
+    // Use sharp cutoff for very low CoC to avoid half-res color bleeding at focus boundaries
+    if coc_norm < 0.05 {
+        return vec4<f32>(source.rgb, 1.0);
+    }
+    
+    let strength = smoothstep(0.05, 0.5, coc_norm);
     let color = mix(source.rgb, fused.rgb, strength);
     return vec4<f32>(color, 1.0);
 }

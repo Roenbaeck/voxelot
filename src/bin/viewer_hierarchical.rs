@@ -1250,7 +1250,9 @@ impl App {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: config.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT 
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1282,7 +1284,9 @@ impl App {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: config.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT 
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let post_color_view =
@@ -1701,7 +1705,8 @@ impl App {
     }
 
     fn update_bloom_bind_groups(&mut self) {
-        if self.post_color_view.is_none()
+        if self.offscreen_color_view.is_none()
+            || self.post_color_view.is_none()
             || self.bloom_ping_view.is_none()
             || self.bloom_pong_view.is_none()
         {
@@ -1717,6 +1722,9 @@ impl App {
             return;
         };
 
+        let Some(offscreen_view) = self.offscreen_color_view.as_ref() else {
+            return;
+        };
         let Some(post_view) = self.post_color_view.as_ref() else {
             return;
         };
@@ -1744,7 +1752,7 @@ impl App {
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
-                            resource: wgpu::BindingResource::TextureView(post_view),
+                            resource: wgpu::BindingResource::TextureView(offscreen_view),
                         },
                         wgpu::BindGroupEntry {
                             binding: 2,
@@ -4378,16 +4386,20 @@ impl App {
             || self.dof_settings.blur_strength < 0.05
             || self.dof_settings.focal_range > 450.0;
 
-        if skip_dof {
-            // Copy offscreen color to post_color_view directly
-            if let (Some(_offscreen_view), Some(post_view)) = (
-                self.offscreen_color_view.as_ref(),
-                self.post_color_view.as_ref(),
+        if !skip_dof {
+            if let (Some(dof_pipeline), Some(dof_bind_group), Some(dof_buffer), Some(dof_color_view)) = (
+                self.dof_pipeline.as_ref(),
+                self.dof_bind_group.as_ref(),
+                self.dof_uniform_buffer.as_ref(),
+                self.dof_color_view.as_ref(),
             ) {
-                let mut copy_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("DoF Copy Pass"),
+                let blur_strength = self.dof_settings.blur_strength;
+                let gpu_uniforms = self.pack_dof_uniforms(blur_strength);
+                queue.write_buffer(dof_buffer, 0, bytemuck::cast_slice(&gpu_uniforms));
+                let mut post_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("DoF Blur Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: post_view,
+                        view: dof_color_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -4399,45 +4411,13 @@ impl App {
                     timestamp_writes: None,
                     occlusion_query_set: None,
                 });
-                if let (Some(composite_pipeline), Some(composite_bind_group)) = (
-                    self.composite_pipeline.as_ref(),
-                    self.composite_bind_group.as_ref(),
-                ) {
-                    copy_pass.set_pipeline(composite_pipeline);
-                    copy_pass.set_bind_group(0, composite_bind_group, &[]);
-                    copy_pass.draw(0..3, 0..1);
-                }
+                post_pass.set_pipeline(dof_pipeline);
+                post_pass.set_bind_group(0, dof_bind_group, &[]);
+                post_pass.draw(0..3, 0..1);
             }
-        } else if let (Some(dof_pipeline), Some(dof_bind_group), Some(dof_buffer), Some(dof_color_view)) = (
-            self.dof_pipeline.as_ref(),
-            self.dof_bind_group.as_ref(),
-            self.dof_uniform_buffer.as_ref(),
-            self.dof_color_view.as_ref(),
-        ) {
-            let blur_strength = self.dof_settings.blur_strength;
-            let gpu_uniforms = self.pack_dof_uniforms(blur_strength);
-            queue.write_buffer(dof_buffer, 0, bytemuck::cast_slice(&gpu_uniforms));
-            let mut post_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("DoF Blur Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: dof_color_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            post_pass.set_pipeline(dof_pipeline);
-            post_pass.set_bind_group(0, dof_bind_group, &[]);
-            post_pass.draw(0..3, 0..1);
         }
 
-        let run_smoothing = self.dof_enabled && self.dof_settings.blur_strength > 0.01;
+        let run_smoothing = !skip_dof && self.dof_enabled && self.dof_settings.blur_strength > 0.01;
         if run_smoothing {
             self.update_dof_smooth_uniforms();
 
@@ -4495,33 +4475,52 @@ impl App {
             }
         }
 
-        // Final DoF combine: source color + blurred DoF + CoC => post_color_view
-        if let (Some(dof_combine_pipeline), Some(dof_combine_bind_group), Some(post_color_view)) = (
-            self.dof_combine_pipeline.as_ref(),
-            self.dof_combine_bind_group.as_ref(),
-            self.post_color_view.as_ref(),
-        ) {
-            let mut combine_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("DoF Combine Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: post_color_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            combine_pass.set_pipeline(dof_combine_pipeline);
-            combine_pass.set_bind_group(0, dof_combine_bind_group, &[]);
-            combine_pass.draw(0..3, 0..1);
-        }
-
-        if self.bloom_enabled {
+        // Final DoF combine: source color + blurred DoF + CoC => post_color_view (skip if DoF disabled)
+        if !skip_dof {
+            if let (Some(dof_combine_pipeline), Some(dof_combine_bind_group), Some(post_color_view)) = (
+                self.dof_combine_pipeline.as_ref(),
+                self.dof_combine_bind_group.as_ref(),
+                self.post_color_view.as_ref(),
+            ) {
+                let mut combine_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("DoF Combine Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: post_color_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                combine_pass.set_pipeline(dof_combine_pipeline);
+                combine_pass.set_bind_group(0, dof_combine_bind_group, &[]);
+                combine_pass.draw(0..3, 0..1);
+            }
+        } else {
+            // DoF disabled: copy offscreen color directly to post_color_view for bloom/composite
+            if let (Some(offscreen_tex), Some(post_tex)) = (
+                self.offscreen_color_texture.as_ref(),
+                self.post_color_texture.as_ref(),
+            ) {
+                let size = self.config.as_ref().map(|c| wgpu::Extent3d {
+                    width: c.width,
+                    height: c.height,
+                    depth_or_array_layers: 1,
+                });
+                if let Some(extent) = size {
+                    encoder.copy_texture_to_texture(
+                        offscreen_tex.as_image_copy(),
+                        post_tex.as_image_copy(),
+                        extent,
+                    );
+                }
+            }
+        }        if self.bloom_enabled {
             if let (
                 Some(bloom_extract_pipeline),
                 Some(bloom_extract_bind_group),
