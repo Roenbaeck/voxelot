@@ -112,6 +112,8 @@ pub struct PerformanceConfig {
     pub mesh_worker_count: Option<usize>,
     #[serde(default = "default_mesh_upload_baseline")]
     pub mesh_upload_baseline: usize,
+    #[serde(default = "default_fallback_detail_distance")]
+    pub fallback_detail_distance: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,6 +233,10 @@ fn default_mesh_upload_baseline() -> usize {
     4
 }
 
+fn default_fallback_detail_distance() -> f32 {
+    500.0
+}
+
 fn default_true() -> bool {
     true
 }
@@ -318,6 +324,7 @@ impl Default for PerformanceConfig {
             mesh_cache_budget_mb: default_mesh_cache_mb(),
             mesh_worker_count: default_mesh_workers(),
             mesh_upload_baseline: default_mesh_upload_baseline(),
+            fallback_detail_distance: default_fallback_detail_distance(),
         }
     }
 }

@@ -123,15 +123,25 @@ class OctreeWorld:
         current_chunk.set_voxel(leaf_x, leaf_y, leaf_z, voxel_type)
     
     def save(self, filename: str):
-        """Save the world to an .oct file."""
-        with open(filename, 'wb') as f:
-            # Write depth byte
-            f.write(struct.pack('B', self.depth))
-            
-            # Write root chunk
-            self.root.write(f)
+        """Save the world to an .oct file with zstd compression."""
+        import io
+        import zstandard as zstd
         
-        print(f"Saved world to {filename}")
+        # Write to memory buffer first
+        buffer = io.BytesIO()
+        buffer.write(struct.pack('B', self.depth))
+        self.root.write(buffer)
+        
+        # Compress with zstd and write to file
+        uncompressed_data = buffer.getvalue()
+        compressor = zstd.ZstdCompressor(level=0)
+        compressed_data = compressor.compress(uncompressed_data)
+        
+        with open(filename, 'wb') as f:
+            f.write(compressed_data)
+        
+        print(f"Saved world to {filename} ({len(uncompressed_data)} bytes uncompressed, {len(compressed_data)} bytes compressed)")
+
 
 
 def calculate_required_depth(max_coord: int) -> int:

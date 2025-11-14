@@ -662,6 +662,7 @@ struct App {
     mesh_upload_max: usize,
     mesh_upload_adjust_timer: f32,
     mesh_cache_budget_bytes: u64,
+    fallback_detail_distance: f32,
     last_frame: Instant,
     frame_count: u64,
     frame_index: u64,
@@ -926,6 +927,7 @@ impl App {
             mesh_upload_max,
             mesh_upload_adjust_timer: 0.0,
             mesh_cache_budget_bytes: cfg.performance.mesh_cache_budget_mb as u64 * 1024 * 1024,
+            fallback_detail_distance: cfg.performance.fallback_detail_distance,
             camera_controller: CameraController::new(initial_camera, &cfg.rendering),
             pending_chunk_meshes: VecDeque::new(),
             pending_chunk_set: HashSet::new(),
@@ -1035,6 +1037,7 @@ impl App {
             full_cfg.performance.mesh_worker_count = Some(self.mesh_worker_count);
             full_cfg.performance.mesh_upload_baseline = self.mesh_upload_baseline;
             full_cfg.performance.mesh_cache_budget_mb = self.mesh_cache_budget_bytes / (1024 * 1024);
+            full_cfg.performance.fallback_detail_distance = self.fallback_detail_distance;
             
             if let Err(e) = full_cfg.save(CONFIG_FILE) {
                 eprintln!("Failed to save unified config: {}", e);
@@ -2035,9 +2038,19 @@ impl App {
             .await
             .unwrap();
 
-        // Request device
+        // Request device with increased limits
+        let mut limits = wgpu::Limits::default();
+        limits.max_buffer_size = 1_073_741_824; // 1 GB (up from 256 MB default)
+        
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("Main Device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: limits,
+                memory_hints: wgpu::MemoryHints::Performance,
+                experimental_features: Default::default(),
+                trace: wgpu::Trace::Off,
+            })
             .await
             .unwrap();
 
@@ -3136,7 +3149,7 @@ impl App {
         let mut new_meshes_created = 0;
         let mut chunks_not_found = 0;
         let mut missing_chunks: HashSet<(i64, i64, i64)> = HashSet::new();
-
+        
         for &key in &leaf_chunks {
             if self.mesh_cache.contains_key(&key) {
                 cpu_mesh_keys.insert(key);
@@ -3345,9 +3358,29 @@ impl App {
                         continue;
                     }
 
-                    if let Some(fallback) = self.fallback_instances_for_chunk(key) {
-                        out.extend_from_slice(fallback);
+                    // Distance-based fallback: close = full detail, far = bounding box
+                    let chunk_center = [
+                        v.position[0] as f32 + (v.scale as f32) / 2.0,
+                        v.position[1] as f32 + (v.scale as f32) / 2.0,
+                        v.position[2] as f32 + (v.scale as f32) / 2.0,
+                    ];
+                    let camera_pos = self.camera_controller.camera.position;
+                    let dx = chunk_center[0] - camera_pos[0];
+                    let dy = chunk_center[1] - camera_pos[1];
+                    let dz = chunk_center[2] - camera_pos[2];
+                    let distance = (dx * dx + dy * dy + dz * dz).sqrt();
+                    
+                    
+                    
+                    if distance < self.fallback_detail_distance {
+                        // Close: render all voxels
+                        if let Some(fallback) = self.fallback_instances_for_chunk(key) {
+                            out.extend_from_slice(fallback);
+                        } else {
+                            out.push(Self::voxel_to_raw(v, &self.palette));
+                        }
                     } else {
+                        // Far: just render as single bounding box
                         out.push(Self::voxel_to_raw(v, &self.palette));
                     }
                     continue;
@@ -3383,9 +3416,29 @@ impl App {
                         continue;
                     }
 
-                    if let Some(fallback) = self.fallback_instances_for_chunk(key) {
-                        out.extend_from_slice(fallback);
+                    // Distance-based fallback: close = full detail, far = bounding box
+                    let chunk_center = [
+                        v.position[0] as f32 + (v.scale as f32) / 2.0,
+                        v.position[1] as f32 + (v.scale as f32) / 2.0,
+                        v.position[2] as f32 + (v.scale as f32) / 2.0,
+                    ];
+                    let camera_pos = self.camera_controller.camera.position;
+                    let dx = chunk_center[0] - camera_pos[0];
+                    let dy = chunk_center[1] - camera_pos[1];
+                    let dz = chunk_center[2] - camera_pos[2];
+                    let distance = (dx * dx + dy * dy + dz * dz).sqrt();
+                    
+                    
+                    
+                    if distance < self.fallback_detail_distance {
+                        // Close: render all voxels
+                        if let Some(fallback) = self.fallback_instances_for_chunk(key) {
+                            out.extend_from_slice(fallback);
+                        } else {
+                            out.push(Self::voxel_to_raw(v, &self.palette));
+                        }
                     } else {
+                        // Far: just render as single bounding box
                         out.push(Self::voxel_to_raw(v, &self.palette));
                     }
                 } else {

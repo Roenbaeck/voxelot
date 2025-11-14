@@ -302,8 +302,13 @@ class TileSpace:
     def mercator_to_voxel(self, x_m: float, y_m: float) -> Tuple[int, int]:
         rel_x = (x_m - self.min_x_m) / (self.max_x_m - self.min_x_m)
         rel_y = (y_m - self.min_y_m) / (self.max_y_m - self.min_y_m)
-        vx = int(rel_x * (self.voxel_resolution - 1))
-        vz = int(rel_y * (self.voxel_resolution - 1))
+        # Map to voxel_resolution range [0, resolution) to ensure tiles are seamless
+        # when placed at multiples of voxel_resolution
+        vx = int(rel_x * self.voxel_resolution)
+        vz = int(rel_y * self.voxel_resolution)
+        # Clamp to [0, resolution-1] to handle edge case where rel_x or rel_y == 1.0
+        vx = min(vx, self.voxel_resolution - 1)
+        vz = min(vz, self.voxel_resolution - 1)
         return vx, vz
 
 # ---------- Polygon Rasterization (Scanline Fill) ----------

@@ -1,5 +1,5 @@
 [world]
-file = "worlds/world_2.oct"
+file = "worlds/world_1.oct"
 palette = "worlds/palette.txt"
 camera_position = [
     320.0,
@@ -8,23 +8,23 @@ camera_position = [
 ]
 
 [rendering]
-lod_subdivide_distance = 500.0
-lod_merge_distance = 1000.0
-chunk_lod_distance = 800.0
+lod_subdivide_distance = 300.0
+lod_merge_distance = 600.0
+chunk_lod_distance = 1000.0
 fov_degrees = 70.0
 near_plane = 0.10000000149011612
-far_plane = 5000.0
-camera_speed_multiplier = 1.0
+far_plane = 3000.0
+camera_speed_multiplier = 2.44140625
 
 [atmosphere]
-fog_density = 0.003000000026077032
-time_of_day = 0.41675320267677307
+fog_density = 0.0029000001959502697
+time_of_day = 0.7115307450294495
 
 [effects.depth_of_field]
 enabled = true
 focal_distance = 120.0
-focal_range = 16.0
-blur_strength = 1.600000023841858
+focal_range = 151.0
+blur_strength = 1.2999999523162842
 
 [effects.bloom]
 enabled = true
@@ -43,6 +43,7 @@ map_size = 4096
 mesh_cache_budget_mb = 256
 mesh_worker_count = 6
 mesh_upload_baseline = 4
+fallback_detail_distance = 500.0
 
 [debug]
 show_fps = true
