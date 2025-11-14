@@ -963,7 +963,7 @@ impl App {
             last_mouse_pos: None,
             time_of_day: 0.5,    // Start at noon
             time_paused: false,  // Time cycle starts running
-            fog_density: 0.0015, // Default fog density
+            fog_density: 0.003000, // Default fog density
             light_probe_buffer: None,
             light_probe_capacity: 0,
             lod_distance: 800.0, // Default LOD render distance
@@ -1135,14 +1135,14 @@ impl App {
                 );
             }
             KeyCode::KeyF => {
-                // Decrease fog density
-                self.fog_density = (self.fog_density - 0.0002).max(0.0);
-                println!("Fog density: {:.4}", self.fog_density);
+                // Decrease fog density (smaller step)
+                self.fog_density = (self.fog_density - 0.00005).max(0.0);
+                println!("Fog density: {:.6}", self.fog_density);
             }
             KeyCode::KeyG => {
-                // Increase fog density
-                self.fog_density = (self.fog_density + 0.0002).min(0.01);
-                println!("Fog density: {:.4}", self.fog_density);
+                // Increase fog density (smaller step)
+                self.fog_density = (self.fog_density + 0.00005).min(0.01);
+                println!("Fog density: {:.6}", self.fog_density);
             }
             KeyCode::KeyB => {
                 self.bloom_enabled = !self.bloom_enabled;
@@ -3018,7 +3018,7 @@ impl App {
             sun_view_proj: [[0.0; 4]; 4],
             camera_shadow_strength: [0.0, 0.0, 0.0, 1.0],
             sun_direction_shadow_bias: [0.5, 1.0, 0.3, SHADOW_BIAS],
-            fog_time_pad: [0.0015, 0.5, 0.0, 0.0],
+            fog_time_pad: [0.003000, 0.5, 0.0, 0.0],
             sun_color_pad: [1.0, 0.95, 0.8, 0.0],
             ambient_color_pad: [0.3, 0.35, 0.45, 0.0],
             shadow_texel_size_pad: [shadow_texel, shadow_texel, 0.0, 0.0],

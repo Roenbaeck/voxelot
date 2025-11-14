@@ -120,7 +120,7 @@ fn default_camera_speed() -> f32 {
 }
 
 fn default_fog_density() -> f32 {
-    0.0005
+    0.003000
 }
 
 fn default_time_of_day() -> f32 {
