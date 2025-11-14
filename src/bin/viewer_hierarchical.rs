@@ -704,35 +704,31 @@ struct App {
     bloom_ping_view: Option<wgpu::TextureView>,
     bloom_pong_texture: Option<wgpu::Texture>,
     bloom_pong_view: Option<wgpu::TextureView>,
-    dof_smooth_ping_texture: Option<wgpu::Texture>,
-    dof_smooth_ping_view: Option<wgpu::TextureView>,
     bloom_extract_pipeline: Option<wgpu::RenderPipeline>,
     bloom_blur_pipeline: Option<wgpu::RenderPipeline>,
     composite_pipeline: Option<wgpu::RenderPipeline>,
-    dof_smooth_pipeline: Option<wgpu::RenderPipeline>,
     bloom_extract_bind_group_layout: Option<wgpu::BindGroupLayout>,
     bloom_blur_bind_group_layout: Option<wgpu::BindGroupLayout>,
     composite_bind_group_layout: Option<wgpu::BindGroupLayout>,
-    dof_smooth_bind_group_layout: Option<wgpu::BindGroupLayout>,
     bloom_extract_bind_group: Option<wgpu::BindGroup>,
     bloom_blur_horizontal_bind_group: Option<wgpu::BindGroup>,
     bloom_blur_vertical_bind_group: Option<wgpu::BindGroup>,
-    dof_smooth_horizontal_bind_group: Option<wgpu::BindGroup>,
-    dof_smooth_vertical_bind_group: Option<wgpu::BindGroup>,
     composite_bind_group: Option<wgpu::BindGroup>,
     bloom_extract_uniform_buffer: Option<wgpu::Buffer>,
     bloom_blur_horizontal_uniform_buffer: Option<wgpu::Buffer>,
     bloom_blur_vertical_uniform_buffer: Option<wgpu::Buffer>,
     composite_uniform_buffer: Option<wgpu::Buffer>,
+    // Legacy smoothing fields retained (unused) to satisfy existing init code
+    dof_smooth_ping_texture: Option<wgpu::Texture>,
+    dof_smooth_ping_view: Option<wgpu::TextureView>,
+    dof_smooth_pipeline: Option<wgpu::RenderPipeline>,
+    dof_smooth_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    dof_smooth_horizontal_bind_group: Option<wgpu::BindGroup>,
+    dof_smooth_vertical_bind_group: Option<wgpu::BindGroup>,
     dof_smooth_horizontal_uniform_buffer: Option<wgpu::Buffer>,
     dof_smooth_vertical_uniform_buffer: Option<wgpu::Buffer>,
 
     // New CoC/DoF combine resources
-    dof_coc_texture: Option<wgpu::Texture>,
-    dof_coc_view: Option<wgpu::TextureView>,
-    dof_coc_pipeline: Option<wgpu::RenderPipeline>,
-    dof_coc_bind_group_layout: Option<wgpu::BindGroupLayout>,
-    dof_coc_bind_group: Option<wgpu::BindGroup>,
 
     // DoF color buffer that stores blurred result before combine
     dof_color_texture: Option<wgpu::Texture>,
@@ -1023,11 +1019,6 @@ impl App {
             composite_uniform_buffer: None,
             dof_smooth_horizontal_uniform_buffer: None,
             dof_smooth_vertical_uniform_buffer: None,
-            dof_coc_texture: None,
-            dof_coc_view: None,
-            dof_coc_pipeline: None,
-            dof_coc_bind_group_layout: None,
-            dof_coc_bind_group: None,
             dof_color_texture: None,
             dof_color_view: None,
             dof_combine_pipeline: None,
@@ -1374,8 +1365,6 @@ impl App {
         self.post_color_texture = Some(post_color_texture);
         self.dof_color_texture = Some(dof_color_texture);
         self.dof_color_view = Some(dof_color_view);
-        self.dof_coc_texture = None;
-        self.dof_coc_view = None;
         self.dof_smooth_ping_view = Some(dof_smooth_ping_view);
         self.dof_smooth_ping_texture = Some(dof_smooth_ping_texture);
         self.bloom_ping_view = Some(bloom_ping_view);
@@ -1391,36 +1380,6 @@ impl App {
         self.update_bloom_bind_groups();
     }
 
-    fn update_dof_coc_bind_group(&mut self) {
-        let (Some(device), Some(layout), Some(depth_view), Some(sampler), Some(ubo)) = (
-            self.device.as_ref(),
-            self.dof_coc_bind_group_layout.as_ref(),
-            self.offscreen_depth_view.as_ref(),
-            self.post_sampler.as_ref(),
-            self.dof_uniform_buffer.as_ref(),
-        ) else {
-            return;
-        };
-
-        self.dof_coc_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("DoF CoC Bind Group"),
-            layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: ubo.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(depth_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(sampler),
-                },
-            ],
-        }));
-    }
 
     fn recreate_shadow_map(&mut self) {
         let Some(device) = self.device.as_ref() else {
@@ -3320,8 +3279,7 @@ impl App {
         self.dof_bind_group_layout = Some(dof_bind_group_layout);
         self.dof_uniform_buffer = Some(dof_uniform_buffer);
         // Remove separate CoC pipeline/bind group (fused into blur pass)
-        self.dof_coc_pipeline = None;
-        self.dof_coc_bind_group_layout = None; // fused, unused
+        // CoC pipeline removed (fused)
         self.dof_combine_pipeline = Some(dof_combine_pipeline);
         self.dof_combine_bind_group_layout = Some(dof_combine_bind_group_layout);
         self.post_sampler = Some(post_sampler);
@@ -4415,20 +4373,50 @@ impl App {
 
         // CoC pass removed (fused into blur pass).
 
-        if let (Some(dof_pipeline), Some(dof_bind_group), Some(dof_buffer), Some(dof_color_view)) = (
+        // Early-out conditions: skip DoF when negligible effect
+        let skip_dof = !self.dof_enabled
+            || self.dof_settings.blur_strength < 0.05
+            || self.dof_settings.focal_range > 450.0;
+
+        if skip_dof {
+            // Copy offscreen color to post_color_view directly
+            if let (Some(_offscreen_view), Some(post_view)) = (
+                self.offscreen_color_view.as_ref(),
+                self.post_color_view.as_ref(),
+            ) {
+                let mut copy_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("DoF Copy Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: post_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                if let (Some(composite_pipeline), Some(composite_bind_group)) = (
+                    self.composite_pipeline.as_ref(),
+                    self.composite_bind_group.as_ref(),
+                ) {
+                    copy_pass.set_pipeline(composite_pipeline);
+                    copy_pass.set_bind_group(0, composite_bind_group, &[]);
+                    copy_pass.draw(0..3, 0..1);
+                }
+            }
+        } else if let (Some(dof_pipeline), Some(dof_bind_group), Some(dof_buffer), Some(dof_color_view)) = (
             self.dof_pipeline.as_ref(),
             self.dof_bind_group.as_ref(),
             self.dof_uniform_buffer.as_ref(),
             self.dof_color_view.as_ref(),
         ) {
-            let blur_strength = if self.dof_enabled {
-                self.dof_settings.blur_strength
-            } else {
-                0.0
-            };
+            let blur_strength = self.dof_settings.blur_strength;
             let gpu_uniforms = self.pack_dof_uniforms(blur_strength);
             queue.write_buffer(dof_buffer, 0, bytemuck::cast_slice(&gpu_uniforms));
-
             let mut post_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("DoF Blur Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -4447,8 +4435,6 @@ impl App {
             post_pass.set_pipeline(dof_pipeline);
             post_pass.set_bind_group(0, dof_bind_group, &[]);
             post_pass.draw(0..3, 0..1);
-        } else {
-            eprintln!("DoF resources unavailable; skipping post-process!");
         }
 
         let run_smoothing = self.dof_enabled && self.dof_settings.blur_strength > 0.01;
