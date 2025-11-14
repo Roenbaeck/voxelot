@@ -16,9 +16,9 @@ var<uniform> dof_uniforms: DoFUniforms;
 @group(0) @binding(1)
 var color_texture: texture_2d<f32>;
 
-// CoC texture produced by dof_coc.wgsl; .r contains CoC in pixels.
+// Depth texture for reconstructing CoC on-the-fly (fused pass).
 @group(0) @binding(2)
-var coc_texture: texture_2d<f32>;
+var depth_texture: texture_depth_2d;
 
 @group(0) @binding(3)
 var color_sampler: sampler;
@@ -90,50 +90,55 @@ const BOKEH_SAMPLES: array<vec2<f32>, 12> = array<vec2<f32>, 12>(
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let dimensions = vec2<f32>(textureDimensions(color_texture, 0));
     let pixel_size = 1.0 / dimensions;
-
     let base_uv = clamp(input.uv, vec2<f32>(0.0), vec2<f32>(1.0));
-    let base_coords = vec2<i32>(base_uv * (dimensions - vec2<f32>(1.0)));
-    // Sample depth via color texture's dimensions for consistency
-    let coc_value = textureLoad(coc_texture, base_coords, 0).r;
-    let coc_abs = abs(coc_value);
 
-    // Early exit if blur is disabled
-    if dof_uniforms.blur_strength <= 0.01 {
-        return textureSample(color_texture, color_sampler, base_uv);
+    // Reconstruct linear depth and CoC (signed) directly; focal band zeroed.
+    let depth = textureSample(depth_texture, color_sampler, base_uv);
+    let near_plane = dof_uniforms.near_plane;
+    let far_plane = dof_uniforms.far_plane;
+    let z_ndc = depth * 2.0 - 1.0;
+    let linear_depth = (2.0 * near_plane * far_plane) /
+        (far_plane + near_plane - z_ndc * (far_plane - near_plane));
+
+    let focus_distance = dof_uniforms.focal_distance;
+    let focal_range = dof_uniforms.focal_range;
+    let distance_from_focus = linear_depth - focus_distance;
+    if abs(distance_from_focus) < focal_range || dof_uniforms.blur_strength <= 0.01 {
+        let base_color = textureSample(color_texture, color_sampler, base_uv).rgb;
+        return vec4<f32>(base_color, 0.0);
     }
 
-    // Use CoC magnitude as blur driver
-    if coc_abs < 0.01 {
-        return textureSample(color_texture, color_sampler, base_uv);
-    }
+    // Compute pixel CoC radius (signed) and derive magnitude.
+    let sensor_scale = dimensions.y * 0.5;
+    let blur_start = distance_from_focus - sign(distance_from_focus) * focal_range;
+    let coc_norm = blur_start / max(abs(linear_depth), 1e-3);
+    let coc_pixels = clamp(coc_norm * sensor_scale * 0.02, -15.0, 15.0);
+    let coc_abs = abs(coc_pixels);
 
-    // Convert CoC in pixels to texture-space radius.
+    // Adaptive tap count based on radius.
+    var taps: u32;
+    if coc_abs < 3.0 { taps = 4u; }
+    else if coc_abs < 8.0 { taps = 8u; }
+    else { taps = 12u; }
+
     let blur_radius_pixels = clamp(coc_abs * dof_uniforms.blur_strength, 0.5, 20.0);
+    let uv_radius = blur_radius_pixels * pixel_size;
     let base_color = textureSample(color_texture, color_sampler, base_uv).rgb;
-
-    // Accumulate bokeh samples in a disc scaled by CoC.
     var accum = base_color;
     var weight_sum = 1.0;
 
-    // Convert pixel radius to UV radius.
-    let uv_radius = blur_radius_pixels * pixel_size;
-
-    for (var i: u32 = 0u; i < 12u; i = i + 1u) {
+    // Gather (no CoC edge gating to keep fused pass cheaper).
+    for (var i: u32 = 0u; i < taps; i = i + 1u) {
         let dir = BOKEH_SAMPLES[i];
         let sample_uv = base_uv + dir * uv_radius;
         if all(sample_uv >= vec2<f32>(0.0)) && all(sample_uv <= vec2<f32>(1.0)) {
-            let coords = vec2<i32>(sample_uv * (dimensions - vec2<f32>(1.0)));
-            let sample_coc = abs(textureLoad(coc_texture, coords, 0).r);
-            // Preserve edges: only gather from samples that are at least
-            // as blurry as our current pixel (or slightly less).
-            if sample_coc >= coc_abs * 0.6 {
-                let c = textureSample(color_texture, color_sampler, sample_uv).rgb;
-                accum += c;
-                weight_sum += 1.0;
-            }
+            let c = textureSample(color_texture, color_sampler, sample_uv).rgb;
+            accum += c;
+            weight_sum += 1.0;
         }
     }
 
     let blurred = accum / weight_sum;
-    return vec4<f32>(blurred, 1.0);
+    // Store normalized CoC magnitude in alpha for combine pass.
+    return vec4<f32>(blurred, coc_abs / 15.0);
 }

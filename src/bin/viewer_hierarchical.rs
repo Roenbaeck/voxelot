@@ -1297,12 +1297,14 @@ impl App {
         let post_color_view =
             post_color_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Intermediate color buffer that stores blurred DoF result before final combine
+        // Fused DoF blurred texture (half resolution) storing color + normalized CoC in alpha.
+        let fused_width = (config.width / 2).max(1);
+        let fused_height = (config.height / 2).max(1);
         let dof_color_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("DoF Color Texture"),
+            label: Some("DoF Fused HalfRes Texture"),
             size: wgpu::Extent3d {
-                width: config.width,
-                height: config.height,
+                width: fused_width,
+                height: fused_height,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -1312,8 +1314,7 @@ impl App {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        let dof_color_view =
-            dof_color_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let dof_color_view = dof_color_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let dof_smooth_ping_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("DoF Smooth Ping Texture"),
@@ -1364,22 +1365,6 @@ impl App {
         let bloom_pong_view =
             bloom_pong_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // CoC texture at full resolution, single-channel float
-        let coc_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("DoF CoC Texture"),
-            size: wgpu::Extent3d {
-                width: config.width,
-                height: config.height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let coc_view = coc_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         self.offscreen_color_view = Some(color_view);
         self.offscreen_color_texture = Some(color_texture);
@@ -1389,8 +1374,8 @@ impl App {
         self.post_color_texture = Some(post_color_texture);
         self.dof_color_texture = Some(dof_color_texture);
         self.dof_color_view = Some(dof_color_view);
-        self.dof_coc_texture = Some(coc_texture);
-        self.dof_coc_view = Some(coc_view);
+        self.dof_coc_texture = None;
+        self.dof_coc_view = None;
         self.dof_smooth_ping_view = Some(dof_smooth_ping_view);
         self.dof_smooth_ping_texture = Some(dof_smooth_ping_texture);
         self.bloom_ping_view = Some(bloom_ping_view);
@@ -1540,18 +1525,17 @@ impl App {
             Some(device),
             Some(layout),
             Some(color_view),
-            Some(coc_view),
+            Some(depth_view),
             Some(sampler),
             Some(ubo),
         ) = (
             self.device.as_ref(),
             self.dof_bind_group_layout.as_ref(),
             self.offscreen_color_view.as_ref(),
-            self.dof_coc_view.as_ref(),
+            self.offscreen_depth_view.as_ref(),
             self.post_sampler.as_ref(),
             self.dof_uniform_buffer.as_ref(),
-        )
-        else {
+        ) else {
             return;
         };
 
@@ -1559,22 +1543,10 @@ impl App {
             label: Some("DoF Bind Group"),
             layout,
             entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: ubo.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(color_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(coc_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::Sampler(sampler),
-                },
+                wgpu::BindGroupEntry { binding: 0, resource: ubo.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(color_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(depth_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(sampler) },
             ],
         }));
     }
@@ -1584,41 +1556,23 @@ impl App {
             Some(device),
             Some(layout),
             Some(dof_color_view),
-            Some(coc_view),
             Some(source_view),
             Some(sampler),
         ) = (
             self.device.as_ref(),
             self.dof_combine_bind_group_layout.as_ref(),
             self.dof_color_view.as_ref(),
-            self.dof_coc_view.as_ref(),
             self.offscreen_color_view.as_ref(),
             self.post_sampler.as_ref(),
-        )
-        else {
-            return;
-        };
+        ) else { return; };
 
         self.dof_combine_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("DoF Combine Bind Group"),
             layout,
             entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(dof_color_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(coc_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(source_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::Sampler(sampler),
-                },
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(dof_color_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(source_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
             ],
         }));
     }
@@ -2631,137 +2585,88 @@ impl App {
             source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/dof_blur.wgsl").into()),
         });
 
-        let dof_coc_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("DoF CoC Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/dof_coc.wgsl").into()),
-        });
-
         let dof_combine_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("DoF Combine Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/dof_combine.wgsl").into()),
         });
 
-        let dof_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("DoF Bind Group Layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+        // Fused DoF bind group layout: uniform, source color, depth, sampler.
+        let dof_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("DoF Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        // CoC is stored in an R32Float texture which is not filterable on many backends.
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
 
-        let dof_coc_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("DoF CoC Bind Group Layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Depth,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
+        // Removed separate CoC bind group layout (CoC computed in fused blur pass).
 
-        let dof_combine_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("DoF Combine Bind Group Layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
+        // Combine now uses fused blurred texture (with CoC in alpha) + source color + sampler.
+        let dof_combine_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("DoF Combine Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            // CoC texture is R32Float (non-filterable on many backends).
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        // CoC texture at binding 1 is non-filterable; use a non-filtering sampler
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
-                        count: None,
-                    },
-                ],
-            });
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
 
         let dof_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("DoF Pipeline Layout"),
@@ -2769,11 +2674,7 @@ impl App {
             push_constant_ranges: &[],
         });
 
-        let dof_coc_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("DoF CoC Pipeline Layout"),
-            bind_group_layouts: &[&dof_coc_bind_group_layout],
-            push_constant_ranges: &[],
-        });
+        // Removed separate CoC pipeline layout (fused DoF pass handles CoC).
 
         let dof_combine_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("DoF Combine Pipeline Layout"),
@@ -2820,32 +2721,8 @@ impl App {
             cache: None,
         });
 
-        let dof_coc_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("DoF CoC Pipeline"),
-            layout: Some(&dof_coc_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &dof_coc_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &dof_coc_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::R32Float,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
-
+        // Removed separate CoC pipeline (fused into blur pass).
+        // Fused DoF combine pipeline (uses blurred texture alpha for CoC)
         let dof_combine_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("DoF Combine Pipeline"),
             layout: Some(&dof_combine_pipeline_layout),
@@ -3442,8 +3319,9 @@ impl App {
         self.dof_pipeline = Some(dof_pipeline);
         self.dof_bind_group_layout = Some(dof_bind_group_layout);
         self.dof_uniform_buffer = Some(dof_uniform_buffer);
-        self.dof_coc_pipeline = Some(dof_coc_pipeline);
-        self.dof_coc_bind_group_layout = Some(dof_coc_bind_group_layout);
+        // Remove separate CoC pipeline/bind group (fused into blur pass)
+        self.dof_coc_pipeline = None;
+        self.dof_coc_bind_group_layout = None; // fused, unused
         self.dof_combine_pipeline = Some(dof_combine_pipeline);
         self.dof_combine_bind_group_layout = Some(dof_combine_bind_group_layout);
         self.post_sampler = Some(post_sampler);
@@ -4524,9 +4402,6 @@ impl App {
             self.update_dof_bind_group();
         }
 
-        if self.dof_coc_bind_group.is_none() {
-            self.update_dof_coc_bind_group();
-        }
 
         self.update_bloom_uniforms();
 
@@ -4538,30 +4413,7 @@ impl App {
             self.update_bloom_bind_groups();
         }
 
-        if let (Some(dof_coc_pipeline), Some(dof_coc_bind_group), Some(dof_coc_view)) = (
-            self.dof_coc_pipeline.as_ref(),
-            self.dof_coc_bind_group.as_ref(),
-            self.dof_coc_view.as_ref(),
-        ) {
-            let mut coc_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("DoF CoC Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: dof_coc_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            coc_pass.set_pipeline(dof_coc_pipeline);
-            coc_pass.set_bind_group(0, dof_coc_bind_group, &[]);
-            coc_pass.draw(0..3, 0..1);
-        }
+        // CoC pass removed (fused into blur pass).
 
         if let (Some(dof_pipeline), Some(dof_bind_group), Some(dof_buffer), Some(dof_color_view)) = (
             self.dof_pipeline.as_ref(),

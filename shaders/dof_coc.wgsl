@@ -58,11 +58,19 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
     // Focus model: distance from focal plane mapped to CoC size.
     let focus_distance = dof_uniforms.focal_distance;
+    let focal_range = dof_uniforms.focal_range;
     let distance_from_focus = linear_depth - focus_distance;
 
+    // Zero CoC within focal range (sharp band)
+    if abs(distance_from_focus) < focal_range {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+
     // Scale factor: choose constants to get a good artistic range.
+    // Preserve sign: negative for foreground, positive for background
+    let blur_start = distance_from_focus - sign(distance_from_focus) * focal_range;
     let sensor_scale = dimensions.y * 0.5;
-    let coc_norm = distance_from_focus / max(linear_depth, 1e-3);
+    let coc_norm = blur_start / max(abs(linear_depth), 1e-3);
     let coc_pixels = clamp(coc_norm * sensor_scale * 0.02, -15.0, 15.0);
 
     return vec4<f32>(coc_pixels, 0.0, 0.0, 1.0);

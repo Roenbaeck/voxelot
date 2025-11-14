@@ -1,16 +1,14 @@
 // Depth of Field combine pass
 // Inspired by Streets-GL (MIT licensed) dofCombine.frag implementation.
 
+// Fused DoF texture: RGB blurred color, A = normalized CoC (0..1)
 @group(0) @binding(0)
-var dof_texture: texture_2d<f32>;
+var dof_fused_texture: texture_2d<f32>;
 
 @group(0) @binding(1)
-var coc_texture: texture_2d<f32>;
-
-@group(0) @binding(2)
 var source_texture: texture_2d<f32>;
 
-@group(0) @binding(3)
+@group(0) @binding(2)
 var linear_sampler: sampler;
 
 struct VertexOutput {
@@ -38,11 +36,9 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let uv = clamp(input.uv, vec2<f32>(0.0), vec2<f32>(1.0));
     let source = textureSample(source_texture, linear_sampler, uv);
-    let dof = textureSample(dof_texture, linear_sampler, uv);
-    let coc = textureSample(coc_texture, linear_sampler, uv).r;
-
-    let strength = smoothstep(0.1, 1.0, abs(coc));
-    // Simple lerp between sharp and blurred based on CoC.
-    let color = mix(source.rgb, dof.rgb, strength);
+    let fused = textureSample(dof_fused_texture, linear_sampler, uv);
+    let coc_norm = fused.a; // normalized CoC magnitude from fused pass
+    let strength = smoothstep(0.01, 0.5, coc_norm);
+    let color = mix(source.rgb, fused.rgb, strength);
     return vec4<f32>(color, 1.0);
 }
