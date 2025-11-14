@@ -116,12 +116,14 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let coc_abs = abs(coc_pixels);
 
     // Adaptive tap count based on radius.
+    // Use more samples for larger blur radii to ensure smooth results
     var taps: u32;
-    if coc_abs < 3.0 { taps = 4u; }
-    else if coc_abs < 8.0 { taps = 8u; }
-    else { taps = 12u; }
+    if coc_abs < 2.0 { taps = 4u; }
+    else if coc_abs < 5.0 { taps = 8u; }
+    else if coc_abs < 10.0 { taps = 12u; }
+    else { taps = 12u; } // All 12 samples for distant blur
 
-    let blur_radius_pixels = clamp(coc_abs * dof_uniforms.blur_strength, 0.5, 20.0);
+    let blur_radius_pixels = clamp(coc_abs * dof_uniforms.blur_strength, 0.5, 25.0);
     let uv_radius = blur_radius_pixels * pixel_size;
     let base_color = textureSample(color_texture, color_sampler, base_uv).rgb;
     var accum = base_color;
