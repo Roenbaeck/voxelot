@@ -15,6 +15,10 @@ pub struct Config {
     #[serde(default)]
     pub effects: EffectsConfig,
     #[serde(default)]
+    pub shadows: ShadowConfig,
+    #[serde(default)]
+    pub performance: PerformanceConfig,
+    #[serde(default)]
     pub debug: DebugConfig,
 }
 
@@ -57,17 +61,57 @@ pub struct AtmosphereConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EffectsConfig {
     #[serde(default)]
-    pub depth_of_field: bool,
-    #[serde(default = "default_dof_focus")]
-    pub dof_focus_distance: f32,
-    #[serde(default = "default_dof_blur")]
-    pub dof_blur_size: f32,
-    #[serde(default = "default_bloom")]
-    pub bloom: bool,
+    pub depth_of_field: DepthOfFieldConfig,
+    #[serde(default)]
+    pub bloom: BloomConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DepthOfFieldConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_dof_focal_distance")]
+    pub focal_distance: f32,
+    #[serde(default = "default_dof_focal_range")]
+    pub focal_range: f32,
+    #[serde(default = "default_dof_blur_strength")]
+    pub blur_strength: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BloomConfig {
+    #[serde(default = "default_bloom_enabled")]
+    pub enabled: bool,
     #[serde(default = "default_bloom_threshold")]
-    pub bloom_threshold: f32,
+    pub threshold: f32,
+    #[serde(default = "default_bloom_knee")]
+    pub knee: f32,
     #[serde(default = "default_bloom_intensity")]
-    pub bloom_intensity: f32,
+    pub intensity: f32,
+    #[serde(default = "default_bloom_strength")]
+    pub bloom_strength: f32,
+    #[serde(default = "default_bloom_saturation")]
+    pub saturation_boost: f32,
+    #[serde(default = "default_bloom_exposure")]
+    pub exposure: f32,
+    #[serde(default = "default_bloom_blur_radius")]
+    pub blur_radius: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowConfig {
+    #[serde(default = "default_shadow_map_size")]
+    pub map_size: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerformanceConfig {
+    #[serde(default = "default_mesh_cache_mb")]
+    pub mesh_cache_budget_mb: u64,
+    #[serde(default = "default_mesh_workers")]
+    pub mesh_worker_count: Option<usize>,
+    #[serde(default = "default_mesh_upload_baseline")]
+    pub mesh_upload_baseline: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,24 +171,64 @@ fn default_time_of_day() -> f32 {
     0.5
 }
 
-fn default_dof_focus() -> f32 {
-    200.0
+fn default_dof_focal_distance() -> f32 {
+    120.0
 }
 
-fn default_dof_blur() -> f32 {
-    2.0
+fn default_dof_focal_range() -> f32 {
+    16.0
 }
 
-fn default_bloom() -> bool {
+fn default_dof_blur_strength() -> f32 {
+    1.6
+}
+
+fn default_bloom_enabled() -> bool {
     true
 }
 
 fn default_bloom_threshold() -> f32 {
-    0.8
+    0.7
+}
+
+fn default_bloom_knee() -> f32 {
+    0.6
 }
 
 fn default_bloom_intensity() -> f32 {
-    0.3
+    1.8
+}
+
+fn default_bloom_strength() -> f32 {
+    1.6
+}
+
+fn default_bloom_saturation() -> f32 {
+    1.5
+}
+
+fn default_bloom_exposure() -> f32 {
+    1.18
+}
+
+fn default_bloom_blur_radius() -> f32 {
+    3.8
+}
+
+fn default_shadow_map_size() -> u32 {
+    4096
+}
+
+fn default_mesh_cache_mb() -> u64 {
+    256
+}
+
+fn default_mesh_workers() -> Option<usize> {
+    None // Auto-detect
+}
+
+fn default_mesh_upload_baseline() -> usize {
+    4
 }
 
 fn default_true() -> bool {
@@ -185,15 +269,55 @@ impl Default for AtmosphereConfig {
     }
 }
 
+impl Default for DepthOfFieldConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            focal_distance: default_dof_focal_distance(),
+            focal_range: default_dof_focal_range(),
+            blur_strength: default_dof_blur_strength(),
+        }
+    }
+}
+
+impl Default for BloomConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_bloom_enabled(),
+            threshold: default_bloom_threshold(),
+            knee: default_bloom_knee(),
+            intensity: default_bloom_intensity(),
+            bloom_strength: default_bloom_strength(),
+            saturation_boost: default_bloom_saturation(),
+            exposure: default_bloom_exposure(),
+            blur_radius: default_bloom_blur_radius(),
+        }
+    }
+}
+
 impl Default for EffectsConfig {
     fn default() -> Self {
         Self {
-            depth_of_field: false,
-            dof_focus_distance: default_dof_focus(),
-            dof_blur_size: default_dof_blur(),
-            bloom: default_bloom(),
-            bloom_threshold: default_bloom_threshold(),
-            bloom_intensity: default_bloom_intensity(),
+            depth_of_field: DepthOfFieldConfig::default(),
+            bloom: BloomConfig::default(),
+        }
+    }
+}
+
+impl Default for ShadowConfig {
+    fn default() -> Self {
+        Self {
+            map_size: default_shadow_map_size(),
+        }
+    }
+}
+
+impl Default for PerformanceConfig {
+    fn default() -> Self {
+        Self {
+            mesh_cache_budget_mb: default_mesh_cache_mb(),
+            mesh_worker_count: default_mesh_workers(),
+            mesh_upload_baseline: default_mesh_upload_baseline(),
         }
     }
 }
@@ -214,6 +338,8 @@ impl Default for Config {
             rendering: RenderingConfig::default(),
             atmosphere: AtmosphereConfig::default(),
             effects: EffectsConfig::default(),
+            shadows: ShadowConfig::default(),
+            performance: PerformanceConfig::default(),
             debug: DebugConfig::default(),
         }
     }

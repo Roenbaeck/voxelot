@@ -39,8 +39,6 @@ const WINDOW_WIDTH: u32 = 1280;
 const WINDOW_HEIGHT: u32 = 720;
 const CONFIG_FILE: &str = "config.toml"; // Unified TOML configuration only
 const GPU_CULL_WORKGROUP_SIZE: u32 = 64;
-const DEFAULT_MESH_CACHE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
-const SHADOW_MAP_SIZE: u32 = 4096;
 const SHADOW_FRUSTUM_EXTENT_MIN: f32 = 150.0;
 const SHADOW_FRUSTUM_EXTENT_MAX: f32 = 600.0;
 const SHADOW_DISTANCE_MULTIPLIER: f32 = 2.5;
@@ -663,6 +661,7 @@ struct App {
     mesh_upload_baseline: usize,
     mesh_upload_max: usize,
     mesh_upload_adjust_timer: f32,
+    mesh_cache_budget_bytes: u64,
     last_frame: Instant,
     frame_count: u64,
     frame_index: u64,
@@ -732,8 +731,8 @@ impl App {
         let process_pid = Pid::from(std::process::id() as usize);
         system_info.refresh_process(process_pid);
 
-        // Load configuration
-        let app_config = voxelot::Config::load_or_default(CONFIG_FILE);
+        // Load configuration once for all initialization
+        let cfg = voxelot::Config::load_or_default(CONFIG_FILE);
 
         let initial_camera;
         let mut world;
@@ -796,24 +795,25 @@ impl App {
                 }
             }
         } else {
-            initial_camera = app_config.world.camera_position;
+            initial_camera = cfg.world.camera_position;
             
-            println!("Loading voxel data from {}...", app_config.world.file);
+            println!("Loading voxel data from {}...", cfg.world.file);
                 // Load octree format from configured path — use auto-detecting loader
-                world = voxelot::load_world_file(std::path::Path::new(&app_config.world.file))
+                world = voxelot::load_world_file(std::path::Path::new(&cfg.world.file))
                     .unwrap_or_else(|e| {
-                        eprintln!("ERROR: Failed to load world file '{}': {}", app_config.world.file, e);
+                        eprintln!("ERROR: Failed to load world file '{}': {}", cfg.world.file, e);
                         eprintln!("Please check that the file path in config.toml is correct.");
                         std::process::exit(1);
                     });
                 println!("Loaded world from {} (depth {})", 
-                         app_config.world.file, world.hierarchy_depth());
+                         cfg.world.file, world.hierarchy_depth());
         }
 
         println!("World created with voxels");
 
-        println!("Loading palette from {}...", app_config.world.palette);
-        let palette = Palette::load(&app_config.world.palette);
+        println!("Loading palette from {}...", cfg.world.palette);
+        let palette = Palette::load(&cfg.world.palette);
+
         let (mesh_job_tx, mesh_job_rx) = unbounded::<MeshJob>();
         let (mesh_result_tx, mesh_result_rx) = unbounded::<MeshResult>();
 
@@ -821,7 +821,8 @@ impl App {
             .map(|n| n.get().saturating_sub(2))
             .unwrap_or(1)
             .max(1);
-        let mesh_worker_count = available_workers.min(6);
+        let mesh_worker_count = cfg.performance.mesh_worker_count
+            .unwrap_or_else(|| available_workers.min(6));
 
         for worker_index in 0..mesh_worker_count {
             let job_rx = mesh_job_rx.clone();
@@ -855,7 +856,7 @@ impl App {
         drop(mesh_result_tx);
         drop(mesh_job_rx);
 
-        let mesh_upload_baseline = 4usize;
+        let mesh_upload_baseline = cfg.performance.mesh_upload_baseline;
         let mesh_upload_max = (mesh_worker_count * 4).max(mesh_upload_baseline * 2);
 
         println!("Updating LOD metadata...");
@@ -924,11 +925,8 @@ impl App {
             mesh_upload_baseline,
             mesh_upload_max,
             mesh_upload_adjust_timer: 0.0,
-            // Load unified TOML config once and feed rendering section into camera controller
-            camera_controller: {
-                let full_cfg = voxelot::Config::load_or_default(CONFIG_FILE);
-                CameraController::new(initial_camera, &full_cfg.rendering)
-            },
+            mesh_cache_budget_bytes: cfg.performance.mesh_cache_budget_mb as u64 * 1024 * 1024,
+            camera_controller: CameraController::new(initial_camera, &cfg.rendering),
             pending_chunk_meshes: VecDeque::new(),
             pending_chunk_set: HashSet::new(),
             last_frame: Instant::now(),
@@ -937,12 +935,12 @@ impl App {
             last_fps_print: Instant::now(),
             mouse_pressed: false,
             last_mouse_pos: None,
-            time_of_day: 0.5,    // Start at noon
-            time_paused: false,  // Time cycle starts running
-            fog_density: 0.003000, // Default fog density
+            time_of_day: cfg.atmosphere.time_of_day,
+            time_paused: false,
+            fog_density: cfg.atmosphere.fog_density,
             light_probe_buffer: None,
             light_probe_capacity: 0,
-            lod_distance: 800.0, // Default LOD render distance
+            lod_distance: cfg.rendering.chunk_lod_distance,
             dof_pipeline: None,
             dof_bind_group_layout: None,
             dof_bind_group: None,
@@ -978,22 +976,22 @@ impl App {
             dof_combine_bind_group_layout: None,
             dof_combine_bind_group: None,
             dof_settings: DoFSettings {
-                focal_distance: 120.0,
-                focal_range: 16.0,
-                blur_strength: 1.6,
+                focal_distance: cfg.effects.depth_of_field.focal_distance,
+                focal_range: cfg.effects.depth_of_field.focal_range,
+                blur_strength: cfg.effects.depth_of_field.blur_strength,
             },
-            dof_enabled: true,
+            dof_enabled: cfg.effects.depth_of_field.enabled,
             bloom_settings: BloomSettings {
-                threshold: 0.7,
-                knee: 0.6,
-                intensity: 1.8,
-                bloom_strength: 1.6,
-                saturation_boost: 1.5,
-                exposure: 1.18,
-                blur_radius: 3.8,
+                threshold: cfg.effects.bloom.threshold,
+                knee: cfg.effects.bloom.knee,
+                intensity: cfg.effects.bloom.intensity,
+                bloom_strength: cfg.effects.bloom.bloom_strength,
+                saturation_boost: cfg.effects.bloom.saturation_boost,
+                exposure: cfg.effects.bloom.exposure,
+                blur_radius: cfg.effects.bloom.blur_radius,
             },
-            bloom_enabled: true,
-            shadow_map_size: SHADOW_MAP_SIZE,
+            bloom_enabled: cfg.effects.bloom.enabled,
+            shadow_map_size: cfg.shadows.map_size,
         }
     }
 
@@ -1001,6 +999,7 @@ impl App {
         // Persist full TOML config using unified Config (camera speed multiplier retained)
         // We read existing file, update rendering subsection relevant fields, then save.
         if let Ok(mut full_cfg) = voxelot::Config::load(CONFIG_FILE) {
+            // Rendering settings
             full_cfg.rendering.lod_subdivide_distance = self.camera_controller.camera.config.lod_subdivide_distance;
             full_cfg.rendering.lod_merge_distance = self.camera_controller.camera.config.lod_merge_distance;
             full_cfg.rendering.chunk_lod_distance = self.camera_controller.camera.config.lod_render_distance;
@@ -1008,6 +1007,35 @@ impl App {
             full_cfg.rendering.near_plane = self.camera_controller.camera.config.near_plane;
             full_cfg.rendering.far_plane = self.camera_controller.camera.config.far_plane;
             full_cfg.rendering.camera_speed_multiplier = self.camera_controller.speed_multiplier;
+            
+            // Atmosphere settings
+            full_cfg.atmosphere.time_of_day = self.time_of_day;
+            full_cfg.atmosphere.fog_density = self.fog_density;
+            
+            // DoF settings
+            full_cfg.effects.depth_of_field.enabled = self.dof_enabled;
+            full_cfg.effects.depth_of_field.focal_distance = self.dof_settings.focal_distance;
+            full_cfg.effects.depth_of_field.focal_range = self.dof_settings.focal_range;
+            full_cfg.effects.depth_of_field.blur_strength = self.dof_settings.blur_strength;
+            
+            // Bloom settings
+            full_cfg.effects.bloom.enabled = self.bloom_enabled;
+            full_cfg.effects.bloom.threshold = self.bloom_settings.threshold;
+            full_cfg.effects.bloom.knee = self.bloom_settings.knee;
+            full_cfg.effects.bloom.intensity = self.bloom_settings.intensity;
+            full_cfg.effects.bloom.bloom_strength = self.bloom_settings.bloom_strength;
+            full_cfg.effects.bloom.saturation_boost = self.bloom_settings.saturation_boost;
+            full_cfg.effects.bloom.exposure = self.bloom_settings.exposure;
+            full_cfg.effects.bloom.blur_radius = self.bloom_settings.blur_radius;
+            
+            // Shadow settings
+            full_cfg.shadows.map_size = self.shadow_map_size;
+            
+            // Performance settings
+            full_cfg.performance.mesh_worker_count = Some(self.mesh_worker_count);
+            full_cfg.performance.mesh_upload_baseline = self.mesh_upload_baseline;
+            full_cfg.performance.mesh_cache_budget_mb = self.mesh_cache_budget_bytes / (1024 * 1024);
+            
             if let Err(e) = full_cfg.save(CONFIG_FILE) {
                 eprintln!("Failed to save unified config: {}", e);
             } else {
@@ -1705,7 +1733,7 @@ impl App {
     }
 
     fn mesh_cache_byte_budget(&self) -> u64 {
-        DEFAULT_MESH_CACHE_BUDGET_BYTES
+        self.mesh_cache_budget_bytes
     }
 
     fn max_inflight_jobs(&self) -> usize {
