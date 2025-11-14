@@ -35,13 +35,18 @@ pub struct Palette {
 impl Palette {
     /// Load palette from text file. Falls back to built-in defaults on error.
     pub fn load<P: AsRef<Path>>(path: P) -> Self {
-        let text = fs::read_to_string(path.as_ref()).ok();
-        if let Some(contents) = text {
-            if let Some(palette) = Self::from_string(&contents) {
-                return palette;
-            }
-        }
-        Self::default()
+        let path_ref = path.as_ref();
+        let text = fs::read_to_string(path_ref).unwrap_or_else(|e| {
+            eprintln!("ERROR: Failed to read palette file '{}': {}", path_ref.display(), e);
+            eprintln!("Please check that the file path in config.toml is correct.");
+            std::process::exit(1);
+        });
+        
+        Self::from_string(&text).unwrap_or_else(|| {
+            eprintln!("ERROR: Failed to parse palette file '{}'", path_ref.display());
+            eprintln!("Palette file must contain at least one valid material definition.");
+            std::process::exit(1);
+        })
     }
 
     /// Parse palette from string. Supported formats per line:
@@ -186,24 +191,5 @@ impl Palette {
 
     pub fn gpu_bytes(&self) -> &[u8] {
         bytemuck::cast_slice(&self.albedo_cache)
-    }
-}
-
-impl Default for Palette {
-    fn default() -> Self {
-        // Mirrors palette.txt defaults
-        let mut materials = vec![Material::default(); 8];
-        materials[1] = Material::new([0.102, 0.902, 0.302, 1.0], [0.0, 0.0, 0.0], 0.0);
-        materials[2] = Material::new([1.0, 0.349, 0.349, 1.0], [0.0, 0.0, 0.0], 0.0);
-        materials[3] = Material::new([0.349, 0.502, 1.0, 1.0], [0.0, 0.0, 0.0], 0.0);
-        materials[4] = Material::new([0.949, 0.902, 0.349, 1.0], [0.0, 0.0, 0.0], 0.0);
-        materials[5] = Material::new([0.949, 0.4, 1.0, 1.0], [0.0, 0.0, 0.0], 0.0);
-        materials[6] = Material::new([0.302, 0.949, 1.0, 1.0], [0.0, 0.0, 0.0], 0.0);
-        materials[7] = Material::new([0.851, 0.851, 0.851, 1.0], [0.0, 0.0, 0.0], 0.0);
-        let albedo_cache = materials.iter().map(|m| m.albedo).collect();
-        Self {
-            materials,
-            albedo_cache,
-        }
     }
 }
