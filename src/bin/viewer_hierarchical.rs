@@ -176,7 +176,7 @@ struct Uniforms {
     moon_direction_intensity: [f32; 4],  // xyz = moon dir, w = intensity scalar
     moon_color_pad: [f32; 4],            // xyz = moon color
     light_probe_count: u32,
-    _pad0: u32,
+    lod_distance: f32,                   // LOD render distance for fade calculation
     _pad1: u32,
     _pad2: u32,
 }
@@ -3168,7 +3168,7 @@ impl App {
             moon_direction_intensity: [ -0.5, -1.0, -0.3, 0.2], // initial opposite dim moon
             moon_color_pad: [0.2, 0.25, 0.35, 0.0],
             light_probe_count: 0,
-            _pad0: 0,
+            lod_distance: 800.0,
             _pad1: 0,
             _pad2: 0,
         };
@@ -4198,7 +4198,7 @@ impl App {
             ],
             moon_color_pad: [moon_color[0], moon_color[1], moon_color[2], 0.0],
             light_probe_count,
-            _pad0: 0,
+            lod_distance: self.lod_distance,
             _pad1: 0,
             _pad2: 0,
         };

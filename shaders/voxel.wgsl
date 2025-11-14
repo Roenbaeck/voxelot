@@ -13,7 +13,7 @@ struct Uniforms {
     moon_direction_intensity: vec4<f32>,
     moon_color_pad: vec4<f32>,
     light_probe_count: u32,
-    _pad0: u32,
+    lod_distance: f32,
     _pad1: u32,
     _pad2: u32,
 }
@@ -204,7 +204,25 @@ fn fs_main(input: VertexOutputInstanced) -> @location(0) vec4<f32> {
     let emissive = input.emissive.rgb * emissive_strength;
     let final_color = fogged_color + emissive;
 
-    return vec4<f32>(final_color, 1.0);
+    // Distance-based alpha fade to hide pop-in at far distances
+    // Start fading at 80% of LOD distance, fully transparent at 95%
+    let fade_start = uniforms.lod_distance * 0.80;
+    let fade_end = uniforms.lod_distance * 0.95;
+    let fade_factor = smoothstep(fade_start, fade_end, distance);
+    
+    // Use world position hash for stable, deterministic alpha testing
+    // Higher frequency (50.0) creates finer noise that blurs better
+    let hash_pos = floor(input.world_pos * 50.0);
+    let hash_val = fract(sin(dot(hash_pos, vec3<f32>(12.9898, 78.233, 45.164))) * 43758.5453);
+    
+    if fade_factor > hash_val {
+        discard;
+    }
+    
+    // Brighten colors as they approach fade region for fog-like appearance
+    let brightened = mix(final_color, fog_color, fade_factor * 0.6);
+
+    return vec4<f32>(brightened, 1.0);
 }
 
 // Mesh pipeline entry points -------------------------------------------------
@@ -277,7 +295,26 @@ fn fs_mesh(input: VertexOutputMesh) -> @location(0) vec4<f32> {
     // Add emissive after fog so it stays bright
     let emissive = input.emissive.rgb * emissive_strength;
     let final_color = fogged_color + emissive;
-    return vec4<f32>(final_color, 1.0);
+    
+    // Distance-based alpha fade to hide pop-in at far distances
+    // Start fading at 80% of LOD distance, fully transparent at 95%
+    let fade_start = uniforms.lod_distance * 0.80;
+    let fade_end = uniforms.lod_distance * 0.95;
+    let fade_factor = smoothstep(fade_start, fade_end, distance);
+    
+    // Use world position hash for stable, deterministic alpha testing
+    // Higher frequency (50.0) creates finer noise that blurs better
+    let hash_pos = floor(input.world_pos * 50.0);
+    let hash_val = fract(sin(dot(hash_pos, vec3<f32>(12.9898, 78.233, 45.164))) * 43758.5453);
+    
+    if fade_factor > hash_val {
+        discard;
+    }
+    
+    // Brighten colors as they approach fade region for fog-like appearance
+    let brightened = mix(final_color, fog_color, fade_factor * 0.6);
+    
+    return vec4<f32>(brightened, 1.0);
 }
 
 fn compute_shadow(light_space_pos: vec4<f32>, normal: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
