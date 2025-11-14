@@ -860,6 +860,10 @@ impl App {
                 .spawn(move || {
                     for job in job_rx.iter() {
                         let MeshJob { key, chunk } = job;
+                        // Skip meshing completely empty chunks early.
+                        if chunk.voxel_count == 0 {
+                            continue;
+                        }
                         let mesh = generate_chunk_mesh(&chunk, &palette_clone);
                         if result_tx
                             .send(MeshResult {
