@@ -3840,7 +3840,7 @@ impl App {
             let twilight_ambient = [0.08, 0.08, 0.15];
             let sunrise_sun = [1.0, 0.6, 0.3];
             let sunrise_ambient = [0.3, 0.2, 0.2];
-            let day_sun = [1.0, 0.95, 0.8];
+            let day_sun = [0.8, 0.76, 0.64]; // Reduced from [1.0, 0.95, 0.8] to 80%
             let day_ambient = [0.3, 0.35, 0.45];
             
             // Interpolate between color phases
