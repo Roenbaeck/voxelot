@@ -110,10 +110,20 @@ Configuration is now unified and saved in structured TOML `config.toml` with tab
 [rendering]    # LOD distances, camera planes, FOV, speed multiplier
 [atmosphere]   # fog density, time_of_day
 [effects]      # bloom, depth of field parameters
+[shadows]      # shadow map size / darkness multiplier
 [debug]        # debug overlay toggles
 ```
 
 Only this TOML format is supported; legacy flat key=value config has been removed.
+
+Shadows configuration (examples):
+
+```toml
+[shadows]
+map_size = 4096
+darkness = 1.0 # 1.0 = default; >1 darkens shadows, <1 lightens
+backface_ambient_scale = 0.7 # 1.0 = no extra darkening; <1.0 = darker back faces
+```
 
 ### Architecture
 

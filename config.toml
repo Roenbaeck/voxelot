@@ -17,8 +17,8 @@ far_plane = 3000.0
 camera_speed_multiplier = 2.44140625
 
 [atmosphere]
-fog_density = 0.0029000001959502697
-time_of_day = 0.7115307450294495
+fog_density = 0.000599999912083149
+time_of_day = 0.6543545722961426
 
 [effects.depth_of_field]
 enabled = true
@@ -38,6 +38,8 @@ blur_radius = 3.799999952316284
 
 [shadows]
 map_size = 4096
+darkness = 2.0
+backface_ambient_scale = 0.25
 
 [performance]
 mesh_cache_budget_mb = 256

@@ -171,6 +171,7 @@ struct Uniforms {
     sun_color_pad: [f32; 4],             // xyz = sun color
     ambient_color_pad: [f32; 4],         // xyz = ambient color
     shadow_texel_size_pad: [f32; 4],     // xy = 1 / shadow map size
+    shadow_darkness_pad: [f32; 4],       // x = shadow darkness multiplier
     moon_direction_intensity: [f32; 4],  // xyz = moon dir, w = intensity scalar
     moon_color_pad: [f32; 4],            // xyz = moon color
     light_probe_count: u32,
@@ -724,6 +725,8 @@ struct App {
     bloom_settings: BloomSettings,
     bloom_enabled: bool,
     shadow_map_size: u32,
+    shadow_darkness: f32,
+    shadow_backface_scale: f32,
 }
 
 impl App {
@@ -994,6 +997,8 @@ impl App {
             },
             bloom_enabled: cfg.effects.bloom.enabled,
             shadow_map_size: cfg.shadows.map_size,
+            shadow_darkness: cfg.shadows.darkness,
+            shadow_backface_scale: cfg.shadows.backface_ambient_scale,
         }
     }
 
@@ -1032,6 +1037,8 @@ impl App {
             
             // Shadow settings
             full_cfg.shadows.map_size = self.shadow_map_size;
+            full_cfg.shadows.backface_ambient_scale = self.shadow_backface_scale;
+            full_cfg.shadows.darkness = self.shadow_darkness;
             
             // Performance settings
             full_cfg.performance.mesh_worker_count = Some(self.mesh_worker_count);
@@ -2881,6 +2888,7 @@ impl App {
             sun_color_pad: [1.0, 0.95, 0.8, 0.0],
             ambient_color_pad: [0.3, 0.35, 0.45, 0.0],
             shadow_texel_size_pad: [shadow_texel, shadow_texel, 0.0, 0.0],
+            shadow_darkness_pad: [self.shadow_darkness, self.shadow_backface_scale, 0.0, 0.0],
             moon_direction_intensity: [ -0.5, -1.0, -0.3, 0.2], // initial opposite dim moon
             moon_color_pad: [0.2, 0.25, 0.35, 0.0],
             light_probe_count: 0,
@@ -3938,6 +3946,7 @@ impl App {
             sun_color_pad: [sun_color[0], sun_color[1], sun_color[2], 0.0],
             ambient_color_pad: [ambient_color[0], ambient_color[1], ambient_color[2], 0.0],
             shadow_texel_size_pad: [shadow_texel, shadow_texel, 0.0, 0.0],
+            shadow_darkness_pad: [self.shadow_darkness, self.shadow_backface_scale, 0.0, 0.0],
             moon_direction_intensity: [
                 moon_direction_vec.x,
                 moon_direction_vec.y,

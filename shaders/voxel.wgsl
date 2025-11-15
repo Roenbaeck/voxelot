@@ -9,6 +9,7 @@ struct Uniforms {
     sun_color_pad: vec4<f32>,
     ambient_color_pad: vec4<f32>,
     shadow_texel_size_pad: vec4<f32>,
+    shadow_darkness: vec4<f32>,
     // New dual-light additions (moon has no shadow map; intensity in w)
     moon_direction_intensity: vec4<f32>,
     moon_color_pad: vec4<f32>,
@@ -154,12 +155,19 @@ fn vs_main(
 @fragment
 fn fs_main(input: VertexOutputInstanced) -> @location(0) vec4<f32> {
     let sun_dir = normalize(uniforms.sun_direction_shadow_bias.xyz);
-    let sun_diffuse = max(dot(input.normal, sun_dir), 0.0);
+    let ndotl_raw = dot(input.normal, sun_dir);
+    let sun_diffuse = max(ndotl_raw, 0.0);
     let base_shadow = compute_shadow(input.light_space_pos, input.normal, sun_dir);
     let shadow_strength = uniforms.camera_shadow_strength.w;
-    let shadow_visibility = mix(1.0, base_shadow, shadow_strength);
+    let raw_visibility = mix(1.0, base_shadow, shadow_strength);
+    let shadow_visibility = clamp(1.0 - (1.0 - raw_visibility) * uniforms.shadow_darkness.x, 0.0, 1.0);
     let sun_contribution = sun_diffuse * uniforms.sun_color_pad.xyz * shadow_visibility;
-    let ambient = uniforms.ambient_color_pad.xyz;
+    var ambient = uniforms.ambient_color_pad.xyz;
+    // If normal faces away from sun, reduce ambient for clear back-face darkening.
+    // back_strength == 0 for faces facing sun, >0 for faces facing away
+    let back_strength = clamp(-ndotl_raw, 0.0, 1.0);
+    let back_scale = clamp(uniforms.shadow_darkness.y, 0.0, 1.0); // clamp for safety
+    ambient = ambient * mix(vec3<f32>(1.0), vec3<f32>(back_scale), back_strength);
 
     // Moon light (no shadows yet) -------------------------------------------------
     let moon_dir = normalize(uniforms.moon_direction_intensity.xyz);
@@ -250,9 +258,15 @@ fn fs_mesh(input: VertexOutputMesh) -> @location(0) vec4<f32> {
     let sun_diffuse = max(dot(input.normal, sun_dir), 0.0);
     let base_shadow = compute_shadow(input.light_space_pos, input.normal, sun_dir);
     let shadow_strength = uniforms.camera_shadow_strength.w;
-    let shadow_visibility = mix(1.0, base_shadow, shadow_strength);
+    let raw_visibility = mix(1.0, base_shadow, shadow_strength);
+    let shadow_visibility = clamp(1.0 - (1.0 - raw_visibility) * uniforms.shadow_darkness.x, 0.0, 1.0);
     let sun_contribution = sun_diffuse * uniforms.sun_color_pad.xyz * shadow_visibility;
-    let ambient = uniforms.ambient_color_pad.xyz;
+    var ambient = uniforms.ambient_color_pad.xyz;
+    // If normal faces away from sun, reduce ambient for back-face darkening
+    let ndotl_raw = dot(input.normal, sun_dir);
+    let back_strength = clamp(-ndotl_raw, 0.0, 1.0);
+    let back_scale = clamp(uniforms.shadow_darkness.y, 0.0, 1.0);
+    ambient = ambient * mix(vec3<f32>(1.0), vec3<f32>(back_scale), back_strength);
 
     // Moon light (no shadows yet)
     let moon_dir = normalize(uniforms.moon_direction_intensity.xyz);
