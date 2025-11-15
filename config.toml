@@ -18,15 +18,16 @@ camera_speed_multiplier = 4.76837158203125
 
 [atmosphere]
 fog_density = 0.0009499997249804437
-time_of_day = 0.7972920536994934
+time_of_day = 0.6678189635276794
 
 [effects.depth_of_field]
 enabled = true
 focal_distance = 120.0
-focal_range = 15.0
+focal_range = 5.0
 blur_strength = 2.5
 kawase_iterations = 3
 kawase_offset = 1.0
+kawase_enabled = true
 
 [effects.bloom]
 enabled = true

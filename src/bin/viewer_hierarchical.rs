@@ -121,6 +121,7 @@ impl MeshCacheEntry {
         self.vertex_bytes + self.index_bytes
     }
 }
+// Ensure impl CameraController is properly closed (fix potential brace mismatch introduced by refactor)
 
 #[derive(Clone, Debug)]
 struct ChunkEmitterWorld {
@@ -188,6 +189,7 @@ struct DoFSettings {
     blur_strength: f32,
     kawase_iterations: usize,
     kawase_offset: f32,
+    kawase_enabled: bool,
 }
 
 #[repr(C)]
@@ -575,26 +577,18 @@ impl CameraController {
             velocity[1] -= 1.0;
         }
 
-        // Normalize velocity
-        let len =
-            (velocity[0] * velocity[0] + velocity[1] * velocity[1] + velocity[2] * velocity[2])
-                .sqrt();
-        if len > 0.001 {
-            velocity[0] /= len;
-            velocity[1] /= len;
-            velocity[2] /= len;
+        // Normalize velocity and move camera
+        let mag = (velocity[0] * velocity[0] + velocity[1] * velocity[1] + velocity[2] * velocity[2]).sqrt();
+        if mag > 0.00001 {
+            let inv = 1.0 / mag;
+            let dir = [velocity[0] * inv, velocity[1] * inv, velocity[2] * inv];
+            let speed = self.base_speed * self.speed_multiplier * self.distance_speed_scale();
+            let delta = [dir[0] * speed * dt, dir[1] * speed * dt, dir[2] * speed * dt];
+            self.camera.position[0] += delta[0];
+            self.camera.position[1] += delta[1];
+            self.camera.position[2] += delta[2];
+            self.update_camera_vectors();
         }
-
-        // Apply movement
-        let dynamic_speed = self.base_speed * self.speed_multiplier * self.distance_speed_scale();
-        let pos = self.camera.position;
-        self.camera.position = [
-            pos[0] + velocity[0] * dynamic_speed * dt,
-            pos[1] + velocity[1] * dynamic_speed * dt,
-            pos[2] + velocity[2] * dynamic_speed * dt,
-        ];
-
-        self.update_camera_vectors();
     }
 
     fn distance_speed_scale(&self) -> f32 {
@@ -686,6 +680,7 @@ struct App {
 
     // Post-processing state
     dof_pipeline: Option<wgpu::RenderPipeline>,
+    dof_coc_pipeline: Option<wgpu::RenderPipeline>,
     dof_bind_group_layout: Option<wgpu::BindGroupLayout>,
     dof_bind_group: Option<wgpu::BindGroup>,
     dof_uniform_buffer: Option<wgpu::Buffer>,
@@ -735,6 +730,13 @@ struct App {
     kawase_ping_views: Vec<Option<wgpu::TextureView>>,
     kawase_pong_textures: Vec<Option<wgpu::Texture>>,
     kawase_pong_views: Vec<Option<wgpu::TextureView>>,
+    // Kawase per-level extents (width, height)
+    kawase_level_sizes: Vec<(u32, u32)>,
+    kawase_last_ubo: Vec<[f32; 4]>,
+    // Performance instrumentation: accumulate kawase timing
+    kawase_write_acc: std::time::Duration,
+    kawase_pass_acc: std::time::Duration,
+    kawase_acc_frames: u64,
     bloom_settings: BloomSettings,
     bloom_enabled: bool,
     shadow_map_size: u32,
@@ -893,6 +895,7 @@ impl App {
         println!("Time of Day: T (cycle through day/night)");
         println!("Fog Density: F/G (decrease/increase)");
         println!("Depth of Field: / (toggle), , and . adjust focus");
+        println!("Kawase DoF: X (toggle), U/I (offset -/+), O/P (iterations -/+)");
         println!("Bloom: B (toggle)");
         println!("Quit: ESC");
         println!("================\n");
@@ -962,6 +965,7 @@ impl App {
             light_probe_capacity: 0,
             lod_distance: cfg.rendering.chunk_lod_distance,
             dof_pipeline: None,
+            dof_coc_pipeline: None,
             dof_bind_group_layout: None,
             dof_bind_group: None,
             dof_uniform_buffer: None,
@@ -1001,6 +1005,7 @@ impl App {
                 blur_strength: cfg.effects.depth_of_field.blur_strength,
                 kawase_iterations: cfg.effects.depth_of_field.kawase_iterations,
                 kawase_offset: cfg.effects.depth_of_field.kawase_offset,
+                kawase_enabled: cfg.effects.depth_of_field.kawase_enabled,
             },
             dof_enabled: cfg.effects.depth_of_field.enabled,
             kawase_down_pipeline: None,
@@ -1013,6 +1018,12 @@ impl App {
             kawase_ping_views: Vec::new(),
             kawase_pong_textures: Vec::new(),
             kawase_pong_views: Vec::new(),
+            kawase_level_sizes: Vec::new(),
+            kawase_last_ubo: Vec::new(),
+            // Instrumentation init
+            kawase_write_acc: std::time::Duration::from_secs(0),
+            kawase_pass_acc: std::time::Duration::from_secs(0),
+            kawase_acc_frames: 0,
             bloom_settings: BloomSettings {
                 threshold: cfg.effects.bloom.threshold,
                 knee: cfg.effects.bloom.knee,
@@ -1250,6 +1261,34 @@ impl App {
                     }
                 );
             }
+            KeyCode::KeyX => {
+                self.dof_settings.kawase_enabled = !self.dof_settings.kawase_enabled;
+                println!("Kawase {}", if self.dof_settings.kawase_enabled { "enabled" } else { "disabled" });
+                // Recreate kawase UBOs/bind groups if enabled
+                if self.dof_settings.kawase_enabled {
+                    self.update_kawase_bind_groups();
+                }
+            }
+            KeyCode::KeyU => {
+                self.dof_settings.kawase_offset = (self.dof_settings.kawase_offset - 0.25).max(0.25);
+                println!("Kawase offset: {:.2}", self.dof_settings.kawase_offset);
+                self.update_kawase_bind_groups();
+            }
+            KeyCode::KeyI => {
+                self.dof_settings.kawase_offset = (self.dof_settings.kawase_offset + 0.25).min(10.0);
+                println!("Kawase offset: {:.2}", self.dof_settings.kawase_offset);
+                self.update_kawase_bind_groups();
+            }
+            KeyCode::KeyO => {
+                self.dof_settings.kawase_iterations = (self.dof_settings.kawase_iterations.saturating_sub(1)).max(1);
+                println!("Kawase iterations: {}", self.dof_settings.kawase_iterations);
+                self.update_kawase_bind_groups();
+            }
+            KeyCode::KeyP => {
+                self.dof_settings.kawase_iterations = (self.dof_settings.kawase_iterations + 1).min(6);
+                println!("Kawase iterations: {}", self.dof_settings.kawase_iterations);
+                self.update_kawase_bind_groups();
+            }
             _ => {}
         }
     }
@@ -1380,6 +1419,7 @@ impl App {
         self.kawase_ping_views.clear();
         self.kawase_pong_textures.clear();
         self.kawase_pong_views.clear();
+        self.kawase_level_sizes.clear();
         for level in 0..k_iterations {
             let w = (fused_width >> level).max(1);
             let h = (fused_height >> level).max(1);
@@ -1409,6 +1449,7 @@ impl App {
             self.kawase_ping_views.push(Some(ping_view));
             self.kawase_pong_textures.push(Some(pong_tex));
             self.kawase_pong_views.push(Some(pong_view));
+            self.kawase_level_sizes.push((w, h));
         }
         self.bloom_ping_view = Some(bloom_ping_view);
         self.bloom_ping_texture = Some(bloom_ping_texture);
@@ -1751,9 +1792,12 @@ impl App {
         let iterations = self.dof_settings.kawase_iterations.min(6).max(1);
         for level in 0..iterations {
             // Create uniform buffer for this level (texel size updated every frame)
-            let texel_size = [0.0_f32, 0.0_f32];
-            let offset = self.dof_settings.kawase_offset * (level as f32 + 1.0);
-            let ubo_data = [texel_size[0], texel_size[1], offset, 0.0f32];
+            // Determine initial texel_size from kawase_level_sizes if available
+            let (texel_x, texel_y) = if let Some((w, h)) = self.kawase_level_sizes.get(level) {
+                (1.0 / (*w) as f32, 1.0 / (*h) as f32)
+            } else { (0.0_f32, 0.0_f32) };
+            let offset = self.dof_settings.kawase_offset * (level as f32 + 1.0) * self.dof_settings.blur_strength;
+            let ubo_data = [texel_x, texel_y, offset, 0.0f32];
             let ubo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(&format!("Kawase Uniform L{}", level)),
                 contents: bytemuck::cast_slice(&ubo_data),
@@ -1761,8 +1805,51 @@ impl App {
             });
 
             self.kawase_uniform_buffers.push(Some(ubo));
+            // Create empty placeholders for bind groups; we'll populate them now if we have the required resources
             self.kawase_down_bind_groups.push(None);
             self.kawase_up_bind_groups.push(None);
+            // initialize last_ubo data vector
+            self.kawase_last_ubo.push(ubo_data);
+        }
+
+        // Create/update the bind groups now that we have UBOs and textures created
+        let Some(layout) = self.kawase_bind_group_layout.as_ref() else { return; };
+        let Some(sampler) = self.post_sampler.as_ref() else { return; };
+        // DoF color view is the initial input for level 0 down pass; ping views provide subsequent levels
+        let dof_input_view = self.dof_color_view.as_ref();
+
+        for level in 0..iterations {
+            // For down passes: input is dof_color_view for level 0, otherwise ping_views[level-1]
+            let input_view = if level == 0 {
+                if let Some(view) = dof_input_view { view } else { continue; }
+            } else {
+                if let Some(Some(view)) = self.kawase_ping_views.get(level - 1) { view } else { continue; }
+            };
+            let ubo_ref = self.kawase_uniform_buffers[level].as_ref().unwrap();
+            let down_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&format!("Kawase Down BG L{}", level)),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: ubo_ref.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(input_view) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
+                ],
+            });
+
+            // For up passes: input is ping_views[level]
+            let up_input_view = if let Some(Some(view)) = self.kawase_ping_views.get(level) { view } else { continue; };
+            let up_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&format!("Kawase Up BG L{}", level)),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: ubo_ref.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(up_input_view) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
+                ],
+            });
+
+            self.kawase_down_bind_groups[level] = Some(down_bg);
+            self.kawase_up_bind_groups[level] = Some(up_bg);
         }
     }
 
@@ -3213,6 +3300,41 @@ impl App {
         self.cull_bind_group = None;
 
         self.dof_pipeline = Some(dof_pipeline);
+        // DoF CoC copy pipeline (if Kawase is enabled, we use this cheap pass to produce CoC alpha + base color as input)
+        let dof_coc_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("DoF CoC Copy Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/dof_coc_copy.wgsl").into()),
+        });
+        let dof_coc_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("DoF CoC Copy Pipeline"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("DoF CoC Pipeline Layout"),
+                bind_group_layouts: &[&dof_bind_group_layout],
+                push_constant_ranges: &[],
+            })),
+            vertex: wgpu::VertexState {
+                module: &dof_coc_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &dof_coc_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        self.dof_coc_pipeline = Some(dof_coc_pipeline);
         self.dof_bind_group_layout = Some(dof_bind_group_layout);
         self.dof_uniform_buffer = Some(dof_uniform_buffer);
         // Remove separate CoC pipeline/bind group (fused into blur pass)
@@ -3260,6 +3382,7 @@ impl App {
 
         viewer_debug!("DEBUG: mesh_pipeline created successfully");
         println!("wgpu initialized");
+        println!("DoF Kawase enabled: {} (kawase_iterations={}, kawase_offset={})", self.dof_settings.kawase_enabled, self.dof_settings.kawase_iterations, self.dof_settings.kawase_offset);
     }
 
     fn render(&mut self) {
@@ -4349,6 +4472,7 @@ impl App {
             || self.dof_settings.focal_range > 450.0;
 
         if !skip_dof {
+            let use_kawase = self.dof_settings.kawase_enabled && self.dof_settings.kawase_iterations > 0;
             if let (Some(dof_pipeline), Some(dof_bind_group), Some(dof_buffer), Some(dof_color_view)) = (
                 self.dof_pipeline.as_ref(),
                 self.dof_bind_group.as_ref(),
@@ -4373,61 +4497,68 @@ impl App {
                     timestamp_writes: None,
                     occlusion_query_set: None,
                 });
-                post_pass.set_pipeline(dof_pipeline);
-                post_pass.set_bind_group(0, dof_bind_group, &[]);
-                post_pass.draw(0..3, 0..1);
+                if !use_kawase {
+                    post_pass.set_pipeline(dof_pipeline);
+                    post_pass.set_bind_group(0, dof_bind_group, &[]);
+                    post_pass.draw(0..3, 0..1);
+                } else {
+                    // If Kawase is enabled, use the cheaper DoF CoC copy pass to generate CoC + base color
+                    if let Some(dof_coc_pipeline) = self.dof_coc_pipeline.as_ref() {
+                        post_pass.set_pipeline(dof_coc_pipeline);
+                        post_pass.set_bind_group(0, dof_bind_group, &[]);
+                        post_pass.draw(0..3, 0..1);
+                    }
+                }
             }
 
             // Dual Kawase blur passes (down + up). We'll dynamically create bind groups per pass.
             if let (
                 Some(kawase_down_pipeline),
                 Some(kawase_up_pipeline),
-                Some(kawase_layout),
-                Some(_kawase_ubos),
                 Some(kawase_ping_views),
-                Some(_kawase_pong_views),
-                Some(dof_tex_view),
-                Some(sampler),
             ) = (
                 self.kawase_down_pipeline.as_ref(),
                 self.kawase_up_pipeline.as_ref(),
-                self.kawase_bind_group_layout.as_ref(),
-                Some(&self.kawase_uniform_buffers),
                 Some(&self.kawase_ping_views),
-                Some(&self.kawase_pong_views),
-                self.dof_color_view.as_ref(),
-                self.post_sampler.as_ref(),
+                // dof_color_view is not required here because bind groups carry the input textures
             ) {
                 let iterations = self.dof_settings.kawase_iterations.min(6).max(1);
+                let inst_start = std::time::Instant::now();
                 // Down passes
-                let mut input_view = dof_tex_view;
+                // `input_view` is not needed since we use pre-allocated bind groups which embed the input texture
                 for level in 0..iterations {
                     let target_view = kawase_ping_views[level].as_ref().expect("Kawase ping view missing");
                     // Update UBO for this level with texel size and offset
                     if let Some(Some(ubo)) = self.kawase_uniform_buffers.get(level) {
-                        // Compute texel size from target view (size may be derived from texture extents)
-                        // As an approximation here, we'll compute from device config
-                        if let Some(config) = self.config.as_ref() {
-                            let w = (config.width / 2) >> level; // approximate size
-                            let h = (config.height / 2) >> level;
-                            let texel_size = [1.0 / w as f32, 1.0 / h as f32];
-                            let offset = self.dof_settings.kawase_offset * (level as f32 + 1.0);
+                        // Compute texel size from the saved kawase_level_sizes
+                        if let Some((w, h)) = self.kawase_level_sizes.get(level) {
+                            let texel_size = [1.0 / (*w) as f32, 1.0 / (*h) as f32];
+                            let offset = self.dof_settings.kawase_offset * (level as f32 + 1.0) * self.dof_settings.blur_strength;
                             let ubo_data = [texel_size[0], texel_size[1], offset, 0.0f32];
-                            let queue_ref = self.queue.as_ref().unwrap();
-                            queue_ref.write_buffer(ubo, 0, bytemuck::cast_slice(&ubo_data));
+                            // Only write if changed (reduce CPU/GPU traffic)
+                            let changed = match self.kawase_last_ubo.get(level) {
+                                Some(prev) => {
+                                    (prev[0] - ubo_data[0]).abs() > 1e-6
+                                        || (prev[1] - ubo_data[1]).abs() > 1e-6
+                                        || (prev[2] - ubo_data[2]).abs() > 1e-6
+                                        || (prev[3] - ubo_data[3]).abs() > 1e-6
+                                }
+                                None => true,
+                            };
+                            if changed {
+                                let write_start = std::time::Instant::now();
+                                let queue_ref = self.queue.as_ref().unwrap();
+                                queue_ref.write_buffer(ubo, 0, bytemuck::cast_slice(&ubo_data));
+                                if let Some(prev) = self.kawase_last_ubo.get_mut(level) {
+                                    *prev = ubo_data;
+                                }
+                                self.kawase_write_acc += write_start.elapsed();
+                            }
                         }
                     }
 
-                    // Create bind group on the fly with input_view
-                    let bind_group = self.device.as_ref().unwrap().create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some(&format!("Kawase Down BG L{}", level)),
-                        layout: kawase_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: self.kawase_uniform_buffers[level].as_ref().unwrap().as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(input_view) },
-                            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
-                        ],
-                    });
+                    // Use pre-allocated down bind group for the level
+                    if let Some(Some(bind_group)) = self.kawase_down_bind_groups.get(level) {
 
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some(&format!("Kawase Down L{}", level)),
@@ -4442,43 +4573,48 @@ impl App {
                         occlusion_query_set: None,
                     });
                     // Cache the down bind group for potential reuse
-                    if level < self.kawase_down_bind_groups.len() {
-                        self.kawase_down_bind_groups[level] = Some(bind_group);
-                    }
-                    pass.set_pipeline(kawase_down_pipeline);
-                    pass.set_bind_group(0, self.kawase_down_bind_groups[level].as_ref().unwrap(), &[]);
+                        pass.set_pipeline(kawase_down_pipeline);
+                        pass.set_bind_group(0, bind_group, &[]);
                     pass.draw(0..3, 0..1);
 
-                    input_view = target_view;
+                    // No update needed; bind groups control the inputs
+                    }
                 }
 
                 // Up passes
                 for level_rev in (0..iterations).rev() {
-                    let input_view = kawase_ping_views[level_rev].as_ref().expect("Kawase ping view missing");
                     let target_view = if level_rev == 0 { self.dof_color_view.as_ref().unwrap() } else { self.kawase_pong_views[level_rev-1].as_ref().unwrap() };
                     // Update UBO again for this level
                     if let Some(Some(ubo)) = self.kawase_uniform_buffers.get(level_rev) {
-                        if let Some(config) = self.config.as_ref() {
-                            let w = (config.width / 2) >> level_rev; // approximate size
-                            let h = (config.height / 2) >> level_rev;
-                            let texel_size = [1.0 / w as f32, 1.0 / h as f32];
-                            let offset = self.dof_settings.kawase_offset * (level_rev as f32 + 1.0);
+                        if let Some((w, h)) = self.kawase_level_sizes.get(level_rev) {
+                            let texel_size = [1.0 / (*w) as f32, 1.0 / (*h) as f32];
+                            let offset = self.dof_settings.kawase_offset * (level_rev as f32 + 1.0) * self.dof_settings.blur_strength;
                             let ubo_data = [texel_size[0], texel_size[1], offset, 0.0f32];
-                            let queue_ref = self.queue.as_ref().unwrap();
-                            queue_ref.write_buffer(ubo, 0, bytemuck::cast_slice(&ubo_data));
+                            let changed = match self.kawase_last_ubo.get(level_rev) {
+                                Some(prev) => {
+                                    (prev[0] - ubo_data[0]).abs() > 1e-6
+                                        || (prev[1] - ubo_data[1]).abs() > 1e-6
+                                        || (prev[2] - ubo_data[2]).abs() > 1e-6
+                                        || (prev[3] - ubo_data[3]).abs() > 1e-6
+                                }
+                                None => true,
+                            };
+                            if changed {
+                                let write_start = std::time::Instant::now();
+                                let queue_ref = self.queue.as_ref().unwrap();
+                                queue_ref.write_buffer(ubo, 0, bytemuck::cast_slice(&ubo_data));
+                                if let Some(prev) = self.kawase_last_ubo.get_mut(level_rev) {
+                                    *prev = ubo_data;
+                                }
+                                self.kawase_write_acc += write_start.elapsed();
+                            }
                         }
                     }
 
-                    let bind_group = self.device.as_ref().unwrap().create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some(&format!("Kawase Up BG L{}", level_rev)),
-                        layout: kawase_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: self.kawase_uniform_buffers[level_rev].as_ref().unwrap().as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(input_view) },
-                            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
-                        ],
-                    });
+                    // Use pre-allocated up bind group for the level
+                    if let Some(Some(bind_group)) = self.kawase_up_bind_groups.get(level_rev) {
 
+                    let pass_start = std::time::Instant::now();
                     let mut up_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some(&format!("Kawase Up L{}", level_rev)),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -4492,12 +4628,13 @@ impl App {
                         occlusion_query_set: None,
                     });
                     // Cache the up bind group for potential reuse
-                    if level_rev < self.kawase_up_bind_groups.len() {
-                        self.kawase_up_bind_groups[level_rev] = Some(bind_group);
+                        up_pass.set_pipeline(kawase_up_pipeline);
+                        up_pass.set_bind_group(0, bind_group, &[]);
+                        up_pass.draw(0..3, 0..1);
+                        self.kawase_pass_acc += pass_start.elapsed();
                     }
-                    up_pass.set_pipeline(kawase_up_pipeline);
-                    up_pass.set_bind_group(0, self.kawase_up_bind_groups[level_rev].as_ref().unwrap(), &[]);
-                    up_pass.draw(0..3, 0..1);
+                    self.kawase_acc_frames += 1;
+                    self.kawase_pass_acc += inst_start.elapsed();
                 }
             }
         }
@@ -4659,7 +4796,7 @@ impl App {
 
         // Stats
         self.frame_count += 1;
-        if now.duration_since(self.last_fps_print).as_secs() >= 1 {
+            if now.duration_since(self.last_fps_print).as_secs() >= 1 {
             let total_visible = visible.len();
             let mesh_cache_mib = self.mesh_cache_bytes as f64 / (1024.0 * 1024.0);
             let mesh_budget_mib = self.mesh_cache_byte_budget() as f64 / (1024.0 * 1024.0);
@@ -4670,7 +4807,7 @@ impl App {
                 .map(|p| p.memory() as f64 / (1024.0 * 1024.0))
                 .unwrap_or(0.0);
             println!(
-                "FPS: {}, Visible items: {}, Leaf chunks: {}, Meshed chunks: {}, Pending: {}, Fallback: {}, Mesh cache: {:.1}/{:.1} MiB, Process: {:.1} MiB, Cull: {:.2}ms, Group: {:.2}ms, Mesh: {:.2}ms, Instances: {:.2}ms",
+                "FPS: {}, Visible items: {}, Leaf chunks: {}, Meshed chunks: {}, Pending: {}, Fallback: {}, Mesh cache: {:.1}/{:.1} MiB, Process: {:.1} MiB, Cull: {:.2}ms, Group: {:.2}ms, Mesh: {:.2}ms, Instances: {:.2}ms, DoF Kawase: {} (iter={}, off={:.2})",
                 self.frame_count,
                 total_visible,
                 leaf_chunks.len(),
@@ -4684,7 +4821,19 @@ impl App {
                 grouping_time.as_secs_f64() * 1000.0,
                 mesh_time.as_secs_f64() * 1000.0,
                 instance_time.as_secs_f64() * 1000.0
+                , if self.dof_settings.kawase_enabled {"enabled"} else {"disabled"}
+                , self.dof_settings.kawase_iterations
+                , self.dof_settings.kawase_offset
             );
+                // Print Kawase timing ones per second to avoid spamming
+                if self.kawase_acc_frames > 0 {
+                    let avg_write = self.kawase_write_acc.as_secs_f64() * 1000.0 / self.kawase_acc_frames as f64;
+                    let avg_pass = self.kawase_pass_acc.as_secs_f64() * 1000.0 / self.kawase_acc_frames as f64;
+                    println!("Kawase write avg: {:.3}ms, pass avg: {:.3}ms (over {} frames)", avg_write, avg_pass, self.kawase_acc_frames);
+                    self.kawase_write_acc = std::time::Duration::from_secs(0);
+                    self.kawase_pass_acc = std::time::Duration::from_secs(0);
+                    self.kawase_acc_frames = 0;
+                }
             self.frame_count = 0;
             self.last_fps_print = now;
         }
