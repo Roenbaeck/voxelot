@@ -14,17 +14,19 @@ chunk_lod_distance = 1000.0
 fov_degrees = 70.0
 near_plane = 0.10000000149011612
 far_plane = 3000.0
-camera_speed_multiplier = 3.814697265625
+camera_speed_multiplier = 4.76837158203125
 
 [atmosphere]
 fog_density = 0.0009499997249804437
-time_of_day = 0.33109423518180847
+time_of_day = 0.7972920536994934
 
 [effects.depth_of_field]
 enabled = true
 focal_distance = 120.0
-focal_range = 151.0
-blur_strength = 1.2999999523162842
+focal_range = 15.0
+blur_strength = 2.5
+kawase_iterations = 3
+kawase_offset = 1.0
 
 [effects.bloom]
 enabled = true

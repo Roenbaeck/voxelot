@@ -76,6 +76,10 @@ pub struct DepthOfFieldConfig {
     pub focal_range: f32,
     #[serde(default = "default_dof_blur_strength")]
     pub blur_strength: f32,
+    #[serde(default = "default_dof_kawase_iterations")]
+    pub kawase_iterations: usize,
+    #[serde(default = "default_dof_kawase_offset")]
+    pub kawase_offset: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,6 +195,14 @@ fn default_dof_blur_strength() -> f32 {
     1.6
 }
 
+fn default_dof_kawase_iterations() -> usize {
+    3
+}
+
+fn default_dof_kawase_offset() -> f32 {
+    1.0
+}
+
 fn default_bloom_enabled() -> bool {
     true
 }
@@ -300,6 +312,8 @@ impl Default for DepthOfFieldConfig {
             focal_distance: default_dof_focal_distance(),
             focal_range: default_dof_focal_range(),
             blur_strength: default_dof_blur_strength(),
+            kawase_iterations: default_dof_kawase_iterations(),
+            kawase_offset: default_dof_kawase_offset(),
         }
     }
 }
