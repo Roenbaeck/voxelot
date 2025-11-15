@@ -109,32 +109,58 @@ fn load_chunk(chunk: &mut Chunk, reader: &mut impl Read) -> io::Result<()> {
     reader.read_exact(&mut count_bytes)?;
     let count = u16::from_le_bytes(count_bytes);
     
-    // Read each occupied position
+    // Read each occupied position into a temporary list, then commit in sorted order.
+    // This avoids O(n^2) vector insert costs in `Chunk::set` when positions are read out of rank order.
+    let mut entries: Vec<(u16, Voxel)> = Vec::with_capacity(count as usize);
+
     for _ in 0..count {
         // Read position (u16: z * 256 + y * 16 + x)
         let mut pos_bytes = [0u8; 2];
         reader.read_exact(&mut pos_bytes)?;
         let pos_encoded = u16::from_le_bytes(pos_bytes);
-        
-        let x = (pos_encoded % 16) as u8;
-        let y = ((pos_encoded / 16) % 16) as u8;
-        let z = (pos_encoded / 256) as u8;
-        
+
         // Read voxel type
         let mut type_byte = [0u8; 1];
         reader.read_exact(&mut type_byte)?;
         let vtype = type_byte[0];
-        
+
         if vtype == 0 {
-            // Sub-chunk follows
+            // Sub-chunk follows; load recursively and store
             let mut sub_chunk = Chunk::new();
             load_chunk(&mut sub_chunk, reader)?;
-            chunk.set_chunk(x, y, z, sub_chunk);
+            entries.push((pos_encoded, Voxel::Chunk(Box::new(sub_chunk))));
         } else if vtype != 255 {
             // Solid voxel
-            chunk.set(x, y, z, vtype);
+            entries.push((pos_encoded, Voxel::Solid(vtype)));
         }
         // 255 means empty (shouldn't happen but handle gracefully)
+    }
+
+    // Sort entries by encoded position (flat index) so we can push into `voxels` in rank order
+    entries.sort_by_key(|(pos, _)| *pos);
+
+    // Reserve capacity and then commit entries into presence/voxels in order
+    chunk.voxels.reserve(entries.len());
+    for (pos_encoded, voxel) in entries {
+        let x = (pos_encoded % 16) as u8;
+        let y = ((pos_encoded / 16) % 16) as u8;
+        let z = (pos_encoded / 256) as u8;
+
+        // Append presence and voxel in rank order
+        chunk.presence.add(pos_encoded as u32);
+        chunk.voxels.push(voxel);
+
+        // Update marginals for this slot
+        chunk.px |= 1 << x;
+        chunk.py |= 1 << y;
+        chunk.pz |= 1 << z;
+
+        // If this was a sub-chunk, also OR-in its projection bits for quick coarse culling
+        if let Voxel::Chunk(ref sub_chunk) = chunk.voxels.last().unwrap() {
+            chunk.px |= sub_chunk.px;
+            chunk.py |= sub_chunk.py;
+            chunk.pz |= sub_chunk.pz;
+        }
     }
     
     Ok(())

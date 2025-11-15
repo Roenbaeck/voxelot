@@ -818,14 +818,16 @@ impl App {
             
             println!("Loading voxel data from {}...", cfg.world.file);
                 // Load octree format from configured path — use auto-detecting loader
+                let load_start = Instant::now();
                 world = voxelot::load_world_file(std::path::Path::new(&cfg.world.file))
                     .unwrap_or_else(|e| {
                         eprintln!("ERROR: Failed to load world file '{}': {}", cfg.world.file, e);
                         eprintln!("Please check that the file path in config.toml is correct.");
                         std::process::exit(1);
                     });
-                println!("Loaded world from {} (depth {})", 
-                         cfg.world.file, world.hierarchy_depth());
+                let load_elapsed = load_start.elapsed();
+                println!("Loaded world from {} (depth {}) (took {:.3}s)", 
+                         cfg.world.file, world.hierarchy_depth(), load_elapsed.as_secs_f32());
         }
 
         println!("World created with voxels");
@@ -880,8 +882,10 @@ impl App {
         let mesh_upload_max = (mesh_worker_count * 4).max(mesh_upload_baseline * 2);
 
         println!("Updating LOD metadata...");
+        let lod_start = Instant::now();
         world.update_all_lod_metadata(&palette);
-        println!("LOD metadata updated");
+        let lod_elapsed = lod_start.elapsed();
+        println!("LOD metadata updated (took {:.3}s)", lod_elapsed.as_secs_f32());
 
         println!("\n=== Controls ===");
         println!("Movement: WASD + Space/Shift (up/down)");

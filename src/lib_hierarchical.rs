@@ -269,21 +269,28 @@ impl Chunk {
         let mut emissive_voxels = 0u32;
         let mut solid_count = 0u32;
 
+        // Use palette color cache directly to avoid allocating `Material` per voxel.
+        let color_cache = palette.colors();
         for voxel in &self.voxels {
             if let Voxel::Solid(voxel_type) = voxel {
-                let material = palette.material(*voxel_type as u32);
-                albedo_sum[0] += material.albedo[0];
-                albedo_sum[1] += material.albedo[1];
-                albedo_sum[2] += material.albedo[2];
-                albedo_sum[3] += material.albedo[3];
+                let idx = *voxel_type as usize;
+                let material_color = if idx < color_cache.len() {
+                    color_cache[idx]
+                } else {
+                    [1.0, 1.0, 1.0, 1.0]
+                };
+                albedo_sum[0] += material_color[0];
+                albedo_sum[1] += material_color[1];
+                albedo_sum[2] += material_color[2];
+                albedo_sum[3] += material_color[3];
                 solid_count += 1;
 
-                if material.emissive_intensity > 0.0 {
-                    let intensity = material.emissive_intensity;
-                    emissive_sum[0] += material.emissive[0] * intensity;
-                    emissive_sum[1] += material.emissive[1] * intensity;
-                    emissive_sum[2] += material.emissive[2] * intensity;
-                    emissive_power += intensity;
+                let (emissive_color, emissive_strength) = palette.emissive(*voxel_type as u32);
+                if emissive_strength > 0.0 {
+                    emissive_sum[0] += emissive_color[0] * emissive_strength;
+                    emissive_sum[1] += emissive_color[1] * emissive_strength;
+                    emissive_sum[2] += emissive_color[2] * emissive_strength;
+                    emissive_power += emissive_strength;
                     emissive_voxels += 1;
                 }
             }
@@ -793,12 +800,15 @@ impl World {
 
     /// Recursive helper to update LOD metadata bottom-up
     fn update_chunk_lod_recursive(chunk: &mut Chunk, palette: &Palette) {
-        // First, recursively update all sub-chunks
-        for voxel in &mut chunk.voxels {
-            if let Voxel::Chunk(sub_chunk) = voxel {
+        // First, recursively update all sub-chunks. Use Rayon to parallelize recursion across
+        // different sub-chunks where possible - this gives a large speedup for deep/large worlds.
+        use rayon::prelude::*;
+        chunk
+            .voxels
+            .par_iter_mut()
+            .for_each(|voxel| if let Voxel::Chunk(sub_chunk) = voxel {
                 Self::update_chunk_lod_recursive(sub_chunk, palette);
-            }
-        }
+            });
 
         // Then update this chunk's metadata
         chunk.update_lod_metadata(palette);
