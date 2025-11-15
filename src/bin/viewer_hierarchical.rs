@@ -3662,8 +3662,25 @@ impl App {
                             out.push(Self::voxel_to_raw(v, &self.palette));
                         }
                     } else {
-                        // Far: just render as single bounding box
-                        out.push(Self::voxel_to_raw(v, &self.palette));
+                        // Far: prefer using chunk.average_color for LOD bounding box if available
+                        if let Some(chunk) = self.world.get_leaf_chunk_at_origin(WorldPos::new(key.0, key.1, key.2)) {
+                            let avg = chunk.average_color;
+                            let custom_color = [
+                                avg[0] as f32 / 255.0,
+                                avg[1] as f32 / 255.0,
+                                avg[2] as f32 / 255.0,
+                                1.0,
+                            ];
+                            out.push(VoxelInstanceRaw {
+                                position: [v.position[0] as f32, v.position[1] as f32, v.position[2] as f32],
+                                voxel_type: v.voxel_type as u32,
+                                scale: v.scale as f32,
+                                custom_color,
+                                emissive: [0.0, 0.0, 0.0, 0.0],
+                            });
+                        } else {
+                            out.push(Self::voxel_to_raw(v, &self.palette));
+                        }
                     }
                     continue;
                 }
@@ -3720,8 +3737,25 @@ impl App {
                             out.push(Self::voxel_to_raw(v, &self.palette));
                         }
                     } else {
-                        // Far: just render as single bounding box
-                        out.push(Self::voxel_to_raw(v, &self.palette));
+                        // Far: prefer using chunk.average_color for LOD bounding box if available
+                        if let Some(chunk) = self.world.get_leaf_chunk_at_origin(WorldPos::new(key.0, key.1, key.2)) {
+                            let avg = chunk.average_color;
+                            let custom_color = [
+                                avg[0] as f32 / 255.0,
+                                avg[1] as f32 / 255.0,
+                                avg[2] as f32 / 255.0,
+                                1.0,
+                            ];
+                            out.push(VoxelInstanceRaw {
+                                position: [v.position[0] as f32, v.position[1] as f32, v.position[2] as f32],
+                                voxel_type: v.voxel_type as u32,
+                                scale: v.scale as f32,
+                                custom_color,
+                                emissive: [0.0, 0.0, 0.0, 0.0],
+                            });
+                        } else {
+                            out.push(Self::voxel_to_raw(v, &self.palette));
+                        }
                     }
                 } else {
                     out.push(Self::voxel_to_raw(v, &self.palette));
