@@ -47,6 +47,36 @@ mod tests {
         }
         assert!(found_less_than_one, "No vertex had AO < 1.0 (expected some occlusion)");
     }
+
+    #[test]
+    fn test_generate_chunk_mesh_isolated_no_ao() {
+        let palette = Palette::from_string("0 255 255 255 255\n1 255 255 255 255\n").unwrap();
+        let mut chunk = Chunk::new();
+        // Single isolated voxel
+        chunk.set(8, 8, 8, 1);
+        let mesh = generate_chunk_mesh(&chunk, &palette, 1.0);
+        // All vertex alphas should be 1.0
+        assert!(mesh.vertices.len() > 0);
+        for v in &mesh.vertices {
+            let a = v.color[3];
+            assert!(a >= 0.9999 && a <= 1.0, "Expected AO alpha near 1.0 for isolated voxel, got {}", a);
+        }
+    }
+
+    #[test]
+    fn test_generate_chunk_mesh_ground_isolated_no_ao() {
+        let palette = Palette::from_string("0 255 255 255 255\n1 255 255 255 255\n").unwrap();
+        let mut chunk = Chunk::new();
+        // Single isolated voxel at the ground (y = 0)
+        chunk.set(8, 0, 8, 1);
+        let mesh = generate_chunk_mesh(&chunk, &palette, 1.0);
+        // All vertex alphas should be near 1.0
+        assert!(mesh.vertices.len() > 0);
+        for v in &mesh.vertices {
+            let a = v.color[3];
+            assert!(a >= 0.9999 && a <= 1.0, "Expected AO alpha near 1.0 for ground isolated voxel, got {}", a);
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -276,18 +306,39 @@ fn emit_quad<F>(
     ];
 
     // Helper to compute simple AO at a corner by sampling the 8 voxels touching the corner
+    // To avoid self-shadowing, exclude owner voxels (the voxels that own this face)
+    let mut owner_coords: Vec<[i32; 3]> = Vec::new();
+    for ou in u0..(u0 + du) {
+        for ov in v0..(v0 + dv) {
+            let mut owner = [0i32; 3];
+            owner[axis] = if positive { d } else { d - 1 };
+            owner[u_axis] = ou;
+            owner[v_axis] = ov;
+            owner_coords.push(owner);
+        }
+    }
+
     let compute_ao = |x: i32, y: i32, z: i32| -> f32 {
         let mut count = 0u32;
+        let mut samples = 0u32;
         for dx in -1..=0 {
             for dy in -1..=0 {
                 for dz in -1..=0 {
-                    if get_type(x + dx, y + dy, z + dz).is_some() {
+                    let sx = x + dx;
+                    let sy = y + dy;
+                    let sz = z + dz;
+                    // Skip owner's own voxels so the block doesn't occlude itself
+                    if owner_coords.iter().any(|o| o[0] == sx && o[1] == sy && o[2] == sz) {
+                        continue;
+                    }
+                    samples += 1;
+                    if get_type(sx, sy, sz).is_some() {
                         count += 1;
                     }
                 }
             }
         }
-        let occ = count as f32 / 8.0; // 0..1
+        let occ = if samples > 0 { count as f32 / samples as f32 } else { 0.0 };
         let ao = 1.0 - (occ * ao_strength);
         ao.clamp(0.0, 1.0)
     };
