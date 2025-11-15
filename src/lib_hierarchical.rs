@@ -79,6 +79,12 @@ pub struct Chunk {
     /// Alpha represents occupancy (0 = empty, 255 = fully dense)
     pub average_color: [u8; 4],
 
+    /// Compact axis-aligned bounding box covering all voxels in this chunk.
+    /// Stored as local coordinates (xmin, ymin, zmin, xmax, ymax, zmax) within 0..=15.
+    /// None if the chunk is empty. Useful for coarse fallback geometry when we don't want to
+    /// generate the full mesh for distant chunks.
+    pub bounding_box: Option<[u8; 6]>,
+
     /// Sum of emissive RGB (intensity-weighted) for voxels in this chunk
     pub emissive_sum: [f32; 3],
 
@@ -107,6 +113,7 @@ impl Chunk {
             emissive_power: 0.0,
             emissive_voxels: 0,
             solid_ratio: 0.0,
+            bounding_box: None,
         }
     }
 
@@ -298,6 +305,34 @@ impl Chunk {
 
         self.voxel_count = solid_count;
         self.solid_ratio = solid_count as f32 / TOTAL_SLOTS;
+
+        // Compute a per-chunk bounding box across all solid voxels (leaf or otherwise).
+        let mut xmin: u8 = 16;
+        let mut ymin: u8 = 16;
+        let mut zmin: u8 = 16;
+        let mut xmax: u8 = 0;
+        let mut ymax: u8 = 0;
+        let mut zmax: u8 = 0;
+        let mut bbox_found = false;
+
+        // Iterate again to build min/max if we see any solid voxel
+        for ((x, y, z), voxel) in self.iter() {
+            if let Voxel::Solid(_) = voxel {
+                bbox_found = true;
+                if x < xmin { xmin = x; }
+                if y < ymin { ymin = y; }
+                if z < zmin { zmin = z; }
+                if x > xmax { xmax = x; }
+                if y > ymax { ymax = y; }
+                if z > zmax { zmax = z; }
+            }
+        }
+
+        if bbox_found {
+            self.bounding_box = Some([xmin, ymin, zmin, xmax, ymax, zmax]);
+        } else {
+            self.bounding_box = None;
+        }
 
         if solid_count > 0 {
             let occupancy_scale = 255.0 / TOTAL_SLOTS;

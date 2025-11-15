@@ -3669,6 +3669,86 @@ impl App {
                         // Far: prefer using chunk.average_color for LOD bounding box if available
                         if let Some(chunk) = self.world.get_leaf_chunk_at_origin(WorldPos::new(key.0, key.1, key.2)) {
                             let avg = chunk.average_color;
+                            // prefer an AABB where available for a closer visual fallback
+                            if let Some(bbox) = chunk.bounding_box {
+                                let xmin = bbox[0] as f32;
+                                let ymin = bbox[1] as f32;
+                                let zmin = bbox[2] as f32;
+                                let xmax = bbox[3] as f32;
+                                let ymax = bbox[4] as f32;
+                                let zmax = bbox[5] as f32;
+
+                                let local_cx = (xmin + xmax + 1.0) * 0.5;
+                                let local_cy = (ymin + ymax + 1.0) * 0.5;
+                                let local_cz = (zmin + zmax + 1.0) * 0.5;
+
+                                let world_center = [
+                                    v.position[0] as f32 + local_cx,
+                                    v.position[1] as f32 + local_cy,
+                                    v.position[2] as f32 + local_cz,
+                                ];
+
+                                let size_x = xmax - xmin + 1.0;
+                                let size_y = ymax - ymin + 1.0;
+                                let size_z = zmax - zmin + 1.0;
+                                let scale = size_x.max(size_y).max(size_z);
+
+                                let custom_color = [
+                                    avg[0] as f32 / 255.0,
+                                    avg[1] as f32 / 255.0,
+                                    avg[2] as f32 / 255.0,
+                                    1.0,
+                                ];
+
+                                out.push(VoxelInstanceRaw {
+                                    position: world_center,
+                                    voxel_type: v.voxel_type as u32,
+                                    scale,
+                                    custom_color,
+                                    emissive: [0.0, 0.0, 0.0, 0.0],
+                                });
+                                continue;
+                            }
+                            // prefer an AABB where available for a closer visual fallback
+                            if let Some(bbox) = chunk.bounding_box {
+                                let xmin = bbox[0] as f32;
+                                let ymin = bbox[1] as f32;
+                                let zmin = bbox[2] as f32;
+                                let xmax = bbox[3] as f32;
+                                let ymax = bbox[4] as f32;
+                                let zmax = bbox[5] as f32;
+
+                                let local_cx = (xmin + xmax + 1.0) * 0.5;
+                                let local_cy = (ymin + ymax + 1.0) * 0.5;
+                                let local_cz = (zmin + zmax + 1.0) * 0.5;
+
+                                let world_center = [
+                                    v.position[0] as f32 + local_cx,
+                                    v.position[1] as f32 + local_cy,
+                                    v.position[2] as f32 + local_cz,
+                                ];
+
+                                let size_x = xmax - xmin + 1.0;
+                                let size_y = ymax - ymin + 1.0;
+                                let size_z = zmax - zmin + 1.0;
+                                let scale = size_x.max(size_y).max(size_z);
+
+                                let custom_color = [
+                                    avg[0] as f32 / 255.0,
+                                    avg[1] as f32 / 255.0,
+                                    avg[2] as f32 / 255.0,
+                                    1.0,
+                                ];
+
+                                out.push(VoxelInstanceRaw {
+                                    position: world_center,
+                                    voxel_type: v.voxel_type as u32,
+                                    scale,
+                                    custom_color,
+                                    emissive: [0.0, 0.0, 0.0, 0.0],
+                                });
+                                continue;
+                            }
                             let custom_color = [
                                 avg[0] as f32 / 255.0,
                                 avg[1] as f32 / 255.0,
