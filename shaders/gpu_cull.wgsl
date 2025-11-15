@@ -33,13 +33,17 @@ fn cs_main(@builtin(global_invocation_id) global_id : vec3<u32>) {
 
     let instance = candidates[index];
     let to_instance = instance.position - params.camera_position;
-    let distance = length(to_instance);
+    // Avoid expensive length() by comparing squared distances
+    let dist_sq = dot(to_instance, to_instance);
+    let near_sq = params.near_plane * params.near_plane;
+    let far_sq = params.far_plane * params.far_plane;
+    let lod_sq = params.lod_render_distance * params.lod_render_distance;
 
-    let within_depth = distance >= params.near_plane && distance <= params.far_plane;
-    let within_lod = distance <= params.lod_render_distance;
+    let within_depth = dist_sq >= near_sq && dist_sq <= far_sq;
+    let within_lod = dist_sq <= lod_sq;
 
-    let forward = normalize(params.camera_forward);
-    let in_front = dot(forward, to_instance) > -instance.scale;
+    // Assume camera_forward is normalized by CPU-side camera; avoid normalize() in shader
+    let in_front = dot(params.camera_forward, to_instance) > -instance.scale;
 
     let visible = within_depth && within_lod && in_front;
 

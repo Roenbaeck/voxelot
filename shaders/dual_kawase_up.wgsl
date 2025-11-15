@@ -41,7 +41,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let ts = kawase.texel_size;
 
     // Upsample and blur by sampling neighbors
-    let c = textureSample(input_texture, input_sampler, uv).rgb;
+    let center_sample = textureSample(input_texture, input_sampler, uv);
+    let c = center_sample.rgb;
     let s1 = textureSample(input_texture, input_sampler, uv + vec2<f32>( ts.x * off, 0.0)).rgb;
     let s2 = textureSample(input_texture, input_sampler, uv + vec2<f32>(-ts.x * off, 0.0)).rgb;
     let s3 = textureSample(input_texture, input_sampler, uv + vec2<f32>(0.0, ts.y * off)).rgb;
@@ -49,6 +50,6 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
     let avg = (c + s1 + s2 + s3 + s4) / 5.0;
 
-    let alpha = textureSample(input_texture, input_sampler, uv).a;
+    let alpha = center_sample.a;
     return vec4<f32>(avg, alpha);
 }
