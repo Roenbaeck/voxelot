@@ -14,11 +14,11 @@ chunk_lod_distance = 1000.0
 fov_degrees = 70.0
 near_plane = 0.10000000149011612
 far_plane = 3000.0
-camera_speed_multiplier = 2.44140625
+camera_speed_multiplier = 3.814697265625
 
 [atmosphere]
 fog_density = 0.000599999912083149
-time_of_day = 0.6543545722961426
+time_of_day = 0.33786410093307495
 
 [effects.depth_of_field]
 enabled = true
@@ -40,6 +40,7 @@ blur_radius = 3.799999952316284
 map_size = 4096
 darkness = 2.0
 backface_ambient_scale = 0.25
+ao_strength = 0.8999999761581421
 
 [performance]
 mesh_cache_budget_mb = 256

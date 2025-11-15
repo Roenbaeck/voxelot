@@ -106,6 +106,8 @@ pub struct ShadowConfig {
     pub darkness: f32,
     #[serde(default = "default_backface_ambient_scale")]
     pub backface_ambient_scale: f32,
+    #[serde(default = "default_ao_strength")]
+    pub ao_strength: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,6 +235,10 @@ fn default_backface_ambient_scale() -> f32 {
     0.7
 }
 
+fn default_ao_strength() -> f32 {
+    0.9
+}
+
 fn default_mesh_cache_mb() -> u64 {
     256
 }
@@ -328,6 +334,7 @@ impl Default for ShadowConfig {
             map_size: default_shadow_map_size(),
             darkness: default_shadow_darkness(),
             backface_ambient_scale: default_backface_ambient_scale(),
+            ao_strength: default_ao_strength(),
         }
     }
 }
@@ -410,5 +417,6 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(cfg.shadows.darkness, default_shadow_darkness());
         assert_eq!(cfg.shadows.backface_ambient_scale, default_backface_ambient_scale());
+        assert_eq!(cfg.shadows.ao_strength, default_ao_strength());
     }
 }

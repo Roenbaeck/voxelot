@@ -11,6 +11,44 @@ macro_rules! mesh_debug {
     };
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lib_hierarchical::Chunk;
+    use crate::palette::Palette;
+
+    #[test]
+    fn test_generate_chunk_mesh_ao_present() {
+        // Construct a small palette with indices 0..=1
+        let palette = Palette::from_string("0 255 255 255 255\n1 255 255 255 255\n").unwrap();
+
+        // Create a chunk and set a small cluster of voxels to cause AO
+        let mut chunk = Chunk::new();
+        // Central voxel
+        chunk.set(8, 8, 8, 1);
+        // Place some neighbors to reduce AO at one corner
+        chunk.set(7, 8, 8, 1);
+        chunk.set(8, 7, 8, 1);
+        chunk.set(8, 8, 7, 1);
+
+        // Generate mesh with full AO strength
+        let mesh = generate_chunk_mesh(&chunk, &palette, 1.0);
+
+        // There should be at least one vertex where the alpha channel is less than 1.0
+        // (meaning AO was applied), and all alpha values should be in [0.0, 1.0]
+        assert!(mesh.vertices.len() > 0);
+        let mut found_less_than_one = false;
+        for v in &mesh.vertices {
+            let a = v.color[3];
+            assert!(a >= 0.0 && a <= 1.0);
+            if a < 1.0 {
+                found_less_than_one = true;
+            }
+        }
+        assert!(found_less_than_one, "No vertex had AO < 1.0 (expected some occlusion)");
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct MeshVertex {
     pub position: [f32; 3],
@@ -36,7 +74,7 @@ pub struct ChunkMesh {
 
 /// Generate a greedy mesh for a 16x16x16 chunk.
 /// Merges coplanar faces with identical voxel types into larger quads.
-pub fn generate_chunk_mesh(chunk: &Chunk, palette: &Palette) -> ChunkMesh {
+pub fn generate_chunk_mesh(chunk: &Chunk, palette: &Palette, ao_strength: f32) -> ChunkMesh {
     // 3 axes: 0=x, 1=y, 2=z
     let mut mesh = ChunkMesh::default();
 
@@ -153,8 +191,19 @@ pub fn generate_chunk_mesh(chunk: &Chunk, palette: &Palette) -> ChunkMesh {
 
                     // Emit this rectangle
                     emit_quad(
-                        &mut mesh, palette, axis, d, u_axis, v_axis, u_start, v_start, width,
-                        height, t,
+                        &mut mesh,
+                        palette,
+                        axis,
+                        d,
+                        u_axis,
+                        v_axis,
+                        u_start,
+                        v_start,
+                        width,
+                        height,
+                        t,
+                        &get_type,
+                        ao_strength,
                     );
                     faces_this_axis += 1;
 
@@ -176,7 +225,7 @@ pub fn generate_chunk_mesh(chunk: &Chunk, palette: &Palette) -> ChunkMesh {
     mesh
 }
 
-fn emit_quad(
+fn emit_quad<F>(
     mesh: &mut ChunkMesh,
     palette: &Palette,
     axis: usize,
@@ -188,7 +237,9 @@ fn emit_quad(
     du: i32,
     dv: i32,
     face_type: i32,
-) {
+    get_type: &F,
+    ao_strength: f32,
+) where F: Fn(i32, i32, i32) -> Option<u8> {
     if face_type == 0 {
         return;
     }
@@ -224,6 +275,23 @@ fn emit_quad(
         material.emissive_intensity,
     ];
 
+    // Helper to compute simple AO at a corner by sampling the 8 voxels touching the corner
+    let compute_ao = |x: i32, y: i32, z: i32| -> f32 {
+        let mut count = 0u32;
+        for dx in -1..=0 {
+            for dy in -1..=0 {
+                for dz in -1..=0 {
+                    if get_type(x + dx, y + dy, z + dz).is_some() {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        let occ = count as f32 / 8.0; // 0..1
+        let ao = 1.0 - (occ * ao_strength);
+        ao.clamp(0.0, 1.0)
+    };
+
     // Four corners (in voxel space), convert to f32
     let p0 = [base[0] as f32, base[1] as f32, base[2] as f32];
     let p1 = [
@@ -243,29 +311,44 @@ fn emit_quad(
     ];
 
     let base_index = mesh.vertices.len() as u32;
+    // Compute AO for each corner and set it into color alpha
+    let c0_ao = compute_ao(base[0], base[1], base[2]);
+    let c1_ao = compute_ao(base[0] + du_vec[0], base[1] + du_vec[1], base[2] + du_vec[2]);
+    let c2_ao = compute_ao(base[0] + du_vec[0] + dv_vec[0], base[1] + du_vec[1] + dv_vec[1], base[2] + du_vec[2] + dv_vec[2]);
+    let c3_ao = compute_ao(base[0] + dv_vec[0], base[1] + dv_vec[1], base[2] + dv_vec[2]);
+
+    let mut color0 = color;
+    let mut color1 = color;
+    let mut color2 = color;
+    let mut color3 = color;
+    color0[3] = c0_ao;
+    color1[3] = c1_ao;
+    color2[3] = c2_ao;
+    color3[3] = c3_ao;
+
     mesh.vertices.extend_from_slice(&[
         MeshVertex {
             position: p0,
             normal,
-            color,
+            color: color0,
             emissive,
         },
         MeshVertex {
             position: p1,
             normal,
-            color,
+            color: color1,
             emissive,
         },
         MeshVertex {
             position: p2,
             normal,
-            color,
+            color: color2,
             emissive,
         },
         MeshVertex {
             position: p3,
             normal,
-            color,
+            color: color3,
             emissive,
         },
     ]);

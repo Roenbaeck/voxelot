@@ -123,6 +123,7 @@ Shadows configuration (examples):
 map_size = 4096
 darkness = 1.0 # 1.0 = default; >1 darkens shadows, <1 lightens
 backface_ambient_scale = 0.7 # 1.0 = no extra darkening; <1.0 = darker back faces
+ao_strength = 0.9 # Strength of baked ambient occlusion (0..1). Lower = stronger AO.
 ```
 
 ### Architecture

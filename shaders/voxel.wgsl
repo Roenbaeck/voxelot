@@ -33,7 +33,7 @@ struct LightProbe {
 
 struct VertexOutputInstanced {
     @builtin(position) position: vec4<f32>,
-    @location(0) color: vec3<f32>,
+    @location(0) color: vec4<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) emissive: vec4<f32>,
     @location(3) light_space_pos: vec4<f32>,
@@ -42,7 +42,7 @@ struct VertexOutputInstanced {
 
 struct VertexOutputMesh {
     @builtin(position) position: vec4<f32>,
-    @location(0) color: vec3<f32>,
+    @location(0) color: vec4<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) emissive: vec4<f32>,
     @location(3) light_space_pos: vec4<f32>,
@@ -142,9 +142,9 @@ fn vs_main(
     
     // Use custom color if alpha > 0, otherwise use voxel type color
     if (instance_custom_color.a > 0.0) {
-        output.color = instance_custom_color.rgb;
+           output.color = instance_custom_color;
     } else {
-        output.color = get_voxel_color(instance_voxel_type);
+           output.color = vec4<f32>(get_voxel_color(instance_voxel_type), 1.0);
     }
 
     output.emissive = instance_emissive;
@@ -199,7 +199,8 @@ fn fs_main(input: VertexOutputInstanced) -> @location(0) vec4<f32> {
     // Emissive surfaces should show their base color + emission, not lit base color + emission
     let emissive_strength = input.emissive.a;
     let lighting_multiplier = mix(1.0, 0.3, emissive_strength);
-    let color = input.color * (lighting * lighting_multiplier);
+    let ao = input.color.a; // vertex AO baked into color alpha
+    let color = input.color.rgb * (lighting * lighting_multiplier) * ao;
 
     let fog_color = vec3<f32>(0.7, 0.8, 0.9);
     // Use world-space distance from camera (input.world_pos contains world-space position)
@@ -247,7 +248,7 @@ fn vs_mesh(
     out.light_space_pos = uniforms.sun_view_proj * world_pos;
     out.world_pos = world_pos.xyz;
     out.normal = normal;
-    out.color = color.rgb;
+    out.color = color;
     out.emissive = emissive;
     return out;
 }
@@ -298,7 +299,7 @@ fn fs_mesh(input: VertexOutputMesh) -> @location(0) vec4<f32> {
     // Emissive surfaces should show their base color + emission, not lit base color + emission
     let emissive_strength = input.emissive.a;
     let lighting_multiplier = mix(1.0, 0.3, emissive_strength);
-    let color = input.color * (lighting * lighting_multiplier);
+        let color = input.color.rgb * (lighting * lighting_multiplier) * input.color.a;
     
     let fog_color = vec3<f32>(0.7, 0.8, 0.9);
     // Use world-space distance from camera for mesh pipeline as well

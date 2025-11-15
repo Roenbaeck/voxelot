@@ -727,6 +727,7 @@ struct App {
     shadow_map_size: u32,
     shadow_darkness: f32,
     shadow_backface_scale: f32,
+    shadow_ao_strength: f32,
 }
 
 impl App {
@@ -828,7 +829,8 @@ impl App {
         let mesh_worker_count = cfg.performance.mesh_worker_count
             .unwrap_or_else(|| available_workers.min(6));
 
-        for worker_index in 0..mesh_worker_count {
+    let ao_strength = cfg.shadows.ao_strength;
+    for worker_index in 0..mesh_worker_count {
             let job_rx = mesh_job_rx.clone();
             let result_tx = mesh_result_tx.clone();
             let palette_clone = palette.clone();
@@ -841,7 +843,7 @@ impl App {
                         if chunk.voxel_count == 0 {
                             continue;
                         }
-                        let mesh = generate_chunk_mesh(&chunk, &palette_clone);
+                        let mesh = generate_chunk_mesh(&chunk, &palette_clone, ao_strength);
                         if result_tx
                             .send(MeshResult {
                                 key,
@@ -999,6 +1001,7 @@ impl App {
             shadow_map_size: cfg.shadows.map_size,
             shadow_darkness: cfg.shadows.darkness,
             shadow_backface_scale: cfg.shadows.backface_ambient_scale,
+            shadow_ao_strength: cfg.shadows.ao_strength,
         }
     }
 
@@ -1038,6 +1041,7 @@ impl App {
             // Shadow settings
             full_cfg.shadows.map_size = self.shadow_map_size;
             full_cfg.shadows.backface_ambient_scale = self.shadow_backface_scale;
+            full_cfg.shadows.ao_strength = self.shadow_ao_strength;
             full_cfg.shadows.darkness = self.shadow_darkness;
             
             // Performance settings
