@@ -18,7 +18,7 @@ camera_speed_multiplier = 4.76837158203125
 
 [atmosphere]
 fog_density = 0.0009499997249804437
-time_of_day = 0.22881217300891876
+time_of_day = 0.37533706426620483
 
 [effects.depth_of_field]
 enabled = true
@@ -45,9 +45,9 @@ sample_count = 32
 slice_count = 8
 radius = 50.0
 thickness = 25.0
-strength = 2.0
+strength = 1.0
 blur_enabled = true
-blur_radius = 2.0
+blur_radius = 4.0
 
 [shadows]
 map_size = 4096
