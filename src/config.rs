@@ -82,6 +82,10 @@ pub struct SsaoConfig {
     pub thickness: f32,
     #[serde(default = "default_ssao_strength")]
     pub strength: f32,
+    #[serde(default = "default_ssao_blur_enabled")]
+    pub blur_enabled: bool,
+    #[serde(default = "default_ssao_blur_radius")]
+    pub blur_radius: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,6 +271,10 @@ fn default_ssao_thickness() -> f32 { 0.5 }
 
 fn default_ssao_strength() -> f32 { 1.0 }
 
+fn default_ssao_blur_enabled() -> bool { true }
+
+fn default_ssao_blur_radius() -> f32 { 2.0 }
+
 fn default_shadow_map_size() -> u32 {
     4096
 }
@@ -385,6 +393,8 @@ impl Default for SsaoConfig {
             radius: default_ssao_radius(),
             thickness: default_ssao_thickness(),
             strength: default_ssao_strength(),
+            blur_enabled: default_ssao_blur_enabled(),
+            blur_radius: default_ssao_blur_radius(),
         }
     }
 }
