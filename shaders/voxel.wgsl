@@ -210,8 +210,11 @@ fn fs_main(input: VertexOutputInstanced) -> @location(0) vec4<f32> {
     // Use world-space distance from camera (input.world_pos contains world-space position)
     // uniforms.camera_shadow_strength.xyz stores camera world position (see Rust binding comment)
     let distance = length(input.world_pos - uniforms.camera_shadow_strength.xyz);
-    let fog_factor = 1.0 - exp(-uniforms.fog_time_pad.x * distance);
-    let fogged_color = mix(color, fog_color, fog_factor * 0.5);
+    let transmittance = exp(-uniforms.fog_time_pad.x * distance);
+    let fog_factor = 1.0 - transmittance;
+    // Add volumetric scattering from sun
+    let inscatter = uniforms.sun_color_pad.xyz * 0.05 * fog_factor;
+    let fogged_color = mix(color, fog_color + inscatter, fog_factor);
     
     // Add emissive after fog so it stays bright
     let emissive = input.emissive.rgb * emissive_strength;
@@ -308,8 +311,11 @@ fn fs_mesh(input: VertexOutputMesh) -> @location(0) vec4<f32> {
     let fog_color = vec3<f32>(0.7, 0.8, 0.9);
     // Use world-space distance from camera for mesh pipeline as well
     let distance = length(input.world_pos - uniforms.camera_shadow_strength.xyz);
-    let fog_factor = 1.0 - exp(-uniforms.fog_time_pad.x * distance);
-    let fogged_color = mix(color, fog_color, fog_factor * 0.5);
+    let transmittance = exp(-uniforms.fog_time_pad.x * distance);
+    let fog_factor = 1.0 - transmittance;
+    // Add volumetric scattering from sun
+    let inscatter = uniforms.sun_color_pad.xyz * 0.05 * fog_factor;
+    let fogged_color = mix(color, fog_color + inscatter, fog_factor);
     
     // Add emissive after fog so it stays bright
     let emissive = input.emissive.rgb * emissive_strength;
