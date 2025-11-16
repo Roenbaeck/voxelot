@@ -38,6 +38,7 @@ struct VertexOutputInstanced {
     @location(2) emissive: vec4<f32>,
     @location(3) light_space_pos: vec4<f32>,
     @location(4) world_pos: vec3<f32>,
+    @location(5) ao: f32,
 }
 
 struct VertexOutputMesh {
@@ -123,7 +124,8 @@ fn vs_main(
     @location(0) instance_position: vec3<f32>,
     @location(1) instance_voxel_type: u32,
     @location(2) instance_scale: f32,
-    @location(3) instance_custom_color: vec4<f32>,
+    @location(3) instance_ao: f32,
+    @location(7) instance_custom_color: vec4<f32>,
     @location(4) vertex_position: vec3<f32>,
     @location(5) vertex_normal: vec3<f32>,
     @location(6) instance_emissive: vec4<f32>,
@@ -140,12 +142,14 @@ fn vs_main(
     // Use the per-vertex normal from the buffer
     output.normal = vertex_normal;
     
-    // Use custom color if alpha > 0, otherwise use voxel type color
-    if (instance_custom_color.a > 0.0) {
-           output.color = instance_custom_color;
-    } else {
-           output.color = vec4<f32>(get_voxel_color(instance_voxel_type), 1.0);
-    }
+        // Use custom color if alpha > 0, otherwise use voxel type color
+        if (instance_custom_color.a > 0.0) {
+            output.color = instance_custom_color;
+        } else {
+            output.color = vec4<f32>(get_voxel_color(instance_voxel_type), 1.0);
+        }
+        // AO is passed separately using instance_ao (not embedded in color alpha anymore)
+        output.ao = instance_ao;
 
     output.emissive = instance_emissive;
     
@@ -199,7 +203,7 @@ fn fs_main(input: VertexOutputInstanced) -> @location(0) vec4<f32> {
     // Emissive surfaces should show their base color + emission, not lit base color + emission
     let emissive_strength = input.emissive.a;
     let lighting_multiplier = mix(1.0, 0.3, emissive_strength);
-    let ao = input.color.a; // vertex AO baked into color alpha
+    let ao = input.ao; // AO passed separately from instance AO attribute
     let color = input.color.rgb * (lighting * lighting_multiplier) * ao;
 
     let fog_color = vec3<f32>(0.7, 0.8, 0.9);
@@ -368,7 +372,8 @@ fn vs_shadow_instanced(
     @location(0) instance_position: vec3<f32>,
     @location(1) _instance_voxel_type: u32,
     @location(2) instance_scale: f32,
-    @location(3) _instance_custom_color: vec4<f32>,
+    @location(3) _instance_ao: f32,
+    @location(7) _instance_custom_color: vec4<f32>,
     @location(4) vertex_position: vec3<f32>,
     @location(5) _vertex_normal: vec3<f32>,
     @location(6) _instance_emissive: vec4<f32>,

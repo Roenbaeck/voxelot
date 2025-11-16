@@ -9,6 +9,7 @@
 //! - Bounded but huge worlds: 16^n units (e.g., 16^4 = 65,536³)
 
 use croaring::Bitmap;
+use std::collections::HashMap;
 
 use crate::palette::Palette;
 
@@ -270,7 +271,10 @@ impl Chunk {
     pub fn update_lod_metadata(&mut self, palette: &Palette) {
         const TOTAL_SLOTS: f32 = (16 * 16 * 16) as f32; // 4096
 
+        // We'll compute both a sum for legacy average and a dominant-type count.
+        // Dominant type is preferable for per-chunk preview colors when mixed.
         let mut albedo_sum = [0.0f32; 4];
+        let mut counts: HashMap<u32, u32> = HashMap::new();
         let mut emissive_sum = [0.0f32; 3];
         let mut emissive_power = 0.0f32;
         let mut emissive_voxels = 0u32;
@@ -290,6 +294,8 @@ impl Chunk {
                 albedo_sum[1] += material_color[1];
                 albedo_sum[2] += material_color[2];
                 albedo_sum[3] += material_color[3];
+
+                *counts.entry(*voxel_type as u32).or_insert(0) += 1;
                 solid_count += 1;
 
                 let (emissive_color, emissive_strength) = palette.emissive(*voxel_type as u32);
@@ -335,13 +341,21 @@ impl Chunk {
         }
 
         if solid_count > 0 {
-            let occupancy_scale = 255.0 / TOTAL_SLOTS;
-            self.average_color = [
-                (albedo_sum[0] * occupancy_scale).clamp(0.0, 255.0) as u8,
-                (albedo_sum[1] * occupancy_scale).clamp(0.0, 255.0) as u8,
-                (albedo_sum[2] * occupancy_scale).clamp(0.0, 255.0) as u8,
-                (albedo_sum[3] * occupancy_scale).clamp(0.0, 255.0) as u8,
-            ];
+            // Use dominant voxel type for the average color preview. Alpha will be fully opaque.
+            if let Some((dominant_type, _)) = counts.into_iter().max_by_key(|&(_t, c)| c) {
+                let color = palette.color_u8(dominant_type);
+                self.average_color = [color[0], color[1], color[2], 255u8];
+            } else {
+                // fallback to occupancy-weighted average
+                let occupancy_scale = 255.0 / TOTAL_SLOTS;
+                self.average_color = [
+                    (albedo_sum[0] * occupancy_scale).clamp(0.0, 255.0) as u8,
+                    (albedo_sum[1] * occupancy_scale).clamp(0.0, 255.0) as u8,
+                    (albedo_sum[2] * occupancy_scale).clamp(0.0, 255.0) as u8,
+                    (albedo_sum[3] * occupancy_scale).clamp(0.0, 255.0) as u8,
+                ];
+            }
+            // keep average_color set to dominant or occupancy-based value
         } else {
             self.average_color = [0, 0, 0, 0];
         }

@@ -60,6 +60,7 @@ struct VoxelInstanceRaw {
     position: [f32; 3],
     voxel_type: u32,
     scale: f32,             // Scale factor (1.0 = 1x1x1, 16.0 = 16x16x16 chunk)
+    ao_factor: f32,         // Ambient occlusion / occupancy factor (0.0..=1.0)
     custom_color: [f32; 4], // RGBA custom color (if custom_color.a > 0, use this instead of voxel_type)
     emissive: [f32; 4],
 }
@@ -2019,17 +2020,20 @@ impl App {
     }
 
     fn voxel_to_raw(v: &VoxelInstance, palette: &Palette) -> VoxelInstanceRaw {
-        let custom_color_f32 = if let Some(rgba) = v.custom_color {
-            [
-                rgba[0] as f32 / 255.0,
-                rgba[1] as f32 / 255.0,
-                rgba[2] as f32 / 255.0,
+        let (custom_color_f32, ao_factor) = if let Some(rgba) = v.custom_color {
+            (
+                [
+                    rgba[0] as f32 / 255.0,
+                    rgba[1] as f32 / 255.0,
+                    rgba[2] as f32 / 255.0,
+                    1.0,
+                ],
                 rgba[3] as f32 / 255.0,
-            ]
+            )
         } else if v.is_leaf_chunk {
-            [0.4, 0.4, 0.45, 0.6]
+            ([0.4, 0.4, 0.45, 1.0], 0.6)
         } else {
-            [0.0, 0.0, 0.0, 0.0]
+            ([0.0, 0.0, 0.0, 0.0], 0.0)
         };
 
         let (emissive_rgb, emissive_intensity) = if v.custom_color.is_some() {
@@ -2046,6 +2050,7 @@ impl App {
             ],
             voxel_type: v.voxel_type as u32,
             scale: v.scale as f32,
+            ao_factor,
             custom_color: custom_color_f32,
             emissive: [
                 emissive_rgb[0],
@@ -2094,6 +2099,7 @@ impl App {
                             position: [world_pos.0 as f32, world_pos.1 as f32, world_pos.2 as f32],
                             voxel_type: *voxel_type as u32,
                             scale: 1.0,
+                            ao_factor: 1.0,
                             custom_color: material.albedo,
                             emissive: [
                                 material.emissive[0],
@@ -2370,7 +2376,8 @@ impl App {
                             0 => Float32x3,  // position
                             1 => Uint32,     // voxel_type
                             2 => Float32,    // scale
-                            3 => Float32x4,  // custom_color (RGBA)
+                            3 => Float32,    // ao_factor
+                            7 => Float32x4,  // custom_color (RGBA) -- moved to avoid vertex attribute conflict
                             6 => Float32x4   // emissive (RGB + intensity)
                         ],
                     },
@@ -2487,7 +2494,8 @@ impl App {
                             0 => Float32x3,
                             1 => Uint32,
                             2 => Float32,
-                            3 => Float32x4,
+                            3 => Float32,
+                            7 => Float32x4,
                             6 => Float32x4
                         ],
                     },
@@ -3704,6 +3712,10 @@ impl App {
                                     position: world_center,
                                     voxel_type: v.voxel_type as u32,
                                     scale,
+                                    // Use full brightness for the bounding-box preview so the
+                                    // dominant color is readable — do not darken by occupancy
+                                    // when showing a chunk-level color preview.
+                                    ao_factor: 1.0,
                                     custom_color,
                                     emissive: [0.0, 0.0, 0.0, 0.0],
                                 });
@@ -3744,6 +3756,7 @@ impl App {
                                     position: world_center,
                                     voxel_type: v.voxel_type as u32,
                                     scale,
+                                    ao_factor: 1.0,
                                     custom_color,
                                     emissive: [0.0, 0.0, 0.0, 0.0],
                                 });
@@ -3759,6 +3772,7 @@ impl App {
                                 position: [v.position[0] as f32, v.position[1] as f32, v.position[2] as f32],
                                 voxel_type: v.voxel_type as u32,
                                 scale: v.scale as f32,
+                                ao_factor: 1.0,
                                 custom_color,
                                 emissive: [0.0, 0.0, 0.0, 0.0],
                             });
@@ -3775,11 +3789,16 @@ impl App {
                     self.palette.emissive(input.voxel_type)
                 };
 
+                let ao = input.custom_color[3];
+                let mut cc = input.custom_color;
+                if cc[3] > 0.0 { cc[3] = 1.0; }
+
                 out.push(VoxelInstanceRaw {
                     position: input.position,
                     voxel_type: input.voxel_type,
                     scale: input.scale,
-                    custom_color: input.custom_color,
+                    ao_factor: ao,
+                    custom_color: cc,
                     emissive: [
                         emissive_rgb[0],
                         emissive_rgb[1],
@@ -3834,6 +3853,7 @@ impl App {
                                 position: [v.position[0] as f32, v.position[1] as f32, v.position[2] as f32],
                                 voxel_type: v.voxel_type as u32,
                                 scale: v.scale as f32,
+                                ao_factor: 1.0,
                                 custom_color,
                                 emissive: [0.0, 0.0, 0.0, 0.0],
                             });
