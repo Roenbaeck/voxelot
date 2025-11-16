@@ -2,7 +2,6 @@
 
 use crate::lib_hierarchical::{Chunk, Voxel};
 use crate::palette::Palette;
-use std::collections::{HashMap, HashSet};
 
 macro_rules! mesh_debug {
     ($($arg:tt)*) => {
@@ -19,34 +18,25 @@ mod tests {
     use crate::palette::Palette;
 
     #[test]
-    fn test_generate_chunk_mesh_ao_present() {
+    fn test_generate_chunk_mesh_basic() {
         // Construct a small palette with indices 0..=1
         let palette = Palette::from_string("0 255 255 255 255\n1 255 255 255 255\n").unwrap();
 
-        // Create a chunk and set a small cluster of voxels to cause AO
+        // Create a chunk with a single voxel
         let mut chunk = Chunk::new();
-        // Central voxel
         chunk.set(8, 8, 8, 1);
-        // Place some neighbors to reduce AO at one corner
-        chunk.set(7, 8, 8, 1);
-        chunk.set(8, 7, 8, 1);
-        chunk.set(8, 8, 7, 1);
 
-        // Generate mesh with full AO strength
-        let mesh = generate_chunk_mesh(&chunk, &palette, 1.0, None);
+        // Generate mesh
+        let mesh = generate_chunk_mesh(&chunk, &palette, None);
 
-        // There should be at least one vertex where the alpha channel is less than 1.0
-        // (meaning AO was applied), and all alpha values should be in [0.0, 1.0]
+        // Should have vertices and indices
         assert!(mesh.vertices.len() > 0);
-        let mut found_less_than_one = false;
+        assert!(mesh.indices.len() > 0);
+        // All vertex alphas should be 1.0 (no AO)
         for v in &mesh.vertices {
             let a = v.color[3];
-            assert!(a >= 0.0 && a <= 1.0);
-            if a < 1.0 {
-                found_less_than_one = true;
-            }
+            assert!(a >= 0.9999 && a <= 1.0);
         }
-        assert!(found_less_than_one, "No vertex had AO < 1.0 (expected some occlusion)");
     }
 
     #[test]
@@ -55,7 +45,7 @@ mod tests {
         let mut chunk = Chunk::new();
         // Single isolated voxel
         chunk.set(8, 8, 8, 1);
-        let mesh = generate_chunk_mesh(&chunk, &palette, 1.0, None);
+        let mesh = generate_chunk_mesh(&chunk, &palette, None);
         // All vertex alphas should be 1.0
         assert!(mesh.vertices.len() > 0);
         for v in &mesh.vertices {
@@ -70,7 +60,7 @@ mod tests {
         let mut chunk = Chunk::new();
         // Single isolated voxel at the ground (y = 0)
         chunk.set(8, 0, 8, 1);
-        let mesh = generate_chunk_mesh(&chunk, &palette, 1.0, None);
+        let mesh = generate_chunk_mesh(&chunk, &palette, None);
         // All vertex alphas should be near 1.0
         assert!(mesh.vertices.len() > 0);
         for v in &mesh.vertices {
@@ -95,7 +85,7 @@ mod tests {
         neighbors.insert((1i8, 1i8, 1i8), neigh);
 
         // Generate mesh for main with neighbors; AO should NOT count neighbor voxels
-        let mesh = generate_chunk_mesh(&main, &palette, 1.0, Some(&neighbors));
+        let mesh = generate_chunk_mesh(&main, &palette, Some(&neighbors));
 
         // All alphas should be near 1.0 — the neighbor should not cause darkening
         assert!(mesh.vertices.len() > 0);
@@ -148,7 +138,6 @@ struct Quad {
 pub fn generate_chunk_mesh(
     chunk: &Chunk,
     palette: &Palette,
-    ao_strength: f32,
     neighbors: Option<&std::collections::HashMap<(i8, i8, i8), Chunk>>,
 ) -> ChunkMesh {
     // 3 axes: 0=x, 1=y, 2=z
@@ -311,105 +300,9 @@ pub fn generate_chunk_mesh(
         mesh_debug!("  {} axis: {} faces", axis_name, faces_this_axis);
     }
 
-    // Build corner masks and owners from collected quads
-    let mut corner_mask: HashMap<(i32, i32, i32), u8> = HashMap::new();
-    let mut corner_owners: HashMap<(i32, i32, i32), HashSet<(i32, i32, i32)>> = HashMap::new();
-
+    // Now emit quads
     for quad in &quads {
-        let Quad { axis, d, u_axis, v_axis, u0, v0, du, dv, face_type } = *quad;
-        let positive = face_type > 0;
-
-        // compute owner coords for this quad; these should be excluded from AO samples
-        let mut owner_coords: Vec<[i32; 3]> = Vec::new();
-        for ou in u0..(u0 + du) {
-            for ov in v0..(v0 + dv) {
-                let mut owner = [0i32; 3];
-                owner[axis] = if positive { d } else { d - 1 };
-                owner[u_axis] = ou;
-                owner[v_axis] = ov;
-                owner_coords.push(owner);
-            }
-        }
-
-        // compute the 4 voxel-space corner coordinates for this rectangle
-        let mut du_vec = [0i32; 3];
-        du_vec[u_axis] = du;
-        let mut dv_vec = [0i32; 3];
-        dv_vec[v_axis] = dv;
-        let mut base = [0i32; 3];
-        base[axis] = d;
-        base[u_axis] = u0;
-        base[v_axis] = v0;
-
-        let bases = [
-            base,
-            [base[0] + du_vec[0], base[1] + du_vec[1], base[2] + du_vec[2]],
-            [base[0] + du_vec[0] + dv_vec[0], base[1] + du_vec[1] + dv_vec[1], base[2] + du_vec[2] + dv_vec[2]],
-            [base[0] + dv_vec[0], base[1] + dv_vec[1], base[2] + dv_vec[2]],
-        ];
-
-        // axis bit: we only keep axis identity (bit 0 = X, bit 1 = Y, bit 2 = Z)
-        let axis_bit = 1u8 << (axis as u8);
-        for bases_corner in &bases {
-            let key = (bases_corner[0], bases_corner[1], bases_corner[2]);
-            let entry = corner_mask.entry(key).or_insert(0u8);
-            *entry |= axis_bit;
-
-            let owners = corner_owners.entry(key).or_insert_with(HashSet::new);
-            for o in &owner_coords {
-                owners.insert((o[0], o[1], o[2]));
-            }
-        }
-    }
-
-    // AO cache: compute for corners with >= 2 different axis bits set (orthogonal)
-    let mut ao_cache: HashMap<(i32, i32, i32), f32> = HashMap::new();
-    for (key, mask) in &corner_mask {
-        // count orthogonal axis bits
-        let mut axis_count = 0;
-        for a in 0..3 {
-            if (mask & (1u8 << a)) != 0 {
-                axis_count += 1;
-            }
-        }
-        if axis_count >= 2 {
-            // compute 3-sample AO for this corner using the owner set to avoid self-occlusion
-            let owners_set = corner_owners.get(&key).unwrap();
-            let mut count = 0u32;
-            let mut samples = 0u32;
-            for dx in -1..=0 {
-                for dy in -1..=0 {
-                    for dz in -1..=0 {
-                        let sx = key.0 + dx;
-                        let sy = key.1 + dy;
-                        let sz = key.2 + dz;
-                        // skip owner voxels
-                        if owners_set.contains(&(sx, sy, sz)) {
-                            continue;
-                        }
-                        // Treat samples outside this chunk as empty air so AO is
-                        // computed locally and doesn't darken seams between
-                        // neighboring chunks.
-                        if sx < 0 || sx >= 16 || sy < 0 || sy >= 16 || sz < 0 || sz >= 16 {
-                            samples += 1; // count as an empty sample, but no occlusion
-                            continue;
-                        }
-                        samples += 1;
-                        if get_type(sx, sy, sz).is_some() {
-                            count += 1;
-                        }
-                    }
-                }
-            }
-            let occ = if samples > 0 { count as f32 / samples as f32 } else { 0.0 };
-            let ao = 1.0 - (occ * ao_strength);
-            ao_cache.insert(*key, ao.clamp(0.0, 1.0));
-        }
-    }
-
-    // Now emit quads using AO cache for candidate corners
-    for quad in &quads {
-        emit_quad_with_ao_cache(&mut mesh, palette, *quad, &get_type, &ao_cache);
+        emit_quad(&mut mesh, palette, *quad);
     }
 
     mesh
@@ -419,17 +312,12 @@ pub fn generate_chunk_mesh(
 // is handled by `emit_quad_with_ao_cache`. Keeping this function produced
 // a dead-code warning; it was also partially implemented and not used.
 
-// Emit a quad using AO values from a precomputed cache; if a corner isn't in the
-// cache it's considered unoccluded (AO = 1.0).
-fn emit_quad_with_ao_cache<F>(
+// Emit a quad with AO always set to 1.0 (no occlusion).
+fn emit_quad(
     mesh: &mut ChunkMesh,
     palette: &Palette,
     quad: Quad,
-    get_type: &F,
-    ao_cache: &HashMap<(i32, i32, i32), f32>,
-) where
-    F: Fn(i32, i32, i32) -> Option<u8>,
-{
+) {
     let Quad { axis, d, u_axis, v_axis, u0, v0, du, dv, face_type } = quad;
     if face_type == 0 {
         return;
@@ -460,20 +348,6 @@ fn emit_quad_with_ao_cache<F>(
         material.emissive_intensity,
     ];
 
-    let key0 = (base[0], base[1], base[2]);
-    let key1 = (base[0] + du_vec[0], base[1] + du_vec[1], base[2] + du_vec[2]);
-    let key2 = (
-        base[0] + du_vec[0] + dv_vec[0],
-        base[1] + du_vec[1] + dv_vec[1],
-        base[2] + du_vec[2] + dv_vec[2],
-    );
-    let key3 = (base[0] + dv_vec[0], base[1] + dv_vec[1], base[2] + dv_vec[2]);
-
-    let c0_ao = ao_cache.get(&key0).copied().unwrap_or(1.0);
-    let c1_ao = ao_cache.get(&key1).copied().unwrap_or(1.0);
-    let c2_ao = ao_cache.get(&key2).copied().unwrap_or(1.0);
-    let c3_ao = ao_cache.get(&key3).copied().unwrap_or(1.0);
-
     let p0 = [base[0] as f32, base[1] as f32, base[2] as f32];
     let p1 = [
         (base[0] + du_vec[0]) as f32,
@@ -491,132 +365,65 @@ fn emit_quad_with_ao_cache<F>(
         (base[2] + dv_vec[2]) as f32,
     ];
 
-    // If AO is generally high or the quad is very small, emit directly.
-    let min_ao = c0_ao.min(c1_ao.min(c2_ao.min(c3_ao)));
+    // AO is always 1.0 (no occlusion)
+    let ao = 1.0;
 
-    const MIN_SIZE: i32 = 2; // Subdivide until quad is about this size
-    const AO_THRESHOLD: f32 = 0.95; // Subdivide if any corner has AO < this
+    let mut color0 = color;
+    let mut color1 = color;
+    let mut color2 = color;
+    let mut color3 = color;
+    color0[3] = ao;
+    color1[3] = ao;
+    color2[3] = ao;
+    color3[3] = ao;
 
-    if du <= MIN_SIZE || dv <= MIN_SIZE || min_ao >= AO_THRESHOLD {
-        let mut color0 = color;
-        let mut color1 = color;
-        let mut color2 = color;
-        let mut color3 = color;
-        color0[3] = c0_ao;
-        color1[3] = c1_ao;
-        color2[3] = c2_ao;
-        color3[3] = c3_ao;
+    let base_index = mesh.vertices.len() as u32;
+    mesh.vertices.extend_from_slice(&[
+        MeshVertex { position: p0, normal, color: color0, emissive },
+        MeshVertex { position: p1, normal, color: color1, emissive },
+        MeshVertex { position: p2, normal, color: color2, emissive },
+        MeshVertex { position: p3, normal, color: color3, emissive },
+    ]);
 
-        let base_index = mesh.vertices.len() as u32;
-        mesh.vertices.extend_from_slice(&[
-            MeshVertex { position: p0, normal, color: color0, emissive },
-            MeshVertex { position: p1, normal, color: color1, emissive },
-            MeshVertex { position: p2, normal, color: color2, emissive },
-            MeshVertex { position: p3, normal, color: color3, emissive },
-        ]);
-
-        if axis == 1 {
-            if positive {
-                mesh.indices.extend_from_slice(&[
-                    base_index,
-                    base_index + 1,
-                    base_index + 2,
-                    base_index,
-                    base_index + 2,
-                    base_index + 3,
-                ]);
-            } else {
-                mesh.indices.extend_from_slice(&[
-                    base_index,
-                    base_index + 3,
-                    base_index + 2,
-                    base_index,
-                    base_index + 2,
-                    base_index + 1,
-                ]);
-            }
+    if axis == 1 {
+        if positive {
+            mesh.indices.extend_from_slice(&[
+                base_index,
+                base_index + 1,
+                base_index + 2,
+                base_index,
+                base_index + 2,
+                base_index + 3,
+            ]);
         } else {
-            if positive {
-                mesh.indices.extend_from_slice(&[
-                    base_index,
-                    base_index + 3,
-                    base_index + 2,
-                    base_index,
-                    base_index + 2,
-                    base_index + 1,
-                ]);
-            } else {
-                mesh.indices.extend_from_slice(&[
-                    base_index,
-                    base_index + 1,
-                    base_index + 2,
-                    base_index,
-                    base_index + 2,
-                    base_index + 3,
-                ]);
-            }
+            mesh.indices.extend_from_slice(&[
+                base_index,
+                base_index + 3,
+                base_index + 2,
+                base_index,
+                base_index + 2,
+                base_index + 1,
+            ]);
         }
-        return;
+    } else {
+        if positive {
+            mesh.indices.extend_from_slice(&[
+                base_index,
+                base_index + 3,
+                base_index + 2,
+                base_index,
+                base_index + 2,
+                base_index + 1,
+            ]);
+        } else {
+            mesh.indices.extend_from_slice(&[
+                base_index,
+                base_index + 1,
+                base_index + 2,
+                base_index,
+                base_index + 2,
+                base_index + 3,
+            ]);
+        }
     }
-
-    // Subdivide quadtree-style: split along u and v axes into 4 subquads
-    let u_mid = u0 + (du + 1) / 2;
-    let v_mid = v0 + (dv + 1) / 2;
-
-    // BL
-    emit_quad_with_ao_cache(
-        mesh,
-        palette,
-        Quad {
-            u0,
-            v0,
-            du: u_mid - u0,
-            dv: v_mid - v0,
-            ..quad
-        },
-        get_type,
-        ao_cache,
-    );
-    // BR
-    emit_quad_with_ao_cache(
-        mesh,
-        palette,
-        Quad {
-            u0: u_mid,
-            v0,
-            du: u0 + du - u_mid,
-            dv: v_mid - v0,
-            ..quad
-        },
-        get_type,
-        ao_cache,
-    );
-    // TL
-    emit_quad_with_ao_cache(
-        mesh,
-        palette,
-        Quad {
-            u0,
-            v0: v_mid,
-            du: u_mid - u0,
-            dv: v0 + dv - v_mid,
-            ..quad
-        },
-        get_type,
-        ao_cache,
-    );
-    // TR
-    emit_quad_with_ao_cache(
-        mesh,
-        palette,
-        Quad {
-            u0: u_mid,
-            v0: v_mid,
-            du: u0 + du - u_mid,
-            dv: v0 + dv - v_mid,
-            ..quad
-        },
-        get_type,
-        ao_cache,
-    );
 }

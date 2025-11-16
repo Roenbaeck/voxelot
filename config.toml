@@ -18,7 +18,7 @@ camera_speed_multiplier = 4.76837158203125
 
 [atmosphere]
 fog_density = 0.0009499997249804437
-time_of_day = 0.6727734804153442
+time_of_day = 0.34968096017837524
 
 [effects.depth_of_field]
 enabled = true
@@ -50,7 +50,6 @@ thickness = 0.5
 map_size = 4096
 darkness = 2.0
 backface_ambient_scale = 0.25
-ao_strength = 0.009999999776482582
 
 [performance]
 mesh_cache_budget_mb = 256

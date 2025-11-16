@@ -786,7 +786,6 @@ struct App {
     shadow_map_size: u32,
     shadow_darkness: f32,
     shadow_backface_scale: f32,
-    shadow_ao_strength: f32,
 }
 
 impl App {
@@ -890,7 +889,6 @@ impl App {
         let mesh_worker_count = cfg.performance.mesh_worker_count
             .unwrap_or_else(|| available_workers.min(6));
 
-    let ao_strength = cfg.shadows.ao_strength;
     for worker_index in 0..mesh_worker_count {
             let job_rx = mesh_job_rx.clone();
             let result_tx = mesh_result_tx.clone();
@@ -904,7 +902,7 @@ impl App {
                         if chunk.voxel_count == 0 {
                             continue;
                         }
-                        let mesh = generate_chunk_mesh(&chunk, &palette_clone, ao_strength, Some(&neighbors));
+                        let mesh = generate_chunk_mesh(&chunk, &palette_clone, Some(&neighbors));
                         if result_tx
                             .send(MeshResult {
                                 key,
@@ -1098,7 +1096,6 @@ impl App {
             shadow_map_size: cfg.shadows.map_size,
             shadow_darkness: cfg.shadows.darkness,
             shadow_backface_scale: cfg.shadows.backface_ambient_scale,
-            shadow_ao_strength: cfg.shadows.ao_strength,
         }
     }
 
@@ -1138,7 +1135,6 @@ impl App {
             // Shadow settings
             full_cfg.shadows.map_size = self.shadow_map_size;
             full_cfg.shadows.backface_ambient_scale = self.shadow_backface_scale;
-            full_cfg.shadows.ao_strength = self.shadow_ao_strength;
             full_cfg.shadows.darkness = self.shadow_darkness;
             
             // Performance settings
@@ -1288,6 +1284,28 @@ impl App {
             KeyCode::KeyN => {
                 self.ssao_enabled = !self.ssao_enabled;
                 println!("SSAO {}", if self.ssao_enabled { "enabled" } else { "disabled" });
+            }
+            KeyCode::F1 => {
+                // decrease SSILVB sample count
+                if self.ssao_settings.sample_count > 1 {
+                    self.ssao_settings.sample_count = self.ssao_settings.sample_count.saturating_sub(1);
+                    println!("SSAO sample_count: {}", self.ssao_settings.sample_count);
+                }
+            }
+            KeyCode::F2 => {
+                // increase SSILVB sample count
+                self.ssao_settings.sample_count = (self.ssao_settings.sample_count + 1).min(32);
+                println!("SSAO sample_count: {}", self.ssao_settings.sample_count);
+            }
+            KeyCode::F3 => {
+                // decrease sampling radius
+                self.ssao_settings.radius = (self.ssao_settings.radius - 1.0).max(0.0);
+                println!("SSAO radius: {}", self.ssao_settings.radius);
+            }
+            KeyCode::F4 => {
+                // increase sampling radius
+                self.ssao_settings.radius += 1.0;
+                println!("SSAO radius: {}", self.ssao_settings.radius);
             }
             KeyCode::KeyH => {
                 self.ssao_debug = !self.ssao_debug;

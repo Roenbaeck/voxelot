@@ -55,17 +55,9 @@ fn popcount(value: u32) -> u32 {
 }
 
 // update bitmask sectors between min and max horizon
-fn update_sectors(minH: f32, maxH: f32, out: u32) -> u32 {
-    let sector_count = 32u;
-    let start_bit = u32(minH * f32(sector_count));
-    let horizon_angle = u32(ceil((maxH - minH) * f32(sector_count)));
-    var angle_mask: u32 = 0u;
-    if (horizon_angle > 0u) {
-        angle_mask = 0xFFFFFFFFu >> (sector_count - horizon_angle);
-    }
-    let current = angle_mask << start_bit;
-    return out | current;
-}
+// update_sectors is not used anymore
+// fn update_sectors(minH: f32, maxH: f32, out: u32) -> u32 {
+// }
 
 @fragment
 fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
@@ -97,15 +89,18 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
             // clamp to screen
             if (sampleUV.x < 0.0 || sampleUV.x > 1.0 || sampleUV.y < 0.0 || sampleUV.y > 1.0) { continue; }
 
-            let sd = reconstruct_position(sampleUV);
-            let sampDirection = normalize(sd - pos);
-            // horizon angles measured along view direction; approximate
-            let frontH = max(-dot(sampDirection, camera), 0.0);
-            let backH = max(dot(pos - sd, camera) - ssao.hit_thickness, 0.0);
-            let clamped_front = clamp(frontH, 0.0, 1.0);
-            let clamped_back = clamp(backH, 0.0, 1.0);
-
-            occlusion_bits = update_sectors(clamped_front, clamped_back, occlusion_bits);
+            // sample raw depth at the sample uv
+            let sd = textureSample(depth_tex, post_sampler, sampleUV);
+            let centerDepth = textureSample(depth_tex, post_sampler, uv);
+            // If the sample depth is closer than the center depth minus thickness, mark occlusion
+            // Make occlusion threshold slightly scale with sample radius to detect more distant occluders
+            if (sd + ssao.hit_thickness < centerDepth - ssao.sample_radius * 0.01) {
+                // Map slice -> sector index for bitmask (32 sectors)
+                let sector_count = 32u;
+                let sector_f = ((f32(slice) + jitter) / slice_count) * f32(sector_count);
+                let sector = u32(clamp(floor(sector_f), 0.0, f32(sector_count) - 1.0));
+                occlusion_bits = occlusion_bits | (1u << sector);
+            }
         }
 
         // compute occlusion for this slice
