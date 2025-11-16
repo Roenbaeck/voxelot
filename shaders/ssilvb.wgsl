@@ -5,8 +5,7 @@ struct SsaoUniforms {
     hit_thickness: f32,
     screen_width: f32,
     screen_height: f32,
-    _pad0: f32,
-    _pad1: f32,
+    inverse_projection: mat4x4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> ssao: SsaoUniforms;
@@ -34,15 +33,13 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 }
 
 // Reconstruct view-space position from depth
-fn reconstruct_position(uv: vec2<f32>) -> vec3<f32> {
-    // depth is returned as [0..1], we need clip Z in [-1,1]
-    let d: f32 = textureSample(depth_tex, post_sampler, uv);
-    // convert from [0,1] to NDC
-    let ndc = vec3<f32>(uv * 2.0 - vec2<f32>(1.0, 1.0), d * 2.0 - 1.0);
-    // Without a full inverse projection, approximate view-space z by linearizing depth
-    // We can use a short approximation here; for better results pass inverse proj: TODO
-    let z = d;
-    return vec3<f32>(ndc.xy, z);
+fn reconstruct_position(uv: vec2<f32>, depth: f32) -> vec3<f32> {
+    // depth is [0,1], convert to NDC [-1,1]
+    let ndc_z = depth * 2.0 - 1.0;
+    let ndc_xy = uv * 2.0 - vec2<f32>(1.0, 1.0);
+    let ndc = vec4<f32>(ndc_xy, ndc_z, 1.0);
+    let view_pos = ssao.inverse_projection * ndc;
+    return view_pos.xyz / view_pos.w;
 }
 
 // bitcount helper using integer bit operations
@@ -55,14 +52,20 @@ fn popcount(value: u32) -> u32 {
 }
 
 // update bitmask sectors between min and max horizon
-// update_sectors is not used anymore
-// fn update_sectors(minH: f32, maxH: f32, out: u32) -> u32 {
-// }
+fn update_sectors(minH: f32, maxH: f32, out: u32) -> u32 {
+    let sector_count = 32u;
+    let start_bit = u32(minH * f32(sector_count));
+    let horizon_angle = u32(ceil((maxH - minH) * f32(sector_count)));
+    let angle_bit = select(0u, 0xFFFFFFFFu >> (sector_count - horizon_angle), horizon_angle > 0u);
+    let current_bitfield = angle_bit << start_bit;
+    return out | current_bitfield;
+}
 
 @fragment
 fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    // Reconstruct a rough position and normal from depth
-    let pos = reconstruct_position(uv);
+    // Get center depth and position
+    let center_depth = textureSample(depth_tex, post_sampler, uv);
+    let pos = reconstruct_position(uv, center_depth);
     let camera = normalize(-pos);
 
     var occlusion_mask: u32 = 0u;
@@ -83,24 +86,31 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
 
         for (var s = 0u; s < ssao.sample_count; s = s + 1u) {
             let step = (f32(s) + jitter) / sample_count + 0.01;
-            let aspect = vec2<f32>(ssao.screen_width / ssao.screen_height, 1.0);
-            let sampleUV = uv - step * sample_radius * omega * aspect;
+            let offset_pixels = step * sample_radius;
+            let sampleUV = uv - vec2<f32>(offset_pixels / ssao.screen_width, offset_pixels / ssao.screen_height) * omega;
 
             // clamp to screen
             if (sampleUV.x < 0.0 || sampleUV.x > 1.0 || sampleUV.y < 0.0 || sampleUV.y > 1.0) { continue; }
 
-            // sample raw depth at the sample uv
+            // sample depth at the sample uv
             let sd = textureSample(depth_tex, post_sampler, sampleUV);
-            let centerDepth = textureSample(depth_tex, post_sampler, uv);
-            // If the sample depth is closer than the center depth minus thickness, mark occlusion
-            // Make occlusion threshold slightly scale with sample radius to detect more distant occluders
-            if (sd + ssao.hit_thickness < centerDepth - ssao.sample_radius * 0.01) {
-                // Map slice -> sector index for bitmask (32 sectors)
-                let sector_count = 32u;
-                let sector_f = ((f32(slice) + jitter) / slice_count) * f32(sector_count);
-                let sector = u32(clamp(floor(sector_f), 0.0, f32(sector_count) - 1.0));
-                occlusion_bits = occlusion_bits | (1u << sector);
-            }
+            let sample_pos = reconstruct_position(sampleUV, sd);
+            let sample_distance = sample_pos - pos;
+            let sample_length = length(sample_distance);
+            if (sample_length < 0.001) { continue; } // avoid self
+            let sample_horizon = sample_distance / sample_length;
+
+            // Compute horizons similar to SSILVB
+            var front_back_horizon = vec2<f32>(
+                dot(sample_horizon, camera),
+                dot(normalize(sample_distance - camera * ssao.hit_thickness), camera)
+            );
+            front_back_horizon = acos(front_back_horizon);
+            // Since no normal, set n = 0
+            let n = 0.0;
+            front_back_horizon = clamp((front_back_horizon + n + 1.57079632679) / 3.14159265359, vec2(0.0, 0.0), vec2(1.0, 1.0));
+
+            occlusion_bits = update_sectors(front_back_horizon.x, front_back_horizon.y, occlusion_bits);
         }
 
         // compute occlusion for this slice

@@ -259,6 +259,7 @@ struct SsaoUniformsRaw {
     screen_height: f32,
     _pad0: f32,
     _pad1: f32,
+    inverse_projection: [[f32; 4]; 4],
 }
 
 const DOF_UNIFORM_FLOATS: usize = 12;
@@ -1206,6 +1207,14 @@ impl App {
     }
 
     fn build_ssilvb_uniforms(&self, src_width: u32, src_height: u32) -> SsaoUniformsRaw {
+        let aspect = src_width as f32 / src_height as f32;
+        let projection = Mat4::perspective_rh(
+            self.camera_controller.camera.fov,
+            aspect,
+            self.camera_controller.camera.near,
+            self.camera_controller.camera.far,
+        );
+        let inv_proj = projection.inverse();
         SsaoUniformsRaw {
             sample_count: self.ssao_settings.sample_count as u32,
             slice_count: self.ssao_settings.slice_count as u32,
@@ -1215,6 +1224,7 @@ impl App {
             screen_height: src_height as f32,
             _pad0: 0.0,
             _pad1: 0.0,
+            inverse_projection: inv_proj.to_cols_array_2d(),
         }
     }
 
