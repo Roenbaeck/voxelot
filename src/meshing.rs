@@ -2,6 +2,7 @@
 
 use crate::lib_hierarchical::{Chunk, Voxel};
 use crate::palette::Palette;
+use std::collections::{HashMap, HashSet};
 
 macro_rules! mesh_debug {
     ($($arg:tt)*) => {
@@ -102,6 +103,20 @@ pub struct ChunkMesh {
     pub emitters: Vec<ChunkEmitter>,
 }
 
+// Representation of a merged quad (rectangle) created during greedy meshing.
+#[derive(Clone, Copy, Debug)]
+struct Quad {
+    axis: usize,
+    d: i32,
+    u_axis: usize,
+    v_axis: usize,
+    u0: i32,
+    v0: i32,
+    du: i32,
+    dv: i32,
+    face_type: i32,
+}
+
 /// Generate a greedy mesh for a 16x16x16 chunk.
 /// Merges coplanar faces with identical voxel types into larger quads.
 pub fn generate_chunk_mesh(chunk: &Chunk, palette: &Palette, ao_strength: f32) -> ChunkMesh {
@@ -142,6 +157,8 @@ pub fn generate_chunk_mesh(chunk: &Chunk, palette: &Palette, ao_strength: f32) -
     };
 
     // For each axis, create faces between differing neighbor voxels
+    let mut quads: Vec<Quad> = Vec::new();
+
     for axis in 0..3 {
         // The other two axes form the 2D mask
         let (u_axis, v_axis) = match axis {
@@ -219,22 +236,19 @@ pub fn generate_chunk_mesh(chunk: &Chunk, palette: &Palette, ao_strength: f32) -
                         height += 1;
                     }
 
-                    // Emit this rectangle
-                    emit_quad(
-                        &mut mesh,
-                        palette,
+                    // Collect this rectangle for second pass: we need to compute
+                    // corner bitmasks and owners for AO caching before final emission.
+                    quads.push(Quad {
                         axis,
                         d,
                         u_axis,
                         v_axis,
-                        u_start,
-                        v_start,
-                        width,
-                        height,
-                        t,
-                        &get_type,
-                        ao_strength,
-                    );
+                        u0: u_start,
+                        v0: v_start,
+                        du: width,
+                        dv: height,
+                        face_type: t,
+                    });
                     faces_this_axis += 1;
 
                     // Mark used
@@ -250,6 +264,108 @@ pub fn generate_chunk_mesh(chunk: &Chunk, palette: &Palette, ao_strength: f32) -
             }
         }
         mesh_debug!("  {} axis: {} faces", axis_name, faces_this_axis);
+    }
+
+    // Build corner masks and owners from collected quads
+    let mut corner_mask: HashMap<(i32, i32, i32), u8> = HashMap::new();
+    let mut corner_owners: HashMap<(i32, i32, i32), HashSet<(i32, i32, i32)>> = HashMap::new();
+
+    for quad in &quads {
+        let Quad { axis, d, u_axis, v_axis, u0, v0, du, dv, face_type } = *quad;
+        let positive = face_type > 0;
+
+        // compute owner coords for this quad; these should be excluded from AO samples
+        let mut owner_coords: Vec<[i32; 3]> = Vec::new();
+        for ou in u0..(u0 + du) {
+            for ov in v0..(v0 + dv) {
+                let mut owner = [0i32; 3];
+                owner[axis] = if positive { d } else { d - 1 };
+                owner[u_axis] = ou;
+                owner[v_axis] = ov;
+                owner_coords.push(owner);
+            }
+        }
+
+        // compute the 4 voxel-space corner coordinates for this rectangle
+        let mut du_vec = [0i32; 3];
+        du_vec[u_axis] = du;
+        let mut dv_vec = [0i32; 3];
+        dv_vec[v_axis] = dv;
+        let mut base = [0i32; 3];
+        base[axis] = d;
+        base[u_axis] = u0;
+        base[v_axis] = v0;
+
+        let bases = [
+            base,
+            [base[0] + du_vec[0], base[1] + du_vec[1], base[2] + du_vec[2]],
+            [base[0] + du_vec[0] + dv_vec[0], base[1] + du_vec[1] + dv_vec[1], base[2] + du_vec[2] + dv_vec[2]],
+            [base[0] + dv_vec[0], base[1] + dv_vec[1], base[2] + dv_vec[2]],
+        ];
+
+        // axis bit: we only keep axis identity (bit 0 = X, bit 1 = Y, bit 2 = Z)
+        let axis_bit = 1u8 << (axis as u8);
+        for bases_corner in &bases {
+            let key = (bases_corner[0], bases_corner[1], bases_corner[2]);
+            let entry = corner_mask.entry(key).or_insert(0u8);
+            *entry |= axis_bit;
+
+            let owners = corner_owners.entry(key).or_insert_with(HashSet::new);
+            for o in &owner_coords {
+                owners.insert((o[0], o[1], o[2]));
+            }
+        }
+    }
+
+    // AO cache: compute for corners with >= 2 different axis bits set (orthogonal)
+    let mut ao_cache: HashMap<(i32, i32, i32), f32> = HashMap::new();
+    for (key, mask) in &corner_mask {
+        // count orthogonal axis bits
+        let mut axis_count = 0;
+        for a in 0..3 {
+            if (mask & (1u8 << a)) != 0 {
+                axis_count += 1;
+            }
+        }
+        if axis_count >= 2 {
+            // Quick hack: skip AO for corners on the chunk boundary. Neighbor chunk
+            // voxels are not visible to this per-chunk mesher, which causes sharp
+            // seams; by skipping AO computation for boundary corners we avoid
+            // the abrupt darkening at chunk borders. This will lose AO at some
+            // seams but removes the visible artifact.
+            if key.0 == 0 || key.1 == 0 || key.2 == 0 || key.0 == 16 || key.1 == 16 || key.2 == 16 {
+                continue;
+            }
+            // compute 3-sample AO for this corner using the owner set to avoid self-occlusion
+            let owners_set = corner_owners.get(&key).unwrap();
+            let mut count = 0u32;
+            let mut samples = 0u32;
+            for dx in -1..=0 {
+                for dy in -1..=0 {
+                    for dz in -1..=0 {
+                        let sx = key.0 + dx;
+                        let sy = key.1 + dy;
+                        let sz = key.2 + dz;
+                        // skip owner voxels
+                        if owners_set.contains(&(sx, sy, sz)) {
+                            continue;
+                        }
+                        samples += 1;
+                        if get_type(sx, sy, sz).is_some() {
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            let occ = if samples > 0 { count as f32 / samples as f32 } else { 0.0 };
+            let ao = 1.0 - (occ * ao_strength);
+            ao_cache.insert(*key, ao.clamp(0.0, 1.0));
+        }
+    }
+
+    // Now emit quads using AO cache for candidate corners
+    for quad in &quads {
+        emit_quad_with_ao_cache(&mut mesh, palette, *quad, &get_type, &ao_cache);
     }
 
     mesh
@@ -309,6 +425,10 @@ fn emit_quad<F>(
     // To avoid self-shadowing, exclude owner voxels (the voxels that own this face)
     let mut owner_coords: Vec<[i32; 3]> = Vec::new();
     for ou in u0..(u0 + du) {
+
+    // End of owner loop
+
+    // Now emit quads using AO cache for candidate corners
         for ov in v0..(v0 + dv) {
             let mut owner = [0i32; 3];
             owner[axis] = if positive { d } else { d - 1 };
@@ -407,6 +527,139 @@ fn emit_quad<F>(
     // Two triangles with winding order dependent on face orientation
     // Positive faces (normal points toward -axis): use p0→p3→p2 and p0→p2→p1
     // Negative faces (normal points toward +axis): reverse winding to p0→p1→p2 and p0→p2→p3
+    if axis == 1 {
+        if positive {
+            mesh.indices.extend_from_slice(&[
+                base_index,
+                base_index + 1,
+                base_index + 2,
+                base_index,
+                base_index + 2,
+                base_index + 3,
+            ]);
+        } else {
+            mesh.indices.extend_from_slice(&[
+                base_index,
+                base_index + 3,
+                base_index + 2,
+                base_index,
+                base_index + 2,
+                base_index + 1,
+            ]);
+        }
+    } else {
+        if positive {
+            mesh.indices.extend_from_slice(&[
+                base_index,
+                base_index + 3,
+                base_index + 2,
+                base_index,
+                base_index + 2,
+                base_index + 1,
+            ]);
+        } else {
+            mesh.indices.extend_from_slice(&[
+                base_index,
+                base_index + 1,
+                base_index + 2,
+                base_index,
+                base_index + 2,
+                base_index + 3,
+            ]);
+        }
+    }
+}
+
+// Emit a quad using AO values from a precomputed cache; if a corner isn't in the
+// cache it's considered unoccluded (AO = 1.0).
+fn emit_quad_with_ao_cache<F>(
+    mesh: &mut ChunkMesh,
+    palette: &Palette,
+    quad: Quad,
+    get_type: &F,
+    ao_cache: &HashMap<(i32, i32, i32), f32>,
+) where
+    F: Fn(i32, i32, i32) -> Option<u8>,
+{
+    let Quad { axis, d, u_axis, v_axis, u0, v0, du, dv, face_type } = quad;
+    if face_type == 0 {
+        return;
+    }
+
+    let positive = face_type > 0;
+    let mat = face_type.abs() as u8;
+
+    let mut base = [0i32; 3];
+    base[axis] = d;
+    base[u_axis] = u0;
+    base[v_axis] = v0;
+
+    let mut du_vec = [0i32; 3];
+    du_vec[u_axis] = du;
+    let mut dv_vec = [0i32; 3];
+    dv_vec[v_axis] = dv;
+
+    let mut normal = [0.0f32; 3];
+    normal[axis] = if positive { -1.0 } else { 1.0 };
+
+    let material = palette.material(mat as u32);
+    let color = material.albedo;
+    let emissive = [
+        material.emissive[0],
+        material.emissive[1],
+        material.emissive[2],
+        material.emissive_intensity,
+    ];
+
+    let key0 = (base[0], base[1], base[2]);
+    let key1 = (base[0] + du_vec[0], base[1] + du_vec[1], base[2] + du_vec[2]);
+    let key2 = (
+        base[0] + du_vec[0] + dv_vec[0],
+        base[1] + du_vec[1] + dv_vec[1],
+        base[2] + du_vec[2] + dv_vec[2],
+    );
+    let key3 = (base[0] + dv_vec[0], base[1] + dv_vec[1], base[2] + dv_vec[2]);
+
+    let c0_ao = ao_cache.get(&key0).copied().unwrap_or(1.0);
+    let c1_ao = ao_cache.get(&key1).copied().unwrap_or(1.0);
+    let c2_ao = ao_cache.get(&key2).copied().unwrap_or(1.0);
+    let c3_ao = ao_cache.get(&key3).copied().unwrap_or(1.0);
+
+    let p0 = [base[0] as f32, base[1] as f32, base[2] as f32];
+    let p1 = [
+        (base[0] + du_vec[0]) as f32,
+        (base[1] + du_vec[1]) as f32,
+        (base[2] + du_vec[2]) as f32,
+    ];
+    let p2 = [
+        (base[0] + du_vec[0] + dv_vec[0]) as f32,
+        (base[1] + du_vec[1] + dv_vec[1]) as f32,
+        (base[2] + du_vec[2] + dv_vec[2]) as f32,
+    ];
+    let p3 = [
+        (base[0] + dv_vec[0]) as f32,
+        (base[1] + dv_vec[1]) as f32,
+        (base[2] + dv_vec[2]) as f32,
+    ];
+
+    let mut color0 = color;
+    let mut color1 = color;
+    let mut color2 = color;
+    let mut color3 = color;
+    color0[3] = c0_ao;
+    color1[3] = c1_ao;
+    color2[3] = c2_ao;
+    color3[3] = c3_ao;
+
+    let base_index = mesh.vertices.len() as u32;
+    mesh.vertices.extend_from_slice(&[
+        MeshVertex { position: p0, normal, color: color0, emissive },
+        MeshVertex { position: p1, normal, color: color1, emissive },
+        MeshVertex { position: p2, normal, color: color2, emissive },
+        MeshVertex { position: p3, normal, color: color3, emissive },
+    ]);
+
+    // Indices like `emit_quad`
     if axis == 1 {
         if positive {
             mesh.indices.extend_from_slice(&[
