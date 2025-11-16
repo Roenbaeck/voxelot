@@ -18,7 +18,7 @@ camera_speed_multiplier = 4.76837158203125
 
 [atmosphere]
 fog_density = 0.0009499997249804437
-time_of_day = 0.10244262963533401
+time_of_day = 0.42269960045814514
 
 [effects.depth_of_field]
 enabled = true
@@ -50,6 +50,7 @@ mesh_cache_budget_mb = 256
 mesh_worker_count = 6
 mesh_upload_baseline = 4
 fallback_detail_distance = 500.0
+mesh_priority_sort_interval_frames = 30
 
 [debug]
 show_fps = true

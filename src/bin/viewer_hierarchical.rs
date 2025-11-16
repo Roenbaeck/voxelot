@@ -659,6 +659,9 @@ struct App {
     mesh_upload_baseline: usize,
     mesh_upload_max: usize,
     mesh_upload_adjust_timer: f32,
+    // Periodic mesh priority sorting (frames)
+    pending_mesh_sort_interval_frames: u64,
+    last_pending_mesh_sort_frame: u64,
     mesh_cache_budget_bytes: u64,
     fallback_detail_distance: f32,
     last_frame: Instant,
@@ -951,6 +954,8 @@ impl App {
             mesh_upload_baseline,
             mesh_upload_max,
             mesh_upload_adjust_timer: 0.0,
+            pending_mesh_sort_interval_frames: cfg.performance.mesh_priority_sort_interval_frames,
+            last_pending_mesh_sort_frame: 0,
             mesh_cache_budget_bytes: cfg.performance.mesh_cache_budget_mb as u64 * 1024 * 1024,
             fallback_detail_distance: cfg.performance.fallback_detail_distance,
             camera_controller: CameraController::new(initial_camera, &cfg.rendering),
@@ -1088,6 +1093,7 @@ impl App {
             full_cfg.performance.mesh_upload_baseline = self.mesh_upload_baseline;
             full_cfg.performance.mesh_cache_budget_mb = self.mesh_cache_budget_bytes / (1024 * 1024);
             full_cfg.performance.fallback_detail_distance = self.fallback_detail_distance;
+            full_cfg.performance.mesh_priority_sort_interval_frames = self.pending_mesh_sort_interval_frames;
             
             if let Err(e) = full_cfg.save(CONFIG_FILE) {
                 eprintln!("Failed to save unified config: {}", e);
@@ -3465,6 +3471,22 @@ impl App {
 
         let max_inflight = self.max_inflight_jobs();
         while self.mesh_jobs_in_flight < max_inflight {
+            // Occasionally re-sort the pending mesh queue to prioritize near-camera chunks.
+            // This avoids reordering every frame and keeps scheduling cheap.
+            if self.pending_chunk_meshes.len() > 4 && (self.frame_index == 0 || (self.frame_index - self.last_pending_mesh_sort_frame) >= self.pending_mesh_sort_interval_frames) {
+                let cam_pos = self.camera_controller.camera.position;
+                let mut vec: Vec<_> = self.pending_chunk_meshes.iter().cloned().collect();
+                vec.sort_by(|a, b| {
+                    let ca = [a.0 as f32 + 8.0, a.1 as f32 + 8.0, a.2 as f32 + 8.0];
+                    let cb = [b.0 as f32 + 8.0, b.1 as f32 + 8.0, b.2 as f32 + 8.0];
+                    let da = (ca[0] - cam_pos[0]).mul_add(ca[0] - cam_pos[0], (ca[1] - cam_pos[1]).mul_add(ca[1] - cam_pos[1], (ca[2] - cam_pos[2]).powi(2))).abs();
+                    let db = (cb[0] - cam_pos[0]).mul_add(cb[0] - cam_pos[0], (cb[1] - cam_pos[1]).mul_add(cb[1] - cam_pos[1], (cb[2] - cam_pos[2]).powi(2))).abs();
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                self.pending_chunk_meshes.clear();
+                for k in vec { self.pending_chunk_meshes.push_back(k); }
+                self.last_pending_mesh_sort_frame = self.frame_index;
+            }
             let Some(key) = self.pending_chunk_meshes.pop_front() else {
                 break;
             };
