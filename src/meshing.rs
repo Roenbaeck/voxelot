@@ -78,6 +78,32 @@ mod tests {
             assert!(a >= 0.9999 && a <= 1.0, "Expected AO alpha near 1.0 for ground isolated voxel, got {}", a);
         }
     }
+
+    #[test]
+    fn test_generate_chunk_mesh_chunk_boundary_no_ao_from_neighbors() {
+        let palette = Palette::from_string("0 255 255 255 255\n1 255 255 255 255\n").unwrap();
+
+        // Main chunk has a single voxel at the corner touching the +X +Y +Z boundary
+        let mut main = Chunk::new();
+        main.set(15, 15, 15, 1);
+
+        // Neighbor at +X +Y +Z has a voxel diagonally at (0,0,0)
+        let mut neigh = Chunk::new();
+        neigh.set(0, 0, 0, 1);
+
+        let mut neighbors = std::collections::HashMap::new();
+        neighbors.insert((1i8, 1i8, 1i8), neigh);
+
+        // Generate mesh for main with neighbors; AO should NOT count neighbor voxels
+        let mesh = generate_chunk_mesh(&main, &palette, 1.0, Some(&neighbors));
+
+        // All alphas should be near 1.0 — the neighbor should not cause darkening
+        assert!(mesh.vertices.len() > 0);
+        for v in &mesh.vertices {
+            let a = v.color[3];
+            assert!(a >= 0.9999 && a <= 1.0, "Expected AO alpha near 1.0 for seam corner, got {}", a);
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -361,6 +387,13 @@ pub fn generate_chunk_mesh(
                         if owners_set.contains(&(sx, sy, sz)) {
                             continue;
                         }
+                        // Treat samples outside this chunk as empty air so AO is
+                        // computed locally and doesn't darken seams between
+                        // neighboring chunks.
+                        if sx < 0 || sx >= 16 || sy < 0 || sy >= 16 || sz < 0 || sz >= 16 {
+                            samples += 1; // count as an empty sample, but no occlusion
+                            continue;
+                        }
                         samples += 1;
                         if get_type(sx, sy, sz).is_some() {
                             count += 1;
@@ -382,204 +415,9 @@ pub fn generate_chunk_mesh(
     mesh
 }
 
-fn emit_quad<F>(
-    mesh: &mut ChunkMesh,
-    palette: &Palette,
-    axis: usize,
-    d: i32,
-    u_axis: usize,
-    v_axis: usize,
-    u0: i32,
-    v0: i32,
-    du: i32,
-    dv: i32,
-    face_type: i32,
-    get_type: &F,
-    ao_strength: f32,
-) where F: Fn(i32, i32, i32) -> Option<u8> {
-    if face_type == 0 {
-        return;
-    }
-
-    // Determine face orientation and material
-    let positive = face_type > 0;
-    let mat = face_type.abs() as u8;
-
-    // Base corner in voxel space
-    // Face is always at position 'd' along the axis (the boundary slice)
-    let mut base = [0i32; 3];
-    base[axis] = d;
-    base[u_axis] = u0;
-    base[v_axis] = v0;
-
-    // Size vectors along u and v
-    let mut du_vec = [0i32; 3];
-    du_vec[u_axis] = du;
-    let mut dv_vec = [0i32; 3];
-    dv_vec[v_axis] = dv;
-
-    // Normal (pointing away from solid, toward empty)
-    let mut normal = [0.0f32; 3];
-    normal[axis] = if positive { -1.0 } else { 1.0 };
-
-    // Color and emissive data from palette
-    let material = palette.material(mat as u32);
-    let color = material.albedo;
-    let emissive = [
-        material.emissive[0],
-        material.emissive[1],
-        material.emissive[2],
-        material.emissive_intensity,
-    ];
-
-    // Helper to compute simple AO at a corner by sampling the 8 voxels touching the corner
-    // To avoid self-shadowing, exclude owner voxels (the voxels that own this face)
-    let mut owner_coords: Vec<[i32; 3]> = Vec::new();
-    for ou in u0..(u0 + du) {
-
-    // End of owner loop
-
-    // Now emit quads using AO cache for candidate corners
-        for ov in v0..(v0 + dv) {
-            let mut owner = [0i32; 3];
-            owner[axis] = if positive { d } else { d - 1 };
-            owner[u_axis] = ou;
-            owner[v_axis] = ov;
-            owner_coords.push(owner);
-        }
-    }
-
-    let compute_ao = |x: i32, y: i32, z: i32| -> f32 {
-        let mut count = 0u32;
-        let mut samples = 0u32;
-        for dx in -1..=0 {
-            for dy in -1..=0 {
-                for dz in -1..=0 {
-                    let sx = x + dx;
-                    let sy = y + dy;
-                    let sz = z + dz;
-                    // Skip owner's own voxels so the block doesn't occlude itself
-                    if owner_coords.iter().any(|o| o[0] == sx && o[1] == sy && o[2] == sz) {
-                        continue;
-                    }
-                    samples += 1;
-                    if get_type(sx, sy, sz).is_some() {
-                        count += 1;
-                    }
-                }
-            }
-        }
-        let occ = if samples > 0 { count as f32 / samples as f32 } else { 0.0 };
-        let ao = 1.0 - (occ * ao_strength);
-        ao.clamp(0.0, 1.0)
-    };
-
-    // Four corners (in voxel space), convert to f32
-    let p0 = [base[0] as f32, base[1] as f32, base[2] as f32];
-    let p1 = [
-        (base[0] + du_vec[0]) as f32,
-        (base[1] + du_vec[1]) as f32,
-        (base[2] + du_vec[2]) as f32,
-    ];
-    let p2 = [
-        (base[0] + du_vec[0] + dv_vec[0]) as f32,
-        (base[1] + du_vec[1] + dv_vec[1]) as f32,
-        (base[2] + du_vec[2] + dv_vec[2]) as f32,
-    ];
-    let p3 = [
-        (base[0] + dv_vec[0]) as f32,
-        (base[1] + dv_vec[1]) as f32,
-        (base[2] + dv_vec[2]) as f32,
-    ];
-
-    let base_index = mesh.vertices.len() as u32;
-    // Compute AO for each corner and set it into color alpha
-    let c0_ao = compute_ao(base[0], base[1], base[2]);
-    let c1_ao = compute_ao(base[0] + du_vec[0], base[1] + du_vec[1], base[2] + du_vec[2]);
-    let c2_ao = compute_ao(base[0] + du_vec[0] + dv_vec[0], base[1] + du_vec[1] + dv_vec[1], base[2] + du_vec[2] + dv_vec[2]);
-    let c3_ao = compute_ao(base[0] + dv_vec[0], base[1] + dv_vec[1], base[2] + dv_vec[2]);
-
-    let mut color0 = color;
-    let mut color1 = color;
-    let mut color2 = color;
-    let mut color3 = color;
-    color0[3] = c0_ao;
-    color1[3] = c1_ao;
-    color2[3] = c2_ao;
-    color3[3] = c3_ao;
-
-    mesh.vertices.extend_from_slice(&[
-        MeshVertex {
-            position: p0,
-            normal,
-            color: color0,
-            emissive,
-        },
-        MeshVertex {
-            position: p1,
-            normal,
-            color: color1,
-            emissive,
-        },
-        MeshVertex {
-            position: p2,
-            normal,
-            color: color2,
-            emissive,
-        },
-        MeshVertex {
-            position: p3,
-            normal,
-            color: color3,
-            emissive,
-        },
-    ]);
-
-    // Two triangles with winding order dependent on face orientation
-    // Positive faces (normal points toward -axis): use p0→p3→p2 and p0→p2→p1
-    // Negative faces (normal points toward +axis): reverse winding to p0→p1→p2 and p0→p2→p3
-    if axis == 1 {
-        if positive {
-            mesh.indices.extend_from_slice(&[
-                base_index,
-                base_index + 1,
-                base_index + 2,
-                base_index,
-                base_index + 2,
-                base_index + 3,
-            ]);
-        } else {
-            mesh.indices.extend_from_slice(&[
-                base_index,
-                base_index + 3,
-                base_index + 2,
-                base_index,
-                base_index + 2,
-                base_index + 1,
-            ]);
-        }
-    } else {
-        if positive {
-            mesh.indices.extend_from_slice(&[
-                base_index,
-                base_index + 3,
-                base_index + 2,
-                base_index,
-                base_index + 2,
-                base_index + 1,
-            ]);
-        } else {
-            mesh.indices.extend_from_slice(&[
-                base_index,
-                base_index + 1,
-                base_index + 2,
-                base_index,
-                base_index + 2,
-                base_index + 3,
-            ]);
-        }
-    }
-}
+// `emit_quad` is intentionally removed - the AO-aware and cached emission
+// is handled by `emit_quad_with_ao_cache`. Keeping this function produced
+// a dead-code warning; it was also partially implemented and not used.
 
 // Emit a quad using AO values from a precomputed cache; if a corner isn't in the
 // cache it's considered unoccluded (AO = 1.0).
@@ -653,63 +491,132 @@ fn emit_quad_with_ao_cache<F>(
         (base[2] + dv_vec[2]) as f32,
     ];
 
-    let mut color0 = color;
-    let mut color1 = color;
-    let mut color2 = color;
-    let mut color3 = color;
-    color0[3] = c0_ao;
-    color1[3] = c1_ao;
-    color2[3] = c2_ao;
-    color3[3] = c3_ao;
+    // If AO is generally high or the quad is very small, emit directly.
+    let min_ao = c0_ao.min(c1_ao.min(c2_ao.min(c3_ao)));
 
-    let base_index = mesh.vertices.len() as u32;
-    mesh.vertices.extend_from_slice(&[
-        MeshVertex { position: p0, normal, color: color0, emissive },
-        MeshVertex { position: p1, normal, color: color1, emissive },
-        MeshVertex { position: p2, normal, color: color2, emissive },
-        MeshVertex { position: p3, normal, color: color3, emissive },
-    ]);
+    const MIN_SIZE: i32 = 2; // Subdivide until quad is about this size
+    const AO_THRESHOLD: f32 = 0.95; // Subdivide if any corner has AO < this
 
-    // Indices like `emit_quad`
-    if axis == 1 {
-        if positive {
-            mesh.indices.extend_from_slice(&[
-                base_index,
-                base_index + 1,
-                base_index + 2,
-                base_index,
-                base_index + 2,
-                base_index + 3,
-            ]);
+    if du <= MIN_SIZE || dv <= MIN_SIZE || min_ao >= AO_THRESHOLD {
+        let mut color0 = color;
+        let mut color1 = color;
+        let mut color2 = color;
+        let mut color3 = color;
+        color0[3] = c0_ao;
+        color1[3] = c1_ao;
+        color2[3] = c2_ao;
+        color3[3] = c3_ao;
+
+        let base_index = mesh.vertices.len() as u32;
+        mesh.vertices.extend_from_slice(&[
+            MeshVertex { position: p0, normal, color: color0, emissive },
+            MeshVertex { position: p1, normal, color: color1, emissive },
+            MeshVertex { position: p2, normal, color: color2, emissive },
+            MeshVertex { position: p3, normal, color: color3, emissive },
+        ]);
+
+        if axis == 1 {
+            if positive {
+                mesh.indices.extend_from_slice(&[
+                    base_index,
+                    base_index + 1,
+                    base_index + 2,
+                    base_index,
+                    base_index + 2,
+                    base_index + 3,
+                ]);
+            } else {
+                mesh.indices.extend_from_slice(&[
+                    base_index,
+                    base_index + 3,
+                    base_index + 2,
+                    base_index,
+                    base_index + 2,
+                    base_index + 1,
+                ]);
+            }
         } else {
-            mesh.indices.extend_from_slice(&[
-                base_index,
-                base_index + 3,
-                base_index + 2,
-                base_index,
-                base_index + 2,
-                base_index + 1,
-            ]);
+            if positive {
+                mesh.indices.extend_from_slice(&[
+                    base_index,
+                    base_index + 3,
+                    base_index + 2,
+                    base_index,
+                    base_index + 2,
+                    base_index + 1,
+                ]);
+            } else {
+                mesh.indices.extend_from_slice(&[
+                    base_index,
+                    base_index + 1,
+                    base_index + 2,
+                    base_index,
+                    base_index + 2,
+                    base_index + 3,
+                ]);
+            }
         }
-    } else {
-        if positive {
-            mesh.indices.extend_from_slice(&[
-                base_index,
-                base_index + 3,
-                base_index + 2,
-                base_index,
-                base_index + 2,
-                base_index + 1,
-            ]);
-        } else {
-            mesh.indices.extend_from_slice(&[
-                base_index,
-                base_index + 1,
-                base_index + 2,
-                base_index,
-                base_index + 2,
-                base_index + 3,
-            ]);
-        }
+        return;
     }
+
+    // Subdivide quadtree-style: split along u and v axes into 4 subquads
+    let u_mid = u0 + (du + 1) / 2;
+    let v_mid = v0 + (dv + 1) / 2;
+
+    // BL
+    emit_quad_with_ao_cache(
+        mesh,
+        palette,
+        Quad {
+            u0,
+            v0,
+            du: u_mid - u0,
+            dv: v_mid - v0,
+            ..quad
+        },
+        get_type,
+        ao_cache,
+    );
+    // BR
+    emit_quad_with_ao_cache(
+        mesh,
+        palette,
+        Quad {
+            u0: u_mid,
+            v0,
+            du: u0 + du - u_mid,
+            dv: v_mid - v0,
+            ..quad
+        },
+        get_type,
+        ao_cache,
+    );
+    // TL
+    emit_quad_with_ao_cache(
+        mesh,
+        palette,
+        Quad {
+            u0,
+            v0: v_mid,
+            du: u_mid - u0,
+            dv: v0 + dv - v_mid,
+            ..quad
+        },
+        get_type,
+        ao_cache,
+    );
+    // TR
+    emit_quad_with_ao_cache(
+        mesh,
+        palette,
+        Quad {
+            u0: u_mid,
+            v0: v_mid,
+            du: u0 + du - u_mid,
+            dv: v0 + dv - v_mid,
+            ..quad
+        },
+        get_type,
+        ao_cache,
+    );
 }
