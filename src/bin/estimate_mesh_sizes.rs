@@ -42,7 +42,7 @@ fn main() {
         let presence = chunk.count();
         if presence == 0 { continue; }
         nonempty += 1;
-        let mesh = generate_chunk_mesh(chunk, &palette, 1.0);
+        let mesh = generate_chunk_mesh(chunk, &palette, 1.0, None);
         total_vertices += mesh.vertices.len();
         total_indices += mesh.indices.len();
 

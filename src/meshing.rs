@@ -33,7 +33,7 @@ mod tests {
         chunk.set(8, 8, 7, 1);
 
         // Generate mesh with full AO strength
-        let mesh = generate_chunk_mesh(&chunk, &palette, 1.0);
+        let mesh = generate_chunk_mesh(&chunk, &palette, 1.0, None);
 
         // There should be at least one vertex where the alpha channel is less than 1.0
         // (meaning AO was applied), and all alpha values should be in [0.0, 1.0]
@@ -55,7 +55,7 @@ mod tests {
         let mut chunk = Chunk::new();
         // Single isolated voxel
         chunk.set(8, 8, 8, 1);
-        let mesh = generate_chunk_mesh(&chunk, &palette, 1.0);
+        let mesh = generate_chunk_mesh(&chunk, &palette, 1.0, None);
         // All vertex alphas should be 1.0
         assert!(mesh.vertices.len() > 0);
         for v in &mesh.vertices {
@@ -70,7 +70,7 @@ mod tests {
         let mut chunk = Chunk::new();
         // Single isolated voxel at the ground (y = 0)
         chunk.set(8, 0, 8, 1);
-        let mesh = generate_chunk_mesh(&chunk, &palette, 1.0);
+        let mesh = generate_chunk_mesh(&chunk, &palette, 1.0, None);
         // All vertex alphas should be near 1.0
         assert!(mesh.vertices.len() > 0);
         for v in &mesh.vertices {
@@ -119,7 +119,12 @@ struct Quad {
 
 /// Generate a greedy mesh for a 16x16x16 chunk.
 /// Merges coplanar faces with identical voxel types into larger quads.
-pub fn generate_chunk_mesh(chunk: &Chunk, palette: &Palette, ao_strength: f32) -> ChunkMesh {
+pub fn generate_chunk_mesh(
+    chunk: &Chunk,
+    palette: &Palette,
+    ao_strength: f32,
+    neighbors: Option<&std::collections::HashMap<(i8, i8, i8), Chunk>>,
+) -> ChunkMesh {
     // 3 axes: 0=x, 1=y, 2=z
     let mut mesh = ChunkMesh::default();
 
@@ -150,10 +155,24 @@ pub fn generate_chunk_mesh(chunk: &Chunk, palette: &Palette, ao_strength: f32) -
 
     // Helper to get voxel type at (x,y,z)
     let get_type = |x: i32, y: i32, z: i32| -> Option<u8> {
-        if x < 0 || x >= 16 || y < 0 || y >= 16 || z < 0 || z >= 16 {
-            return None;
+        // Inside chunk
+        if x >= 0 && x < 16 && y >= 0 && y < 16 && z >= 0 && z < 16 {
+            return chunk.get_type(x as u8, y as u8, z as u8);
         }
-        chunk.get_type(x as u8, y as u8, z as u8)
+        // Out-of-chunk - check neighbor snapshot if present
+        if let Some(neigh) = &neighbors {
+            let nx = if x < 0 { -1 } else if x >= 16 { 1 } else { 0 };
+            let ny = if y < 0 { -1 } else if y >= 16 { 1 } else { 0 };
+            let nz = if z < 0 { -1 } else if z >= 16 { 1 } else { 0 };
+            let entry = (nx as i8, ny as i8, nz as i8);
+            if let Some(ne) = neigh.get(&entry) {
+                let lx = if nx < 0 { (x + 16) as u8 } else if nx > 0 { (x - 16) as u8 } else { x as u8 };
+                let ly = if ny < 0 { (y + 16) as u8 } else if ny > 0 { (y - 16) as u8 } else { y as u8 };
+                let lz = if nz < 0 { (z + 16) as u8 } else if nz > 0 { (z - 16) as u8 } else { z as u8 };
+                return ne.get_type(lx, ly, lz);
+            }
+        }
+        None
     };
 
     // For each axis, create faces between differing neighbor voxels
@@ -328,14 +347,6 @@ pub fn generate_chunk_mesh(chunk: &Chunk, palette: &Palette, ao_strength: f32) -
             }
         }
         if axis_count >= 2 {
-            // Quick hack: skip AO for corners on the chunk boundary. Neighbor chunk
-            // voxels are not visible to this per-chunk mesher, which causes sharp
-            // seams; by skipping AO computation for boundary corners we avoid
-            // the abrupt darkening at chunk borders. This will lose AO at some
-            // seams but removes the visible artifact.
-            if key.0 == 0 || key.1 == 0 || key.2 == 0 || key.0 == 16 || key.1 == 16 || key.2 == 16 {
-                continue;
-            }
             // compute 3-sample AO for this corner using the owner set to avoid self-occlusion
             let owners_set = corner_owners.get(&key).unwrap();
             let mut count = 0u32;

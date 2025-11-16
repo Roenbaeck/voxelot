@@ -143,6 +143,8 @@ struct ActiveLight {
 struct MeshJob {
     key: (i64, i64, i64),
     chunk: Chunk,
+    /// Neighbor chunks snapshot mapped by (-1..=1) offsets from this chunk
+    neighbors: std::collections::HashMap<(i8, i8, i8), Chunk>,
 }
 
 #[derive(Debug)]
@@ -858,12 +860,12 @@ impl App {
                 .name(format!("mesh-worker-{}", worker_index))
                 .spawn(move || {
                     for job in job_rx.iter() {
-                        let MeshJob { key, chunk } = job;
+                        let MeshJob { key, chunk, neighbors } = job;
                         // Skip meshing completely empty chunks early.
                         if chunk.voxel_count == 0 {
                             continue;
                         }
-                        let mesh = generate_chunk_mesh(&chunk, &palette_clone, ao_strength);
+                        let mesh = generate_chunk_mesh(&chunk, &palette_clone, ao_strength, Some(&neighbors));
                         if result_tx
                             .send(MeshResult {
                                 key,
@@ -3496,11 +3498,27 @@ impl App {
                 .get_leaf_chunk_at_origin(WorldPos::new(key.0, key.1, key.2))
             {
                 Some(chunk) => {
+                    // Snapshot neighbor chunks so AO can be computed across chunk bounds.
+                    let mut neighbors: std::collections::HashMap<(i8, i8, i8), Chunk> = std::collections::HashMap::new();
+                    for dx in -1i64..=1 {
+                        for dy in -1i64..=1 {
+                            for dz in -1i64..=1 {
+                                let nx = key.0 + dx * 16;
+                                let ny = key.1 + dy * 16;
+                                let nz = key.2 + dz * 16;
+                                if let Some(nc) = self.world.get_leaf_chunk_at_origin(WorldPos::new(nx, ny, nz)) {
+                                    neighbors.insert((dx as i8, dy as i8, dz as i8), nc.clone());
+                                }
+                            }
+                        }
+                    }
+
                     if self
                         .mesh_job_tx
                         .send(MeshJob {
                             key,
                             chunk: chunk.clone(),
+                            neighbors,
                         })
                         .is_ok()
                     {
