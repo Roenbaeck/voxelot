@@ -222,7 +222,12 @@ struct CompositeUniforms {
     bloom_strength: f32,
     saturation_boost: f32,
     exposure: f32,
+    ssao_enabled: f32,
+    ssao_debug: f32,
+    ssao_strength: f32,
     _padding0: f32,
+    _padding1: f32,
+    _padding2: f32,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -234,6 +239,31 @@ struct BloomSettings {
     saturation_boost: f32,
     exposure: f32,
     blur_radius: f32,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct SsaoSettings {
+    sample_count: u32,
+    slice_count: u32,
+    radius: f32,
+    thickness: f32,
+    strength: f32,
+    blur_enabled: bool,
+    blur_radius: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct SsaoUniformsRaw {
+    sample_count: u32,
+    slice_count: u32,
+    sample_radius: f32,
+    hit_thickness: f32,
+    screen_width: f32,
+    screen_height: f32,
+    _pad0: f32,
+    _pad1: f32,
+    inverse_projection: [[f32; 4]; 4],
 }
 
 const DOF_UNIFORM_FLOATS: usize = 12;
@@ -701,8 +731,15 @@ struct App {
     bloom_pong_texture: Option<wgpu::Texture>,
     bloom_pong_view: Option<wgpu::TextureView>,
     bloom_extract_pipeline: Option<wgpu::RenderPipeline>,
+    // SSILVB (GTAO/SSAO with visibility bitmask)
+    ssilvb_pipeline: Option<wgpu::RenderPipeline>,
     bloom_blur_pipeline: Option<wgpu::RenderPipeline>,
+    ssao_blur_pipeline: Option<wgpu::RenderPipeline>,
     composite_pipeline: Option<wgpu::RenderPipeline>,
+    // SSILVB bind/group
+    ssilvb_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    ssilvb_bind_group: Option<wgpu::BindGroup>,
+    ssilvb_uniform_buffer: Option<wgpu::Buffer>,
     bloom_extract_bind_group_layout: Option<wgpu::BindGroupLayout>,
     bloom_blur_bind_group_layout: Option<wgpu::BindGroupLayout>,
     composite_bind_group_layout: Option<wgpu::BindGroupLayout>,
@@ -710,10 +747,21 @@ struct App {
     bloom_blur_horizontal_bind_group: Option<wgpu::BindGroup>,
     bloom_blur_vertical_bind_group: Option<wgpu::BindGroup>,
     composite_bind_group: Option<wgpu::BindGroup>,
+    ssao_ping_texture: Option<wgpu::Texture>,
+    ssao_ping_view: Option<wgpu::TextureView>,
+    ssao_pong_texture: Option<wgpu::Texture>,
+    ssao_pong_view: Option<wgpu::TextureView>,
+    // ssao_readback_buffer: Option<wgpu::Buffer>, // removed: readback temporarily disabled
     bloom_extract_uniform_buffer: Option<wgpu::Buffer>,
     bloom_blur_horizontal_uniform_buffer: Option<wgpu::Buffer>,
     bloom_blur_vertical_uniform_buffer: Option<wgpu::Buffer>,
+    ssao_blur_horizontal_uniform_buffer: Option<wgpu::Buffer>,
+    ssao_blur_vertical_uniform_buffer: Option<wgpu::Buffer>,
+    ssao_blur_horizontal_bind_group: Option<wgpu::BindGroup>,
+    ssao_blur_vertical_bind_group: Option<wgpu::BindGroup>,
     composite_uniform_buffer: Option<wgpu::Buffer>,
+    ssao_enabled: bool,
+    ssao_debug: bool,
 
     // DoF color buffer that stores blurred result before combine
     dof_color_texture: Option<wgpu::Texture>,
@@ -744,10 +792,10 @@ struct App {
     kawase_acc_frames: u64,
     bloom_settings: BloomSettings,
     bloom_enabled: bool,
+    ssao_settings: SsaoSettings,
     shadow_map_size: u32,
     shadow_darkness: f32,
     shadow_backface_scale: f32,
-    shadow_ao_strength: f32,
 }
 
 impl App {
@@ -851,7 +899,6 @@ impl App {
         let mesh_worker_count = cfg.performance.mesh_worker_count
             .unwrap_or_else(|| available_workers.min(6));
 
-    let ao_strength = cfg.shadows.ao_strength;
     for worker_index in 0..mesh_worker_count {
             let job_rx = mesh_job_rx.clone();
             let result_tx = mesh_result_tx.clone();
@@ -865,7 +912,7 @@ impl App {
                         if chunk.voxel_count == 0 {
                             continue;
                         }
-                        let mesh = generate_chunk_mesh(&chunk, &palette_clone, ao_strength, Some(&neighbors));
+                        let mesh = generate_chunk_mesh(&chunk, &palette_clone, Some(&neighbors));
                         if result_tx
                             .send(MeshResult {
                                 key,
@@ -990,8 +1037,14 @@ impl App {
             bloom_ping_view: None,
             bloom_pong_texture: None,
             bloom_pong_view: None,
+            ssao_ping_texture: None,
+            ssao_ping_view: None,
+            ssao_pong_texture: None,
+            ssao_pong_view: None,
+            // ssao_readback_buffer: None,
             bloom_extract_pipeline: None,
             bloom_blur_pipeline: None,
+            ssao_blur_pipeline: None,
             composite_pipeline: None,
             bloom_extract_bind_group_layout: None,
             bloom_blur_bind_group_layout: None,
@@ -1003,7 +1056,15 @@ impl App {
             bloom_extract_uniform_buffer: None,
             bloom_blur_horizontal_uniform_buffer: None,
             bloom_blur_vertical_uniform_buffer: None,
+            ssao_blur_horizontal_uniform_buffer: None,
+            ssao_blur_vertical_uniform_buffer: None,
+            ssao_blur_horizontal_bind_group: None,
+            ssao_blur_vertical_bind_group: None,
             composite_uniform_buffer: None,
+            ssilvb_pipeline: None,
+            ssilvb_bind_group_layout: None,
+            ssilvb_bind_group: None,
+            ssilvb_uniform_buffer: None,
             dof_color_texture: None,
             dof_color_view: None,
             dof_combine_pipeline: None,
@@ -1044,10 +1105,12 @@ impl App {
                 blur_radius: cfg.effects.bloom.blur_radius,
             },
             bloom_enabled: cfg.effects.bloom.enabled,
+            ssao_settings: SsaoSettings { sample_count: 8, slice_count: 4, radius: 4.0, thickness: 0.5, strength: cfg.effects.ssao.strength, blur_enabled: cfg.effects.ssao.blur_enabled, blur_radius: cfg.effects.ssao.blur_radius },
+            ssao_enabled: cfg.effects.ssao.enabled,
+            ssao_debug: false,
             shadow_map_size: cfg.shadows.map_size,
             shadow_darkness: cfg.shadows.darkness,
             shadow_backface_scale: cfg.shadows.backface_ambient_scale,
-            shadow_ao_strength: cfg.shadows.ao_strength,
         }
     }
 
@@ -1087,7 +1150,6 @@ impl App {
             // Shadow settings
             full_cfg.shadows.map_size = self.shadow_map_size;
             full_cfg.shadows.backface_ambient_scale = self.shadow_backface_scale;
-            full_cfg.shadows.ao_strength = self.shadow_ao_strength;
             full_cfg.shadows.darkness = self.shadow_darkness;
             
             // Performance settings
@@ -1158,6 +1220,46 @@ impl App {
         }
     }
 
+    fn build_ssao_blur_uniforms(
+        &self,
+        target_width: u32,
+        target_height: u32,
+        direction: [f32; 2],
+    ) -> BloomBlurUniforms {
+        BloomBlurUniforms {
+            direction,
+            radius: self.ssao_settings.blur_radius,
+            _padding0: 0.0,
+            texel_size: [
+                1.0 / target_width.max(1) as f32,
+                1.0 / target_height.max(1) as f32,
+            ],
+            _padding1: [0.0; 2],
+        }
+    }
+
+    fn build_ssilvb_uniforms(&self, src_width: u32, src_height: u32) -> SsaoUniformsRaw {
+        let aspect = src_width as f32 / src_height as f32;
+        let projection = Mat4::perspective_rh(
+            self.camera_controller.camera.fov,
+            aspect,
+            self.camera_controller.camera.near,
+            self.camera_controller.camera.far,
+        );
+        let inv_proj = projection.inverse();
+        SsaoUniformsRaw {
+            sample_count: self.ssao_settings.sample_count as u32,
+            slice_count: self.ssao_settings.slice_count as u32,
+            sample_radius: self.ssao_settings.radius,
+            hit_thickness: self.ssao_settings.thickness,
+            screen_width: src_width as f32,
+            screen_height: src_height as f32,
+            _pad0: 0.0,
+            _pad1: 0.0,
+            inverse_projection: inv_proj.to_cols_array_2d(),
+        }
+    }
+
     fn build_composite_uniforms(&self) -> CompositeUniforms {
         CompositeUniforms {
             bloom_strength: if self.bloom_enabled {
@@ -1167,7 +1269,12 @@ impl App {
             },
             saturation_boost: self.bloom_settings.saturation_boost,
             exposure: self.bloom_settings.exposure,
+            ssao_enabled: if self.ssao_enabled { 1.0 } else { 0.0 },
+            ssao_debug: if self.ssao_debug { 1.0 } else { 0.0 },
+            ssao_strength: self.ssao_settings.strength,
             _padding0: 0.0,
+            _padding1: 0.0,
+            _padding2: 0.0,
         }
     }
 
@@ -1216,6 +1323,40 @@ impl App {
                         "disabled"
                     }
                 );
+            }
+            KeyCode::KeyN => {
+                self.ssao_enabled = !self.ssao_enabled;
+                println!("SSAO {}", if self.ssao_enabled { "enabled" } else { "disabled" });
+            }
+            KeyCode::F1 => {
+                // decrease SSILVB sample count
+                if self.ssao_settings.sample_count > 1 {
+                    self.ssao_settings.sample_count = self.ssao_settings.sample_count.saturating_sub(1);
+                    println!("SSAO sample_count: {}", self.ssao_settings.sample_count);
+                }
+            }
+            KeyCode::F2 => {
+                // increase SSILVB sample count
+                self.ssao_settings.sample_count = (self.ssao_settings.sample_count + 1).min(32);
+                println!("SSAO sample_count: {}", self.ssao_settings.sample_count);
+            }
+            KeyCode::F3 => {
+                // decrease sampling radius
+                self.ssao_settings.radius = (self.ssao_settings.radius - 1.0).max(0.0);
+                println!("SSAO radius: {}", self.ssao_settings.radius);
+            }
+            KeyCode::F4 => {
+                // increase sampling radius
+                self.ssao_settings.radius += 1.0;
+                println!("SSAO radius: {}", self.ssao_settings.radius);
+            }
+            KeyCode::KeyH => {
+                self.ssao_debug = !self.ssao_debug;
+                println!("SSAO debug {}", if self.ssao_debug { "enabled" } else { "disabled" });
+                if self.ssao_debug {
+                    // schedule immediate readback of SSAO ping texture to print stats
+                    // readback currently disabled, visual debug still active
+                }
             }
             KeyCode::KeyK => {
                 // Decrease LOD distance (more detail at distance)
@@ -1467,6 +1608,40 @@ impl App {
         self.bloom_pong_view = Some(bloom_pong_view);
         self.bloom_pong_texture = Some(bloom_pong_texture);
 
+        // SSAO ping/pong textures (half-res like bloom)
+        let ssao_extent = wgpu::Extent3d {
+            width: (config.width / 2).max(1),
+            height: (config.height / 2).max(1),
+            depth_or_array_layers: 1,
+        };
+        let ssao_ping_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("SSAO Ping Texture"),
+            size: ssao_extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let ssao_ping_view = ssao_ping_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let ssao_pong_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("SSAO Pong Texture"),
+            size: ssao_extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let ssao_pong_view = ssao_pong_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        self.ssao_ping_texture = Some(ssao_ping_texture);
+        self.ssao_ping_view = Some(ssao_ping_view);
+        self.ssao_pong_texture = Some(ssao_pong_texture);
+        self.ssao_pong_view = Some(ssao_pong_view);
+
         self.update_dof_bind_group();
     // Combine bind group depends on DoF color and CoC buffers
     self.update_dof_combine_bind_group();
@@ -1657,8 +1832,28 @@ impl App {
             queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[data]));
         }
 
+        if let Some(buffer) = self.ssao_blur_horizontal_uniform_buffer.as_ref() {
+            let ssao_width = (config.width / 2).max(1);
+            let ssao_height = (config.height / 2).max(1);
+            let data = self.build_ssao_blur_uniforms(ssao_width, ssao_height, [1.0, 0.0]);
+            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[data]));
+        }
+
+        if let Some(buffer) = self.ssao_blur_vertical_uniform_buffer.as_ref() {
+            let ssao_width = (config.width / 2).max(1);
+            let ssao_height = (config.height / 2).max(1);
+            let data = self.build_ssao_blur_uniforms(ssao_width, ssao_height, [0.0, 1.0]);
+            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[data]));
+        }
+
         if let Some(buffer) = self.composite_uniform_buffer.as_ref() {
             let data = self.build_composite_uniforms();
+            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[data]));
+        }
+
+        // SSILVB uniforms
+        if let Some(buffer) = self.ssilvb_uniform_buffer.as_ref() {
+            let data = self.build_ssilvb_uniforms((config.width / 2).max(1), (config.height / 2).max(1));
             queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[data]));
         }
     }
@@ -1740,6 +1935,42 @@ impl App {
                     ],
                 }));
 
+            // SSAO blur horizontal bind group (use bloom blur pipeline)
+            if self.ssao_settings.blur_enabled {
+                if let (Some(ssao_h_ubo), Some(ssao_ping_view), Some(psampler)) = (
+                self.ssao_blur_horizontal_uniform_buffer.as_ref(),
+                self.ssao_ping_view.as_ref(),
+                self.post_sampler.as_ref(),
+            ) {
+                self.ssao_blur_horizontal_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("SSAO Blur Horizontal Bind Group"),
+                    layout: blur_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: ssao_h_ubo.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(ssao_ping_view) },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(psampler) },
+                    ],
+                }));
+                }
+            }
+
+            // SSAO bind group uses uniform 0, offscreen depth (1), and post sampler (2)
+            if let (Some(ssao_ubo), Some(depth_view), Some(psampler)) = (
+                self.ssilvb_uniform_buffer.as_ref(),
+                self.offscreen_depth_view.as_ref(),
+                self.post_sampler.as_ref(),
+            ) {
+                self.ssilvb_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("SSILVB Bind Group"),
+                    layout: self.ssilvb_bind_group_layout.as_ref().unwrap(),
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: ssao_ubo.as_entire_binding(), },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(depth_view), },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(psampler), },
+                    ],
+                }));
+            }
+
             self.bloom_blur_vertical_bind_group =
                 Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("Bloom Blur Vertical Bind Group"),
@@ -1759,11 +1990,31 @@ impl App {
                         },
                     ],
                 }));
+
+            // SSAO blur vertical bind group (reads from SSAO Pong after horizontal)
+            if self.ssao_settings.blur_enabled {
+                if let (Some(ssao_v_ubo), Some(ssao_pong_view), Some(psampler)) = (
+                self.ssao_blur_vertical_uniform_buffer.as_ref(),
+                self.ssao_pong_view.as_ref(),
+                self.post_sampler.as_ref(),
+            ) {
+                self.ssao_blur_vertical_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("SSAO Blur Vertical Bind Group"),
+                    layout: blur_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: ssao_v_ubo.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(ssao_pong_view) },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(psampler) },
+                    ],
+                }));
+                }
+            }
         }
 
-        if let (Some(composite_ubo), Some(sampler)) = (
+        if let (Some(composite_ubo), Some(sampler), Some(ssao_ping_view)) = (
             self.composite_uniform_buffer.as_ref(),
             self.post_sampler.as_ref(),
+            self.ssao_ping_view.as_ref(),
         ) {
             self.composite_bind_group =
                 Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1783,6 +2034,10 @@ impl App {
                             resource: wgpu::BindingResource::TextureView(bloom_ping_view),
                         },
                         wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::TextureView(ssao_ping_view),
+                        },
+                        wgpu::BindGroupEntry {
                             binding: 3,
                             resource: wgpu::BindingResource::Sampler(sampler),
                         },
@@ -1790,6 +2045,8 @@ impl App {
                 }));
         }
     }
+
+    // Readbacks are disabled — use the debug overlay for immediate inspection
 
     fn update_kawase_bind_groups(&mut self) {
         let Some(device) = self.device.as_ref() else {
@@ -2827,9 +3084,9 @@ impl App {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
 
@@ -2840,9 +3097,21 @@ impl App {
             ),
         });
 
+        let ssilvb_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("SSILVB / SSAO Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../shaders/ssilvb.wgsl").into(),
+            ),
+        });
+
         let bloom_blur_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Bloom Blur Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/bloom_blur.wgsl").into()),
+        });
+
+        let ssao_blur_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("SSAO Blur Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/ssao_blur.wgsl").into()),
         });
 
         let composite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -2884,6 +3153,35 @@ impl App {
                     },
                 ],
             });
+
+            let ssilvb_bind_group_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("SSILVB Bind Group Layout"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                });
 
         let bloom_blur_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -2944,6 +3242,16 @@ impl App {
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
                             sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -3059,6 +3367,32 @@ impl App {
             cache: None,
         });
 
+        let ssao_blur_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("SSAO Blur Pipeline"),
+            layout: Some(&bloom_blur_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &ssao_blur_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &ssao_blur_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         let composite_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Composite Pipeline"),
             layout: Some(&composite_pipeline_layout),
@@ -3160,6 +3494,25 @@ impl App {
             contents: bytemuck::cast_slice(&[uniforms]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+
+        // SSAO blur uniforms (half-resolution like SSao textures)
+        let ssao_width = (config.width / 2).max(1);
+        let ssao_height = (config.height / 2).max(1);
+        let ssao_blur_horizontal_uniforms = self.build_ssao_blur_uniforms(ssao_width, ssao_height, [1.0, 0.0]);
+        let ssao_blur_horizontal_uniform_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("SSAO Blur Horizontal Uniform Buffer"),
+                contents: bytemuck::cast_slice(&[ssao_blur_horizontal_uniforms]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+
+        let ssao_blur_vertical_uniforms = self.build_ssao_blur_uniforms(ssao_width, ssao_height, [0.0, 1.0]);
+        let ssao_blur_vertical_uniform_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("SSAO Blur Vertical Uniform Buffer"),
+                contents: bytemuck::cast_slice(&[ssao_blur_vertical_uniforms]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
 
         // Create light probe buffer (start with capacity for 64 probes)
         let light_probe_capacity = 64;
@@ -3311,6 +3664,7 @@ impl App {
         self.dof_bind_group = None;
         self.bloom_extract_pipeline = Some(bloom_extract_pipeline);
         self.bloom_blur_pipeline = Some(bloom_blur_pipeline);
+        self.ssao_blur_pipeline = Some(ssao_blur_pipeline);
         self.composite_pipeline = Some(composite_pipeline);
         self.bloom_extract_bind_group_layout = Some(bloom_extract_bind_group_layout);
         self.bloom_blur_bind_group_layout = Some(bloom_blur_bind_group_layout);
@@ -3318,11 +3672,58 @@ impl App {
         self.bloom_extract_uniform_buffer = Some(bloom_extract_uniform_buffer);
         self.bloom_blur_horizontal_uniform_buffer = Some(bloom_blur_horizontal_uniform_buffer);
         self.bloom_blur_vertical_uniform_buffer = Some(bloom_blur_vertical_uniform_buffer);
+        self.ssao_blur_horizontal_uniform_buffer = Some(ssao_blur_horizontal_uniform_buffer);
+        self.ssao_blur_vertical_uniform_buffer = Some(ssao_blur_vertical_uniform_buffer);
+            // Don't create SSAO blur bind groups until ping/pong views exist; update later in update_bloom_bind_groups()
         self.composite_uniform_buffer = Some(composite_uniform_buffer);
+        // SSILVB uniforms
+        let ssilvb_uniforms = self.build_ssilvb_uniforms((config.width / 2).max(1), (config.height / 2).max(1));
+        let ssilvb_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("SSILVB Uniform Buffer"),
+            contents: bytemuck::cast_slice(&[ssilvb_uniforms]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        self.ssilvb_uniform_buffer = Some(ssilvb_uniform_buffer);
         self.bloom_extract_bind_group = None;
         self.bloom_blur_horizontal_bind_group = None;
         self.bloom_blur_vertical_bind_group = None;
         self.composite_bind_group = None;
+
+        // SSILVB: SSAO pipeline creation
+        let ssilvb_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("SSILVB Pipeline Layout"),
+            bind_group_layouts: &[&ssilvb_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let ssilvb_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("SSILVB Pipeline"),
+            layout: Some(&ssilvb_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &ssilvb_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &ssilvb_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        self.ssilvb_pipeline = Some(ssilvb_pipeline);
+        self.ssilvb_bind_group_layout = Some(ssilvb_bind_group_layout);
 
         self.window = Some(window);
         self.surface = Some(surface);
@@ -4797,6 +5198,97 @@ impl App {
                 self.bloom_extract_bind_group.as_ref(),
                 self.bloom_ping_view.as_ref(),
             ) {
+                    // SSILVB/SSAO: run before bloom so AO can affect later passes
+                    if self.ssao_enabled {
+                        if let (
+                            Some(ssilvb_pipeline),
+                            Some(ssilvb_bind_group),
+                            Some(ssao_ping_view),
+                        ) = (
+                            self.ssilvb_pipeline.as_ref(),
+                            self.ssilvb_bind_group.as_ref(),
+                            self.ssao_ping_view.as_ref(),
+                        ) {
+                            let mut ssao_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("SSILVB Pass"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: ssao_ping_view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                                    depth_slice: None,
+                                })],
+                                depth_stencil_attachment: None,
+                                timestamp_writes: None,
+                                occlusion_query_set: None,
+                            });
+                            ssao_pass.set_pipeline(ssilvb_pipeline);
+                            ssao_pass.set_bind_group(0, ssilvb_bind_group, &[]);
+                            ssao_pass.draw(0..3, 0..1);
+                        }
+
+                        // Optional SSAO blur (reduce speckle): horizontal then vertical
+                        if self.ssao_settings.blur_enabled {
+                            if let (
+                            Some(ssao_blur_pipeline),
+                            Some(ssao_blur_h),
+                            Some(ssao_pong_view),
+                        ) = (
+                            self.ssao_blur_pipeline.as_ref(),
+                            self.ssao_blur_horizontal_bind_group.as_ref(),
+                            self.ssao_pong_view.as_ref(),
+                        ) {
+                            let mut blur_pass_h = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("SSAO Blur Horizontal Pass"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: ssao_pong_view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                    depth_slice: None,
+                                })],
+                                depth_stencil_attachment: None,
+                                timestamp_writes: None,
+                                occlusion_query_set: None,
+                            });
+                            blur_pass_h.set_pipeline(ssao_blur_pipeline);
+                            blur_pass_h.set_bind_group(0, ssao_blur_h, &[]);
+                            blur_pass_h.draw(0..3, 0..1);
+                            }
+                        }
+
+                        if self.ssao_settings.blur_enabled {
+                            if let (
+                            Some(ssao_blur_pipeline),
+                            Some(ssao_blur_v),
+                            Some(ssao_ping_view),
+                        ) = (
+                            self.ssao_blur_pipeline.as_ref(),
+                            self.ssao_blur_vertical_bind_group.as_ref(),
+                            self.ssao_ping_view.as_ref(),
+                        ) {
+                            let mut blur_pass_v = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("SSAO Blur Vertical Pass"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: ssao_ping_view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                    depth_slice: None,
+                                })],
+                                depth_stencil_attachment: None,
+                                timestamp_writes: None,
+                                occlusion_query_set: None,
+                            });
+                            blur_pass_v.set_pipeline(ssao_blur_pipeline);
+                            blur_pass_v.set_bind_group(0, ssao_blur_v, &[]);
+                            blur_pass_v.draw(0..3, 0..1);
+                            }
+                        }
+                    }
                 let mut extract_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Bloom Extract Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {

@@ -64,6 +64,28 @@ pub struct EffectsConfig {
     pub depth_of_field: DepthOfFieldConfig,
     #[serde(default)]
     pub bloom: BloomConfig,
+    #[serde(default)]
+    pub ssao: SsaoConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SsaoConfig {
+    #[serde(default = "default_ssao_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_ssao_sample_count")]
+    pub sample_count: u32,
+    #[serde(default = "default_ssao_slice_count")]
+    pub slice_count: u32,
+    #[serde(default = "default_ssao_radius")]
+    pub radius: f32,
+    #[serde(default = "default_ssao_thickness")]
+    pub thickness: f32,
+    #[serde(default = "default_ssao_strength")]
+    pub strength: f32,
+    #[serde(default = "default_ssao_blur_enabled")]
+    pub blur_enabled: bool,
+    #[serde(default = "default_ssao_blur_radius")]
+    pub blur_radius: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,8 +134,6 @@ pub struct ShadowConfig {
     pub darkness: f32,
     #[serde(default = "default_backface_ambient_scale")]
     pub backface_ambient_scale: f32,
-    #[serde(default = "default_ao_strength")]
-    pub ao_strength: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,6 +263,18 @@ fn default_bloom_blur_radius() -> f32 {
     3.8
 }
 
+fn default_ssao_enabled() -> bool { false }
+fn default_ssao_sample_count() -> u32 { 8 }
+fn default_ssao_slice_count() -> u32 { 4 }
+fn default_ssao_radius() -> f32 { 4.0 }
+fn default_ssao_thickness() -> f32 { 0.5 }
+
+fn default_ssao_strength() -> f32 { 1.0 }
+
+fn default_ssao_blur_enabled() -> bool { true }
+
+fn default_ssao_blur_radius() -> f32 { 2.0 }
+
 fn default_shadow_map_size() -> u32 {
     4096
 }
@@ -253,10 +285,6 @@ fn default_shadow_darkness() -> f32 {
 
 fn default_backface_ambient_scale() -> f32 {
     0.7
-}
-
-fn default_ao_strength() -> f32 {
-    0.9
 }
 
 fn default_mesh_cache_mb() -> u64 {
@@ -351,6 +379,22 @@ impl Default for EffectsConfig {
         Self {
             depth_of_field: DepthOfFieldConfig::default(),
             bloom: BloomConfig::default(),
+            ssao: SsaoConfig::default(),
+        }
+    }
+}
+
+impl Default for SsaoConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_ssao_enabled(),
+            sample_count: default_ssao_sample_count(),
+            slice_count: default_ssao_slice_count(),
+            radius: default_ssao_radius(),
+            thickness: default_ssao_thickness(),
+            strength: default_ssao_strength(),
+            blur_enabled: default_ssao_blur_enabled(),
+            blur_radius: default_ssao_blur_radius(),
         }
     }
 }
@@ -361,7 +405,6 @@ impl Default for ShadowConfig {
             map_size: default_shadow_map_size(),
             darkness: default_shadow_darkness(),
             backface_ambient_scale: default_backface_ambient_scale(),
-            ao_strength: default_ao_strength(),
         }
     }
 }
@@ -445,6 +488,5 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(cfg.shadows.darkness, default_shadow_darkness());
         assert_eq!(cfg.shadows.backface_ambient_scale, default_backface_ambient_scale());
-        assert_eq!(cfg.shadows.ao_strength, default_ao_strength());
     }
 }
