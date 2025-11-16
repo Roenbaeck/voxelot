@@ -64,6 +64,22 @@ pub struct EffectsConfig {
     pub depth_of_field: DepthOfFieldConfig,
     #[serde(default)]
     pub bloom: BloomConfig,
+    #[serde(default)]
+    pub ssao: SsaoConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SsaoConfig {
+    #[serde(default = "default_ssao_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_ssao_sample_count")]
+    pub sample_count: u32,
+    #[serde(default = "default_ssao_slice_count")]
+    pub slice_count: u32,
+    #[serde(default = "default_ssao_radius")]
+    pub radius: f32,
+    #[serde(default = "default_ssao_thickness")]
+    pub thickness: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,6 +259,12 @@ fn default_bloom_blur_radius() -> f32 {
     3.8
 }
 
+fn default_ssao_enabled() -> bool { false }
+fn default_ssao_sample_count() -> u32 { 8 }
+fn default_ssao_slice_count() -> u32 { 4 }
+fn default_ssao_radius() -> f32 { 4.0 }
+fn default_ssao_thickness() -> f32 { 0.5 }
+
 fn default_shadow_map_size() -> u32 {
     4096
 }
@@ -351,6 +373,19 @@ impl Default for EffectsConfig {
         Self {
             depth_of_field: DepthOfFieldConfig::default(),
             bloom: BloomConfig::default(),
+            ssao: SsaoConfig::default(),
+        }
+    }
+}
+
+impl Default for SsaoConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_ssao_enabled(),
+            sample_count: default_ssao_sample_count(),
+            slice_count: default_ssao_slice_count(),
+            radius: default_ssao_radius(),
+            thickness: default_ssao_thickness(),
         }
     }
 }

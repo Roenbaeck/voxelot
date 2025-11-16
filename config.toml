@@ -1,5 +1,5 @@
 [world]
-file = "worlds/world_3.oct"
+file = "worlds/world_1.oct"
 palette = "worlds/palette.txt"
 camera_position = [
     320.0,
@@ -18,10 +18,10 @@ camera_speed_multiplier = 4.76837158203125
 
 [atmosphere]
 fog_density = 0.0009499997249804437
-time_of_day = 0.2402334362268448
+time_of_day = 0.6727734804153442
 
 [effects.depth_of_field]
-enabled = false
+enabled = true
 focal_distance = 120.0
 focal_range = 5.0
 blur_strength = 2.5
@@ -39,11 +39,18 @@ saturation_boost = 1.5
 exposure = 1.1799999475479126
 blur_radius = 3.799999952316284
 
+[effects.ssao]
+enabled = false
+sample_count = 8
+slice_count = 4
+radius = 4.0
+thickness = 0.5
+
 [shadows]
 map_size = 4096
 darkness = 2.0
 backface_ambient_scale = 0.25
-ao_strength = 0.8999999761581421
+ao_strength = 0.009999999776482582
 
 [performance]
 mesh_cache_budget_mb = 256
