@@ -5,6 +5,7 @@ struct CompositeUniforms {
     ssao_enabled: f32,
     // Reserve a full vec4 for other per-pass state (debug and padding)
     ssao_debug: f32,
+    ssao_strength: f32,
     _pad0: f32,
     _pad1: f32,
     _pad2: f32,
@@ -42,14 +43,17 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let base = textureSample(post_color, post_sampler, uv).rgb;
     let bloom = textureSample(bloom_texture, post_sampler, uv).rgb;
     var ao: f32 = 1.0;
+    var raw_ao: f32 = 1.0;
     if (composite.ssao_enabled > 0.5) {
-        ao = textureSample(ssao_texture, post_sampler, uv).a;
+        raw_ao = textureSample(ssao_texture, post_sampler, uv).a;
+        // Blend between no occlusion (1.0) and raw AO by strength.
+        ao = 1.0 - composite.ssao_strength * (1.0 - raw_ao);
     }
 
     // Optional debug overlay: show SSAO in greyscale when ssao_debug is set
     if (composite.ssao_debug > 0.5) {
         // Show raw AO as greyscale (white = occluded) for easier debugging.
-        return vec4<f32>(vec3<f32>(ao), 1.0);
+        return vec4<f32>(vec3<f32>(raw_ao), 1.0);
     }
 
     let luma = dot(base, vec3<f32>(0.299, 0.587, 0.114));

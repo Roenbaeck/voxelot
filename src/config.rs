@@ -80,6 +80,8 @@ pub struct SsaoConfig {
     pub radius: f32,
     #[serde(default = "default_ssao_thickness")]
     pub thickness: f32,
+    #[serde(default = "default_ssao_strength")]
+    pub strength: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -263,6 +265,8 @@ fn default_ssao_slice_count() -> u32 { 4 }
 fn default_ssao_radius() -> f32 { 4.0 }
 fn default_ssao_thickness() -> f32 { 0.5 }
 
+fn default_ssao_strength() -> f32 { 1.0 }
+
 fn default_shadow_map_size() -> u32 {
     4096
 }
@@ -380,6 +384,7 @@ impl Default for SsaoConfig {
             slice_count: default_ssao_slice_count(),
             radius: default_ssao_radius(),
             thickness: default_ssao_thickness(),
+            strength: default_ssao_strength(),
         }
     }
 }

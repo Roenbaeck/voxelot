@@ -224,6 +224,7 @@ struct CompositeUniforms {
     exposure: f32,
     ssao_enabled: f32,
     ssao_debug: f32,
+    ssao_strength: f32,
     _padding0: f32,
     _padding1: f32,
     _padding2: f32,
@@ -246,6 +247,7 @@ struct SsaoSettings {
     slice_count: u32,
     radius: f32,
     thickness: f32,
+    strength: f32,
 }
 
 #[repr(C)]
@@ -730,6 +732,7 @@ struct App {
     // SSILVB (GTAO/SSAO with visibility bitmask)
     ssilvb_pipeline: Option<wgpu::RenderPipeline>,
     bloom_blur_pipeline: Option<wgpu::RenderPipeline>,
+    ssao_blur_pipeline: Option<wgpu::RenderPipeline>,
     composite_pipeline: Option<wgpu::RenderPipeline>,
     // SSILVB bind/group
     ssilvb_bind_group_layout: Option<wgpu::BindGroupLayout>,
@@ -750,6 +753,10 @@ struct App {
     bloom_extract_uniform_buffer: Option<wgpu::Buffer>,
     bloom_blur_horizontal_uniform_buffer: Option<wgpu::Buffer>,
     bloom_blur_vertical_uniform_buffer: Option<wgpu::Buffer>,
+    ssao_blur_horizontal_uniform_buffer: Option<wgpu::Buffer>,
+    ssao_blur_vertical_uniform_buffer: Option<wgpu::Buffer>,
+    ssao_blur_horizontal_bind_group: Option<wgpu::BindGroup>,
+    ssao_blur_vertical_bind_group: Option<wgpu::BindGroup>,
     composite_uniform_buffer: Option<wgpu::Buffer>,
     ssao_enabled: bool,
     ssao_debug: bool,
@@ -1035,6 +1042,7 @@ impl App {
             // ssao_readback_buffer: None,
             bloom_extract_pipeline: None,
             bloom_blur_pipeline: None,
+            ssao_blur_pipeline: None,
             composite_pipeline: None,
             bloom_extract_bind_group_layout: None,
             bloom_blur_bind_group_layout: None,
@@ -1046,6 +1054,10 @@ impl App {
             bloom_extract_uniform_buffer: None,
             bloom_blur_horizontal_uniform_buffer: None,
             bloom_blur_vertical_uniform_buffer: None,
+            ssao_blur_horizontal_uniform_buffer: None,
+            ssao_blur_vertical_uniform_buffer: None,
+            ssao_blur_horizontal_bind_group: None,
+            ssao_blur_vertical_bind_group: None,
             composite_uniform_buffer: None,
             ssilvb_pipeline: None,
             ssilvb_bind_group_layout: None,
@@ -1091,7 +1103,7 @@ impl App {
                 blur_radius: cfg.effects.bloom.blur_radius,
             },
             bloom_enabled: cfg.effects.bloom.enabled,
-            ssao_settings: SsaoSettings { sample_count: 8, slice_count: 4, radius: 4.0, thickness: 0.5 },
+            ssao_settings: SsaoSettings { sample_count: 8, slice_count: 4, radius: 4.0, thickness: 0.5, strength: cfg.effects.ssao.strength },
             ssao_enabled: cfg.effects.ssao.enabled,
             ssao_debug: false,
             shadow_map_size: cfg.shadows.map_size,
@@ -1239,6 +1251,7 @@ impl App {
             exposure: self.bloom_settings.exposure,
             ssao_enabled: if self.ssao_enabled { 1.0 } else { 0.0 },
             ssao_debug: if self.ssao_debug { 1.0 } else { 0.0 },
+            ssao_strength: self.ssao_settings.strength,
             _padding0: 0.0,
             _padding1: 0.0,
             _padding2: 0.0,
@@ -1799,6 +1812,20 @@ impl App {
             queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[data]));
         }
 
+        if let Some(buffer) = self.ssao_blur_horizontal_uniform_buffer.as_ref() {
+            let ssao_width = (config.width / 2).max(1);
+            let ssao_height = (config.height / 2).max(1);
+            let data = self.build_bloom_blur_uniforms(ssao_width, ssao_height, [1.0, 0.0]);
+            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[data]));
+        }
+
+        if let Some(buffer) = self.ssao_blur_vertical_uniform_buffer.as_ref() {
+            let ssao_width = (config.width / 2).max(1);
+            let ssao_height = (config.height / 2).max(1);
+            let data = self.build_bloom_blur_uniforms(ssao_width, ssao_height, [0.0, 1.0]);
+            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[data]));
+        }
+
         if let Some(buffer) = self.composite_uniform_buffer.as_ref() {
             let data = self.build_composite_uniforms();
             queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[data]));
@@ -1888,6 +1915,23 @@ impl App {
                     ],
                 }));
 
+            // SSAO blur horizontal bind group (use bloom blur pipeline)
+            if let (Some(ssao_h_ubo), Some(ssao_ping_view), Some(psampler)) = (
+                self.ssao_blur_horizontal_uniform_buffer.as_ref(),
+                self.ssao_ping_view.as_ref(),
+                self.post_sampler.as_ref(),
+            ) {
+                self.ssao_blur_horizontal_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("SSAO Blur Horizontal Bind Group"),
+                    layout: blur_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: ssao_h_ubo.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(ssao_ping_view) },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(psampler) },
+                    ],
+                }));
+            }
+
             // SSAO bind group uses uniform 0, offscreen depth (1), and post sampler (2)
             if let (Some(ssao_ubo), Some(depth_view), Some(psampler)) = (
                 self.ssilvb_uniform_buffer.as_ref(),
@@ -1924,6 +1968,23 @@ impl App {
                         },
                     ],
                 }));
+
+            // SSAO blur vertical bind group (reads from SSAO Pong after horizontal)
+            if let (Some(ssao_v_ubo), Some(ssao_pong_view), Some(psampler)) = (
+                self.ssao_blur_vertical_uniform_buffer.as_ref(),
+                self.ssao_pong_view.as_ref(),
+                self.post_sampler.as_ref(),
+            ) {
+                self.ssao_blur_vertical_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("SSAO Blur Vertical Bind Group"),
+                    layout: blur_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: ssao_v_ubo.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(ssao_pong_view) },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(psampler) },
+                    ],
+                }));
+            }
         }
 
         if let (Some(composite_ubo), Some(sampler), Some(ssao_ping_view)) = (
@@ -3024,6 +3085,11 @@ impl App {
             source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/bloom_blur.wgsl").into()),
         });
 
+        let ssao_blur_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("SSAO Blur Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/ssao_blur.wgsl").into()),
+        });
+
         let composite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Composite Shader"),
             source: wgpu::ShaderSource::Wgsl(
@@ -3277,6 +3343,32 @@ impl App {
             cache: None,
         });
 
+        let ssao_blur_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("SSAO Blur Pipeline"),
+            layout: Some(&bloom_blur_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &ssao_blur_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &ssao_blur_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         let composite_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Composite Pipeline"),
             layout: Some(&composite_pipeline_layout),
@@ -3378,6 +3470,25 @@ impl App {
             contents: bytemuck::cast_slice(&[uniforms]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+
+        // SSAO blur uniforms (half-resolution like SSao textures)
+        let ssao_width = (config.width / 2).max(1);
+        let ssao_height = (config.height / 2).max(1);
+        let ssao_blur_horizontal_uniforms = self.build_bloom_blur_uniforms(ssao_width, ssao_height, [1.0, 0.0]);
+        let ssao_blur_horizontal_uniform_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("SSAO Blur Horizontal Uniform Buffer"),
+                contents: bytemuck::cast_slice(&[ssao_blur_horizontal_uniforms]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+
+        let ssao_blur_vertical_uniforms = self.build_bloom_blur_uniforms(ssao_width, ssao_height, [0.0, 1.0]);
+        let ssao_blur_vertical_uniform_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("SSAO Blur Vertical Uniform Buffer"),
+                contents: bytemuck::cast_slice(&[ssao_blur_vertical_uniforms]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
 
         // Create light probe buffer (start with capacity for 64 probes)
         let light_probe_capacity = 64;
@@ -3529,6 +3640,7 @@ impl App {
         self.dof_bind_group = None;
         self.bloom_extract_pipeline = Some(bloom_extract_pipeline);
         self.bloom_blur_pipeline = Some(bloom_blur_pipeline);
+        self.ssao_blur_pipeline = Some(ssao_blur_pipeline);
         self.composite_pipeline = Some(composite_pipeline);
         self.bloom_extract_bind_group_layout = Some(bloom_extract_bind_group_layout);
         self.bloom_blur_bind_group_layout = Some(bloom_blur_bind_group_layout);
@@ -3536,6 +3648,8 @@ impl App {
         self.bloom_extract_uniform_buffer = Some(bloom_extract_uniform_buffer);
         self.bloom_blur_horizontal_uniform_buffer = Some(bloom_blur_horizontal_uniform_buffer);
         self.bloom_blur_vertical_uniform_buffer = Some(bloom_blur_vertical_uniform_buffer);
+        self.ssao_blur_horizontal_uniform_buffer = Some(ssao_blur_horizontal_uniform_buffer);
+        self.ssao_blur_vertical_uniform_buffer = Some(ssao_blur_vertical_uniform_buffer);
         self.composite_uniform_buffer = Some(composite_uniform_buffer);
         // SSILVB uniforms
         let ssilvb_uniforms = self.build_ssilvb_uniforms((config.width / 2).max(1), (config.height / 2).max(1));
@@ -5085,6 +5199,65 @@ impl App {
                             ssao_pass.set_pipeline(ssilvb_pipeline);
                             ssao_pass.set_bind_group(0, ssilvb_bind_group, &[]);
                             ssao_pass.draw(0..3, 0..1);
+                        }
+
+                        // Optional SSAO blur (reduce speckle): horizontal then vertical
+                        if let (
+                            Some(ssao_blur_pipeline),
+                            Some(ssao_blur_h),
+                            Some(ssao_pong_view),
+                        ) = (
+                            self.ssao_blur_pipeline.as_ref(),
+                            self.ssao_blur_horizontal_bind_group.as_ref(),
+                            self.ssao_pong_view.as_ref(),
+                        ) {
+                            let mut blur_pass_h = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("SSAO Blur Horizontal Pass"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: ssao_pong_view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                    depth_slice: None,
+                                })],
+                                depth_stencil_attachment: None,
+                                timestamp_writes: None,
+                                occlusion_query_set: None,
+                            });
+                            blur_pass_h.set_pipeline(ssao_blur_pipeline);
+                            blur_pass_h.set_bind_group(0, ssao_blur_h, &[]);
+                            blur_pass_h.draw(0..3, 0..1);
+                        }
+
+                        if let (
+                            Some(ssao_blur_pipeline),
+                            Some(ssao_blur_v),
+                            Some(ssao_ping_view),
+                        ) = (
+                            self.ssao_blur_pipeline.as_ref(),
+                            self.ssao_blur_vertical_bind_group.as_ref(),
+                            self.ssao_ping_view.as_ref(),
+                        ) {
+                            let mut blur_pass_v = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("SSAO Blur Vertical Pass"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: ssao_ping_view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                    depth_slice: None,
+                                })],
+                                depth_stencil_attachment: None,
+                                timestamp_writes: None,
+                                occlusion_query_set: None,
+                            });
+                            blur_pass_v.set_pipeline(ssao_blur_pipeline);
+                            blur_pass_v.set_bind_group(0, ssao_blur_v, &[]);
+                            blur_pass_v.draw(0..3, 0..1);
                         }
                     }
                 let mut extract_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
