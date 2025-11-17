@@ -16,31 +16,32 @@ A high-performance sparse voxel engine using hierarchical chunks with LOD and Ro
 ### Quick Start
 
 ```bash
-# Test hierarchical LOD system
-cargo run --bin test_hierarchical_lod
-
-# Test projection bit propagation
-cargo run --bin test_projection_bits
-
-# Run the interactive viewer
+# Run the interactive viewer (release recommended)
 cargo run --release --bin viewer_hierarchical
 
-# Run benchmarks
-cargo run --release --bin bench_culling
+# Show generator help (Rust)
+cargo run --bin generate_world -- --help
+
+# Convert ASCII voxel text to .oct (expects `osm_voxels.txt` in CWD)
+cargo run --bin convert_osm_format
+
+# Validate generated world coverage
+cargo run --bin check_world_gaps -- worlds/world_1.oct worlds/world_1_meta.json
 ```
 
 ### Data Generation (Voxelizing Real World Tiles)
 
 Two generators are now provided:
 
-1. `voxel_generator_tiles.py` – dry-coded tile-based prototype that rasterizes synthetic building footprints per Web Mercator tile and writes the viewer-ready `osm_voxels.txt` plus `osm_voxels_meta.json`. We've patched it to pre-fill tile columns so seams remain filled.
-2. `generate_world` – Rust generator that mirrors the Python generator's procedural rules and writes `.oct` + full metadata directly for faster runs and better tile coverage.
+1. `voxel_generator_tiles.py` – a Python prototype that synthesizes tile footprints and voxelizes them. The script writes `.oct` files by default (`--format oct`) for direct compatibility with the viewer; use `--format txt` to emit ASCII lines of the form `x y z voxel_type` if you need a human-readable/exportable intermediate.
 
-**File Format:** Voxel data is stored in a compact binary octree format (`.oct` files). The default world is `world_1.oct`. Use the converter tool to process text format data:
+2. `generate_world` – a Rust generator that implements the same procedural rules, is significantly faster for large areas, and writes compressed `.oct` + full metadata by default. It also supports `--format txt` or `--format both` for ASCII output alongside `.oct`.
+
+**File Format:** The preferred runtime format is the compact binary octree (`.oct`). The example world files are named like `world_1.oct`. If you have an ASCII export (lines `x y z voxel_type`), convert it with `convert_osm_format`:
 
 ```bash
-# Convert osm_voxels.txt to world_1.oct (6x compression)
-cargo run --release --bin convert_osm_format
+# Convert ascii `osm_voxels.txt` (in CWD) into `world_1.oct`
+cargo run --bin convert_osm_format
 ```
 
 **Configuration:** The viewer uses `config.toml` for all settings including world file path, camera position, rendering options, and visual effects. Edit this file to customize your experience.
@@ -51,14 +52,14 @@ Planned evolution of the tile generator:
 - Introduce per-tile material palettes & compressed binary output.
 - Hook into streaming residency so tiles load/unload around the camera.
 
-Output compatibility: The Python generator (`voxel_generator_tiles.py`) emits ASCII lines `x y z voxel_type` by default which can be converted into `.oct` with `convert_osm_format`; the Rust generator (`generate_world`) writes compressed `.oct` files by default but can also emit ASCII text with `--format txt` or both (see the usage example above). Both generators produce a metadata JSON with per-tile stats.
+The generators produce a metadata JSON with per-tile stats. The Rust generator (`generate_world`) writes compressed `.oct` files by default and also supports ASCII export via `--format txt` or `--format both`. The Python prototype (`worlds/voxel_generator_tiles.py`) defaults to writing `.oct` as well (`--format oct`) so it can be used directly with the viewer; use `--format txt` to emit ASCII lines `x y z voxel_type` if you need a human-readable intermediate for tooling.
 
-See `VOXEL_GENERATOR_REVAMP.md` for detailed architecture and roadmap. (This document was added to summarize the migration to a Rust generator and seam-fix plans.)
+See `VOXEL_GENERATOR_REVAMP.md` for detailed architecture and roadmap (migration notes and seam-fix details).
 
 Regenerate the default New York sample world with the Python generator (now seam-safe):
 
 ```bash
-./.venv/bin/python voxel_generator_tiles.py \
+python3 worlds/voxel_generator_tiles.py \
     --center-lon -74.0060 \
     --center-lat 40.7128 \
     --zoom 15 \
@@ -66,7 +67,9 @@ Regenerate the default New York sample world with the Python generator (now seam
     --voxels-per-tile 128 \
     --meters-per-voxel 1.25 \
     --max-height-voxels 192 \
-    --seed 1337
+    --seed 1337 \
+    --output-name worlds/world_1 \
+    --format oct
 ```
 
 Or run the Rust generator to emit `.oct` + metadata directly:
@@ -111,7 +114,11 @@ cargo run --bin generate_world -- \
 **Visual Features:**
 - **Dynamic Lighting**: Day/night cycle with realistic sun/moon colors and positions
 - **Atmospheric Fog**: Exponential distance fog with adjustable density (0.0-0.01)
-- **Tilt-Shift DoF & Bloom**: Configurable depth of field with Gaussian smoothing plus cinematic bloom pipeline
+- **Post-Processing & Effects**: High-quality post pipeline with the following shader-driven effects:
+    - **Screen-Space Ambient Occlusion (SSAO)**: multi-slice horizon-based SSAO with a separable blur pass (see `ssilvb.wgsl` and `ssao_blur.wgsl`), blended in the final composite with adjustable strength and debug view.
+    - **Bloom**: multi-scale Dual-Kawase bloom extract + blur passes (`bloom_extract.wgsl`, `dual_kawase_down.wgsl`, `dual_kawase_up.wgsl`) for cinematic highlights.
+    - **Depth-Of-Field (DoF)**: circle-of-confusion (CoC) generation, blur and combine passes (`dof_coc_copy.wgsl`, `dof_blur.wgsl`, `dof_combine.wgsl`) supporting tilt-shift-like focus control.
+    - **Post Composite**: exposure, saturation, SSAO application and bloom blending are handled in a dedicated composite pass (`post_composite.wgsl`).
 - **Backface Culling**: GPU-level optimization reducing fragment work by ~50%
 - **Distance-Based LOD**: Distant chunks (>800 units default) render as simplified colored blocks
   - Chunks automatically compute average RGBA color (alpha = occupancy)
@@ -192,7 +199,4 @@ struct World {
 - Parallel chunk processing with rayon
 - Spatial visibility caching
 
-See [OUTLINE.md](OUTLINE.md) for the full design evolution.
-
-## Project Structure
 
