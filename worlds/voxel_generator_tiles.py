@@ -399,6 +399,11 @@ def voxelize_tile(tile: TileId, data: Dict[str, Any], space: TileSpace, max_heig
     ]
     mat_index = {m.name: i for i, m in enumerate(materials)}
 
+    # Pre-fill every column of the tile with ground to avoid seams between tiles
+    for vx in range(space.voxel_resolution):
+        for vz in range(space.voxel_resolution):
+            voxels.append(VoxelRecord(vx, 0, vz, mat_index["ground_grass"]))
+
     def project_polygon(footprint: List[Tuple[float, float]]) -> List[Tuple[int, int]]:
         projected: List[Tuple[int, int]] = []
         for lon, lat in footprint:
@@ -412,11 +417,6 @@ def voxelize_tile(tile: TileId, data: Dict[str, Any], space: TileSpace, max_heig
             if len(projected) < 3:
                 continue
             yield rasterize_polygon(projected, space.voxel_resolution)
-
-    # Fill block interiors with base ground
-    for cells in polygon_cells(data.get("blocks", [])):
-        for vx, vz in cells:
-            voxels.append(VoxelRecord(vx, 0, vz, mat_index["ground_grass"]))
 
     # Water overrides ground (give it some depth)
     for cells in polygon_cells(data.get("water", [])):

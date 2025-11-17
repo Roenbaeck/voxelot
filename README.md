@@ -33,8 +33,8 @@ cargo run --release --bin bench_culling
 
 Two generators are now provided:
 
-1. `osm_voxel_generator.py` – legacy one-shot Overpass query producing a coarse static dump `osm_voxels.txt`.
-2. `voxel_generator_tiles.py` – new dry-coded tile-based prototype (no external deps yet) that rasterizes synthetic building footprints per Web Mercator tile and writes the viewer-ready `osm_voxels.txt` plus `osm_voxels_meta.json`.
+1. `voxel_generator_tiles.py` – dry-coded tile-based prototype that rasterizes synthetic building footprints per Web Mercator tile and writes the viewer-ready `osm_voxels.txt` plus `osm_voxels_meta.json`. We've patched it to pre-fill tile columns so seams remain filled.
+2. `generate_world` – Rust generator that mirrors the Python generator's procedural rules and writes `.oct` + full metadata directly for faster runs and better tile coverage.
 
 **File Format:** Voxel data is stored in a compact binary octree format (`.oct` files). The default world is `world_1.oct`. Use the converter tool to process text format data:
 
@@ -53,9 +53,9 @@ Planned evolution of the tile generator:
 
 Output compatibility: Both generators currently emit ASCII lines `x y z voxel_type` which can then be converted to the efficient binary format. The meta JSON documents tile stats for tooling.
 
-See `VOXEL_GENERATOR_REVAMP.md` for detailed architecture and roadmap.
+See `VOXEL_GENERATOR_REVAMP.md` for detailed architecture and roadmap. (This document was added to summarize the migration to a Rust generator and seam-fix plans.)
 
-Regenerate the default New York sample world with:
+Regenerate the default New York sample world with the Python generator (now seam-safe):
 
 ```bash
 ./.venv/bin/python voxel_generator_tiles.py \
@@ -67,6 +67,22 @@ Regenerate the default New York sample world with:
     --meters-per-voxel 1.25 \
     --max-height-voxels 192 \
     --seed 1337
+```
+
+Or run the Rust generator to emit `.oct` + metadata directly:
+
+```bash
+cargo run --bin generate_world -- \
+    --center-lon=-74.0060 \
+    --center-lat=40.7128 \
+    --zoom=15 \
+    --radius=2 \
+    --voxels-per-tile=128 \
+    --meters-per-voxel=1.25 \
+    --max-height-voxels=192 \
+    --seed=1337 \
+    --output-name=worlds/world_1 \
+    --format=oct
 ```
 
 ### Interactive Viewer Controls
