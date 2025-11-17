@@ -51,7 +51,7 @@ Planned evolution of the tile generator:
 - Introduce per-tile material palettes & compressed binary output.
 - Hook into streaming residency so tiles load/unload around the camera.
 
-Output compatibility: Both generators currently emit ASCII lines `x y z voxel_type` which can then be converted to the efficient binary format. The meta JSON documents tile stats for tooling.
+Output compatibility: The Python generator (`voxel_generator_tiles.py`) emits ASCII lines `x y z voxel_type` by default which can be converted into `.oct` with `convert_osm_format`; the Rust generator (`generate_world`) writes compressed `.oct` files by default but can also emit ASCII text with `--format txt` or both (see the usage example above). Both generators produce a metadata JSON with per-tile stats.
 
 See `VOXEL_GENERATOR_REVAMP.md` for detailed architecture and roadmap. (This document was added to summarize the migration to a Rust generator and seam-fix plans.)
 
