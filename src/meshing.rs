@@ -50,7 +50,11 @@ mod tests {
         assert!(mesh.vertices.len() > 0);
         for v in &mesh.vertices {
             let a = v.color[3];
-            assert!(a >= 0.9999 && a <= 1.0, "Expected AO alpha near 1.0 for isolated voxel, got {}", a);
+            assert!(
+                a >= 0.9999 && a <= 1.0,
+                "Expected AO alpha near 1.0 for isolated voxel, got {}",
+                a
+            );
         }
     }
 
@@ -65,7 +69,11 @@ mod tests {
         assert!(mesh.vertices.len() > 0);
         for v in &mesh.vertices {
             let a = v.color[3];
-            assert!(a >= 0.9999 && a <= 1.0, "Expected AO alpha near 1.0 for ground isolated voxel, got {}", a);
+            assert!(
+                a >= 0.9999 && a <= 1.0,
+                "Expected AO alpha near 1.0 for ground isolated voxel, got {}",
+                a
+            );
         }
     }
 
@@ -91,7 +99,11 @@ mod tests {
         assert!(mesh.vertices.len() > 0);
         for v in &mesh.vertices {
             let a = v.color[3];
-            assert!(a >= 0.9999 && a <= 1.0, "Expected AO alpha near 1.0 for seam corner, got {}", a);
+            assert!(
+                a >= 0.9999 && a <= 1.0,
+                "Expected AO alpha near 1.0 for seam corner, got {}",
+                a
+            );
         }
     }
 }
@@ -176,14 +188,50 @@ pub fn generate_chunk_mesh(
         }
         // Out-of-chunk - check neighbor snapshot if present
         if let Some(neigh) = &neighbors {
-            let nx = if x < 0 { -1 } else if x >= 16 { 1 } else { 0 };
-            let ny = if y < 0 { -1 } else if y >= 16 { 1 } else { 0 };
-            let nz = if z < 0 { -1 } else if z >= 16 { 1 } else { 0 };
+            let nx = if x < 0 {
+                -1
+            } else if x >= 16 {
+                1
+            } else {
+                0
+            };
+            let ny = if y < 0 {
+                -1
+            } else if y >= 16 {
+                1
+            } else {
+                0
+            };
+            let nz = if z < 0 {
+                -1
+            } else if z >= 16 {
+                1
+            } else {
+                0
+            };
             let entry = (nx as i8, ny as i8, nz as i8);
             if let Some(ne) = neigh.get(&entry) {
-                let lx = if nx < 0 { (x + 16) as u8 } else if nx > 0 { (x - 16) as u8 } else { x as u8 };
-                let ly = if ny < 0 { (y + 16) as u8 } else if ny > 0 { (y - 16) as u8 } else { y as u8 };
-                let lz = if nz < 0 { (z + 16) as u8 } else if nz > 0 { (z - 16) as u8 } else { z as u8 };
+                let lx = if nx < 0 {
+                    (x + 16) as u8
+                } else if nx > 0 {
+                    (x - 16) as u8
+                } else {
+                    x as u8
+                };
+                let ly = if ny < 0 {
+                    (y + 16) as u8
+                } else if ny > 0 {
+                    (y - 16) as u8
+                } else {
+                    y as u8
+                };
+                let lz = if nz < 0 {
+                    (z + 16) as u8
+                } else if nz > 0 {
+                    (z - 16) as u8
+                } else {
+                    z as u8
+                };
                 return ne.get_type(lx, ly, lz);
             }
         }
@@ -313,12 +361,18 @@ pub fn generate_chunk_mesh(
 // a dead-code warning; it was also partially implemented and not used.
 
 // Emit a quad with AO always set to 1.0 (no occlusion).
-fn emit_quad(
-    mesh: &mut ChunkMesh,
-    palette: &Palette,
-    quad: Quad,
-) {
-    let Quad { axis, d, u_axis, v_axis, u0, v0, du, dv, face_type } = quad;
+fn emit_quad(mesh: &mut ChunkMesh, palette: &Palette, quad: Quad) {
+    let Quad {
+        axis,
+        d,
+        u_axis,
+        v_axis,
+        u0,
+        v0,
+        du,
+        dv,
+        face_type,
+    } = quad;
     if face_type == 0 {
         return;
     }
@@ -379,10 +433,30 @@ fn emit_quad(
 
     let base_index = mesh.vertices.len() as u32;
     mesh.vertices.extend_from_slice(&[
-        MeshVertex { position: p0, normal, color: color0, emissive },
-        MeshVertex { position: p1, normal, color: color1, emissive },
-        MeshVertex { position: p2, normal, color: color2, emissive },
-        MeshVertex { position: p3, normal, color: color3, emissive },
+        MeshVertex {
+            position: p0,
+            normal,
+            color: color0,
+            emissive,
+        },
+        MeshVertex {
+            position: p1,
+            normal,
+            color: color1,
+            emissive,
+        },
+        MeshVertex {
+            position: p2,
+            normal,
+            color: color2,
+            emissive,
+        },
+        MeshVertex {
+            position: p3,
+            normal,
+            color: color3,
+            emissive,
+        },
     ]);
 
     if axis == 1 {

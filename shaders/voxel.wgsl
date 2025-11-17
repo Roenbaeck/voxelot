@@ -209,7 +209,8 @@ fn fs_main(input: VertexOutputInstanced) -> @location(0) vec4<f32> {
     let fog_color = vec3<f32>(0.7, 0.8, 0.9);
     // Use world-space distance from camera (input.world_pos contains world-space position)
     // uniforms.camera_shadow_strength.xyz stores camera world position (see Rust binding comment)
-    let distance = length(input.world_pos - uniforms.camera_shadow_strength.xyz);
+    let relative_pos = input.world_pos - uniforms.camera_shadow_strength.xyz;
+    let distance = length(relative_pos);
     let transmittance = exp(-uniforms.fog_time_pad.x * distance);
     let fog_factor = 1.0 - transmittance;
     // Add volumetric scattering from sun
@@ -228,7 +229,7 @@ fn fs_main(input: VertexOutputInstanced) -> @location(0) vec4<f32> {
     
     // Use world position hash for stable, deterministic alpha testing
     // Higher frequency (50.0) creates finer noise that blurs better
-    let hash_pos = floor(input.world_pos * 50.0);
+    let hash_pos = floor(relative_pos * 50.0);
     let hash_val = fract(sin(dot(hash_pos, vec3<f32>(12.9898, 78.233, 45.164))) * 43758.5453);
     
     if fade_factor > hash_val {
@@ -310,7 +311,8 @@ fn fs_mesh(input: VertexOutputMesh) -> @location(0) vec4<f32> {
     
     let fog_color = vec3<f32>(0.7, 0.8, 0.9);
     // Use world-space distance from camera for mesh pipeline as well
-    let distance = length(input.world_pos - uniforms.camera_shadow_strength.xyz);
+    let relative_pos = input.world_pos - uniforms.camera_shadow_strength.xyz;
+    let distance = length(relative_pos);
     let transmittance = exp(-uniforms.fog_time_pad.x * distance);
     let fog_factor = 1.0 - transmittance;
     // Add volumetric scattering from sun

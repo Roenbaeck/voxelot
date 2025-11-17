@@ -1,5 +1,5 @@
 [world]
-file = "worlds/world_3.oct"
+file = "worlds/world_1.oct"
 palette = "worlds/palette.txt"
 camera_position = [
     320.0,
@@ -18,7 +18,7 @@ camera_speed_multiplier = 4.76837158203125
 
 [atmosphere]
 fog_density = 0.0004999999655410647
-time_of_day = 0.32398509979248047
+time_of_day = 0.15319512784481049
 
 [effects.depth_of_field]
 enabled = true

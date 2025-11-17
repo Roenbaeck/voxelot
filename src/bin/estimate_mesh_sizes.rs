@@ -1,5 +1,5 @@
 use std::env;
-use voxelot::{load_world_file, Palette, generate_chunk_mesh, Chunk};
+use voxelot::{generate_chunk_mesh, load_world_file, Chunk, Palette};
 
 fn collect_leaf_chunks<'a>(chunk: &'a Chunk, out: &mut Vec<&'a Chunk>) {
     // A leaf chunk is a chunk without any sub-chunks (i.e. contains only Solid voxels)
@@ -40,7 +40,9 @@ fn main() {
     for (i, chunk) in leaves.iter().enumerate() {
         // Count presence directly; `voxel_count` may not be initialized on load
         let presence = chunk.count();
-        if presence == 0 { continue; }
+        if presence == 0 {
+            continue;
+        }
         nonempty += 1;
         let mesh = generate_chunk_mesh(chunk, &palette, None);
         total_vertices += mesh.vertices.len();
@@ -64,13 +66,26 @@ fn main() {
             buf.extend(&pz.to_le_bytes());
 
             // normal: choose axis with largest absolute component
-            let axis_idx: u8 = if v.normal[0].abs() > v.normal[1].abs() && v.normal[0].abs() > v.normal[2].abs() {
-                if v.normal[0] > 0.0 { 0 } else { 1 }
-            } else if v.normal[1].abs() > v.normal[2].abs() {
-                if v.normal[1] > 0.0 { 2 } else { 3 }
-            } else {
-                if v.normal[2] > 0.0 { 4 } else { 5 }
-            };
+            let axis_idx: u8 =
+                if v.normal[0].abs() > v.normal[1].abs() && v.normal[0].abs() > v.normal[2].abs() {
+                    if v.normal[0] > 0.0 {
+                        0
+                    } else {
+                        1
+                    }
+                } else if v.normal[1].abs() > v.normal[2].abs() {
+                    if v.normal[1] > 0.0 {
+                        2
+                    } else {
+                        3
+                    }
+                } else {
+                    if v.normal[2] > 0.0 {
+                        4
+                    } else {
+                        5
+                    }
+                };
             buf.push(axis_idx);
 
             // color: convert to u8
@@ -106,23 +121,46 @@ fn main() {
             let compressed = zstd::stream::encode_all(&buf[..], *level).expect("zstd failure");
             compressed_bytes_by_level[i] += compressed.len();
         }
-        if i % 1000 == 0 { println!("Processed {} leaves", i); }
+        if i % 1000 == 0 {
+            println!("Processed {} leaves", i);
+        }
     }
 
     let mut nonzero_presence = 0usize;
     for chunk in &leaves {
-        if chunk.count() > 0 { nonzero_presence += 1; }
+        if chunk.count() > 0 {
+            nonzero_presence += 1;
+        }
     }
     println!("Leaf chunks with presence>0: {}", nonzero_presence);
 
     let vertex_bytes = total_vertices * std::mem::size_of::<voxelot::meshing::MeshVertex>();
     let index_bytes = total_indices * std::mem::size_of::<u32>();
     println!("Non-empty leaf chunks: {}", nonempty);
-    println!("Total mesh vertices: {} ({} bytes)", total_vertices, vertex_bytes);
-    println!("Total mesh indices: {} ({} bytes)", total_indices, index_bytes);
-    println!("Total raw mesh bytes (vertices + indices): {} bytes ({:.2} MiB)", vertex_bytes + index_bytes, (vertex_bytes + index_bytes) as f64 / (1024.0*1024.0));
-    println!("Quantized bytes (before compression): {} bytes ({:.2} MiB)", quantized_bytes, quantized_bytes as f64 / 1024.0 / 1024.0);
+    println!(
+        "Total mesh vertices: {} ({} bytes)",
+        total_vertices, vertex_bytes
+    );
+    println!(
+        "Total mesh indices: {} ({} bytes)",
+        total_indices, index_bytes
+    );
+    println!(
+        "Total raw mesh bytes (vertices + indices): {} bytes ({:.2} MiB)",
+        vertex_bytes + index_bytes,
+        (vertex_bytes + index_bytes) as f64 / (1024.0 * 1024.0)
+    );
+    println!(
+        "Quantized bytes (before compression): {} bytes ({:.2} MiB)",
+        quantized_bytes,
+        quantized_bytes as f64 / 1024.0 / 1024.0
+    );
     for (i, level) in [1, 3, 6, 9, 14].iter().enumerate() {
-        println!("Compressed quantized (zstd level {}) total: {} bytes ({:.2} MiB)", level, compressed_bytes_by_level[i], compressed_bytes_by_level[i] as f64 / 1024.0 / 1024.0);
+        println!(
+            "Compressed quantized (zstd level {}) total: {} bytes ({:.2} MiB)",
+            level,
+            compressed_bytes_by_level[i],
+            compressed_bytes_by_level[i] as f64 / 1024.0 / 1024.0
+        );
     }
 }

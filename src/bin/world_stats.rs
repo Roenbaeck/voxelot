@@ -79,12 +79,13 @@ fn main() -> std::io::Result<()> {
                     let ey = base_y + scale - 1;
                     let ez = base_z + scale - 1;
                     update_bbox(
-                        min_x, min_y, min_z, max_x, max_y, max_z, base_x, base_y, base_z,
-                        ex, ey, ez,
+                        min_x, min_y, min_z, max_x, max_y, max_z, base_x, base_y, base_z, ex, ey,
+                        ez,
                     );
 
                     // Add leaf-equivalent voxel count
-                    let voxels_in_region: u128 = (scale as u128) * (scale as u128) * (scale as u128);
+                    let voxels_in_region: u128 =
+                        (scale as u128) * (scale as u128) * (scale as u128);
                     *leaf_voxel_count += voxels_in_region;
                 }
                 Voxel::Chunk(sub) => {
@@ -124,11 +125,26 @@ fn main() -> std::io::Result<()> {
     );
 
     println!("Top-level presence count (root slots): {}", world.count());
+    println!("Root positions:");
+    for (x, y, z) in world.root().positions() {
+        println!(
+            "  ({},{},{}) -> world-origin=({}, {}, {})",
+            x,
+            y,
+            z,
+            (x as i64) * 16i64.pow(depth as u32 - 1),
+            (y as i64) * 16i64.pow(depth as u32 - 1),
+            (z as i64) * 16i64.pow(depth as u32 - 1)
+        );
+    }
     println!("Leaf-equivalent voxel count: {}", leaf_voxel_count);
-    if let (Some(minx), Some(miny), Some(minz), Some(maxx), Some(maxy), Some(maxz)) = (
-        min_x, min_y, min_z, max_x, max_y, max_z,
-    ) {
-        println!("Voxel bounding box: min=({}, {}, {}), max=({}, {}, {})", minx, miny, minz, maxx, maxy, maxz);
+    if let (Some(minx), Some(miny), Some(minz), Some(maxx), Some(maxy), Some(maxz)) =
+        (min_x, min_y, min_z, max_x, max_y, max_z)
+    {
+        println!(
+            "Voxel bounding box: min=({}, {}, {}), max=({}, {}, {})",
+            minx, miny, minz, maxx, maxy, maxz
+        );
     } else {
         println!("Voxel bounding box: (empty)");
     }

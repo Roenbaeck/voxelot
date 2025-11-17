@@ -7,382 +7,395 @@
     "radius": 2,
     "voxel_resolution": 128,
     "meters_per_voxel": 1.25,
-    "max_height_voxels": 192
+    "max_height_voxels": 192,
+    "bounds": {
+      "min_x": 0,
+      "max_x": 639,
+      "min_y": 0,
+      "max_y": 115,
+      "min_z": 0,
+      "max_z": 639
+    },
+    "camera_position": [
+      319,
+      165,
+      319
+    ]
   },
   "tiles": [
     {
       "z": 15,
       "x": 9645,
       "y": 12318,
-      "voxel_count": 525407,
-      "stats": {
-        "district": "downtown",
-        "building_count": 62,
-        "park_count": 1,
-        "water_features": 0,
-        "road_segments": 10,
-        "average_height_m": 59.37903225806454,
-        "voxel_count": 525407
-      }
-    },
-    {
-      "z": 15,
-      "x": 9646,
-      "y": 12318,
-      "voxel_count": 126746,
-      "stats": {
-        "district": "mixed_use",
-        "building_count": 42,
-        "park_count": 1,
-        "water_features": 0,
-        "road_segments": 10,
-        "average_height_m": 23.471428571428568,
-        "voxel_count": 126746
-      }
-    },
-    {
-      "z": 15,
-      "x": 9647,
-      "y": 12318,
-      "voxel_count": 91438,
-      "stats": {
-        "district": "residential",
-        "building_count": 40,
-        "park_count": 1,
-        "water_features": 0,
-        "road_segments": 10,
-        "average_height_m": 12.4775,
-        "voxel_count": 91438
-      }
-    },
-    {
-      "z": 15,
-      "x": 9648,
-      "y": 12318,
-      "voxel_count": 467135,
-      "stats": {
-        "district": "downtown",
-        "building_count": 65,
-        "park_count": 0,
-        "water_features": 0,
-        "road_segments": 10,
-        "average_height_m": 51.16769230769231,
-        "voxel_count": 467135
-      }
-    },
-    {
-      "z": 15,
-      "x": 9649,
-      "y": 12318,
-      "voxel_count": 68211,
+      "voxel_count": 87134,
       "stats": {
         "district": "residential",
         "building_count": 29,
-        "park_count": 2,
+        "park_count": 0,
         "water_features": 0,
         "road_segments": 10,
-        "average_height_m": 12.934482758620687,
-        "voxel_count": 68211
-      }
-    },
-    {
-      "z": 15,
-      "x": 9645,
-      "y": 12319,
-      "voxel_count": 144310,
-      "stats": {
-        "district": "mixed_use",
-        "building_count": 36,
-        "park_count": 0,
-        "water_features": 1,
-        "road_segments": 10,
-        "average_height_m": 24.62777777777778,
-        "voxel_count": 144310
+        "average_height_m": 12.934482758620689,
+        "voxel_count": 87134
       }
     },
     {
       "z": 15,
       "x": 9646,
-      "y": 12319,
-      "voxel_count": 145204,
-      "stats": {
-        "district": "mixed_use",
-        "building_count": 38,
-        "park_count": 1,
-        "water_features": 0,
-        "road_segments": 10,
-        "average_height_m": 21.536842105263155,
-        "voxel_count": 145204
-      }
-    },
-    {
-      "z": 15,
-      "x": 9647,
-      "y": 12319,
-      "voxel_count": 81938,
+      "y": 12318,
+      "voxel_count": 110753,
       "stats": {
         "district": "residential",
-        "building_count": 38,
-        "park_count": 2,
-        "water_features": 0,
-        "road_segments": 10,
-        "average_height_m": 11.339473684210521,
-        "voxel_count": 81938
-      }
-    },
-    {
-      "z": 15,
-      "x": 9648,
-      "y": 12319,
-      "voxel_count": 101753,
-      "stats": {
-        "district": "residential",
-        "building_count": 44,
-        "park_count": 0,
-        "water_features": 0,
-        "road_segments": 10,
-        "average_height_m": 12.89318181818182,
-        "voxel_count": 101753
-      }
-    },
-    {
-      "z": 15,
-      "x": 9649,
-      "y": 12319,
-      "voxel_count": 84064,
-      "stats": {
-        "district": "residential",
-        "building_count": 37,
-        "park_count": 0,
-        "water_features": 0,
-        "road_segments": 10,
-        "average_height_m": 11.478378378378375,
-        "voxel_count": 84064
-      }
-    },
-    {
-      "z": 15,
-      "x": 9645,
-      "y": 12320,
-      "voxel_count": 177542,
-      "stats": {
-        "district": "mixed_use",
         "building_count": 42,
-        "park_count": 0,
+        "park_count": 1,
         "water_features": 0,
         "road_segments": 10,
-        "average_height_m": 26.49761904761905,
-        "voxel_count": 177542
-      }
-    },
-    {
-      "z": 15,
-      "x": 9646,
-      "y": 12320,
-      "voxel_count": 86521,
-      "stats": {
-        "district": "residential",
-        "building_count": 32,
-        "park_count": 1,
-        "water_features": 1,
-        "road_segments": 10,
-        "average_height_m": 12.981249999999998,
-        "voxel_count": 86521
+        "average_height_m": 12.547619047619046,
+        "voxel_count": 110753
       }
     },
     {
       "z": 15,
       "x": 9647,
-      "y": 12320,
-      "voxel_count": 502066,
+      "y": 12318,
+      "voxel_count": 485179,
       "stats": {
         "district": "downtown",
-        "building_count": 60,
+        "building_count": 61,
+        "park_count": 0,
+        "water_features": 1,
+        "road_segments": 10,
+        "average_height_m": 54.85081967213115,
+        "voxel_count": 485179
+      }
+    },
+    {
+      "z": 15,
+      "x": 9648,
+      "y": 12318,
+      "voxel_count": 230922,
+      "stats": {
+        "district": "mixed_use",
+        "building_count": 59,
+        "park_count": 0,
+        "water_features": 1,
+        "road_segments": 10,
+        "average_height_m": 23.906779661016948,
+        "voxel_count": 230922
+      }
+    },
+    {
+      "z": 15,
+      "x": 9649,
+      "y": 12318,
+      "voxel_count": 141914,
+      "stats": {
+        "district": "industrial",
+        "building_count": 32,
+        "park_count": 0,
+        "water_features": 1,
+        "road_segments": 10,
+        "average_height_m": 21.053124999999998,
+        "voxel_count": 141914
+      }
+    },
+    {
+      "z": 15,
+      "x": 9645,
+      "y": 12319,
+      "voxel_count": 100760,
+      "stats": {
+        "district": "residential",
+        "building_count": 35,
+        "park_count": 0,
+        "water_features": 2,
+        "road_segments": 10,
+        "average_height_m": 11.248571428571426,
+        "voxel_count": 100760
+      }
+    },
+    {
+      "z": 15,
+      "x": 9646,
+      "y": 12319,
+      "voxel_count": 581669,
+      "stats": {
+        "district": "downtown",
+        "building_count": 67,
         "park_count": 1,
         "water_features": 0,
         "road_segments": 10,
-        "average_height_m": 57.41166666666666,
-        "voxel_count": 502066
+        "average_height_m": 58.39402985074627,
+        "voxel_count": 581669
+      }
+    },
+    {
+      "z": 15,
+      "x": 9647,
+      "y": 12319,
+      "voxel_count": 210198,
+      "stats": {
+        "district": "mixed_use",
+        "building_count": 54,
+        "park_count": 1,
+        "water_features": 1,
+        "road_segments": 10,
+        "average_height_m": 26.120370370370363,
+        "voxel_count": 210198
+      }
+    },
+    {
+      "z": 15,
+      "x": 9648,
+      "y": 12319,
+      "voxel_count": 514156,
+      "stats": {
+        "district": "downtown",
+        "building_count": 66,
+        "park_count": 0,
+        "water_features": 1,
+        "road_segments": 10,
+        "average_height_m": 51.36666666666668,
+        "voxel_count": 514156
+      }
+    },
+    {
+      "z": 15,
+      "x": 9649,
+      "y": 12319,
+      "voxel_count": 153150,
+      "stats": {
+        "district": "mixed_use",
+        "building_count": 37,
+        "park_count": 2,
+        "water_features": 0,
+        "road_segments": 10,
+        "average_height_m": 23.291891891891886,
+        "voxel_count": 153150
+      }
+    },
+    {
+      "z": 15,
+      "x": 9645,
+      "y": 12320,
+      "voxel_count": 109320,
+      "stats": {
+        "district": "residential",
+        "building_count": 38,
+        "park_count": 0,
+        "water_features": 1,
+        "road_segments": 10,
+        "average_height_m": 11.50263157894737,
+        "voxel_count": 109320
+      }
+    },
+    {
+      "z": 15,
+      "x": 9646,
+      "y": 12320,
+      "voxel_count": 210341,
+      "stats": {
+        "district": "mixed_use",
+        "building_count": 48,
+        "park_count": 0,
+        "water_features": 1,
+        "road_segments": 10,
+        "average_height_m": 24.218749999999996,
+        "voxel_count": 210341
+      }
+    },
+    {
+      "z": 15,
+      "x": 9647,
+      "y": 12320,
+      "voxel_count": 144060,
+      "stats": {
+        "district": "mixed_use",
+        "building_count": 38,
+        "park_count": 0,
+        "water_features": 1,
+        "road_segments": 10,
+        "average_height_m": 22.76052631578947,
+        "voxel_count": 144060
       }
     },
     {
       "z": 15,
       "x": 9648,
       "y": 12320,
-      "voxel_count": 194203,
+      "voxel_count": 99055,
       "stats": {
-        "district": "mixed_use",
-        "building_count": 42,
+        "district": "residential",
+        "building_count": 36,
         "park_count": 2,
-        "water_features": 1,
+        "water_features": 2,
         "road_segments": 10,
-        "average_height_m": 26.05476190476191,
-        "voxel_count": 194203
+        "average_height_m": 12.65833333333333,
+        "voxel_count": 99055
       }
     },
     {
       "z": 15,
       "x": 9649,
       "y": 12320,
-      "voxel_count": 85397,
+      "voxel_count": 75819,
       "stats": {
         "district": "residential",
-        "building_count": 40,
+        "building_count": 33,
         "park_count": 0,
-        "water_features": 1,
+        "water_features": 0,
         "road_segments": 10,
-        "average_height_m": 11.469999999999995,
-        "voxel_count": 85397
+        "average_height_m": 11.178787878787878,
+        "voxel_count": 75819
       }
     },
     {
       "z": 15,
       "x": 9645,
       "y": 12321,
-      "voxel_count": 106305,
+      "voxel_count": 108129,
       "stats": {
         "district": "industrial",
         "building_count": 26,
-        "park_count": 1,
-        "water_features": 1,
+        "park_count": 2,
+        "water_features": 0,
         "road_segments": 10,
-        "average_height_m": 20.669230769230772,
-        "voxel_count": 106305
+        "average_height_m": 23.146153846153844,
+        "voxel_count": 108129
       }
     },
     {
       "z": 15,
       "x": 9646,
       "y": 12321,
-      "voxel_count": 160967,
+      "voxel_count": 231228,
       "stats": {
         "district": "mixed_use",
-        "building_count": 44,
-        "park_count": 1,
+        "building_count": 59,
+        "park_count": 0,
         "water_features": 0,
         "road_segments": 10,
-        "average_height_m": 21.488636363636356,
-        "voxel_count": 160967
+        "average_height_m": 24.694915254237284,
+        "voxel_count": 231228
       }
     },
     {
       "z": 15,
       "x": 9647,
       "y": 12321,
-      "voxel_count": 126557,
+      "voxel_count": 91599,
       "stats": {
-        "district": "mixed_use",
-        "building_count": 39,
-        "park_count": 2,
+        "district": "residential",
+        "building_count": 37,
+        "park_count": 1,
         "water_features": 0,
         "road_segments": 10,
-        "average_height_m": 22.73333333333333,
-        "voxel_count": 126557
+        "average_height_m": 11.562162162162162,
+        "voxel_count": 91599
       }
     },
     {
       "z": 15,
       "x": 9648,
       "y": 12321,
-      "voxel_count": 121311,
+      "voxel_count": 468383,
       "stats": {
-        "district": "industrial",
-        "building_count": 32,
-        "park_count": 1,
-        "water_features": 0,
+        "district": "downtown",
+        "building_count": 60,
+        "park_count": 0,
+        "water_features": 1,
         "road_segments": 10,
-        "average_height_m": 22.421875,
-        "voxel_count": 121311
+        "average_height_m": 56.141666666666666,
+        "voxel_count": 468383
       }
     },
     {
       "z": 15,
       "x": 9649,
       "y": 12321,
-      "voxel_count": 105535,
+      "voxel_count": 465547,
       "stats": {
-        "district": "industrial",
-        "building_count": 32,
+        "district": "downtown",
+        "building_count": 63,
         "park_count": 1,
         "water_features": 0,
         "road_segments": 10,
-        "average_height_m": 20.196875000000006,
-        "voxel_count": 105535
+        "average_height_m": 52.79999999999999,
+        "voxel_count": 465547
       }
     },
     {
       "z": 15,
       "x": 9645,
       "y": 12322,
-      "voxel_count": 79557,
+      "voxel_count": 110281,
       "stats": {
         "district": "residential",
-        "building_count": 34,
+        "building_count": 44,
         "park_count": 1,
         "water_features": 1,
         "road_segments": 10,
-        "average_height_m": 12.764705882352942,
-        "voxel_count": 79557
+        "average_height_m": 11.836363636363632,
+        "voxel_count": 110281
       }
     },
     {
       "z": 15,
       "x": 9646,
       "y": 12322,
-      "voxel_count": 166734,
+      "voxel_count": 105881,
       "stats": {
-        "district": "mixed_use",
-        "building_count": 49,
-        "park_count": 1,
-        "water_features": 0,
+        "district": "residential",
+        "building_count": 39,
+        "park_count": 2,
+        "water_features": 1,
         "road_segments": 10,
-        "average_height_m": 25.87551020408164,
-        "voxel_count": 166734
+        "average_height_m": 12.876923076923076,
+        "voxel_count": 105881
       }
     },
     {
       "z": 15,
       "x": 9647,
       "y": 12322,
-      "voxel_count": 181921,
+      "voxel_count": 110000,
       "stats": {
-        "district": "mixed_use",
-        "building_count": 47,
-        "park_count": 1,
+        "district": "industrial",
+        "building_count": 31,
+        "park_count": 0,
         "water_features": 0,
         "road_segments": 10,
-        "average_height_m": 24.865957446808512,
-        "voxel_count": 181921
+        "average_height_m": 19.090322580645157,
+        "voxel_count": 110000
       }
     },
     {
       "z": 15,
       "x": 9648,
       "y": 12322,
-      "voxel_count": 439156,
+      "voxel_count": 116048,
       "stats": {
-        "district": "downtown",
-        "building_count": 64,
-        "park_count": 1,
+        "district": "residential",
+        "building_count": 43,
+        "park_count": 0,
         "water_features": 0,
         "road_segments": 10,
-        "average_height_m": 49.06562499999998,
-        "voxel_count": 439156
+        "average_height_m": 12.616279069767439,
+        "voxel_count": 116048
       }
     },
     {
       "z": 15,
       "x": 9649,
       "y": 12322,
-      "voxel_count": 450938,
+      "voxel_count": 149929,
       "stats": {
-        "district": "downtown",
-        "building_count": 52,
+        "district": "mixed_use",
+        "building_count": 34,
         "park_count": 2,
-        "water_features": 0,
+        "water_features": 1,
         "road_segments": 10,
-        "average_height_m": 54.73076923076923,
-        "voxel_count": 450938
+        "average_height_m": 25.620588235294115,
+        "voxel_count": 149929
       }
     }
   ]

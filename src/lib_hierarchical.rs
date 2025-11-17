@@ -325,12 +325,24 @@ impl Chunk {
         for ((x, y, z), voxel) in self.iter() {
             if let Voxel::Solid(_) = voxel {
                 bbox_found = true;
-                if x < xmin { xmin = x; }
-                if y < ymin { ymin = y; }
-                if z < zmin { zmin = z; }
-                if x > xmax { xmax = x; }
-                if y > ymax { ymax = y; }
-                if z > zmax { zmax = z; }
+                if x < xmin {
+                    xmin = x;
+                }
+                if y < ymin {
+                    ymin = y;
+                }
+                if z < zmin {
+                    zmin = z;
+                }
+                if x > xmax {
+                    xmax = x;
+                }
+                if y > ymax {
+                    ymax = y;
+                }
+                if z > zmax {
+                    zmax = z;
+                }
             }
         }
 
@@ -852,12 +864,11 @@ impl World {
         // First, recursively update all sub-chunks. Use Rayon to parallelize recursion across
         // different sub-chunks where possible - this gives a large speedup for deep/large worlds.
         use rayon::prelude::*;
-        chunk
-            .voxels
-            .par_iter_mut()
-            .for_each(|voxel| if let Voxel::Chunk(sub_chunk) = voxel {
+        chunk.voxels.par_iter_mut().for_each(|voxel| {
+            if let Voxel::Chunk(sub_chunk) = voxel {
                 Self::update_chunk_lod_recursive(sub_chunk, palette);
-            });
+            }
+        });
 
         // Then update this chunk's metadata
         chunk.update_lod_metadata(palette);

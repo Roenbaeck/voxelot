@@ -37,13 +37,20 @@ impl Palette {
     pub fn load<P: AsRef<Path>>(path: P) -> Self {
         let path_ref = path.as_ref();
         let text = fs::read_to_string(path_ref).unwrap_or_else(|e| {
-            eprintln!("ERROR: Failed to read palette file '{}': {}", path_ref.display(), e);
+            eprintln!(
+                "ERROR: Failed to read palette file '{}': {}",
+                path_ref.display(),
+                e
+            );
             eprintln!("Please check that the file path in config.toml is correct.");
             std::process::exit(1);
         });
-        
+
         Self::from_string(&text).unwrap_or_else(|| {
-            eprintln!("ERROR: Failed to parse palette file '{}'", path_ref.display());
+            eprintln!(
+                "ERROR: Failed to parse palette file '{}'",
+                path_ref.display()
+            );
             eprintln!("Palette file must contain at least one valid material definition.");
             std::process::exit(1);
         })

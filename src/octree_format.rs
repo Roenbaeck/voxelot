@@ -12,20 +12,23 @@
 //!   - Otherwise: solid voxel type (1-254)
 
 use crate::lib_hierarchical::{Chunk, Voxel};
-use std::io::{self, Read, Write};
 use std::fs::File;
+use std::io::{self, Read, Write};
 use std::path::Path;
 use zstd::stream::read::Decoder as ZstdDecoder;
 use zstd::stream::write::Encoder as ZstdEncoder;
 
 /// Save world to compact format
-pub fn save_world(world: &crate::lib_hierarchical::World, writer: &mut impl Write) -> io::Result<()> {
+pub fn save_world(
+    world: &crate::lib_hierarchical::World,
+    writer: &mut impl Write,
+) -> io::Result<()> {
     // Write depth
     writer.write_all(&[world.hierarchy_depth()])?;
-    
+
     // Write root chunk
     save_chunk(world.root(), writer)?;
-    
+
     Ok(())
 }
 
@@ -33,32 +36,40 @@ pub fn save_world(world: &crate::lib_hierarchical::World, writer: &mut impl Writ
 /// and a small header is written so readers can detect the format. The function
 /// keeps backwards compatibility: files without our signature are treated as
 /// legacy uncompressed `.oct` files.
-pub fn save_world_file(world: &crate::lib_hierarchical::World, path: &Path, _compress: bool) -> io::Result<()> {
+pub fn save_world_file(
+    world: &crate::lib_hierarchical::World,
+    path: &Path,
+    _compress: bool,
+) -> io::Result<()> {
     // Use zstd compression; caller's compress flag is ignored (always compress)
     let mut payload: Vec<u8> = Vec::new();
     save_world(world, &mut payload)?;
 
     let file = File::create(path)?;
-    let mut encoder = ZstdEncoder::new(file, 0).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let mut encoder =
+        ZstdEncoder::new(file, 0).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     encoder.write_all(&payload)?;
-    encoder.finish().map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    encoder
+        .finish()
+        .map(|_| ())
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
 }
 
 /// Save a chunk recursively
 fn save_chunk(chunk: &Chunk, writer: &mut impl Write) -> io::Result<()> {
     // Get all occupied positions
     let positions: Vec<(u8, u8, u8)> = chunk.positions().collect();
-    
+
     // Write count (u16)
     let count = positions.len() as u16;
     writer.write_all(&count.to_le_bytes())?;
-    
+
     // Write each position and its data
     for (x, y, z) in positions {
         // Encode position as u16 (z * 256 + y * 16 + x)
         let pos_encoded = (z as u16) * 256 + (y as u16) * 16 + (x as u16);
         writer.write_all(&pos_encoded.to_le_bytes())?;
-        
+
         match chunk.get(x, y, z) {
             Some(Voxel::Solid(vtype)) => {
                 writer.write_all(&[*vtype])?;
@@ -73,7 +84,7 @@ fn save_chunk(chunk: &Chunk, writer: &mut impl Write) -> io::Result<()> {
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -83,13 +94,13 @@ pub fn load_world(reader: &mut impl Read) -> io::Result<crate::lib_hierarchical:
     let mut depth_byte = [0u8; 1];
     reader.read_exact(&mut depth_byte)?;
     let depth = depth_byte[0];
-    
+
     // Create empty world
     let mut world = crate::lib_hierarchical::World::new(depth);
-    
+
     // Load root chunk
     load_chunk(world.root_mut(), reader)?;
-    
+
     Ok(world)
 }
 
@@ -98,7 +109,8 @@ pub fn load_world(reader: &mut impl Read) -> io::Result<crate::lib_hierarchical:
 /// gzip-compressed). Detection is automatic.
 pub fn load_world_file(path: &Path) -> io::Result<crate::lib_hierarchical::World> {
     let file = File::open(path)?;
-    let mut decoder = ZstdDecoder::new(file).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let mut decoder =
+        ZstdDecoder::new(file).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     load_world(&mut decoder)
 }
 
@@ -108,7 +120,7 @@ fn load_chunk(chunk: &mut Chunk, reader: &mut impl Read) -> io::Result<()> {
     let mut count_bytes = [0u8; 2];
     reader.read_exact(&mut count_bytes)?;
     let count = u16::from_le_bytes(count_bytes);
-    
+
     // Read each occupied position into a temporary list, then commit in sorted order.
     // This avoids O(n^2) vector insert costs in `Chunk::set` when positions are read out of rank order.
     let mut entries: Vec<(u16, Voxel)> = Vec::with_capacity(count as usize);
@@ -162,6 +174,6 @@ fn load_chunk(chunk: &mut Chunk, reader: &mut impl Read) -> io::Result<()> {
             chunk.pz |= sub_chunk.pz;
         }
     }
-    
+
     Ok(())
 }

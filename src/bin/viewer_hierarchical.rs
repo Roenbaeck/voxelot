@@ -179,7 +179,7 @@ struct Uniforms {
     moon_direction_intensity: [f32; 4],  // xyz = moon dir, w = intensity scalar
     moon_color_pad: [f32; 4],            // xyz = moon color
     light_probe_count: u32,
-    lod_distance: f32,                   // LOD render distance for fade calculation
+    lod_distance: f32, // LOD render distance for fade calculation
     _pad1: u32,
     _pad2: u32,
 }
@@ -611,12 +611,18 @@ impl CameraController {
         }
 
         // Normalize velocity and move camera
-        let mag = (velocity[0] * velocity[0] + velocity[1] * velocity[1] + velocity[2] * velocity[2]).sqrt();
+        let mag =
+            (velocity[0] * velocity[0] + velocity[1] * velocity[1] + velocity[2] * velocity[2])
+                .sqrt();
         if mag > 0.00001 {
             let inv = 1.0 / mag;
             let dir = [velocity[0] * inv, velocity[1] * inv, velocity[2] * inv];
             let speed = self.base_speed * self.speed_multiplier * self.distance_speed_scale();
-            let delta = [dir[0] * speed * dt, dir[1] * speed * dt, dir[2] * speed * dt];
+            let delta = [
+                dir[0] * speed * dt,
+                dir[1] * speed * dt,
+                dir[2] * speed * dt,
+            ];
             self.camera.position[0] += delta[0];
             self.camera.position[1] += delta[1];
             self.camera.position[2] += delta[2];
@@ -869,19 +875,27 @@ impl App {
             }
         } else {
             initial_camera = cfg.world.camera_position;
-            
+
             println!("Loading voxel data from {}...", cfg.world.file);
-                // Load octree format from configured path — use auto-detecting loader
-                let load_start = Instant::now();
-                world = voxelot::load_world_file(std::path::Path::new(&cfg.world.file))
-                    .unwrap_or_else(|e| {
-                        eprintln!("ERROR: Failed to load world file '{}': {}", cfg.world.file, e);
-                        eprintln!("Please check that the file path in config.toml is correct.");
-                        std::process::exit(1);
-                    });
-                let load_elapsed = load_start.elapsed();
-                println!("Loaded world from {} (depth {}) (took {:.3}s)", 
-                         cfg.world.file, world.hierarchy_depth(), load_elapsed.as_secs_f32());
+            // Load octree format from configured path — use auto-detecting loader
+            let load_start = Instant::now();
+            world = voxelot::load_world_file(std::path::Path::new(&cfg.world.file)).unwrap_or_else(
+                |e| {
+                    eprintln!(
+                        "ERROR: Failed to load world file '{}': {}",
+                        cfg.world.file, e
+                    );
+                    eprintln!("Please check that the file path in config.toml is correct.");
+                    std::process::exit(1);
+                },
+            );
+            let load_elapsed = load_start.elapsed();
+            println!(
+                "Loaded world from {} (depth {}) (took {:.3}s)",
+                cfg.world.file,
+                world.hierarchy_depth(),
+                load_elapsed.as_secs_f32()
+            );
         }
 
         println!("World created with voxels");
@@ -896,10 +910,12 @@ impl App {
             .map(|n| n.get().saturating_sub(2))
             .unwrap_or(1)
             .max(1);
-        let mesh_worker_count = cfg.performance.mesh_worker_count
+        let mesh_worker_count = cfg
+            .performance
+            .mesh_worker_count
             .unwrap_or_else(|| available_workers.min(6));
 
-    for worker_index in 0..mesh_worker_count {
+        for worker_index in 0..mesh_worker_count {
             let job_rx = mesh_job_rx.clone();
             let result_tx = mesh_result_tx.clone();
             let palette_clone = palette.clone();
@@ -907,7 +923,11 @@ impl App {
                 .name(format!("mesh-worker-{}", worker_index))
                 .spawn(move || {
                     for job in job_rx.iter() {
-                        let MeshJob { key, chunk, neighbors } = job;
+                        let MeshJob {
+                            key,
+                            chunk,
+                            neighbors,
+                        } = job;
                         // Skip meshing completely empty chunks early.
                         if chunk.voxel_count == 0 {
                             continue;
@@ -938,7 +958,10 @@ impl App {
         let lod_start = Instant::now();
         world.update_all_lod_metadata(&palette);
         let lod_elapsed = lod_start.elapsed();
-        println!("LOD metadata updated (took {:.3}s)", lod_elapsed.as_secs_f32());
+        println!(
+            "LOD metadata updated (took {:.3}s)",
+            lod_elapsed.as_secs_f32()
+        );
 
         println!("\n=== Controls ===");
         println!("Movement: WASD + Space/Shift (up/down)");
@@ -1105,7 +1128,15 @@ impl App {
                 blur_radius: cfg.effects.bloom.blur_radius,
             },
             bloom_enabled: cfg.effects.bloom.enabled,
-            ssao_settings: SsaoSettings { sample_count: 8, slice_count: 4, radius: 4.0, thickness: 0.5, strength: cfg.effects.ssao.strength, blur_enabled: cfg.effects.ssao.blur_enabled, blur_radius: cfg.effects.ssao.blur_radius },
+            ssao_settings: SsaoSettings {
+                sample_count: 8,
+                slice_count: 4,
+                radius: 4.0,
+                thickness: 0.5,
+                strength: cfg.effects.ssao.strength,
+                blur_enabled: cfg.effects.ssao.blur_enabled,
+                blur_radius: cfg.effects.ssao.blur_radius,
+            },
             ssao_enabled: cfg.effects.ssao.enabled,
             ssao_debug: false,
             shadow_map_size: cfg.shadows.map_size,
@@ -1119,24 +1150,27 @@ impl App {
         // We read existing file, update rendering subsection relevant fields, then save.
         if let Ok(mut full_cfg) = voxelot::Config::load(CONFIG_FILE) {
             // Rendering settings
-            full_cfg.rendering.lod_subdivide_distance = self.camera_controller.camera.config.lod_subdivide_distance;
-            full_cfg.rendering.lod_merge_distance = self.camera_controller.camera.config.lod_merge_distance;
-            full_cfg.rendering.chunk_lod_distance = self.camera_controller.camera.config.lod_render_distance;
+            full_cfg.rendering.lod_subdivide_distance =
+                self.camera_controller.camera.config.lod_subdivide_distance;
+            full_cfg.rendering.lod_merge_distance =
+                self.camera_controller.camera.config.lod_merge_distance;
+            full_cfg.rendering.chunk_lod_distance =
+                self.camera_controller.camera.config.lod_render_distance;
             full_cfg.rendering.fov_degrees = self.camera_controller.camera.config.fov_degrees;
             full_cfg.rendering.near_plane = self.camera_controller.camera.config.near_plane;
             full_cfg.rendering.far_plane = self.camera_controller.camera.config.far_plane;
             full_cfg.rendering.camera_speed_multiplier = self.camera_controller.speed_multiplier;
-            
+
             // Atmosphere settings
             full_cfg.atmosphere.time_of_day = self.time_of_day;
             full_cfg.atmosphere.fog_density = self.fog_density;
-            
+
             // DoF settings
             full_cfg.effects.depth_of_field.enabled = self.dof_enabled;
             full_cfg.effects.depth_of_field.focal_distance = self.dof_settings.focal_distance;
             full_cfg.effects.depth_of_field.focal_range = self.dof_settings.focal_range;
             full_cfg.effects.depth_of_field.blur_strength = self.dof_settings.blur_strength;
-            
+
             // Bloom settings
             full_cfg.effects.bloom.enabled = self.bloom_enabled;
             full_cfg.effects.bloom.threshold = self.bloom_settings.threshold;
@@ -1146,19 +1180,21 @@ impl App {
             full_cfg.effects.bloom.saturation_boost = self.bloom_settings.saturation_boost;
             full_cfg.effects.bloom.exposure = self.bloom_settings.exposure;
             full_cfg.effects.bloom.blur_radius = self.bloom_settings.blur_radius;
-            
+
             // Shadow settings
             full_cfg.shadows.map_size = self.shadow_map_size;
             full_cfg.shadows.backface_ambient_scale = self.shadow_backface_scale;
             full_cfg.shadows.darkness = self.shadow_darkness;
-            
+
             // Performance settings
             full_cfg.performance.mesh_worker_count = Some(self.mesh_worker_count);
             full_cfg.performance.mesh_upload_baseline = self.mesh_upload_baseline;
-            full_cfg.performance.mesh_cache_budget_mb = self.mesh_cache_budget_bytes / (1024 * 1024);
+            full_cfg.performance.mesh_cache_budget_mb =
+                self.mesh_cache_budget_bytes / (1024 * 1024);
             full_cfg.performance.fallback_detail_distance = self.fallback_detail_distance;
-            full_cfg.performance.mesh_priority_sort_interval_frames = self.pending_mesh_sort_interval_frames;
-            
+            full_cfg.performance.mesh_priority_sort_interval_frames =
+                self.pending_mesh_sort_interval_frames;
+
             if let Err(e) = full_cfg.save(CONFIG_FILE) {
                 eprintln!("Failed to save unified config: {}", e);
             } else {
@@ -1167,7 +1203,8 @@ impl App {
         } else {
             eprintln!("Warning: could not load existing TOML config for update; creating default.");
             let mut full_cfg = voxelot::Config::default();
-            full_cfg.rendering.lod_subdivide_distance = self.camera_controller.camera.config.lod_subdivide_distance;
+            full_cfg.rendering.lod_subdivide_distance =
+                self.camera_controller.camera.config.lod_subdivide_distance;
             if let Err(e) = full_cfg.save(CONFIG_FILE) {
                 eprintln!("Failed to write default unified config: {}", e);
             }
@@ -1298,7 +1335,11 @@ impl App {
                 };
                 println!(
                     "Time {} at {:.3} ({})",
-                    if self.time_paused { "paused" } else { "resumed" },
+                    if self.time_paused {
+                        "paused"
+                    } else {
+                        "resumed"
+                    },
                     self.time_of_day,
                     phase
                 );
@@ -1326,12 +1367,20 @@ impl App {
             }
             KeyCode::KeyN => {
                 self.ssao_enabled = !self.ssao_enabled;
-                println!("SSAO {}", if self.ssao_enabled { "enabled" } else { "disabled" });
+                println!(
+                    "SSAO {}",
+                    if self.ssao_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
             }
             KeyCode::F1 => {
                 // decrease SSILVB sample count
                 if self.ssao_settings.sample_count > 1 {
-                    self.ssao_settings.sample_count = self.ssao_settings.sample_count.saturating_sub(1);
+                    self.ssao_settings.sample_count =
+                        self.ssao_settings.sample_count.saturating_sub(1);
                     println!("SSAO sample_count: {}", self.ssao_settings.sample_count);
                 }
             }
@@ -1352,7 +1401,14 @@ impl App {
             }
             KeyCode::KeyH => {
                 self.ssao_debug = !self.ssao_debug;
-                println!("SSAO debug {}", if self.ssao_debug { "enabled" } else { "disabled" });
+                println!(
+                    "SSAO debug {}",
+                    if self.ssao_debug {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
                 if self.ssao_debug {
                     // schedule immediate readback of SSAO ping texture to print stats
                     // readback currently disabled, visual debug still active
@@ -1415,29 +1471,40 @@ impl App {
             }
             KeyCode::KeyX => {
                 self.dof_settings.kawase_enabled = !self.dof_settings.kawase_enabled;
-                println!("Kawase {}", if self.dof_settings.kawase_enabled { "enabled" } else { "disabled" });
+                println!(
+                    "Kawase {}",
+                    if self.dof_settings.kawase_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
                 // Recreate kawase UBOs/bind groups if enabled
                 if self.dof_settings.kawase_enabled {
                     self.update_kawase_bind_groups();
                 }
             }
             KeyCode::KeyU => {
-                self.dof_settings.kawase_offset = (self.dof_settings.kawase_offset - 0.25).max(0.25);
+                self.dof_settings.kawase_offset =
+                    (self.dof_settings.kawase_offset - 0.25).max(0.25);
                 println!("Kawase offset: {:.2}", self.dof_settings.kawase_offset);
                 self.update_kawase_bind_groups();
             }
             KeyCode::KeyI => {
-                self.dof_settings.kawase_offset = (self.dof_settings.kawase_offset + 0.25).min(10.0);
+                self.dof_settings.kawase_offset =
+                    (self.dof_settings.kawase_offset + 0.25).min(10.0);
                 println!("Kawase offset: {:.2}", self.dof_settings.kawase_offset);
                 self.update_kawase_bind_groups();
             }
             KeyCode::KeyO => {
-                self.dof_settings.kawase_iterations = (self.dof_settings.kawase_iterations.saturating_sub(1)).max(1);
+                self.dof_settings.kawase_iterations =
+                    (self.dof_settings.kawase_iterations.saturating_sub(1)).max(1);
                 println!("Kawase iterations: {}", self.dof_settings.kawase_iterations);
                 self.update_kawase_bind_groups();
             }
             KeyCode::KeyP => {
-                self.dof_settings.kawase_iterations = (self.dof_settings.kawase_iterations + 1).min(6);
+                self.dof_settings.kawase_iterations =
+                    (self.dof_settings.kawase_iterations + 1).min(6);
                 println!("Kawase iterations: {}", self.dof_settings.kawase_iterations);
                 self.update_kawase_bind_groups();
             }
@@ -1461,7 +1528,7 @@ impl App {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: config.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT 
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
@@ -1495,7 +1562,7 @@ impl App {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: config.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT 
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
@@ -1554,7 +1621,6 @@ impl App {
         let bloom_pong_view =
             bloom_pong_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-
         self.offscreen_color_view = Some(color_view);
         self.offscreen_color_texture = Some(color_texture);
         self.offscreen_depth_view = Some(depth_view);
@@ -1577,23 +1643,33 @@ impl App {
             let h = (fused_height >> level).max(1);
             let ping_tex = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(&format!("DoF Kawase Ping L{}", level)),
-                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: config.format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             });
             let ping_view = ping_tex.create_view(&wgpu::TextureViewDescriptor::default());
             let pong_tex = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(&format!("DoF Kawase Pong L{}", level)),
-                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: config.format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             });
             let pong_view = pong_tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1643,14 +1719,13 @@ impl App {
         self.ssao_pong_view = Some(ssao_pong_view);
 
         self.update_dof_bind_group();
-    // Combine bind group depends on DoF color and CoC buffers
-    self.update_dof_combine_bind_group();
+        // Combine bind group depends on DoF color and CoC buffers
+        self.update_dof_combine_bind_group();
         // Kawase registrations (UBOs/BindGroups per level)
         self.update_kawase_bind_groups();
         self.update_bloom_uniforms();
         self.update_bloom_bind_groups();
     }
-
 
     fn recreate_shadow_map(&mut self) {
         let Some(device) = self.device.as_ref() else {
@@ -1765,7 +1840,8 @@ impl App {
             self.offscreen_depth_view.as_ref(),
             self.post_sampler.as_ref(),
             self.dof_uniform_buffer.as_ref(),
-        ) else {
+        )
+        else {
             return;
         };
 
@@ -1773,36 +1849,53 @@ impl App {
             label: Some("DoF Bind Group"),
             layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: ubo.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(color_view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(depth_view) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(sampler) },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: ubo.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(color_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
             ],
         }));
     }
 
     fn update_dof_combine_bind_group(&mut self) {
-        let (
-            Some(device),
-            Some(layout),
-            Some(dof_color_view),
-            Some(source_view),
-            Some(sampler),
-        ) = (
+        let (Some(device), Some(layout), Some(dof_color_view), Some(source_view), Some(sampler)) = (
             self.device.as_ref(),
             self.dof_combine_bind_group_layout.as_ref(),
             self.dof_color_view.as_ref(),
             self.offscreen_color_view.as_ref(),
             self.post_sampler.as_ref(),
-        ) else { return; };
+        ) else {
+            return;
+        };
 
         self.dof_combine_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("DoF Combine Bind Group"),
             layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(dof_color_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(source_view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(dof_color_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(source_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
             ],
         }));
     }
@@ -1853,7 +1946,8 @@ impl App {
 
         // SSILVB uniforms
         if let Some(buffer) = self.ssilvb_uniform_buffer.as_ref() {
-            let data = self.build_ssilvb_uniforms((config.width / 2).max(1), (config.height / 2).max(1));
+            let data =
+                self.build_ssilvb_uniforms((config.width / 2).max(1), (config.height / 2).max(1));
             queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[data]));
         }
     }
@@ -1938,19 +2032,29 @@ impl App {
             // SSAO blur horizontal bind group (use bloom blur pipeline)
             if self.ssao_settings.blur_enabled {
                 if let (Some(ssao_h_ubo), Some(ssao_ping_view), Some(psampler)) = (
-                self.ssao_blur_horizontal_uniform_buffer.as_ref(),
-                self.ssao_ping_view.as_ref(),
-                self.post_sampler.as_ref(),
-            ) {
-                self.ssao_blur_horizontal_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("SSAO Blur Horizontal Bind Group"),
-                    layout: blur_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: ssao_h_ubo.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(ssao_ping_view) },
-                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(psampler) },
-                    ],
-                }));
+                    self.ssao_blur_horizontal_uniform_buffer.as_ref(),
+                    self.ssao_ping_view.as_ref(),
+                    self.post_sampler.as_ref(),
+                ) {
+                    self.ssao_blur_horizontal_bind_group =
+                        Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("SSAO Blur Horizontal Bind Group"),
+                            layout: blur_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: ssao_h_ubo.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::TextureView(ssao_ping_view),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: wgpu::BindingResource::Sampler(psampler),
+                                },
+                            ],
+                        }));
                 }
             }
 
@@ -1960,15 +2064,25 @@ impl App {
                 self.offscreen_depth_view.as_ref(),
                 self.post_sampler.as_ref(),
             ) {
-                self.ssilvb_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("SSILVB Bind Group"),
-                    layout: self.ssilvb_bind_group_layout.as_ref().unwrap(),
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: ssao_ubo.as_entire_binding(), },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(depth_view), },
-                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(psampler), },
-                    ],
-                }));
+                self.ssilvb_bind_group =
+                    Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("SSILVB Bind Group"),
+                        layout: self.ssilvb_bind_group_layout.as_ref().unwrap(),
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: ssao_ubo.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(depth_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::Sampler(psampler),
+                            },
+                        ],
+                    }));
             }
 
             self.bloom_blur_vertical_bind_group =
@@ -1994,19 +2108,29 @@ impl App {
             // SSAO blur vertical bind group (reads from SSAO Pong after horizontal)
             if self.ssao_settings.blur_enabled {
                 if let (Some(ssao_v_ubo), Some(ssao_pong_view), Some(psampler)) = (
-                self.ssao_blur_vertical_uniform_buffer.as_ref(),
-                self.ssao_pong_view.as_ref(),
-                self.post_sampler.as_ref(),
-            ) {
-                self.ssao_blur_vertical_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("SSAO Blur Vertical Bind Group"),
-                    layout: blur_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: ssao_v_ubo.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(ssao_pong_view) },
-                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(psampler) },
-                    ],
-                }));
+                    self.ssao_blur_vertical_uniform_buffer.as_ref(),
+                    self.ssao_pong_view.as_ref(),
+                    self.post_sampler.as_ref(),
+                ) {
+                    self.ssao_blur_vertical_bind_group =
+                        Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("SSAO Blur Vertical Bind Group"),
+                            layout: blur_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: ssao_v_ubo.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::TextureView(ssao_pong_view),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: wgpu::BindingResource::Sampler(psampler),
+                                },
+                            ],
+                        }));
                 }
             }
         }
@@ -2063,8 +2187,12 @@ impl App {
             // Determine initial texel_size from kawase_level_sizes if available
             let (texel_x, texel_y) = if let Some((w, h)) = self.kawase_level_sizes.get(level) {
                 (1.0 / (*w) as f32, 1.0 / (*h) as f32)
-            } else { (0.0_f32, 0.0_f32) };
-            let offset = self.dof_settings.kawase_offset * (level as f32 + 1.0) * self.dof_settings.blur_strength;
+            } else {
+                (0.0_f32, 0.0_f32)
+            };
+            let offset = self.dof_settings.kawase_offset
+                * (level as f32 + 1.0)
+                * self.dof_settings.blur_strength;
             let ubo_data = [texel_x, texel_y, offset, 0.0f32];
             let ubo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(&format!("Kawase Uniform L{}", level)),
@@ -2081,38 +2209,72 @@ impl App {
         }
 
         // Create/update the bind groups now that we have UBOs and textures created
-        let Some(layout) = self.kawase_bind_group_layout.as_ref() else { return; };
-        let Some(sampler) = self.post_sampler.as_ref() else { return; };
+        let Some(layout) = self.kawase_bind_group_layout.as_ref() else {
+            return;
+        };
+        let Some(sampler) = self.post_sampler.as_ref() else {
+            return;
+        };
         // DoF color view is the initial input for level 0 down pass; ping views provide subsequent levels
         let dof_input_view = self.dof_color_view.as_ref();
 
         for level in 0..iterations {
             // For down passes: input is dof_color_view for level 0, otherwise ping_views[level-1]
             let input_view = if level == 0 {
-                if let Some(view) = dof_input_view { view } else { continue; }
+                if let Some(view) = dof_input_view {
+                    view
+                } else {
+                    continue;
+                }
             } else {
-                if let Some(Some(view)) = self.kawase_ping_views.get(level - 1) { view } else { continue; }
+                if let Some(Some(view)) = self.kawase_ping_views.get(level - 1) {
+                    view
+                } else {
+                    continue;
+                }
             };
             let ubo_ref = self.kawase_uniform_buffers[level].as_ref().unwrap();
             let down_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(&format!("Kawase Down BG L{}", level)),
                 layout,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: ubo_ref.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(input_view) },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: ubo_ref.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(input_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
                 ],
             });
 
             // For up passes: input is ping_views[level]
-            let up_input_view = if let Some(Some(view)) = self.kawase_ping_views.get(level) { view } else { continue; };
+            let up_input_view = if let Some(Some(view)) = self.kawase_ping_views.get(level) {
+                view
+            } else {
+                continue;
+            };
             let up_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(&format!("Kawase Up BG L{}", level)),
                 layout,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: ubo_ref.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(up_input_view) },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: ubo_ref.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(up_input_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
                 ],
             });
 
@@ -2504,7 +2666,7 @@ impl App {
         // Request device with increased limits
         let mut limits = wgpu::Limits::default();
         limits.max_buffer_size = 1_073_741_824; // 1 GB (up from 256 MB default)
-        
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Main Device"),
@@ -2859,88 +3021,91 @@ impl App {
         });
 
         // Fused DoF bind group layout: uniform, source color, depth, sampler.
-        let dof_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("DoF Bind Group Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+        let dof_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("DoF Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
 
         // Removed separate CoC bind group layout (CoC computed in fused blur pass).
 
         // Combine now uses fused blurred texture (with CoC in alpha) + source color + sampler.
-        let dof_combine_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("DoF Combine Bind Group Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
+        let dof_combine_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("DoF Combine Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
 
-        let dof_combine_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("DoF Combine Pipeline Layout"),
-            bind_group_layouts: &[&dof_combine_bind_group_layout],
-            push_constant_ranges: &[],
-        });
+        let dof_combine_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("DoF Combine Pipeline Layout"),
+                bind_group_layouts: &[&dof_combine_bind_group_layout],
+                push_constant_ranges: &[],
+            });
 
         // Removed separate CoC pipeline (fused into blur pass).
         // Fused DoF combine pipeline (uses blurred texture alpha for CoC)
@@ -2973,55 +3138,62 @@ impl App {
         // Kawase (Dual Kawase) pipelines for down/upsample passes
         let kawase_down_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Kawase Down Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/dual_kawase_down.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../shaders/dual_kawase_down.wgsl").into(),
+            ),
         });
         let kawase_up_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Kawase Up Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/dual_kawase_up.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../shaders/dual_kawase_up.wgsl").into(),
+            ),
         });
 
-        let kawase_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Kawase Bind Group Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+        let kawase_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Kawase Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
 
-        let kawase_down_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Kawase Down Pipeline Layout"),
-            bind_group_layouts: &[&kawase_bind_group_layout],
-            push_constant_ranges: &[],
-        });
-        let kawase_up_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Kawase Up Pipeline Layout"),
-            bind_group_layouts: &[&kawase_bind_group_layout],
-            push_constant_ranges: &[],
-        });
+        let kawase_down_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Kawase Down Pipeline Layout"),
+                bind_group_layouts: &[&kawase_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+        let kawase_up_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Kawase Up Pipeline Layout"),
+                bind_group_layouts: &[&kawase_bind_group_layout],
+                push_constant_ranges: &[],
+            });
 
         let kawase_down_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Kawase Down Pipeline"),
@@ -3099,9 +3271,7 @@ impl App {
 
         let ssilvb_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("SSILVB / SSAO Shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("../../shaders/ssilvb.wgsl").into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/ssilvb.wgsl").into()),
         });
 
         let bloom_blur_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -3154,34 +3324,38 @@ impl App {
                 ],
             });
 
-            let ssilvb_bind_group_layout =
-                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("SSILVB Bind Group Layout"),
-                    entries: &[
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+        let ssilvb_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("SSILVB Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
-                            count: None,
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
                         },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 2,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                            count: None,
-                        },
-                    ],
-                });
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
 
         let bloom_blur_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -3481,7 +3655,7 @@ impl App {
             ambient_color_pad: [0.3, 0.35, 0.45, 0.0],
             shadow_texel_size_pad: [shadow_texel, shadow_texel, 0.0, 0.0],
             shadow_darkness_pad: [self.shadow_darkness, self.shadow_backface_scale, 0.0, 0.0],
-            moon_direction_intensity: [ -0.5, -1.0, -0.3, 0.2], // initial opposite dim moon
+            moon_direction_intensity: [-0.5, -1.0, -0.3, 0.2], // initial opposite dim moon
             moon_color_pad: [0.2, 0.25, 0.35, 0.0],
             light_probe_count: 0,
             lod_distance: 800.0,
@@ -3498,7 +3672,8 @@ impl App {
         // SSAO blur uniforms (half-resolution like SSao textures)
         let ssao_width = (config.width / 2).max(1);
         let ssao_height = (config.height / 2).max(1);
-        let ssao_blur_horizontal_uniforms = self.build_ssao_blur_uniforms(ssao_width, ssao_height, [1.0, 0.0]);
+        let ssao_blur_horizontal_uniforms =
+            self.build_ssao_blur_uniforms(ssao_width, ssao_height, [1.0, 0.0]);
         let ssao_blur_horizontal_uniform_buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("SSAO Blur Horizontal Uniform Buffer"),
@@ -3506,7 +3681,8 @@ impl App {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
 
-        let ssao_blur_vertical_uniforms = self.build_ssao_blur_uniforms(ssao_width, ssao_height, [0.0, 1.0]);
+        let ssao_blur_vertical_uniforms =
+            self.build_ssao_blur_uniforms(ssao_width, ssao_height, [0.0, 1.0]);
         let ssao_blur_vertical_uniform_buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("SSAO Blur Vertical Uniform Buffer"),
@@ -3622,15 +3798,19 @@ impl App {
         // DoF CoC copy pipeline (if Kawase is enabled, we use this cheap pass to produce CoC alpha + base color as input)
         let dof_coc_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("DoF CoC Copy Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/dof_coc_copy.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../shaders/dof_coc_copy.wgsl").into(),
+            ),
         });
         let dof_coc_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("DoF CoC Copy Pipeline"),
-            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("DoF CoC Pipeline Layout"),
-                bind_group_layouts: &[&dof_bind_group_layout],
-                push_constant_ranges: &[],
-            })),
+            layout: Some(
+                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("DoF CoC Pipeline Layout"),
+                    bind_group_layouts: &[&dof_bind_group_layout],
+                    push_constant_ranges: &[],
+                }),
+            ),
             vertex: wgpu::VertexState {
                 module: &dof_coc_shader,
                 entry_point: Some("vs_main"),
@@ -3674,10 +3854,11 @@ impl App {
         self.bloom_blur_vertical_uniform_buffer = Some(bloom_blur_vertical_uniform_buffer);
         self.ssao_blur_horizontal_uniform_buffer = Some(ssao_blur_horizontal_uniform_buffer);
         self.ssao_blur_vertical_uniform_buffer = Some(ssao_blur_vertical_uniform_buffer);
-            // Don't create SSAO blur bind groups until ping/pong views exist; update later in update_bloom_bind_groups()
+        // Don't create SSAO blur bind groups until ping/pong views exist; update later in update_bloom_bind_groups()
         self.composite_uniform_buffer = Some(composite_uniform_buffer);
         // SSILVB uniforms
-        let ssilvb_uniforms = self.build_ssilvb_uniforms((config.width / 2).max(1), (config.height / 2).max(1));
+        let ssilvb_uniforms =
+            self.build_ssilvb_uniforms((config.width / 2).max(1), (config.height / 2).max(1));
         let ssilvb_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("SSILVB Uniform Buffer"),
             contents: bytemuck::cast_slice(&[ssilvb_uniforms]),
@@ -3690,11 +3871,12 @@ impl App {
         self.composite_bind_group = None;
 
         // SSILVB: SSAO pipeline creation
-        let ssilvb_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("SSILVB Pipeline Layout"),
-            bind_group_layouts: &[&ssilvb_bind_group_layout],
-            push_constant_ranges: &[],
-        });
+        let ssilvb_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("SSILVB Pipeline Layout"),
+                bind_group_layouts: &[&ssilvb_bind_group_layout],
+                push_constant_ranges: &[],
+            });
 
         let ssilvb_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("SSILVB Pipeline"),
@@ -3749,7 +3931,12 @@ impl App {
 
         viewer_debug!("DEBUG: mesh_pipeline created successfully");
         println!("wgpu initialized");
-        println!("DoF Kawase enabled: {} (kawase_iterations={}, kawase_offset={})", self.dof_settings.kawase_enabled, self.dof_settings.kawase_iterations, self.dof_settings.kawase_offset);
+        println!(
+            "DoF Kawase enabled: {} (kawase_iterations={}, kawase_offset={})",
+            self.dof_settings.kawase_enabled,
+            self.dof_settings.kawase_iterations,
+            self.dof_settings.kawase_offset
+        );
     }
 
     fn render(&mut self) {
@@ -3844,6 +4031,37 @@ impl App {
                 leaf_chunks.insert((v.position[0], v.position[1], v.position[2]));
             }
         }
+        // Debug: print missing top-level neighbor cells near camera occasionally
+        if cfg!(feature = "viewer-debug") && self.frame_count % 600 == 0 {
+            // Top-level scale (root cell size)
+            let root_scale = 16i64.pow(self.world.hierarchy_depth() as u32 - 1);
+            let mut root_positions: HashSet<(i64, i64, i64)> = HashSet::new();
+            for (x, y, z) in self.world.root().positions() {
+                root_positions.insert((x as i64, y as i64, z as i64));
+            }
+
+            // Look for missing neighbors at root level around camera
+            let cam = self.camera_controller.camera.position;
+            let cam_top_x = (cam[0] as i64 / root_scale).clamp(0, 1 << 30);
+            let cam_top_y = (cam[1] as i64 / root_scale).clamp(0, 1 << 30);
+            let cam_top_z = (cam[2] as i64 / root_scale).clamp(0, 1 << 30);
+
+            for dx in -2i64..=2i64 {
+                for dy in -2i64..=2i64 {
+                    for dz in -2i64..=2i64 {
+                        let nx = cam_top_x + dx;
+                        let ny = cam_top_y + dy;
+                        let nz = cam_top_z + dz;
+                        if !root_positions.contains(&(nx, ny, nz)) {
+                            eprintln!(
+                                "DEBUG: missing root cell at ({}, {}, {}) around camera top-level",
+                                nx, ny, nz
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let grouping_time = grouping_start.elapsed();
 
         let mesh_start = Instant::now();
@@ -3852,7 +4070,7 @@ impl App {
         let mut new_meshes_created = 0;
         let mut chunks_not_found = 0;
         let mut missing_chunks: HashSet<(i64, i64, i64)> = HashSet::new();
-        
+
         for &key in &leaf_chunks {
             if self.mesh_cache.contains_key(&key) {
                 cpu_mesh_keys.insert(key);
@@ -3876,18 +4094,36 @@ impl App {
         while self.mesh_jobs_in_flight < max_inflight {
             // Occasionally re-sort the pending mesh queue to prioritize near-camera chunks.
             // This avoids reordering every frame and keeps scheduling cheap.
-            if self.pending_chunk_meshes.len() > 4 && (self.frame_index == 0 || (self.frame_index - self.last_pending_mesh_sort_frame) >= self.pending_mesh_sort_interval_frames) {
+            if self.pending_chunk_meshes.len() > 4
+                && (self.frame_index == 0
+                    || (self.frame_index - self.last_pending_mesh_sort_frame)
+                        >= self.pending_mesh_sort_interval_frames)
+            {
                 let cam_pos = self.camera_controller.camera.position;
                 let mut vec: Vec<_> = self.pending_chunk_meshes.iter().cloned().collect();
                 vec.sort_by(|a, b| {
                     let ca = [a.0 as f32 + 8.0, a.1 as f32 + 8.0, a.2 as f32 + 8.0];
                     let cb = [b.0 as f32 + 8.0, b.1 as f32 + 8.0, b.2 as f32 + 8.0];
-                    let da = (ca[0] - cam_pos[0]).mul_add(ca[0] - cam_pos[0], (ca[1] - cam_pos[1]).mul_add(ca[1] - cam_pos[1], (ca[2] - cam_pos[2]).powi(2))).abs();
-                    let db = (cb[0] - cam_pos[0]).mul_add(cb[0] - cam_pos[0], (cb[1] - cam_pos[1]).mul_add(cb[1] - cam_pos[1], (cb[2] - cam_pos[2]).powi(2))).abs();
+                    let da = (ca[0] - cam_pos[0])
+                        .mul_add(
+                            ca[0] - cam_pos[0],
+                            (ca[1] - cam_pos[1])
+                                .mul_add(ca[1] - cam_pos[1], (ca[2] - cam_pos[2]).powi(2)),
+                        )
+                        .abs();
+                    let db = (cb[0] - cam_pos[0])
+                        .mul_add(
+                            cb[0] - cam_pos[0],
+                            (cb[1] - cam_pos[1])
+                                .mul_add(cb[1] - cam_pos[1], (cb[2] - cam_pos[2]).powi(2)),
+                        )
+                        .abs();
                     da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
                 });
                 self.pending_chunk_meshes.clear();
-                for k in vec { self.pending_chunk_meshes.push_back(k); }
+                for k in vec {
+                    self.pending_chunk_meshes.push_back(k);
+                }
                 self.last_pending_mesh_sort_frame = self.frame_index;
             }
             let Some(key) = self.pending_chunk_meshes.pop_front() else {
@@ -3900,14 +4136,18 @@ impl App {
             {
                 Some(chunk) => {
                     // Snapshot neighbor chunks so AO can be computed across chunk bounds.
-                    let mut neighbors: std::collections::HashMap<(i8, i8, i8), Chunk> = std::collections::HashMap::new();
+                    let mut neighbors: std::collections::HashMap<(i8, i8, i8), Chunk> =
+                        std::collections::HashMap::new();
                     for dx in -1i64..=1 {
                         for dy in -1i64..=1 {
                             for dz in -1i64..=1 {
                                 let nx = key.0 + dx * 16;
                                 let ny = key.1 + dy * 16;
                                 let nz = key.2 + dz * 16;
-                                if let Some(nc) = self.world.get_leaf_chunk_at_origin(WorldPos::new(nx, ny, nz)) {
+                                if let Some(nc) = self
+                                    .world
+                                    .get_leaf_chunk_at_origin(WorldPos::new(nx, ny, nz))
+                                {
                                     neighbors.insert((dx as i8, dy as i8, dz as i8), nc.clone());
                                 }
                             }
@@ -4104,9 +4344,7 @@ impl App {
                     let dy = chunk_center[1] - camera_pos[1];
                     let dz = chunk_center[2] - camera_pos[2];
                     let distance = (dx * dx + dy * dy + dz * dz).sqrt();
-                    
-                    
-                    
+
                     if distance < self.fallback_detail_distance {
                         // Close: render all voxels
                         if let Some(fallback) = self.fallback_instances_for_chunk(key) {
@@ -4116,7 +4354,10 @@ impl App {
                         }
                     } else {
                         // Far: prefer using chunk.average_color for LOD bounding box if available
-                        if let Some(chunk) = self.world.get_leaf_chunk_at_origin(WorldPos::new(key.0, key.1, key.2)) {
+                        if let Some(chunk) = self
+                            .world
+                            .get_leaf_chunk_at_origin(WorldPos::new(key.0, key.1, key.2))
+                        {
                             let avg = chunk.average_color;
                             // prefer an AABB where available for a closer visual fallback
                             if let Some(bbox) = chunk.bounding_box {
@@ -4210,7 +4451,11 @@ impl App {
                                 1.0,
                             ];
                             out.push(VoxelInstanceRaw {
-                                position: [v.position[0] as f32, v.position[1] as f32, v.position[2] as f32],
+                                position: [
+                                    v.position[0] as f32,
+                                    v.position[1] as f32,
+                                    v.position[2] as f32,
+                                ],
                                 voxel_type: v.voxel_type as u32,
                                 scale: v.scale as f32,
                                 ao_factor: 1.0,
@@ -4232,7 +4477,9 @@ impl App {
 
                 let ao = input.custom_color[3];
                 let mut cc = input.custom_color;
-                if cc[3] > 0.0 { cc[3] = 1.0; }
+                if cc[3] > 0.0 {
+                    cc[3] = 1.0;
+                }
 
                 out.push(VoxelInstanceRaw {
                     position: input.position,
@@ -4270,9 +4517,7 @@ impl App {
                     let dy = chunk_center[1] - camera_pos[1];
                     let dz = chunk_center[2] - camera_pos[2];
                     let distance = (dx * dx + dy * dy + dz * dz).sqrt();
-                    
-                    
-                    
+
                     if distance < self.fallback_detail_distance {
                         // Close: render all voxels
                         if let Some(fallback) = self.fallback_instances_for_chunk(key) {
@@ -4282,7 +4527,10 @@ impl App {
                         }
                     } else {
                         // Far: prefer using chunk.average_color for LOD bounding box if available
-                        if let Some(chunk) = self.world.get_leaf_chunk_at_origin(WorldPos::new(key.0, key.1, key.2)) {
+                        if let Some(chunk) = self
+                            .world
+                            .get_leaf_chunk_at_origin(WorldPos::new(key.0, key.1, key.2))
+                        {
                             let avg = chunk.average_color;
                             let custom_color = [
                                 avg[0] as f32 / 255.0,
@@ -4291,7 +4539,11 @@ impl App {
                                 1.0,
                             ];
                             out.push(VoxelInstanceRaw {
-                                position: [v.position[0] as f32, v.position[1] as f32, v.position[2] as f32],
+                                position: [
+                                    v.position[0] as f32,
+                                    v.position[1] as f32,
+                                    v.position[2] as f32,
+                                ],
                                 voxel_type: v.voxel_type as u32,
                                 scale: v.scale as f32,
                                 ao_factor: 1.0,
@@ -4451,7 +4703,7 @@ impl App {
             let sunrise_ambient = [0.3, 0.2, 0.2];
             let day_sun = [0.8, 0.76, 0.64]; // Reduced from [1.0, 0.95, 0.8] to 80%
             let day_ambient = [0.3, 0.35, 0.45];
-            
+
             // Interpolate between color phases
             let t = self.time_of_day;
             if t < 0.125 {
@@ -4626,7 +4878,7 @@ impl App {
         let height = bounds_max.y - bounds_min.y;
         let texel_size_x = width / self.shadow_map_size as f32;
         let texel_size_y = height / self.shadow_map_size as f32;
-        
+
         bounds_min.x = (bounds_min.x / texel_size_x).floor() * texel_size_x;
         bounds_min.y = (bounds_min.y / texel_size_y).floor() * texel_size_y;
         bounds_max.x = (bounds_max.x / texel_size_x).ceil() * texel_size_x;
@@ -4654,7 +4906,7 @@ impl App {
         } else {
             // Sun is below horizon - use moon shadows
             let moon_height = -sun_height; // Moon is on opposite side
-            // Continuous transition: moon shadows gradually appear as moon rises
+                                           // Continuous transition: moon shadows gradually appear as moon rises
             if moon_height < 0.2 {
                 // Moon just rising - fade in moon shadows gradually
                 let fade = (moon_height / 0.2).clamp(0.0, 1.0);
@@ -4978,7 +5230,6 @@ impl App {
             self.update_dof_bind_group();
         }
 
-
         self.update_bloom_uniforms();
 
         if self.composite_bind_group.is_none()
@@ -4996,8 +5247,14 @@ impl App {
 
         if !skip_dof {
             // If DoF is enabled we always run the cheap CoC copy pass to produce base color + CoC in alpha.
-            let use_kawase = self.dof_settings.kawase_enabled && self.dof_settings.kawase_iterations > 0;
-            if let (Some(dof_bind_group), Some(dof_buffer), Some(dof_color_view), Some(dof_coc_pipeline)) = (
+            let use_kawase =
+                self.dof_settings.kawase_enabled && self.dof_settings.kawase_iterations > 0;
+            if let (
+                Some(dof_bind_group),
+                Some(dof_buffer),
+                Some(dof_color_view),
+                Some(dof_coc_pipeline),
+            ) = (
                 self.dof_bind_group.as_ref(),
                 self.dof_uniform_buffer.as_ref(),
                 self.dof_color_view.as_ref(),
@@ -5041,12 +5298,16 @@ impl App {
                     let inst_start = std::time::Instant::now();
                     // Down passes
                     for level in 0..iterations {
-                        let target_view = kawase_ping_views[level].as_ref().expect("Kawase ping view missing");
+                        let target_view = kawase_ping_views[level]
+                            .as_ref()
+                            .expect("Kawase ping view missing");
                         // Update UBO for this level with texel size and offset
                         if let Some(Some(ubo)) = self.kawase_uniform_buffers.get(level) {
                             if let Some((w, h)) = self.kawase_level_sizes.get(level) {
                                 let texel_size = [1.0 / (*w) as f32, 1.0 / (*h) as f32];
-                                let offset = self.dof_settings.kawase_offset * (level as f32 + 1.0) * self.dof_settings.blur_strength;
+                                let offset = self.dof_settings.kawase_offset
+                                    * (level as f32 + 1.0)
+                                    * self.dof_settings.blur_strength;
                                 let ubo_data = [texel_size[0], texel_size[1], offset, 0.0f32];
                                 let changed = match self.kawase_last_ubo.get(level) {
                                     Some(prev) => {
@@ -5075,7 +5336,10 @@ impl App {
                                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                                     view: target_view,
                                     resolve_target: None,
-                                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                        store: wgpu::StoreOp::Store,
+                                    },
                                     depth_slice: None,
                                 })],
                                 depth_stencil_attachment: None,
@@ -5090,11 +5354,17 @@ impl App {
 
                     // Up passes
                     for level_rev in (0..iterations).rev() {
-                        let target_view = if level_rev == 0 { self.dof_color_view.as_ref().unwrap() } else { self.kawase_pong_views[level_rev-1].as_ref().unwrap() };
+                        let target_view = if level_rev == 0 {
+                            self.dof_color_view.as_ref().unwrap()
+                        } else {
+                            self.kawase_pong_views[level_rev - 1].as_ref().unwrap()
+                        };
                         if let Some(Some(ubo)) = self.kawase_uniform_buffers.get(level_rev) {
                             if let Some((w, h)) = self.kawase_level_sizes.get(level_rev) {
                                 let texel_size = [1.0 / (*w) as f32, 1.0 / (*h) as f32];
-                                let offset = self.dof_settings.kawase_offset * (level_rev as f32 + 1.0) * self.dof_settings.blur_strength;
+                                let offset = self.dof_settings.kawase_offset
+                                    * (level_rev as f32 + 1.0)
+                                    * self.dof_settings.blur_strength;
                                 let ubo_data = [texel_size[0], texel_size[1], offset, 0.0f32];
                                 let changed = match self.kawase_last_ubo.get(level_rev) {
                                     Some(prev) => {
@@ -5119,18 +5389,22 @@ impl App {
 
                         if let Some(Some(bind_group)) = self.kawase_up_bind_groups.get(level_rev) {
                             let pass_start = std::time::Instant::now();
-                            let mut up_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                label: Some(&format!("Kawase Up L{}", level_rev)),
-                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                    view: target_view,
-                                    resolve_target: None,
-                                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
-                                    depth_slice: None,
-                                })],
-                                depth_stencil_attachment: None,
-                                timestamp_writes: None,
-                                occlusion_query_set: None,
-                            });
+                            let mut up_pass =
+                                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                    label: Some(&format!("Kawase Up L{}", level_rev)),
+                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                        view: target_view,
+                                        resolve_target: None,
+                                        ops: wgpu::Operations {
+                                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                            store: wgpu::StoreOp::Store,
+                                        },
+                                        depth_slice: None,
+                                    })],
+                                    depth_stencil_attachment: None,
+                                    timestamp_writes: None,
+                                    occlusion_query_set: None,
+                                });
                             up_pass.set_pipeline(kawase_up_pipeline);
                             up_pass.set_bind_group(0, bind_group, &[]);
                             up_pass.draw(0..3, 0..1);
@@ -5145,7 +5419,11 @@ impl App {
 
         // Final DoF combine: source color + blurred DoF + CoC => post_color_view (skip if DoF disabled)
         if !skip_dof {
-            if let (Some(dof_combine_pipeline), Some(dof_combine_bind_group), Some(post_color_view)) = (
+            if let (
+                Some(dof_combine_pipeline),
+                Some(dof_combine_bind_group),
+                Some(post_color_view),
+            ) = (
                 self.dof_combine_pipeline.as_ref(),
                 self.dof_combine_bind_group.as_ref(),
                 self.post_color_view.as_ref(),
@@ -5188,7 +5466,8 @@ impl App {
                     );
                 }
             }
-        }        if self.bloom_enabled {
+        }
+        if self.bloom_enabled {
             if let (
                 Some(bloom_extract_pipeline),
                 Some(bloom_extract_bind_group),
@@ -5198,97 +5477,91 @@ impl App {
                 self.bloom_extract_bind_group.as_ref(),
                 self.bloom_ping_view.as_ref(),
             ) {
-                    // SSILVB/SSAO: run before bloom so AO can affect later passes
-                    if self.ssao_enabled {
-                        if let (
-                            Some(ssilvb_pipeline),
-                            Some(ssilvb_bind_group),
-                            Some(ssao_ping_view),
-                        ) = (
-                            self.ssilvb_pipeline.as_ref(),
-                            self.ssilvb_bind_group.as_ref(),
-                            self.ssao_ping_view.as_ref(),
-                        ) {
-                            let mut ssao_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                // SSILVB/SSAO: run before bloom so AO can affect later passes
+                if self.ssao_enabled {
+                    if let (Some(ssilvb_pipeline), Some(ssilvb_bind_group), Some(ssao_ping_view)) = (
+                        self.ssilvb_pipeline.as_ref(),
+                        self.ssilvb_bind_group.as_ref(),
+                        self.ssao_ping_view.as_ref(),
+                    ) {
+                        let mut ssao_pass =
+                            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                 label: Some("SSILVB Pass"),
                                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                                     view: ssao_ping_view,
                                     resolve_target: None,
-                                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                        store: wgpu::StoreOp::Store,
+                                    },
                                     depth_slice: None,
                                 })],
                                 depth_stencil_attachment: None,
                                 timestamp_writes: None,
                                 occlusion_query_set: None,
                             });
-                            ssao_pass.set_pipeline(ssilvb_pipeline);
-                            ssao_pass.set_bind_group(0, ssilvb_bind_group, &[]);
-                            ssao_pass.draw(0..3, 0..1);
-                        }
+                        ssao_pass.set_pipeline(ssilvb_pipeline);
+                        ssao_pass.set_bind_group(0, ssilvb_bind_group, &[]);
+                        ssao_pass.draw(0..3, 0..1);
+                    }
 
-                        // Optional SSAO blur (reduce speckle): horizontal then vertical
-                        if self.ssao_settings.blur_enabled {
-                            if let (
-                            Some(ssao_blur_pipeline),
-                            Some(ssao_blur_h),
-                            Some(ssao_pong_view),
-                        ) = (
+                    // Optional SSAO blur (reduce speckle): horizontal then vertical
+                    if self.ssao_settings.blur_enabled {
+                        if let (Some(ssao_blur_pipeline), Some(ssao_blur_h), Some(ssao_pong_view)) = (
                             self.ssao_blur_pipeline.as_ref(),
                             self.ssao_blur_horizontal_bind_group.as_ref(),
                             self.ssao_pong_view.as_ref(),
                         ) {
-                            let mut blur_pass_h = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                label: Some("SSAO Blur Horizontal Pass"),
-                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                    view: ssao_pong_view,
-                                    resolve_target: None,
-                                    ops: wgpu::Operations {
-                                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                                        store: wgpu::StoreOp::Store,
-                                    },
-                                    depth_slice: None,
-                                })],
-                                depth_stencil_attachment: None,
-                                timestamp_writes: None,
-                                occlusion_query_set: None,
-                            });
+                            let mut blur_pass_h =
+                                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                    label: Some("SSAO Blur Horizontal Pass"),
+                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                        view: ssao_pong_view,
+                                        resolve_target: None,
+                                        ops: wgpu::Operations {
+                                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                            store: wgpu::StoreOp::Store,
+                                        },
+                                        depth_slice: None,
+                                    })],
+                                    depth_stencil_attachment: None,
+                                    timestamp_writes: None,
+                                    occlusion_query_set: None,
+                                });
                             blur_pass_h.set_pipeline(ssao_blur_pipeline);
                             blur_pass_h.set_bind_group(0, ssao_blur_h, &[]);
                             blur_pass_h.draw(0..3, 0..1);
-                            }
                         }
+                    }
 
-                        if self.ssao_settings.blur_enabled {
-                            if let (
-                            Some(ssao_blur_pipeline),
-                            Some(ssao_blur_v),
-                            Some(ssao_ping_view),
-                        ) = (
+                    if self.ssao_settings.blur_enabled {
+                        if let (Some(ssao_blur_pipeline), Some(ssao_blur_v), Some(ssao_ping_view)) = (
                             self.ssao_blur_pipeline.as_ref(),
                             self.ssao_blur_vertical_bind_group.as_ref(),
                             self.ssao_ping_view.as_ref(),
                         ) {
-                            let mut blur_pass_v = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                label: Some("SSAO Blur Vertical Pass"),
-                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                    view: ssao_ping_view,
-                                    resolve_target: None,
-                                    ops: wgpu::Operations {
-                                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                                        store: wgpu::StoreOp::Store,
-                                    },
-                                    depth_slice: None,
-                                })],
-                                depth_stencil_attachment: None,
-                                timestamp_writes: None,
-                                occlusion_query_set: None,
-                            });
+                            let mut blur_pass_v =
+                                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                    label: Some("SSAO Blur Vertical Pass"),
+                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                        view: ssao_ping_view,
+                                        resolve_target: None,
+                                        ops: wgpu::Operations {
+                                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                            store: wgpu::StoreOp::Store,
+                                        },
+                                        depth_slice: None,
+                                    })],
+                                    depth_stencil_attachment: None,
+                                    timestamp_writes: None,
+                                    occlusion_query_set: None,
+                                });
                             blur_pass_v.set_pipeline(ssao_blur_pipeline);
                             blur_pass_v.set_bind_group(0, ssao_blur_v, &[]);
                             blur_pass_v.draw(0..3, 0..1);
-                            }
                         }
                     }
+                }
                 let mut extract_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Bloom Extract Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -5391,7 +5664,7 @@ impl App {
 
         // Stats
         self.frame_count += 1;
-            if now.duration_since(self.last_fps_print).as_secs() >= 1 {
+        if now.duration_since(self.last_fps_print).as_secs() >= 1 {
             let total_visible = visible.len();
             let mesh_cache_mib = self.mesh_cache_bytes as f64 / (1024.0 * 1024.0);
             let mesh_budget_mib = self.mesh_cache_byte_budget() as f64 / (1024.0 * 1024.0);
@@ -5420,15 +5693,20 @@ impl App {
                 , self.dof_settings.kawase_iterations
                 , self.dof_settings.kawase_offset
             );
-                // Print Kawase timing ones per second to avoid spamming
-                if self.kawase_acc_frames > 0 {
-                    let avg_write = self.kawase_write_acc.as_secs_f64() * 1000.0 / self.kawase_acc_frames as f64;
-                    let avg_pass = self.kawase_pass_acc.as_secs_f64() * 1000.0 / self.kawase_acc_frames as f64;
-                    println!("Kawase write avg: {:.3}ms, pass avg: {:.3}ms (over {} frames)", avg_write, avg_pass, self.kawase_acc_frames);
-                    self.kawase_write_acc = std::time::Duration::from_secs(0);
-                    self.kawase_pass_acc = std::time::Duration::from_secs(0);
-                    self.kawase_acc_frames = 0;
-                }
+            // Print Kawase timing ones per second to avoid spamming
+            if self.kawase_acc_frames > 0 {
+                let avg_write =
+                    self.kawase_write_acc.as_secs_f64() * 1000.0 / self.kawase_acc_frames as f64;
+                let avg_pass =
+                    self.kawase_pass_acc.as_secs_f64() * 1000.0 / self.kawase_acc_frames as f64;
+                println!(
+                    "Kawase write avg: {:.3}ms, pass avg: {:.3}ms (over {} frames)",
+                    avg_write, avg_pass, self.kawase_acc_frames
+                );
+                self.kawase_write_acc = std::time::Duration::from_secs(0);
+                self.kawase_pass_acc = std::time::Duration::from_secs(0);
+                self.kawase_acc_frames = 0;
+            }
             self.frame_count = 0;
             self.last_fps_print = now;
         }

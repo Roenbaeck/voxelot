@@ -260,7 +260,7 @@ pub struct Camera {
 
 impl Camera {
     pub fn new(position: [f32; 3], forward: [f32; 3], up: [f32; 3]) -> Self {
-    Self::with_config(position, forward, up, RenderConfig::default())
+        Self::with_config(position, forward, up, RenderConfig::default())
     }
 
     pub fn with_config(
