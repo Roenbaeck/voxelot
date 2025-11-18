@@ -133,8 +133,28 @@ pub fn generate_chunk_mesh_optimized(
     let mut col_face_masks = [[[0u16; 16]; 16]; 6];
 
     for axis in 0..3 {
+        // Optimization: Pre-calculate masks for i and j loops based on axis
+        // Axis 0 (Y-cols, XZ plane): i=z, j=x. Skip if pz bit i is 0 or px bit j is 0.
+        // Axis 1 (X-cols, ZY plane): i=y, j=z. Skip if py bit i is 0 or pz bit j is 0.
+        // Axis 2 (Z-cols, XY plane): i=y, j=x. Skip if py bit i is 0 or px bit j is 0.
+        let (i_mask, j_mask) = match axis {
+            0 => (chunk.pz, chunk.px),
+            1 => (chunk.py, chunk.pz),
+            _ => (chunk.py, chunk.px),
+        };
+
         for i in 0..16 {
+            // Skip if the entire row/plane at 'i' is empty
+            if (i_mask & (1 << i)) == 0 {
+                continue;
+            }
+
             for j in 0..16 {
+                // Skip if the column at 'j' is empty
+                if (j_mask & (1 << j)) == 0 {
+                    continue;
+                }
+
                 let col = axis_cols[axis][i][j];
 
                 // Negative faces: `col & !(col << 1)`
