@@ -702,6 +702,7 @@ struct App {
     last_pending_mesh_sort_frame: u64,
     mesh_cache_budget_bytes: u64,
     fallback_detail_distance: f32,
+    fallback_bbox_shrink: f32,
     last_frame: Instant,
     frame_count: u64,
     frame_index: u64,
@@ -1032,6 +1033,7 @@ impl App {
             last_pending_mesh_sort_frame: 0,
             mesh_cache_budget_bytes: cfg.performance.mesh_cache_budget_mb as u64 * 1024 * 1024,
             fallback_detail_distance: cfg.performance.fallback_detail_distance,
+            fallback_bbox_shrink: cfg.performance.fallback_bbox_shrink,
             camera_controller: CameraController::new(initial_camera, &cfg.rendering),
             pending_chunk_meshes: VecDeque::new(),
             pending_chunk_set: HashSet::new(),
@@ -4397,6 +4399,32 @@ impl App {
                                 let ymax = bbox[4] as f32;
                                 let zmax = bbox[5] as f32;
 
+                                // Note: keep world_center computed at the end (after shrink)
+
+                                let size_x = xmax - xmin + 1.0;
+                                let size_y = ymax - ymin + 1.0;
+                                let size_z = zmax - zmin + 1.0;
+
+                                // Shrink the fallback bounding box slightly to make it visually
+                                // less obtrusive when the real mesh appears. Only shrink if the
+                                // bbox does not touch any chunk edge so we don't create visible
+                                // gaps between adjacent chunks.
+                                let cfg_shrink = self.fallback_bbox_shrink;
+                                let touches_edge = xmin <= 0.0 || ymin <= 0.0 || zmin <= 0.0 || xmax >= 15.0 || ymax >= 15.0 || zmax >= 15.0;
+                                let shrink = if touches_edge { 1.0 } else { cfg_shrink };
+
+                                let new_x = size_x * shrink;
+                                let new_y = size_y * shrink;
+                                let new_z = size_z * shrink;
+
+                                // compute local center for new bbox; anchor edges remain at same
+                                // coordinate if shrink would move them -> but we avoid shrinking
+                                // if touches edge to prevent gaps
+                                // world_center preserved as original; scaling is uniform so we
+                                // keep center in place to avoid shifting boxes visibly.
+
+                                let scale = new_x.max(new_y).max(new_z);
+
                                 let local_cx = (xmin + xmax + 1.0) * 0.5;
                                 let local_cy = (ymin + ymax + 1.0) * 0.5;
                                 let local_cz = (zmin + zmax + 1.0) * 0.5;
@@ -4406,11 +4434,6 @@ impl App {
                                     v.position[1] as f32 + local_cy,
                                     v.position[2] as f32 + local_cz,
                                 ];
-
-                                let size_x = xmax - xmin + 1.0;
-                                let size_y = ymax - ymin + 1.0;
-                                let size_z = zmax - zmin + 1.0;
-                                let scale = size_x.max(size_y).max(size_z);
 
                                 let custom_color = [
                                     avg[0] as f32 / 255.0,

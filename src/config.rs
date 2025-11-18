@@ -150,6 +150,8 @@ pub struct PerformanceConfig {
     pub mesh_upload_baseline: usize,
     #[serde(default = "default_fallback_detail_distance")]
     pub fallback_detail_distance: f32,
+    #[serde(default = "default_fallback_bbox_shrink")]
+    pub fallback_bbox_shrink: f32,
     #[serde(default = "default_mesh_priority_sort_interval_frames")]
     pub mesh_priority_sort_interval_frames: u64,
 }
@@ -333,6 +335,10 @@ fn default_fallback_detail_distance() -> f32 {
     500.0
 }
 
+fn default_fallback_bbox_shrink() -> f32 {
+    0.92
+}
+
 fn default_mesh_priority_sort_interval_frames() -> u64 {
     30
 }
@@ -448,6 +454,7 @@ impl Default for PerformanceConfig {
             mesh_worker_count: default_mesh_workers(),
             mesh_upload_baseline: default_mesh_upload_baseline(),
             fallback_detail_distance: default_fallback_detail_distance(),
+            fallback_bbox_shrink: default_fallback_bbox_shrink(),
             mesh_priority_sort_interval_frames: default_mesh_priority_sort_interval_frames(),
         }
     }
