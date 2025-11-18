@@ -10,6 +10,7 @@
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use glam::{Mat4, Vec3};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use wgpu::util::DeviceExt;
 use winit::{
@@ -115,11 +116,12 @@ struct MeshCacheEntry {
     vertex_bytes: u64,
     index_bytes: u64,
     last_used_frame: u64,
+    is_placeholder: bool,
 }
 
 impl MeshCacheEntry {
     fn total_bytes(&self) -> u64 {
-        self.vertex_bytes + self.index_bytes
+        if self.is_placeholder { 0 } else { self.vertex_bytes + self.index_bytes }
     }
 }
 // Ensure impl CameraController is properly closed (fix potential brace mismatch introduced by refactor)
@@ -674,6 +676,13 @@ struct App {
     mesh_cache_bytes: u64,
     /// Cached Arc<Chunk> snapshots for mesher jobs to avoid repeated deep clones
     mesh_chunk_arc_cache: HashMap<(i64, i64, i64), Arc<Chunk>>,
+    /// Count of mesh jobs executed per second by worker threads (reset on FPS print)
+    mesh_jobs_executed: Arc<AtomicUsize>,
+    /// Empty placeholder buffers for chunks that have no geometry; reused by many entries
+    empty_mesh_vertex_buffer: Option<wgpu::Buffer>,
+    empty_mesh_index_buffer: Option<wgpu::Buffer>,
+    /// Stat: number of empty meshes processed (non-geometric chunks)
+    stat_empty_meshes: u64,
     fallback_chunk_instances: HashMap<(i64, i64, i64), Vec<VoxelInstanceRaw>>,
     chunk_emitters: HashMap<(i64, i64, i64), Vec<ChunkEmitterWorld>>,
     active_emitters: Vec<ActiveLight>,
@@ -910,6 +919,7 @@ impl App {
 
         let (mesh_job_tx, mesh_job_rx) = unbounded::<MeshJob>();
         let (mesh_result_tx, mesh_result_rx) = unbounded::<MeshResult>();
+        let mesh_jobs_executed = Arc::new(AtomicUsize::new(0));
 
         let available_workers = std::thread::available_parallelism()
             .map(|n| n.get().saturating_sub(2))
@@ -922,6 +932,7 @@ impl App {
 
         for worker_index in 0..mesh_worker_count {
             let job_rx = mesh_job_rx.clone();
+            let jobs_executed = mesh_jobs_executed.clone();
             let result_tx = mesh_result_tx.clone();
             let palette_clone = palette.clone();
                 std::thread::Builder::new()
@@ -948,6 +959,8 @@ impl App {
                         {
                             break;
                         }
+                        // Account for this processed mesh job
+                        jobs_executed.fetch_add(1, Ordering::Relaxed);
                     }
                 })
                 .expect("failed to spawn mesh worker");
@@ -1009,8 +1022,12 @@ impl App {
             gpu_readback_buffer: None,
             gpu_readback_capacity: 0,
             mesh_cache: HashMap::new(),
+            mesh_jobs_executed: mesh_jobs_executed.clone(),
             mesh_cache_bytes: 0,
             mesh_chunk_arc_cache: HashMap::new(),
+            empty_mesh_vertex_buffer: None,
+            empty_mesh_index_buffer: None,
+            stat_empty_meshes: 0,
             fallback_chunk_instances: HashMap::new(),
             chunk_emitters: HashMap::new(),
             active_emitters: Vec::new(),
@@ -1178,6 +1195,10 @@ impl App {
             full_cfg.effects.depth_of_field.enabled = self.dof_enabled;
             full_cfg.effects.depth_of_field.focal_distance = self.dof_settings.focal_distance;
             full_cfg.effects.depth_of_field.focal_range = self.dof_settings.focal_range;
+            full_cfg.effects.depth_of_field.blur_strength = self.dof_settings.blur_strength;
+            full_cfg.effects.depth_of_field.kawase_iterations = self.dof_settings.kawase_iterations;
+            full_cfg.effects.depth_of_field.kawase_offset = self.dof_settings.kawase_offset;
+            full_cfg.effects.depth_of_field.kawase_enabled = self.dof_settings.kawase_enabled;
             full_cfg.effects.depth_of_field.blur_strength = self.dof_settings.blur_strength;
 
             // Bloom settings
@@ -2434,10 +2455,14 @@ impl App {
             }
 
                 if let Some(entry) = self.mesh_cache.remove(&key) {
-                let entry_bytes = entry.total_bytes();
-                entry.vertex_buffer.destroy();
-                entry.index_buffer.destroy();
-                self.mesh_cache_bytes = self.mesh_cache_bytes.saturating_sub(entry_bytes);
+                    let entry_bytes = entry.total_bytes();
+                    // If this was a placeholder (shared empty buffers), do not destroy the buffer
+                    // as it is owned globally. Only destroy buffers for normal entries.
+                    if !entry.is_placeholder {
+                        entry.vertex_buffer.destroy();
+                        entry.index_buffer.destroy();
+                        self.mesh_cache_bytes = self.mesh_cache_bytes.saturating_sub(entry_bytes);
+                    }
                 self.chunk_emitters.remove(&key);
                 // Also drop any cached Arc<Chunk> snapshot for this chunk to free memory
                 self.mesh_chunk_arc_cache.remove(&key);
@@ -4157,6 +4182,13 @@ impl App {
         let max_inflight = self.max_inflight_jobs();
     let schedule_start = std::time::Instant::now();
     while self.mesh_jobs_in_flight < max_inflight {
+            // Backpressure: don't schedule more worker jobs if the ready result queue is already
+            // large. This avoids generating more meshes than we can upload and prevents a
+            // runaway backlog that keeps workers busy indefinitely.
+            let ready_backlog_limit = std::cmp::max(64, self.mesh_upload_limit * 4);
+            if self.ready_chunk_meshes.len() >= ready_backlog_limit {
+                break;
+            }
             // Occasionally re-sort the pending mesh queue to prioritize near-camera chunks.
             // This avoids reordering every frame and keeps scheduling cheap.
             if self.pending_chunk_meshes.len() > 4
@@ -4269,6 +4301,12 @@ impl App {
     mesh_schedule_time += schedule_start.elapsed();
 
     let mut processed_meshes = 0;
+    // Decide per-frame upload limit and allow temporary boost when ready backlog accumulates
+    let mut frame_mesh_upload_limit = self.mesh_upload_limit;
+    if self.ready_chunk_meshes.len() > self.mesh_upload_limit * 4 {
+        // boost cap - allow draining faster when there's a large backlog
+        frame_mesh_upload_limit = self.mesh_upload_max;
+    }
     // Detailed timing for mesh upload parts: vertex buffer creation, index buffer creation and cache insertion.
     let mut mesh_upload_vbuf_time = std::time::Duration::ZERO;
     let mut mesh_upload_ibuf_time = std::time::Duration::ZERO;
@@ -4276,7 +4314,7 @@ impl App {
     let mut mesh_build_vb_time = std::time::Duration::ZERO;
     let mut mesh_emitters_proc_time = std::time::Duration::ZERO;
     let mesh_upload_total_start = std::time::Instant::now();
-        while processed_meshes < self.mesh_upload_limit {
+    while processed_meshes < frame_mesh_upload_limit {
             let Some(result) = self.ready_chunk_meshes.pop_front() else {
                 break;
             };
@@ -4315,6 +4353,45 @@ impl App {
 
             mesh_emitters_proc_time += emitters_start.elapsed();
             if mesh.indices.is_empty() {
+                // Insert a placeholder (no-geometry) entry into the mesh cache so the chunk
+                // won't be re-scheduled every frame. Reuse a global empty buffer pair.
+                if self.empty_mesh_vertex_buffer.is_none() {
+                    let small_vb: Vec<MeshVertexRaw> = vec![MeshVertexRaw {
+                        position: [0.0, 0.0, 0.0],
+                        normal: [0.0, 1.0, 0.0],
+                        color: [1.0, 1.0, 1.0, 1.0],
+                        emissive: [0.0, 0.0, 0.0, 0.0],
+                    }];
+                    let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("Empty Chunk Vertex Buffer"),
+                        contents: bytemuck::cast_slice(&small_vb),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
+                    self.empty_mesh_vertex_buffer = Some(vbuf);
+                }
+                if self.empty_mesh_index_buffer.is_none() {
+                    let small_ib: Vec<u32> = vec![0u32];
+                    let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("Empty Chunk Index Buffer"),
+                        contents: bytemuck::cast_slice(&small_ib),
+                        usage: wgpu::BufferUsages::INDEX,
+                    });
+                    self.empty_mesh_index_buffer = Some(ibuf);
+                }
+
+                let entry = MeshCacheEntry {
+                    vertex_buffer: self.empty_mesh_vertex_buffer.as_ref().unwrap().clone(),
+                    index_buffer: self.empty_mesh_index_buffer.as_ref().unwrap().clone(),
+                    index_count: 0,
+                    vertex_bytes: 0,
+                    index_bytes: 0,
+                    last_used_frame: self.frame_index,
+                    is_placeholder: true,
+                };
+                self.mesh_cache.insert(key, entry);
+                self.fallback_chunk_instances.remove(&key);
+                new_meshes_created += 1;
+                self.stat_empty_meshes += 1;
                 continue;
             }
 
@@ -4389,6 +4466,7 @@ impl App {
                 vertex_bytes,
                 index_bytes,
                 last_used_frame: self.frame_index,
+                is_placeholder: false,
             };
             let entry_start = std::time::Instant::now();
             self.mesh_cache.insert(key, entry);
@@ -5813,23 +5891,34 @@ impl App {
                 .process(self.process_pid)
                 .map(|p| p.memory() as f64 / (1024.0 * 1024.0))
                 .unwrap_or(0.0);
+            let ready_count = self.ready_chunk_meshes.len();
+            let jobs_in_flight = self.mesh_jobs_in_flight;
+            let pending_set_count = self.pending_chunk_set.len();
+            let jobs_per_sec = self.mesh_jobs_executed.swap(0, Ordering::Relaxed);
+            let mesh_idle = self.pending_chunk_meshes.is_empty() && self.ready_chunk_meshes.is_empty() && jobs_in_flight == 0;
             println!(
-                "FPS: {}, Visible items: {}, Leaf chunks: {}, Meshed chunks: {}, Pending: {}, Fallback: {}, Mesh cache: {:.1}/{:.1} MiB, Process: {:.1} MiB, Cull: {:.2}ms, Group: {:.2}ms, Mesh: {:.2}ms, Instances: {:.2}ms, Draws: {}, DoF Kawase: {} (iter={}, off={:.2}), MeshUp: {:.2}ms parts:(leaf:{:.2} sched:{:.2} sort:{:.2} res:{:.2} jobc:{:.2} jobn:{:.2}) vbld:{:.2} v:{:.2} i:{:.2} ins:{:.2} emit:{:.2} processed:{} limit:{}",
+                "FPS: {}, Visible items: {}, Leaf chunks: {}, Meshed chunks: {}, Pending: {}, PendingSet: {}, Ready: {}, InFlight: {}, Fallback: {}, Mesh cache: {:.1}/{:.1} MiB, Process: {:.1} MiB, Cull: {:.2}ms, Group: {:.2}ms, Mesh: {:.2}ms, Instances: {:.2}ms, Draws: {}, Jobs/sec: {}, EmptyMeshes: {}, MeshIdle: {}, DoF Kawase: {} (iter={}, off={:.2}), MeshUp: {:.2}ms parts:(leaf:{:.2} sched:{:.2} sort:{:.2} res:{:.2} jobc:{:.2} jobn:{:.2}) vbld:{:.2} v:{:.2} i:{:.2} ins:{:.2} emit:{:.2} processed:{} limit:{}",
                 self.frame_count,
                 total_visible,
                 leaf_chunks.len(),
                 draw_mesh_keys.len(),
                 self.pending_chunk_meshes.len(),
+                pending_set_count,
+                ready_count,
+                jobs_in_flight,
                 missing_chunks.len(),
                 mesh_cache_mib,
                 mesh_budget_mib,
                 process_mem_mib,
                 cull_time.as_secs_f64() * 1000.0,
                 grouping_time.as_secs_f64() * 1000.0,
-                mesh_time.as_secs_f64() * 1000.0,
+                    (if mesh_idle { std::time::Duration::from_secs(0) } else { mesh_time }).as_secs_f64() * 1000.0,
                 instance_time.as_secs_f64() * 1000.0,
-                draw_calls
-                , if self.dof_settings.kawase_enabled {"enabled"} else {"disabled"}
+                draw_calls,
+                jobs_per_sec,
+                self.stat_empty_meshes,
+                mesh_idle,
+                if self.dof_settings.kawase_enabled {"enabled"} else {"disabled"}
                 , self.dof_settings.kawase_iterations
                 , self.dof_settings.kawase_offset
                 , mesh_upload_total_time.as_secs_f64() * 1000.0
@@ -5845,7 +5934,7 @@ impl App {
                 , mesh_upload_entry_time.as_secs_f64() * 1000.0
                 , mesh_emitters_proc_time.as_secs_f64() * 1000.0
                 , processed_meshes
-                , self.mesh_upload_limit
+                    , frame_mesh_upload_limit
             );
             // Print Kawase timing ones per second to avoid spamming
             if self.kawase_acc_frames > 0 {
