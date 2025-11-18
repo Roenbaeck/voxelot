@@ -32,7 +32,7 @@
 			"args": [
 				"run",
 				"--bin",
-				"viewer_hierarchical"
+				"voxelot"
 			],
 			"problemMatcher": [
 				"$rustc"

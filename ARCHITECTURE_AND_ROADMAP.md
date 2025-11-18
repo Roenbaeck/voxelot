@@ -21,7 +21,7 @@ Implemented:
 - Frustum culling (6-plane) & parallel top-level traversal using Rayon
 - Hierarchical chunk structure with Roaring bitmaps and marginal axis masks (px/py/pz)
 - Distance-based LOD recursion; manual subdivision / merge API
-- Greedy meshing for leaf 16³ chunks with quad merging & emissive capture (`meshing.rs`) and multi-threaded mesh workers in `viewer_hierarchical.rs`
+- Greedy meshing for leaf 16³ chunks with quad merging & emissive capture (`meshing.rs`) and multi-threaded mesh workers in `voxelot.rs`
 - Bloom pass (threshold + mip blur + composite)
 - Tilt-shift Depth of Field (DoF) gather + smoothing (WGSL)
 - Dual directional lighting: sun (shadowed) + moon (no shadows yet) with continuous time-of-day color & intensity transitions

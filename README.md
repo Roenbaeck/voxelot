@@ -17,7 +17,7 @@ A high-performance sparse voxel engine using hierarchical chunks with LOD and Ro
 
 ```bash
 # Run the interactive viewer (release recommended)
-cargo run --release --bin viewer_hierarchical
+cargo run --release --bin voxelot
 
 # Show generator help (Rust)
 cargo run --bin generate_world -- --help
