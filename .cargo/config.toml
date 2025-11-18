@@ -1,0 +1,4 @@
+# Local build tuning: enables host-optimized code generation.
+# Note: this is host-specific. Remove or override in CI/cross-builds.
+[build]
+rustflags = ["-C", "target-cpu=native"]
