@@ -15,6 +15,7 @@ use crate::lib_hierarchical::{Chunk, Voxel};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
+use std::sync::Arc;
 use zstd::stream::read::Decoder as ZstdDecoder;
 use zstd::stream::write::Encoder as ZstdEncoder;
 
@@ -140,7 +141,7 @@ fn load_chunk(chunk: &mut Chunk, reader: &mut impl Read) -> io::Result<()> {
             // Sub-chunk follows; load recursively and store
             let mut sub_chunk = Chunk::new();
             load_chunk(&mut sub_chunk, reader)?;
-            entries.push((pos_encoded, Voxel::Chunk(Box::new(sub_chunk))));
+            entries.push((pos_encoded, Voxel::Chunk(Arc::new(sub_chunk))));
         } else if vtype != 255 {
             // Solid voxel
             entries.push((pos_encoded, Voxel::Solid(vtype)));

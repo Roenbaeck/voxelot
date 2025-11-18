@@ -10,6 +10,7 @@
 
 use croaring::Bitmap;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::palette::Palette;
 
@@ -43,7 +44,7 @@ pub enum Voxel {
     /// A solid voxel with a type
     Solid(VoxelType),
     /// A chunk containing 16³ more voxels  
-    Chunk(Box<Chunk>),
+    Chunk(Arc<Chunk>),
 }
 
 /// A hierarchical chunk ("chunks all the way")
@@ -212,12 +213,12 @@ impl Chunk {
         if self.presence.contains(idx) {
             // Update existing
             let rank = self.presence.rank(idx) as usize;
-            self.voxels[rank - 1] = Voxel::Chunk(Box::new(chunk));
+            self.voxels[rank - 1] = Voxel::Chunk(Arc::new(chunk));
         } else {
             // Insert new
             let rank = self.presence.rank(idx) as usize;
             self.presence.add(idx);
-            self.voxels.insert(rank, Voxel::Chunk(Box::new(chunk)));
+            self.voxels.insert(rank, Voxel::Chunk(Arc::new(chunk)));
 
             // Update marginals - set bit for this position
             self.px |= 1 << x;
@@ -539,7 +540,7 @@ impl WorldPos {
 /// - depth 4: 65,536³ = 281,474,976,710,656 voxels
 pub struct World {
     /// The root chunk - everything is a chunk!
-    root: Chunk,
+    root: Arc<Chunk>,
 
     /// Hierarchy depth (1 = single chunk, 2+ = nested)
     hierarchy_depth: u8,
@@ -566,7 +567,7 @@ impl World {
         );
 
         Self {
-            root: Chunk::new(),
+            root: Arc::new(Chunk::new()),
             hierarchy_depth,
             chunk_size: 16,
         }
@@ -718,7 +719,7 @@ impl World {
 
     /// Navigate to a mutable chunk at the given path depth, creating sub-chunks as needed
     fn navigate_to_mut<'a>(&'a mut self, path: &[(u8, u8, u8)], depth: usize) -> &'a mut Chunk {
-        let mut current = &mut self.root;
+        let mut current = Arc::make_mut(&mut self.root);
 
         for &(x, y, z) in &path[..depth] {
             let idx = Chunk::flat_index(x, y, z);
@@ -736,10 +737,12 @@ impl World {
                 current.set_chunk(x, y, z, Chunk::new());
             }
 
-            // Navigate into the chunk
+            // Navigate into the chunk - need to use Arc::make_mut
             let rank = current.presence.rank(idx) as usize;
             match &mut current.voxels[rank - 1] {
-                Voxel::Chunk(chunk) => current = chunk,
+                Voxel::Chunk(chunk_arc) => {
+                    current = Arc::make_mut(chunk_arc);
+                }
                 _ => unreachable!(),
             }
         }
@@ -771,7 +774,7 @@ impl World {
         if depth == 1 {
             // Special case: single-level world, root IS the leaf chunk
             let &(x, y, z) = path.last().unwrap();
-            self.root.set(x, y, z, voxel_type);
+            Arc::make_mut(&mut self.root).set(x, y, z, voxel_type);
             return;
         }
 
@@ -797,9 +800,9 @@ impl World {
 
         // Now get the leaf chunk and set the voxel in it
         let rank = grandparent.presence.rank(idx) as usize;
-        if let Voxel::Chunk(leaf_chunk) = &mut grandparent.voxels[rank - 1] {
+        if let Voxel::Chunk(leaf_chunk_arc) = &mut grandparent.voxels[rank - 1] {
             let &(x, y, z) = path.last().unwrap();
-            leaf_chunk.set(x, y, z, voxel_type);
+            Arc::make_mut(leaf_chunk_arc).set(x, y, z, voxel_type);
         }
     }
 
@@ -825,7 +828,7 @@ impl World {
 
     /// Get mutable root chunk
     pub fn root_mut(&mut self) -> &mut Chunk {
-        &mut self.root
+        Arc::make_mut(&mut self.root)
     }
 
     /// Subdivide a voxel at world position
@@ -856,7 +859,8 @@ impl World {
     /// This walks through the entire hierarchy and updates voxel_count, average_color,
     /// and emissive aggregates using the provided palette.
     pub fn update_all_lod_metadata(&mut self, palette: &Palette) {
-        Self::update_chunk_lod_recursive(&mut self.root, palette);
+        let root_mut = Arc::make_mut(&mut self.root);
+        Self::update_chunk_lod_recursive(root_mut, palette);
     }
 
     /// Recursive helper to update LOD metadata bottom-up
@@ -865,7 +869,9 @@ impl World {
         // different sub-chunks where possible - this gives a large speedup for deep/large worlds.
         use rayon::prelude::*;
         chunk.voxels.par_iter_mut().for_each(|voxel| {
-            if let Voxel::Chunk(sub_chunk) = voxel {
+            if let Voxel::Chunk(sub_chunk_arc) = voxel {
+                // Use Arc::make_mut to get exclusive access for mutation
+                let sub_chunk = Arc::make_mut(sub_chunk_arc);
                 Self::update_chunk_lod_recursive(sub_chunk, palette);
             }
         });
