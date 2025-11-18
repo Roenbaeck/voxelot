@@ -154,6 +154,8 @@ pub struct PerformanceConfig {
     pub fallback_bbox_shrink: f32,
     #[serde(default = "default_mesh_priority_sort_interval_frames")]
     pub mesh_priority_sort_interval_frames: u64,
+    #[serde(default = "default_mesh_buffer_pool_entries")]
+    pub mesh_buffer_pool_entries: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -343,6 +345,10 @@ fn default_mesh_priority_sort_interval_frames() -> u64 {
     30
 }
 
+fn default_mesh_buffer_pool_entries() -> usize {
+    256
+}
+
 fn default_true() -> bool {
     true
 }
@@ -456,6 +462,7 @@ impl Default for PerformanceConfig {
             fallback_detail_distance: default_fallback_detail_distance(),
             fallback_bbox_shrink: default_fallback_bbox_shrink(),
             mesh_priority_sort_interval_frames: default_mesh_priority_sort_interval_frames(),
+            mesh_buffer_pool_entries: default_mesh_buffer_pool_entries(),
         }
     }
 }

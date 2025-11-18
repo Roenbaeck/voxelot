@@ -683,6 +683,8 @@ struct App {
     empty_mesh_index_buffer: Option<wgpu::Buffer>,
     /// Stat: number of empty meshes processed (non-geometric chunks)
     stat_empty_meshes: u64,
+    stat_vertex_buffers_reused: u64,
+    stat_index_buffers_reused: u64,
     fallback_chunk_instances: HashMap<(i64, i64, i64), Vec<VoxelInstanceRaw>>,
     chunk_emitters: HashMap<(i64, i64, i64), Vec<ChunkEmitterWorld>>,
     active_emitters: Vec<ActiveLight>,
@@ -816,6 +818,10 @@ struct App {
     shadow_backface_scale: f32,
     pcf_radius: f32,
     pcf_poisson_samples: u32,
+    // Mesh GPU buffer pooling to reduce create/destroy churn
+    vertex_buffer_pool: VecDeque<(u64, wgpu::Buffer)>,
+    index_buffer_pool: VecDeque<(u64, wgpu::Buffer)>,
+    mesh_buffer_pool_max_entries: usize,
 }
 
 impl App {
@@ -1024,10 +1030,15 @@ impl App {
             mesh_cache: HashMap::new(),
             mesh_jobs_executed: mesh_jobs_executed.clone(),
             mesh_cache_bytes: 0,
+            vertex_buffer_pool: VecDeque::new(),
+            index_buffer_pool: VecDeque::new(),
+            mesh_buffer_pool_max_entries: cfg.performance.mesh_buffer_pool_entries,
             mesh_chunk_arc_cache: HashMap::new(),
             empty_mesh_vertex_buffer: None,
             empty_mesh_index_buffer: None,
             stat_empty_meshes: 0,
+            stat_vertex_buffers_reused: 0,
+            stat_index_buffers_reused: 0,
             fallback_chunk_instances: HashMap::new(),
             chunk_emitters: HashMap::new(),
             active_emitters: Vec::new(),
@@ -2459,8 +2470,19 @@ impl App {
                     // If this was a placeholder (shared empty buffers), do not destroy the buffer
                     // as it is owned globally. Only destroy buffers for normal entries.
                     if !entry.is_placeholder {
-                        entry.vertex_buffer.destroy();
-                        entry.index_buffer.destroy();
+                        // push back to pool instead of destroying to reduce GPU allocation churn
+                        let vb_bytes = entry.vertex_bytes;
+                        let ib_bytes = entry.index_bytes;
+                        if self.vertex_buffer_pool.len() < self.mesh_buffer_pool_max_entries {
+                            self.vertex_buffer_pool.push_back((vb_bytes, entry.vertex_buffer));
+                        } else {
+                            entry.vertex_buffer.destroy();
+                        }
+                        if self.index_buffer_pool.len() < self.mesh_buffer_pool_max_entries {
+                            self.index_buffer_pool.push_back((ib_bytes, entry.index_buffer));
+                        } else {
+                            entry.index_buffer.destroy();
+                        }
                         self.mesh_cache_bytes = self.mesh_cache_bytes.saturating_sub(entry_bytes);
                     }
                 self.chunk_emitters.remove(&key);
@@ -2522,6 +2544,64 @@ impl App {
                 emissive_intensity,
             ],
         }
+    }
+
+    // Allocate or reuse a vertex buffer from the pool; returns (buffer, capacity_bytes)
+    fn allocate_vertex_buffer_from_pool(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        vb_data: &[MeshVertexRaw],
+    ) -> (wgpu::Buffer, u64) {
+        let required_bytes = (vb_data.len() * std::mem::size_of::<MeshVertexRaw>()) as u64;
+        // Find a pool buffer with at least required capacity
+        if let Some(pos) = self
+            .vertex_buffer_pool
+            .iter()
+            .position(|(cap, _)| *cap >= required_bytes)
+        {
+            let (cap, buf) = self.vertex_buffer_pool.remove(pos).unwrap();
+            // Overwrite contents into the reused buffer
+            queue.write_buffer(&buf, 0, bytemuck::cast_slice(vb_data));
+            self.stat_vertex_buffers_reused += 1;
+            return (buf, cap);
+        }
+
+        // No suitable buffer - create a new one sized exactly to required bytes.
+        let capacity = required_bytes;
+        let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Chunk Mesh Vertex Buffer"),
+            contents: bytemuck::cast_slice(vb_data),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        });
+        (vbuf, capacity)
+    }
+
+    // Allocate or reuse an index buffer from the pool; returns (buffer, capacity_bytes)
+    fn allocate_index_buffer_from_pool(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        idx_data: &[u32],
+    ) -> (wgpu::Buffer, u64) {
+        let required_bytes = (idx_data.len() * std::mem::size_of::<u32>()) as u64;
+        if let Some(pos) = self
+            .index_buffer_pool
+            .iter()
+            .position(|(cap, _)| *cap >= required_bytes)
+        {
+            let (cap, buf) = self.index_buffer_pool.remove(pos).unwrap();
+            queue.write_buffer(&buf, 0, bytemuck::cast_slice(idx_data));
+            self.stat_index_buffers_reused += 1;
+            return (buf, cap);
+        }
+        let capacity = required_bytes;
+        let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Chunk Mesh Index Buffer"),
+            contents: bytemuck::cast_slice(idx_data),
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+        });
+        (ibuf, capacity)
     }
 
     fn fallback_instances_for_chunk(
@@ -4365,7 +4445,7 @@ impl App {
                     let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some("Empty Chunk Vertex Buffer"),
                         contents: bytemuck::cast_slice(&small_vb),
-                        usage: wgpu::BufferUsages::VERTEX,
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                     });
                     self.empty_mesh_vertex_buffer = Some(vbuf);
                 }
@@ -4374,7 +4454,7 @@ impl App {
                     let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some("Empty Chunk Index Buffer"),
                         contents: bytemuck::cast_slice(&small_ib),
-                        usage: wgpu::BufferUsages::INDEX,
+                        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
                     });
                     self.empty_mesh_index_buffer = Some(ibuf);
                 }
@@ -4436,18 +4516,10 @@ impl App {
                 .collect();
             mesh_build_vb_time += vb_build_start.elapsed();
             let vbuf_start = std::time::Instant::now();
-            let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Chunk Mesh Vertex Buffer"),
-                contents: bytemuck::cast_slice(&vb_data),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
+            let (vbuf, _vcap) = self.allocate_vertex_buffer_from_pool(&device, &queue, &vb_data);
             mesh_upload_vbuf_time += vbuf_start.elapsed();
             let ibuf_start = std::time::Instant::now();
-            let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Chunk Mesh Index Buffer"),
-                contents: bytemuck::cast_slice(&mesh.indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
+            let (ibuf, _icap) = self.allocate_index_buffer_from_pool(&device, &queue, &mesh.indices);
             mesh_upload_ibuf_time += ibuf_start.elapsed();
             let vertex_bytes = (vb_data.len() * std::mem::size_of::<MeshVertexRaw>()) as u64;
             let index_bytes = (mesh.indices.len() * std::mem::size_of::<u32>()) as u64;
@@ -5897,7 +5969,7 @@ impl App {
             let jobs_per_sec = self.mesh_jobs_executed.swap(0, Ordering::Relaxed);
             let mesh_idle = self.pending_chunk_meshes.is_empty() && self.ready_chunk_meshes.is_empty() && jobs_in_flight == 0;
             println!(
-                "FPS: {}, Visible items: {}, Leaf chunks: {}, Meshed chunks: {}, Pending: {}, PendingSet: {}, Ready: {}, InFlight: {}, Fallback: {}, Mesh cache: {:.1}/{:.1} MiB, Process: {:.1} MiB, Cull: {:.2}ms, Group: {:.2}ms, Mesh: {:.2}ms, Instances: {:.2}ms, Draws: {}, Jobs/sec: {}, EmptyMeshes: {}, MeshIdle: {}, DoF Kawase: {} (iter={}, off={:.2}), MeshUp: {:.2}ms parts:(leaf:{:.2} sched:{:.2} sort:{:.2} res:{:.2} jobc:{:.2} jobn:{:.2}) vbld:{:.2} v:{:.2} i:{:.2} ins:{:.2} emit:{:.2} processed:{} limit:{}",
+                "FPS: {}, Visible items: {}, Leaf chunks: {}, Meshed chunks: {}, Pending: {}, PendingSet: {}, Ready: {}, InFlight: {}, Fallback: {}, Mesh cache: {:.1}/{:.1} MiB, Process: {:.1} MiB, Cull: {:.2}ms, Group: {:.2}ms, Mesh: {:.2}ms, Instances: {:.2}ms, Draws: {}, Jobs/sec: {}, EmptyMeshes: {}, VReuse: {}, IReuse: {}, VPool: {}, IPool: {}, MeshIdle: {}, DoF Kawase: {} (iter={}, off={:.2}), MeshUp: {:.2}ms parts:(leaf:{:.2} sched:{:.2} sort:{:.2} res:{:.2} jobc:{:.2} jobn:{:.2}) vbld:{:.2} v:{:.2} i:{:.2} ins:{:.2} emit:{:.2} processed:{} limit:{}",
                 self.frame_count,
                 total_visible,
                 leaf_chunks.len(),
@@ -5917,7 +5989,11 @@ impl App {
                 draw_calls,
                 jobs_per_sec,
                 self.stat_empty_meshes,
+                self.stat_vertex_buffers_reused,
+                self.stat_index_buffers_reused,
                 mesh_idle,
+                self.vertex_buffer_pool.len(),
+                self.index_buffer_pool.len(),
                 if self.dof_settings.kawase_enabled {"enabled"} else {"disabled"}
                 , self.dof_settings.kawase_iterations
                 , self.dof_settings.kawase_offset
