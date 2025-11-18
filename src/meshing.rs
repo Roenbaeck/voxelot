@@ -238,7 +238,23 @@ pub fn generate_chunk_mesh(
         None
     };
 
+    // Preallocate meshes using chunk voxel count (upper bound)
+    // Worst-case: each voxel contributes 6 faces; each face -> 4 vertices, 6 indices
+    let upper_vertices = (voxel_count * 6 * 4) as usize;
+    let upper_indices = (voxel_count * 6 * 6) as usize;
+    mesh.vertices.reserve(upper_vertices);
+    mesh.indices.reserve(upper_indices);
+
     // For each axis, create faces between differing neighbor voxels
+    // We'll use a mesh_visiter bitmask per voxel (6 bits) to mark faces already emitted
+    let mut mesh_visiter = vec![0u8; 16 * 16 * 16];
+    const VIS_XN: u8 = 1 << 0;
+    const VIS_XP: u8 = 1 << 1;
+    const VIS_YN: u8 = 1 << 2;
+    const VIS_YP: u8 = 1 << 3;
+    const VIS_ZN: u8 = 1 << 4;
+    const VIS_ZP: u8 = 1 << 5;
+
     let mut quads: Vec<Quad> = Vec::new();
 
     for axis in 0..3 {
@@ -299,7 +315,33 @@ pub fn generate_chunk_mesh(
                         _ => 0,
                     };
 
-                    mask[(u * 16 + v) as usize] = face_type;
+                    // Check if this face was already emitted by a previous axis using mesh_visiter.
+                    if face_type != 0 {
+                        let mut base_coord = a;
+                        if face_type < 0 {
+                            // Negative face anchored on the b side (d - 1)
+                            base_coord = b;
+                        }
+                        // Only mark visited if this face belongs to this chunk (coords in bounds)
+                        if base_coord[0] < 0 || base_coord[0] >= 16 || base_coord[1] < 0 || base_coord[1] >= 16 || base_coord[2] < 0 || base_coord[2] >= 16 {
+                            mask[(u * 16 + v) as usize] = face_type;
+                        } else {
+                            let (bx, by, bz) = (base_coord[0] as u8, base_coord[1] as u8, base_coord[2] as u8);
+                            let idx = Chunk::flat_index(bx, by, bz) as usize;
+                        let face_bit = match axis {
+                            0 => if face_type > 0 { VIS_XN } else { VIS_XP },
+                            1 => if face_type > 0 { VIS_YN } else { VIS_YP },
+                            _ => if face_type > 0 { VIS_ZN } else { VIS_ZP },
+                        };
+                            if (mesh_visiter[idx] & face_bit) != 0 {
+                                mask[(u * 16 + v) as usize] = 0;
+                            } else {
+                                mask[(u * 16 + v) as usize] = face_type;
+                            }
+                        }
+                    } else {
+                        mask[(u * 16 + v) as usize] = 0;
+                    }
                 }
             }
 
@@ -361,6 +403,47 @@ pub fn generate_chunk_mesh(
                     u_start += width;
                 }
                 v_start += 1;
+            }
+        }
+        // Alternatively: also run the per-voxel visitor algorithm to mark already emitted
+        // faces in `mesh_visiter` so subsequent axes don't remesh the same faces.
+        // Walk all voxels and mark face bits for any quad we emitted for this axis.
+        for quad in &quads {
+            // mark visited faces for quad area
+            let mut base = [0i32; 3];
+            base[quad.axis] = quad.d;
+            base[quad.u_axis] = quad.u0;
+            base[quad.v_axis] = quad.v0;
+            let mut du_vec = [0i32; 3];
+            du_vec[quad.u_axis] = quad.du;
+            let mut dv_vec = [0i32; 3];
+            dv_vec[quad.v_axis] = quad.dv;
+
+            // Compute face bit depending on face type and axis
+            let face_bit = match quad.axis {
+                0 => {
+                    if quad.face_type > 0 { VIS_XN } else { VIS_XP }
+                }
+                1 => {
+                    if quad.face_type > 0 { VIS_YN } else { VIS_YP }
+                }
+                _ => {
+                    if quad.face_type > 0 { VIS_ZN } else { VIS_ZP }
+                }
+            };
+
+            // The 'd' coordinate is the plane - we iterate over (u,v) rectangle
+            for u in 0..quad.du {
+                for v in 0..quad.dv {
+                    let x = (base[0] + du_vec[0] * u + dv_vec[0] * v) as u8;
+                    let y = (base[1] + du_vec[1] * u + dv_vec[1] * v) as u8;
+                    let z = (base[2] + du_vec[2] * u + dv_vec[2] * v) as u8;
+                    // Only mark if (x,y,z) inside this chunk
+                    if x < 16 && y < 16 && z < 16 {
+                        let idx = Chunk::flat_index(x, y, z) as usize;
+                        mesh_visiter[idx] |= face_bit;
+                    }
+                }
             }
         }
         mesh_debug!("  {} axis: {} faces", axis_name, faces_this_axis);
