@@ -802,6 +802,8 @@ struct App {
     shadow_map_size: u32,
     shadow_darkness: f32,
     shadow_backface_scale: f32,
+    pcf_radius: f32,
+    pcf_poisson_samples: u32,
 }
 
 impl App {
@@ -1142,6 +1144,8 @@ impl App {
             shadow_map_size: cfg.shadows.map_size,
             shadow_darkness: cfg.shadows.darkness,
             shadow_backface_scale: cfg.shadows.backface_ambient_scale,
+            pcf_radius: cfg.shadows.pcf_radius,
+            pcf_poisson_samples: cfg.shadows.pcf_poisson_samples,
         }
     }
 
@@ -3656,8 +3660,8 @@ impl App {
             shadow_texel_size_pad: [
                 shadow_texel,
                 shadow_texel,
-                voxelot::Config::load_or_default(CONFIG_FILE).shadows.pcf_radius,
-                0.0,
+                self.pcf_radius,
+                self.pcf_poisson_samples as f32,
             ],
             shadow_darkness_pad: [self.shadow_darkness, self.shadow_backface_scale, 0.0, 0.0],
             moon_direction_intensity: [-0.5, -1.0, -0.3, 0.2], // initial opposite dim moon
@@ -5058,8 +5062,8 @@ impl App {
             shadow_texel_size_pad: [
                 shadow_texel,
                 shadow_texel,
-                voxelot::Config::load_or_default(CONFIG_FILE).shadows.pcf_radius,
-                0.0,
+                self.pcf_radius,
+                self.pcf_poisson_samples as f32,
             ],
             shadow_darkness_pad: [self.shadow_darkness, self.shadow_backface_scale, 0.0, 0.0],
             moon_direction_intensity: [
