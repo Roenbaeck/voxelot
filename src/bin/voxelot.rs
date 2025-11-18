@@ -142,9 +142,9 @@ struct ActiveLight {
 #[derive(Debug)]
 struct MeshJob {
     key: (i64, i64, i64),
-    chunk: Chunk,
+    chunk: Arc<Chunk>,
     /// Neighbor chunks snapshot mapped by (-1..=1) offsets from this chunk
-    neighbors: std::collections::HashMap<(i8, i8, i8), Chunk>,
+    neighbors: std::collections::HashMap<(i8, i8, i8), Arc<Chunk>>,
 }
 
 #[derive(Debug)]
@@ -533,7 +533,7 @@ impl CameraController {
                 println!("Far plane: {:.0}", self.camera.config.far_plane);
             }
             _ => {}
-        }
+    }
     }
 
     fn process_mouse(&mut self, delta_x: f64, delta_y: f64) {
@@ -580,7 +580,7 @@ impl CameraController {
         }
 
         let mut velocity = [0.0, 0.0, 0.0];
-        let forward = self.camera.forward;
+        let forward = self.camera.forward.clone();
         let right = self.camera.right();
 
         if self.forward {
@@ -672,6 +672,8 @@ struct App {
     // Mesh cache: per-leaf-chunk mesh GPU buffers and metadata
     mesh_cache: HashMap<(i64, i64, i64), MeshCacheEntry>,
     mesh_cache_bytes: u64,
+    /// Cached Arc<Chunk> snapshots for mesher jobs to avoid repeated deep clones
+    mesh_chunk_arc_cache: HashMap<(i64, i64, i64), Arc<Chunk>>,
     fallback_chunk_instances: HashMap<(i64, i64, i64), Vec<VoxelInstanceRaw>>,
     chunk_emitters: HashMap<(i64, i64, i64), Vec<ChunkEmitterWorld>>,
     active_emitters: Vec<ActiveLight>,
@@ -922,7 +924,7 @@ impl App {
             let job_rx = mesh_job_rx.clone();
             let result_tx = mesh_result_tx.clone();
             let palette_clone = palette.clone();
-            std::thread::Builder::new()
+                std::thread::Builder::new()
                 .name(format!("mesh-worker-{}", worker_index))
                 .spawn(move || {
                     for job in job_rx.iter() {
@@ -935,7 +937,7 @@ impl App {
                         if chunk.voxel_count == 0 {
                             continue;
                         }
-                        let mesh = generate_chunk_mesh(&chunk, &palette_clone, Some(&neighbors));
+                        let mesh = generate_chunk_mesh(&*chunk, &palette_clone, Some(&neighbors));
                         if result_tx
                             .send(MeshResult {
                                 key,
@@ -1008,6 +1010,7 @@ impl App {
             gpu_readback_capacity: 0,
             mesh_cache: HashMap::new(),
             mesh_cache_bytes: 0,
+            mesh_chunk_arc_cache: HashMap::new(),
             fallback_chunk_instances: HashMap::new(),
             chunk_emitters: HashMap::new(),
             active_emitters: Vec::new(),
@@ -2430,12 +2433,14 @@ impl App {
                 break;
             }
 
-            if let Some(entry) = self.mesh_cache.remove(&key) {
+                if let Some(entry) = self.mesh_cache.remove(&key) {
                 let entry_bytes = entry.total_bytes();
                 entry.vertex_buffer.destroy();
                 entry.index_buffer.destroy();
                 self.mesh_cache_bytes = self.mesh_cache_bytes.saturating_sub(entry_bytes);
                 self.chunk_emitters.remove(&key);
+                // Also drop any cached Arc<Chunk> snapshot for this chunk to free memory
+                self.mesh_chunk_arc_cache.remove(&key);
                 freed_bytes += entry_bytes;
                 evicted += 1;
             }
@@ -4093,14 +4098,21 @@ impl App {
         }
         let grouping_time = grouping_start.elapsed();
 
-        let mesh_start = Instant::now();
+    let mesh_start = Instant::now();
+    let mut mesh_leaf_proc_time = std::time::Duration::ZERO;
+    let mut mesh_result_collect_time = std::time::Duration::ZERO;
+    let mut mesh_schedule_time = std::time::Duration::ZERO;
+    let mut mesh_pending_sort_time = std::time::Duration::ZERO;
+    let mut mesh_job_creation_time = std::time::Duration::ZERO;
+    let mut mesh_job_neighbors_time = std::time::Duration::ZERO;
         // Build mesh for any chunk present (near leaf chunk), and mark those chunks for drawing
         let mut cpu_mesh_keys: HashSet<(i64, i64, i64)> = HashSet::new();
         let mut new_meshes_created = 0;
         let mut chunks_not_found = 0;
         let mut missing_chunks: HashSet<(i64, i64, i64)> = HashSet::new();
 
-        for &key in &leaf_chunks {
+    let leaf_scan_start = std::time::Instant::now();
+    for &key in &leaf_chunks {
             if self.mesh_cache.contains_key(&key) {
                 cpu_mesh_keys.insert(key);
             } else {
@@ -4132,15 +4144,19 @@ impl App {
             }
         }
 
-        while let Ok(result) = self.mesh_result_rx.try_recv() {
+    mesh_leaf_proc_time += leaf_scan_start.elapsed();
+    let result_collect_start = std::time::Instant::now();
+    while let Ok(result) = self.mesh_result_rx.try_recv() {
             self.ready_chunk_meshes.push_back(result);
             if self.mesh_jobs_in_flight > 0 {
                 self.mesh_jobs_in_flight -= 1;
             }
         }
+        mesh_result_collect_time += result_collect_start.elapsed();
 
         let max_inflight = self.max_inflight_jobs();
-        while self.mesh_jobs_in_flight < max_inflight {
+    let schedule_start = std::time::Instant::now();
+    while self.mesh_jobs_in_flight < max_inflight {
             // Occasionally re-sort the pending mesh queue to prioritize near-camera chunks.
             // This avoids reordering every frame and keeps scheduling cheap.
             if self.pending_chunk_meshes.len() > 4
@@ -4148,6 +4164,7 @@ impl App {
                     || (self.frame_index - self.last_pending_mesh_sort_frame)
                         >= self.pending_mesh_sort_interval_frames)
             {
+                let sort_start = std::time::Instant::now();
                 let cam_pos = self.camera_controller.camera.position;
                 let mut vec: Vec<_> = self.pending_chunk_meshes.iter().cloned().collect();
                 vec.sort_by(|a, b| {
@@ -4174,10 +4191,12 @@ impl App {
                     self.pending_chunk_meshes.push_back(k);
                 }
                 self.last_pending_mesh_sort_frame = self.frame_index;
+                mesh_pending_sort_time += sort_start.elapsed();
             }
             let Some(key) = self.pending_chunk_meshes.pop_front() else {
                 break;
             };
+            let job_create_start = std::time::Instant::now();
 
             match self
                 .world
@@ -4185,7 +4204,8 @@ impl App {
             {
                 Some(chunk) => {
                     // Snapshot neighbor chunks so AO can be computed across chunk bounds.
-                    let mut neighbors: std::collections::HashMap<(i8, i8, i8), Chunk> =
+                    let neighbor_start = std::time::Instant::now();
+                    let mut neighbors: std::collections::HashMap<(i8, i8, i8), Arc<Chunk>> =
                         std::collections::HashMap::new();
                     for dx in -1i64..=1 {
                         for dy in -1i64..=1 {
@@ -4197,17 +4217,36 @@ impl App {
                                     .world
                                     .get_leaf_chunk_at_origin(WorldPos::new(nx, ny, nz))
                                 {
-                                    neighbors.insert((dx as i8, dy as i8, dz as i8), nc.clone());
+                                    let nk = (nx, ny, nz);
+                                    // Reuse an Arc snapshot if available; otherwise clone and cache
+                                    let arc_neigh = if let Some(existing) = self.mesh_chunk_arc_cache.get(&nk) {
+                                        existing.clone()
+                                    } else {
+                                        let a = Arc::new(nc.clone());
+                                        self.mesh_chunk_arc_cache.insert(nk, a.clone());
+                                        a
+                                    };
+                                    neighbors.insert((dx as i8, dy as i8, dz as i8), arc_neigh);
                                 }
                             }
                         }
                     }
 
+                    mesh_job_neighbors_time += neighbor_start.elapsed();
+                    // Use cached Arc for the chunk as well
+                    let chunk_arc = if let Some(existing) = self.mesh_chunk_arc_cache.get(&key) {
+                        existing.clone()
+                    } else {
+                        let a = Arc::new(chunk.clone());
+                        self.mesh_chunk_arc_cache.insert(key, a.clone());
+                        a
+                    };
+
                     if self
                         .mesh_job_tx
                         .send(MeshJob {
                             key,
-                            chunk: chunk.clone(),
+                            chunk: chunk_arc,
                             neighbors,
                         })
                         .is_ok()
@@ -4218,6 +4257,7 @@ impl App {
                         self.pending_chunk_set.remove(&key);
                         break;
                     }
+                    mesh_job_creation_time += job_create_start.elapsed();
                 }
                 None => {
                     self.pending_chunk_set.remove(&key);
@@ -4225,9 +4265,17 @@ impl App {
                     chunks_not_found += 1;
                 }
             }
-        }
+    }
+    mesh_schedule_time += schedule_start.elapsed();
 
-        let mut processed_meshes = 0;
+    let mut processed_meshes = 0;
+    // Detailed timing for mesh upload parts: vertex buffer creation, index buffer creation and cache insertion.
+    let mut mesh_upload_vbuf_time = std::time::Duration::ZERO;
+    let mut mesh_upload_ibuf_time = std::time::Duration::ZERO;
+    let mut mesh_upload_entry_time = std::time::Duration::ZERO;
+    let mut mesh_build_vb_time = std::time::Duration::ZERO;
+    let mut mesh_emitters_proc_time = std::time::Duration::ZERO;
+    let mesh_upload_total_start = std::time::Instant::now();
         while processed_meshes < self.mesh_upload_limit {
             let Some(result) = self.ready_chunk_meshes.pop_front() else {
                 break;
@@ -4241,6 +4289,7 @@ impl App {
             self.pending_chunk_set.remove(&key);
             processed_meshes += 1;
 
+            let emitters_start = std::time::Instant::now();
             if mesh.emitters.is_empty() {
                 self.chunk_emitters.remove(&key);
             } else {
@@ -4264,6 +4313,7 @@ impl App {
                 }
             }
 
+            mesh_emitters_proc_time += emitters_start.elapsed();
             if mesh.indices.is_empty() {
                 continue;
             }
@@ -4292,6 +4342,7 @@ impl App {
                 }
             }
 
+            let vb_build_start = std::time::Instant::now();
             let vb_data: Vec<MeshVertexRaw> = mesh
                 .vertices
                 .iter()
@@ -4306,16 +4357,21 @@ impl App {
                     emissive: v.emissive,
                 })
                 .collect();
+            mesh_build_vb_time += vb_build_start.elapsed();
+            let vbuf_start = std::time::Instant::now();
             let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Chunk Mesh Vertex Buffer"),
                 contents: bytemuck::cast_slice(&vb_data),
                 usage: wgpu::BufferUsages::VERTEX,
             });
+            mesh_upload_vbuf_time += vbuf_start.elapsed();
+            let ibuf_start = std::time::Instant::now();
             let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Chunk Mesh Index Buffer"),
                 contents: bytemuck::cast_slice(&mesh.indices),
                 usage: wgpu::BufferUsages::INDEX,
             });
+            mesh_upload_ibuf_time += ibuf_start.elapsed();
             let vertex_bytes = (vb_data.len() * std::mem::size_of::<MeshVertexRaw>()) as u64;
             let index_bytes = (mesh.indices.len() * std::mem::size_of::<u32>()) as u64;
             viewer_debug!(
@@ -4334,7 +4390,9 @@ impl App {
                 index_bytes,
                 last_used_frame: self.frame_index,
             };
+            let entry_start = std::time::Instant::now();
             self.mesh_cache.insert(key, entry);
+            mesh_upload_entry_time += entry_start.elapsed();
             self.mesh_cache_bytes += vertex_bytes + index_bytes;
             self.fallback_chunk_instances.remove(&key);
             new_meshes_created += 1;
@@ -4344,7 +4402,8 @@ impl App {
                 missing_chunks.remove(&key);
             }
         }
-        let mesh_time = mesh_start.elapsed();
+    let mesh_upload_total_time = mesh_upload_total_start.elapsed();
+    let mesh_time = mesh_start.elapsed();
 
         if self.mesh_cache_bytes > self.mesh_cache_byte_budget() {
             self.evict_mesh_cache();
@@ -4633,7 +4692,8 @@ impl App {
         };
         let instance_time = instance_start.elapsed();
 
-        self.active_emitters.clear();
+    self.active_emitters.clear();
+    let mut draw_calls: usize = 0;
         for key in &draw_mesh_keys {
             if let Some(emitters) = self.chunk_emitters.get(key) {
                 self.active_emitters
@@ -5214,17 +5274,19 @@ impl App {
                             wgpu::IndexFormat::Uint32,
                         );
                         shadow_pass.draw_indexed(0..entry.index_count, 0, 0..1);
+                        draw_calls += 1;
                     }
                 }
             }
 
-            if !instances.is_empty() {
+                if !instances.is_empty() {
                 shadow_pass.set_pipeline(shadow_pipeline);
                 shadow_pass.set_bind_group(0, shadow_bind_group, &[]);
                 shadow_pass
                     .set_vertex_buffer(0, self.cube_vertex_buffer.as_ref().unwrap().slice(..));
                 shadow_pass.set_vertex_buffer(1, self.instance_buffer.as_ref().unwrap().slice(..));
-                shadow_pass.draw(0..36, 0..instances.len() as u32);
+                    shadow_pass.draw(0..36, 0..instances.len() as u32);
+                    draw_calls += 1;
             }
         }
 
@@ -5279,6 +5341,7 @@ impl App {
                             wgpu::IndexFormat::Uint32,
                         );
                         render_pass.draw_indexed(0..entry.index_count, 0, 0..1);
+                        draw_calls += 1;
                         entry.last_used_frame = self.frame_index;
                         drawn_meshes += 1;
                     }
@@ -5298,6 +5361,7 @@ impl App {
             if !instances.is_empty() {
                 render_pass.set_vertex_buffer(1, self.instance_buffer.as_ref().unwrap().slice(..));
                 render_pass.draw(0..36, 0..instances.len() as u32); // 36 vertices for a cube
+                draw_calls += 1;
             }
         }
 
@@ -5750,7 +5814,7 @@ impl App {
                 .map(|p| p.memory() as f64 / (1024.0 * 1024.0))
                 .unwrap_or(0.0);
             println!(
-                "FPS: {}, Visible items: {}, Leaf chunks: {}, Meshed chunks: {}, Pending: {}, Fallback: {}, Mesh cache: {:.1}/{:.1} MiB, Process: {:.1} MiB, Cull: {:.2}ms, Group: {:.2}ms, Mesh: {:.2}ms, Instances: {:.2}ms, DoF Kawase: {} (iter={}, off={:.2})",
+                "FPS: {}, Visible items: {}, Leaf chunks: {}, Meshed chunks: {}, Pending: {}, Fallback: {}, Mesh cache: {:.1}/{:.1} MiB, Process: {:.1} MiB, Cull: {:.2}ms, Group: {:.2}ms, Mesh: {:.2}ms, Instances: {:.2}ms, Draws: {}, DoF Kawase: {} (iter={}, off={:.2}), MeshUp: {:.2}ms parts:(leaf:{:.2} sched:{:.2} sort:{:.2} res:{:.2} jobc:{:.2} jobn:{:.2}) vbld:{:.2} v:{:.2} i:{:.2} ins:{:.2} emit:{:.2} processed:{} limit:{}",
                 self.frame_count,
                 total_visible,
                 leaf_chunks.len(),
@@ -5763,10 +5827,25 @@ impl App {
                 cull_time.as_secs_f64() * 1000.0,
                 grouping_time.as_secs_f64() * 1000.0,
                 mesh_time.as_secs_f64() * 1000.0,
-                instance_time.as_secs_f64() * 1000.0
+                instance_time.as_secs_f64() * 1000.0,
+                draw_calls
                 , if self.dof_settings.kawase_enabled {"enabled"} else {"disabled"}
                 , self.dof_settings.kawase_iterations
                 , self.dof_settings.kawase_offset
+                , mesh_upload_total_time.as_secs_f64() * 1000.0
+                , mesh_leaf_proc_time.as_secs_f64() * 1000.0
+                , mesh_schedule_time.as_secs_f64() * 1000.0
+                , mesh_pending_sort_time.as_secs_f64() * 1000.0
+                , mesh_result_collect_time.as_secs_f64() * 1000.0
+                , mesh_job_creation_time.as_secs_f64() * 1000.0
+                , mesh_job_neighbors_time.as_secs_f64() * 1000.0
+                , mesh_build_vb_time.as_secs_f64() * 1000.0
+                , mesh_upload_vbuf_time.as_secs_f64() * 1000.0
+                , mesh_upload_ibuf_time.as_secs_f64() * 1000.0
+                , mesh_upload_entry_time.as_secs_f64() * 1000.0
+                , mesh_emitters_proc_time.as_secs_f64() * 1000.0
+                , processed_meshes
+                , self.mesh_upload_limit
             );
             // Print Kawase timing ones per second to avoid spamming
             if self.kawase_acc_frames > 0 {

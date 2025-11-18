@@ -1,6 +1,7 @@
 //! Greedy meshing for bottom-level chunks (16x16x16)
 
 use crate::lib_hierarchical::{Chunk, Voxel};
+use std::sync::Arc;
 use crate::palette::Palette;
 
 macro_rules! mesh_debug {
@@ -89,8 +90,8 @@ mod tests {
         let mut neigh = Chunk::new();
         neigh.set(0, 0, 0, 1);
 
-        let mut neighbors = std::collections::HashMap::new();
-        neighbors.insert((1i8, 1i8, 1i8), neigh);
+    let mut neighbors = std::collections::HashMap::new();
+    neighbors.insert((1i8, 1i8, 1i8), Arc::new(neigh));
 
         // Generate mesh for main with neighbors; AO should NOT count neighbor voxels
         let mesh = generate_chunk_mesh(&main, &palette, Some(&neighbors));
@@ -150,7 +151,7 @@ struct Quad {
 pub fn generate_chunk_mesh(
     chunk: &Chunk,
     palette: &Palette,
-    neighbors: Option<&std::collections::HashMap<(i8, i8, i8), Chunk>>,
+    neighbors: Option<&std::collections::HashMap<(i8, i8, i8), Arc<Chunk>>>,
 ) -> ChunkMesh {
     // 3 axes: 0=x, 1=y, 2=z
     let mut mesh = ChunkMesh::default();
