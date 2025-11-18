@@ -143,6 +143,18 @@ pub fn generate_chunk_mesh_optimized(
             _ => (chunk.py, chunk.px),
         };
 
+        // Hoist neighbor lookups
+        let (neg_neighbor, pos_neighbor) = if let Some(neighs) = neighbors {
+            let (nx, ny, nz) = match axis {
+                0 => (0, -1, 0), // Y-axis neighbor (down)
+                1 => (-1, 0, 0), // X-axis neighbor (left)
+                _ => (0, 0, -1), // Z-axis neighbor (back)
+            };
+            (neighs.get(&(nx, ny, nz)), neighs.get(&(-nx, -ny, -nz)))
+        } else {
+            (None, None)
+        };
+
         for i in 0..16 {
             // Skip if the entire row/plane at 'i' is empty
             if (i_mask & (1 << i)) == 0 {
@@ -167,14 +179,20 @@ pub fn generate_chunk_mesh_optimized(
 
                 col_face_masks[2 * axis + 0][i][j] = internal_neg;
                 col_face_masks[2 * axis + 1][i][j] = internal_pos;
-                // col & ... = 0b0001. Bit 0 is set. Correct, face at 0 pointing "down" (negative).
 
                 // Negative boundary (bit 0): if bit 0 is set, check neighbor at -1.
                 if (col & 1) != 0 {
                     // Check neighbor. If neighbor has solid at 15, mask it out.
-                    // If neighbor is empty/missing, keep it.
-                    let has_neighbor_solid =
-                        check_neighbor_boundary(chunk, neighbors, axis, i, j, -1);
+                    let has_neighbor_solid = if let Some(n_chunk) = neg_neighbor {
+                        match axis {
+                            0 => n_chunk.contains(j as u8, 15, i as u8), // Y-axis: i=z, j=x
+                            1 => n_chunk.contains(15, i as u8, j as u8), // X-axis: i=y, j=z
+                            _ => n_chunk.contains(j as u8, i as u8, 15), // Z-axis: i=y, j=x
+                        }
+                    } else {
+                        false
+                    };
+
                     if has_neighbor_solid {
                         col_face_masks[2 * axis + 0][i][j] &= !1;
                     }
@@ -182,8 +200,16 @@ pub fn generate_chunk_mesh_optimized(
 
                 // Positive boundary (bit 15): if bit 15 is set, check neighbor at 16.
                 if (col & (1 << 15)) != 0 {
-                    let has_neighbor_solid =
-                        check_neighbor_boundary(chunk, neighbors, axis, i, j, 1);
+                    let has_neighbor_solid = if let Some(n_chunk) = pos_neighbor {
+                        match axis {
+                            0 => n_chunk.contains(j as u8, 0, i as u8),
+                            1 => n_chunk.contains(0, i as u8, j as u8),
+                            _ => n_chunk.contains(j as u8, i as u8, 0),
+                        }
+                    } else {
+                        false
+                    };
+
                     if has_neighbor_solid {
                         col_face_masks[2 * axis + 1][i][j] &= !(1 << 15);
                     }
@@ -414,41 +440,6 @@ pub fn generate_chunk_mesh_optimized(
     }
 
     mesh
-}
-
-fn check_neighbor_boundary(
-    _chunk: &Chunk,
-    neighbors: Option<&HashMap<(i8, i8, i8), Arc<Chunk>>>,
-    axis: usize,
-    i: usize,
-    j: usize,
-    dir: i8,
-) -> bool {
-    // Map i,j to x,y,z on the boundary
-    // axis 0 (Y): i=z, j=x. y is boundary.
-    // axis 1 (X): i=y, j=z. x is boundary.
-    // axis 2 (Z): i=y, j=x. z is boundary.
-
-    // If dir=-1, we are at 0, checking -1.
-    // If dir=1, we are at 15, checking 16.
-
-    if let Some(neighs) = neighbors {
-        let (nx, ny, nz) = match axis {
-            0 => (0, dir, 0),
-            1 => (dir, 0, 0),
-            _ => (0, 0, dir),
-        };
-
-        if let Some(n_chunk) = neighs.get(&(nx, ny, nz)) {
-            let (lx, ly, lz) = match axis {
-                0 => (j as u8, if dir == -1 { 15 } else { 0 }, i as u8),
-                1 => (if dir == -1 { 15 } else { 0 }, i as u8, j as u8),
-                _ => (j as u8, i as u8, if dir == -1 { 15 } else { 0 }),
-            };
-            return n_chunk.contains(lx, ly, lz);
-        }
-    }
-    false
 }
 
 fn calculate_ao(
