@@ -127,6 +127,79 @@ impl VisibilityCache {
     }
 }
 
+use std::sync::OnceLock;
+
+/// Precomputed masks for fast culling
+/// Stores bitmaps for all possible contiguous ranges [start, end) in X and Y dimensions (0..16)
+struct CullingMasks {
+    /// x_masks[start][end] -> Bitmap with bits set where x in start..end
+    x_masks: [[croaring::Bitmap; 17]; 16],
+    /// y_masks[start][end] -> Bitmap with bits set where y in start..end
+    y_masks: [[croaring::Bitmap; 17]; 16],
+}
+
+static CULLING_MASKS: OnceLock<CullingMasks> = OnceLock::new();
+
+impl CullingMasks {
+    fn get() -> &'static Self {
+        CULLING_MASKS.get_or_init(|| {
+            let mut x_masks: [[croaring::Bitmap; 17]; 16] = Default::default();
+            let mut y_masks: [[croaring::Bitmap; 17]; 16] = Default::default();
+
+            // Precompute X masks
+            // Index = x + y*16 + z*256
+            for start in 0..16 {
+                for end in (start + 1)..=16 {
+                    let mut bitmap = croaring::Bitmap::new();
+                    // For X range [start, end), we want all indices where x is in this range
+                    // Iterate all y and z
+                    for z in 0..16 {
+                        for y in 0..16 {
+                            // Add range [start + y*16 + z*256, end + y*16 + z*256)
+                            // Since x is the LSB, a contiguous range in x is contiguous in index
+                            let range_start = (start + y * 16 + z * 256) as u32;
+                            let range_end = (end + y * 16 + z * 256) as u32;
+                            bitmap.add_range(range_start..range_end);
+                        }
+                    }
+                    x_masks[start][end] = bitmap;
+                }
+            }
+
+            // Precompute Y masks
+            for start in 0..16 {
+                for end in (start + 1)..=16 {
+                    let mut bitmap = croaring::Bitmap::new();
+                    // For Y range [start, end), we want all indices where y is in this range
+                    // Iterate all z. Within each z, y ranges are contiguous blocks of 16 indices (x=0..16)
+                    for z in 0..16 {
+                        // The Y range corresponds to indices:
+                        // From: 0 (x=0) + start*16 + z*256
+                        // To:   16 (x=16) + (end-1)*16 + z*256
+                        // But wait, Y is not contiguous in index space because X is inner loop.
+                        // Index = x + y*16 + z*256.
+                        // A range of Y means: for a fixed Z, we have y in [start, end).
+                        // For a fixed Z and fixed Y, we have X in [0, 16).
+                        // So for each Z, we have a block of Ys.
+                        // Range of indices for a fixed Z and Y range [start, end):
+                        // Start index: 0 + start*16 + z*256
+                        // End index:   16 + (end-1)*16 + z*256 = 0 + end*16 + z*256
+                        // Yes, since X is 0..16, one full Y row is 16 indices.
+                        // So Y range [start, end) covers contiguous indices [start*16, end*16) within each Z plane.
+
+                        let range_start = (start * 16 + z * 256) as u32;
+                        let range_end = (end * 16 + z * 256) as u32;
+                        bitmap.add_range(range_start..range_end);
+                    }
+                    y_masks[start][end] = bitmap;
+                }
+            }
+
+            Self { x_masks, y_masks }
+        })
+    }
+}
+
 /// Frustum plane for culling tests
 #[derive(Debug, Clone, Copy)]
 struct Plane {
@@ -174,6 +247,7 @@ impl Plane {
 #[derive(Debug, Clone)]
 pub struct Frustum {
     planes: [Plane; 6],
+    pub bounds: ([f32; 3], [f32; 3]), // (min, max) AABB of the frustum
 }
 
 impl Frustum {
@@ -207,30 +281,118 @@ impl Frustum {
             // Left plane
             {
                 let v = add(&forward, &mul_scalar(&right, -half_h));
-                let normal = normalize(cross(&v, &up)); // FIXED: flipped order
+                let normal = normalize(cross(&v, &up));
                 Plane::new(normal, -dot(&normal, &position))
             },
             // Right plane
             {
                 let v = add(&forward, &mul_scalar(&right, half_h));
-                let normal = normalize(cross(&up, &v)); // FIXED: flipped order
+                let normal = normalize(cross(&up, &v));
                 Plane::new(normal, -dot(&normal, &position))
             },
             // Top plane
             {
                 let v = add(&forward, &mul_scalar(&up, half_v));
-                let normal = normalize(cross(&v, &right)); // FIXED: flipped order
+                let normal = normalize(cross(&v, &right));
                 Plane::new(normal, -dot(&normal, &position))
             },
             // Bottom plane
             {
                 let v = add(&forward, &mul_scalar(&up, -half_v));
-                let normal = normalize(cross(&right, &v)); // FIXED: flipped order
+                let normal = normalize(cross(&right, &v));
                 Plane::new(normal, -dot(&normal, &position))
             },
         ];
 
-        Self { planes }
+        // Compute Frustum AABB
+        let near_center = add(&position, &mul_scalar(&forward, near));
+        let far_center = add(&position, &mul_scalar(&forward, far));
+
+        let near_height = 2.0 * (fov * 0.5).tan() * near;
+        let near_width = near_height * aspect;
+
+        let far_height = 2.0 * (fov * 0.5).tan() * far;
+        let far_width = far_height * aspect;
+
+        let mut corners = [[0.0; 3]; 8];
+
+        // Near corners
+        corners[0] = add(
+            &near_center,
+            &add(
+                &mul_scalar(&up, near_height * 0.5),
+                &mul_scalar(&right, -near_width * 0.5),
+            ),
+        ); // TL
+        corners[1] = add(
+            &near_center,
+            &add(
+                &mul_scalar(&up, near_height * 0.5),
+                &mul_scalar(&right, near_width * 0.5),
+            ),
+        ); // TR
+        corners[2] = add(
+            &near_center,
+            &add(
+                &mul_scalar(&up, -near_height * 0.5),
+                &mul_scalar(&right, -near_width * 0.5),
+            ),
+        ); // BL
+        corners[3] = add(
+            &near_center,
+            &add(
+                &mul_scalar(&up, -near_height * 0.5),
+                &mul_scalar(&right, near_width * 0.5),
+            ),
+        ); // BR
+
+        // Far corners
+        corners[4] = add(
+            &far_center,
+            &add(
+                &mul_scalar(&up, far_height * 0.5),
+                &mul_scalar(&right, -far_width * 0.5),
+            ),
+        ); // TL
+        corners[5] = add(
+            &far_center,
+            &add(
+                &mul_scalar(&up, far_height * 0.5),
+                &mul_scalar(&right, far_width * 0.5),
+            ),
+        ); // TR
+        corners[6] = add(
+            &far_center,
+            &add(
+                &mul_scalar(&up, -far_height * 0.5),
+                &mul_scalar(&right, -far_width * 0.5),
+            ),
+        ); // BL
+        corners[7] = add(
+            &far_center,
+            &add(
+                &mul_scalar(&up, -far_height * 0.5),
+                &mul_scalar(&right, far_width * 0.5),
+            ),
+        ); // BR
+
+        let mut min = corners[0];
+        let mut max = corners[0];
+
+        for i in 1..8 {
+            min[0] = min[0].min(corners[i][0]);
+            min[1] = min[1].min(corners[i][1]);
+            min[2] = min[2].min(corners[i][2]);
+
+            max[0] = max[0].max(corners[i][0]);
+            max[1] = max[1].max(corners[i][1]);
+            max[2] = max[2].max(corners[i][2]);
+        }
+
+        Self {
+            planes,
+            bounds: (min, max),
+        }
     }
 
     /// Test if an AABB is visible (not completely outside any plane)
@@ -241,6 +403,34 @@ impl Frustum {
             }
         }
         true // Inside or intersecting all planes
+    }
+
+    /// Calculate intersection between Frustum AABB and another AABB
+    /// Returns None if no intersection, or Some((min, max)) of the intersection box
+    pub fn aabb_intersection(
+        &self,
+        other_min: [f32; 3],
+        other_max: [f32; 3],
+    ) -> Option<([f32; 3], [f32; 3])> {
+        let (f_min, f_max) = self.bounds;
+
+        let min = [
+            f_min[0].max(other_min[0]),
+            f_min[1].max(other_min[1]),
+            f_min[2].max(other_min[2]),
+        ];
+
+        let max = [
+            f_max[0].min(other_max[0]),
+            f_max[1].min(other_max[1]),
+            f_max[2].min(other_max[2]),
+        ];
+
+        if min[0] > max[0] || min[1] > max[1] || min[2] > max[2] {
+            None
+        } else {
+            Some((min, max))
+        }
     }
 }
 
@@ -397,35 +587,206 @@ fn collect_voxels_recursive(
     camera: &Camera,
     result: &mut Vec<VoxelInstance>,
 ) {
-    for ((lx, ly, lz), voxel) in chunk.iter() {
-        let world_x = chunk_offset[0] + lx as i64 * scale;
-        let world_y = chunk_offset[1] + ly as i64 * scale;
-        let world_z = chunk_offset[2] + lz as i64 * scale;
+    // 1. Compute Intersection AABB between Frustum AABB and Chunk AABB
+    let chunk_min = [
+        chunk_offset[0] as f32,
+        chunk_offset[1] as f32,
+        chunk_offset[2] as f32,
+    ];
+    let chunk_size = (scale * 16) as f32;
+    let chunk_max = [
+        chunk_min[0] + chunk_size,
+        chunk_min[1] + chunk_size,
+        chunk_min[2] + chunk_size,
+    ];
+
+    // Get the intersection box in world space
+    let (inter_min, inter_max) = match camera.frustum.aabb_intersection(chunk_min, chunk_max) {
+        Some(bounds) => bounds,
+        None => return, // No overlap with Frustum AABB -> definitely not visible
+    };
+
+    // 2. Convert Intersection AABB to Local Chunk Coordinates (0..16)
+    // We clamp to 0..16 range (exclusive of 16)
+    let local_min_x = ((inter_min[0] - chunk_min[0]) / scale as f32)
+        .floor()
+        .max(0.0) as u32;
+    let local_min_y = ((inter_min[1] - chunk_min[1]) / scale as f32)
+        .floor()
+        .max(0.0) as u32;
+    let local_min_z = ((inter_min[2] - chunk_min[2]) / scale as f32)
+        .floor()
+        .max(0.0) as u32;
+
+    let local_max_x = ((inter_max[0] - chunk_min[0]) / scale as f32)
+        .ceil()
+        .min(16.0) as u32;
+    let local_max_y = ((inter_max[1] - chunk_min[1]) / scale as f32)
+        .ceil()
+        .min(16.0) as u32;
+    let local_max_z = ((inter_max[2] - chunk_min[2]) / scale as f32)
+        .ceil()
+        .min(16.0) as u32;
+
+    if local_min_x >= local_max_x || local_min_y >= local_max_y || local_min_z >= local_max_z {
+        return; // Empty intersection
+    }
+
+    // 3. Marginal Bitmap Culling (Coarse)
+    // Create masks for the relevant ranges
+    let mut mask_x = 0u16;
+    for i in local_min_x..local_max_x {
+        mask_x |= 1 << i;
+    }
+    if (chunk.px & mask_x) == 0 {
+        return;
+    }
+
+    let mut mask_y = 0u16;
+    for i in local_min_y..local_max_y {
+        mask_y |= 1 << i;
+    }
+    if (chunk.py & mask_y) == 0 {
+        return;
+    }
+
+    let mut mask_z = 0u16;
+    for i in local_min_z..local_max_z {
+        mask_z |= 1 << i;
+    }
+    if (chunk.pz & mask_z) == 0 {
+        return;
+    }
+
+    // 4. Roaring Bitmap Masking (Fine)
+    // Instead of iterating all voxels, we iterate only those in the intersection volume.
+
+    let full_coverage = local_min_x == 0
+        && local_max_x == 16
+        && local_min_y == 0
+        && local_max_y == 16
+        && local_min_z == 0
+        && local_max_z == 16;
+
+    if full_coverage {
+        // Standard iteration (but we already did AABB check, so we know it's roughly in view)
+        process_voxels(
+            chunk.presence.iter(),
+            chunk,
+            chunk_offset,
+            scale,
+            camera,
+            result,
+        );
+    } else {
+        // Masked iteration using precomputed masks
+        // Start with the chunk's presence
+        let mut visible_voxels = chunk.presence.clone();
+
+        // Z-Culling: Remove planes outside [local_min_z, local_max_z)
+        // Each Z plane is 256 indices (16x16).
+        // Remove [0, min_z * 256)
+        if local_min_z > 0 {
+            visible_voxels.remove_range(0..(local_min_z as u32 * 256));
+        }
+        // Remove [max_z * 256, 16 * 256)
+        if local_max_z < 16 {
+            visible_voxels.remove_range((local_max_z as u32 * 256)..(16 * 256));
+        }
+
+        // If empty after Z culling, return
+        if visible_voxels.is_empty() {
+            return;
+        }
+
+        let masks = CullingMasks::get();
+
+        // Y-Culling: AND with precomputed Y mask
+        if local_min_y > 0 || local_max_y < 16 {
+            visible_voxels.and_inplace(&masks.y_masks[local_min_y as usize][local_max_y as usize]);
+            if visible_voxels.is_empty() {
+                return;
+            }
+        }
+
+        // X-Culling: AND with precomputed X mask
+        if local_min_x > 0 || local_max_x < 16 {
+            visible_voxels.and_inplace(&masks.x_masks[local_min_x as usize][local_max_x as usize]);
+            if visible_voxels.is_empty() {
+                return;
+            }
+        }
+
+        process_voxels(
+            visible_voxels.iter(),
+            chunk,
+            chunk_offset,
+            scale,
+            camera,
+            result,
+        );
+    }
+}
+
+fn process_voxels<I>(
+    indices: I,
+    chunk: &Chunk,
+    chunk_offset: [i64; 3],
+    scale: i64,
+    camera: &Camera,
+    result: &mut Vec<VoxelInstance>,
+) where
+    I: Iterator<Item = u32>,
+{
+    // We need to map index back to x,y,z.
+    // Assuming index = x + y*16 + z*256
+
+    // We also need to access the voxel data.
+    // Chunk.voxels is indexed by RANK, not position.
+    // So we need: chunk.voxels[chunk.presence.rank(index) - 1]
+
+    for index in indices {
+        let z = index / 256;
+        let rem = index % 256;
+        let y = rem / 16;
+        let x = rem % 16;
+
+        let rank = chunk.presence.rank(index);
+        let voxel = &chunk.voxels[(rank - 1) as usize];
+
+        let world_x = chunk_offset[0] + x as i64 * scale;
+        let world_y = chunk_offset[1] + y as i64 * scale;
+        let world_z = chunk_offset[2] + z as i64 * scale;
 
         match voxel {
             Voxel::Solid(voxel_type) => {
-                // For solid voxels at this hierarchy level, render as a single solid block of the current scale
-                // This avoids descending to individual leaf voxels for culling/rendering.
                 let voxel_center = [
                     world_x as f32 + (scale as f32 / 2.0),
                     world_y as f32 + (scale as f32 / 2.0),
                     world_z as f32 + (scale as f32 / 2.0),
                 ];
 
-                if camera.is_in_front(voxel_center) {
+                // We still do the exact check because the AABB intersection is loose (AABB vs AABB, not Frustum vs Voxel)
+                if camera.frustum.test_aabb(
+                    [world_x as f32, world_y as f32, world_z as f32],
+                    [
+                        (world_x + scale) as f32,
+                        (world_y + scale) as f32,
+                        (world_z + scale) as f32,
+                    ],
+                ) {
                     let distance = camera.distance_to(voxel_center);
                     result.push(VoxelInstance {
                         position: [world_x, world_y, world_z],
                         voxel_type: *voxel_type,
                         distance,
-                        custom_color: None, // Use voxel_type's default color
-                        scale,              // Render this solid as a block of size `scale`
+                        custom_color: None,
+                        scale,
                         is_leaf_chunk: false,
                     });
                 }
             }
             Voxel::Chunk(sub_chunk) => {
-                // For sub-chunks, decide whether to recurse deeper or stop at the final chunk level.
                 let voxel_center = [
                     world_x as f32 + (scale as f32 / 2.0),
                     world_y as f32 + (scale as f32 / 2.0),
@@ -434,24 +795,21 @@ fn collect_voxels_recursive(
 
                 let distance = camera.distance_to(voxel_center);
 
-                // If far away and chunk has voxels, render entire chunk as a single averaged-color block (LOD)
                 if distance >= camera.config.lod_render_distance && sub_chunk.voxel_count > 0 {
                     result.push(VoxelInstance {
                         position: [world_x, world_y, world_z],
-                        voxel_type: 0, // Ignored when custom_color is Some
+                        voxel_type: 0,
                         distance,
                         custom_color: Some(sub_chunk.average_color),
-                        scale, // Render the sub-chunk as a single block of this scale
+                        scale,
                         is_leaf_chunk: false,
                     });
                     continue;
                 }
 
-                // Determine next scale if we were to descend into this sub-chunk
                 let next_scale = scale / 16;
 
                 if next_scale > 1 {
-                    // We are not yet at the final chunk level; recurse to reach the bottom-level chunk
                     collect_voxels_recursive(
                         sub_chunk,
                         [world_x, world_y, world_z],
@@ -460,30 +818,37 @@ fn collect_voxels_recursive(
                         result,
                     );
                 } else {
-                    // We've reached the final chunk level (leaf chunk of 16x16x16 voxels).
                     if distance >= camera.config.lod_render_distance {
-                        // Far: render as a single averaged-color block
                         if sub_chunk.voxel_count > 0 {
                             result.push(VoxelInstance {
                                 position: [world_x, world_y, world_z],
                                 voxel_type: 0,
                                 distance,
                                 custom_color: Some(sub_chunk.average_color),
-                                scale, // at leaf chunk level, `scale` should be 16
+                                scale,
                                 is_leaf_chunk: false,
                             });
                         }
                     } else {
-                        // Near: request the leaf chunk mesh instead of descending to individual voxels.
                         if sub_chunk.voxel_count > 0 {
-                            result.push(VoxelInstance {
-                                position: [world_x, world_y, world_z],
-                                voxel_type: 0,
-                                distance,
-                                custom_color: None,
-                                scale, // chunk size (16)
-                                is_leaf_chunk: true,
-                            });
+                            // Final check before adding leaf chunk
+                            if camera.frustum.test_aabb(
+                                [world_x as f32, world_y as f32, world_z as f32],
+                                [
+                                    (world_x + scale) as f32,
+                                    (world_y + scale) as f32,
+                                    (world_z + scale) as f32,
+                                ],
+                            ) {
+                                result.push(VoxelInstance {
+                                    position: [world_x, world_y, world_z],
+                                    voxel_type: 0,
+                                    distance,
+                                    custom_color: None,
+                                    scale,
+                                    is_leaf_chunk: true,
+                                });
+                            }
                         }
                     }
                 }
