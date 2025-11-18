@@ -134,6 +134,10 @@ pub struct ShadowConfig {
     pub darkness: f32,
     #[serde(default = "default_backface_ambient_scale")]
     pub backface_ambient_scale: f32,
+    #[serde(default = "default_shadow_pcf_radius")]
+    pub pcf_radius: f32,
+    #[serde(default = "default_shadow_pcf_poisson_samples")]
+    pub pcf_poisson_samples: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -295,6 +299,16 @@ fn default_shadow_map_size() -> u32 {
     4096
 }
 
+fn default_shadow_pcf_radius() -> f32 {
+    // radius in texels for PCF (1.0 == 3x3 sampling with offsets -1/0/1)
+    1.0
+}
+
+fn default_shadow_pcf_poisson_samples() -> u32 {
+    // number of Poisson disk samples to use. 0 means disabled (use Gaussian 3x3).
+    0
+}
+
 fn default_shadow_darkness() -> f32 {
     1.0
 }
@@ -421,6 +435,8 @@ impl Default for ShadowConfig {
             map_size: default_shadow_map_size(),
             darkness: default_shadow_darkness(),
             backface_ambient_scale: default_backface_ambient_scale(),
+            pcf_radius: default_shadow_pcf_radius(),
+            pcf_poisson_samples: default_shadow_pcf_poisson_samples(),
         }
     }
 }

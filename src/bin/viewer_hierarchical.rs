@@ -3653,7 +3653,12 @@ impl App {
             fog_time_pad: [0.003000, 0.5, 0.0, 0.0],
             sun_color_pad: [1.0, 0.95, 0.8, 0.0],
             ambient_color_pad: [0.3, 0.35, 0.45, 0.0],
-            shadow_texel_size_pad: [shadow_texel, shadow_texel, 0.0, 0.0],
+            shadow_texel_size_pad: [
+                shadow_texel,
+                shadow_texel,
+                voxelot::Config::load_or_default(CONFIG_FILE).shadows.pcf_radius,
+                0.0,
+            ],
             shadow_darkness_pad: [self.shadow_darkness, self.shadow_backface_scale, 0.0, 0.0],
             moon_direction_intensity: [-0.5, -1.0, -0.3, 0.2], // initial opposite dim moon
             moon_color_pad: [0.2, 0.25, 0.35, 0.0],
@@ -5050,7 +5055,12 @@ impl App {
             fog_time_pad: [self.fog_density, self.time_of_day, 0.0, 0.0],
             sun_color_pad: [sun_color[0], sun_color[1], sun_color[2], 0.0],
             ambient_color_pad: [ambient_color[0], ambient_color[1], ambient_color[2], 0.0],
-            shadow_texel_size_pad: [shadow_texel, shadow_texel, 0.0, 0.0],
+            shadow_texel_size_pad: [
+                shadow_texel,
+                shadow_texel,
+                voxelot::Config::load_or_default(CONFIG_FILE).shadows.pcf_radius,
+                0.0,
+            ],
             shadow_darkness_pad: [self.shadow_darkness, self.shadow_backface_scale, 0.0, 0.0],
             moon_direction_intensity: [
                 moon_direction_vec.x,

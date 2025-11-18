@@ -364,15 +364,60 @@ fn compute_shadow(light_space_pos: vec4<f32>, normal: vec3<f32>, sun_dir: vec3<f
     let texel_bias = max(uniforms.shadow_texel_size_pad.x, uniforms.shadow_texel_size_pad.y) * 0.5;
     let depth_ref = clamp(depth - (base_bias + slope_bias + texel_bias), 0.0, 1.0);
     
-    // 2x2 PCF (Percentage Closer Filtering) for smoother shadow edges
+    // Improved PCF: 3x3 Gaussian kernel for smoother shadow edges.
+    // radius in texels is provided in shadow_texel_size_pad.z
     let texel_size = vec2<f32>(uniforms.shadow_texel_size_pad.x, uniforms.shadow_texel_size_pad.y);
-    var shadow = 0.0;
-    let offset = texel_size * 0.5;
-    shadow += textureSampleCompare(shadow_map, shadow_sampler, uv + vec2(-offset.x, -offset.y), depth_ref);
-    shadow += textureSampleCompare(shadow_map, shadow_sampler, uv + vec2(offset.x, -offset.y), depth_ref);
-    shadow += textureSampleCompare(shadow_map, shadow_sampler, uv + vec2(-offset.x, offset.y), depth_ref);
-    shadow += textureSampleCompare(shadow_map, shadow_sampler, uv + vec2(offset.x, offset.y), depth_ref);
-    return shadow * 0.25;
+    let radius = uniforms.shadow_texel_size_pad.z;
+
+    // If Poisson is enabled (pcf_poisson_samples > 0), use a Poisson disk sampling
+    // pattern with a stable rotation per fragment to reduce banding/hard halo.
+    // Otherwise, use the Gaussian 3x3 as before.
+    let poisson_samples = i32(uniforms.shadow_texel_size_pad.w);
+    if (poisson_samples > 0) {
+        // Poisson disk offsets (8 samples)
+        let poisson: array<vec2<f32>, 8> = array<vec2<f32>, 8>(
+            vec2<f32>(-0.94201624, -0.39906216),
+            vec2<f32>(0.94558609, -0.76890725),
+            vec2<f32>(-0.094184101, -0.92938870),
+            vec2<f32>(0.34495938, 0.29387760),
+            vec2<f32>(-0.91588581, 0.45771432),
+            vec2<f32>(-0.81544232, -0.87912464),
+            vec2<f32>(-0.38277543, 0.27676845),
+            vec2<f32>(0.97484398, 0.75648379),
+        );
+
+        // Stable rotation derived from UV to decorrelate samples between fragments.
+        let rnd = fract(sin(dot(uv, vec2<f32>(12.9898, 78.233))) * 43758.5453);
+        let angle = rnd * 6.28318530718; // 2*pi
+        let c = cos(angle);
+        let s = sin(angle);
+        let rot = mat2x2<f32>(vec2<f32>(c, -s), vec2<f32>(s, c));
+
+        var shadow_val = 0.0;
+        var count = 0;
+        let max_samples = min(poisson_samples, 8);
+        for (var i: i32 = 0; i < max_samples; i = i + 1) {
+            let base_off = poisson[i];
+            let roff = rot * base_off;
+            let off = roff * texel_size * radius;
+            shadow_val += textureSampleCompare(shadow_map, shadow_sampler, uv + off, depth_ref);
+            count = count + 1;
+        }
+        return shadow_val / f32(count);
+    } else {
+        // 3x3 Gaussian weights (sum = 16)
+        let weights = array<f32, 9>(1.0, 2.0, 1.0, 2.0, 4.0, 2.0, 1.0, 2.0, 1.0);
+        var shadow = 0.0;
+        var idx: i32 = 0;
+        for (var y: i32 = -1; y <= 1; y = y + 1) {
+            for (var x: i32 = -1; x <= 1; x = x + 1) {
+                let off = vec2<f32>(f32(x), f32(y)) * texel_size * radius;
+                shadow += weights[idx] * textureSampleCompare(shadow_map, shadow_sampler, uv + off, depth_ref);
+                idx = idx + 1;
+            }
+        }
+        return shadow / 16.0;
+    }
 }
 
 @vertex
