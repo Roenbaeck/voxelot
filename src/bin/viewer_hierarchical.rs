@@ -4085,6 +4085,11 @@ impl App {
                 cpu_mesh_keys.insert(key);
             } else {
                 missing_chunks.insert(key);
+                // If mesh workers are disabled (0), do not enqueue background meshing jobs
+                if self.mesh_worker_count == 0 {
+                    continue;
+                }
+                
                 if !self.pending_chunk_set.contains(&key) {
                     self.pending_chunk_meshes.push_back(key);
                     self.pending_chunk_set.insert(key);
