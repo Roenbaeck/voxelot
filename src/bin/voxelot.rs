@@ -9,8 +9,8 @@
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use glam::{Mat4, Vec3};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use wgpu::util::DeviceExt;
 use winit::{
@@ -24,8 +24,8 @@ use winit::{
 use std::collections::{HashMap, HashSet, VecDeque};
 use sysinfo::{Pid, ProcessExt, System, SystemExt};
 use voxelot::{
-    cull_visible_voxels_parallel, generate_chunk_mesh, Camera, Chunk, ChunkMesh, Palette,
-    RenderConfig, Voxel, VoxelInstance, World, WorldPos,
+    cull_visible_voxels_parallel, Camera, Chunk, ChunkMesh, Palette, RenderConfig, Voxel,
+    VoxelInstance, World, WorldPos,
 };
 
 macro_rules! viewer_debug {
@@ -121,7 +121,11 @@ struct MeshCacheEntry {
 
 impl MeshCacheEntry {
     fn total_bytes(&self) -> u64 {
-        if self.is_placeholder { 0 } else { self.vertex_bytes + self.index_bytes }
+        if self.is_placeholder {
+            0
+        } else {
+            self.vertex_bytes + self.index_bytes
+        }
     }
 }
 // Ensure impl CameraController is properly closed (fix potential brace mismatch introduced by refactor)
@@ -535,7 +539,7 @@ impl CameraController {
                 println!("Far plane: {:.0}", self.camera.config.far_plane);
             }
             _ => {}
-    }
+        }
     }
 
     fn process_mouse(&mut self, delta_x: f64, delta_y: f64) {
@@ -936,25 +940,30 @@ impl App {
             .mesh_worker_count
             .unwrap_or_else(|| available_workers.min(6));
 
+        let worker_palette = Arc::new(palette.clone());
+
         for worker_index in 0..mesh_worker_count {
             let job_rx = mesh_job_rx.clone();
             let jobs_executed = mesh_jobs_executed.clone();
             let result_tx = mesh_result_tx.clone();
-            let palette_clone = palette.clone();
-                std::thread::Builder::new()
+            let palette = worker_palette.clone();
+
+            std::thread::Builder::new()
                 .name(format!("mesh-worker-{}", worker_index))
                 .spawn(move || {
-                    for job in job_rx.iter() {
+                    while let Ok(job) = job_rx.recv() {
                         let MeshJob {
                             key,
                             chunk,
                             neighbors,
                         } = job;
-                        // Skip meshing completely empty chunks early.
-                        if chunk.voxel_count == 0 {
-                            continue;
-                        }
-                        let mesh = generate_chunk_mesh(&*chunk, &palette_clone, Some(&neighbors));
+
+                        let mesh = voxelot::generate_chunk_mesh_optimized(
+                            &chunk,
+                            &palette,
+                            Some(&neighbors),
+                        );
+
                         if result_tx
                             .send(MeshResult {
                                 key,
@@ -2465,26 +2474,28 @@ impl App {
                 break;
             }
 
-                if let Some(entry) = self.mesh_cache.remove(&key) {
-                    let entry_bytes = entry.total_bytes();
-                    // If this was a placeholder (shared empty buffers), do not destroy the buffer
-                    // as it is owned globally. Only destroy buffers for normal entries.
-                    if !entry.is_placeholder {
-                        // push back to pool instead of destroying to reduce GPU allocation churn
-                        let vb_bytes = entry.vertex_bytes;
-                        let ib_bytes = entry.index_bytes;
-                        if self.vertex_buffer_pool.len() < self.mesh_buffer_pool_max_entries {
-                            self.vertex_buffer_pool.push_back((vb_bytes, entry.vertex_buffer));
-                        } else {
-                            entry.vertex_buffer.destroy();
-                        }
-                        if self.index_buffer_pool.len() < self.mesh_buffer_pool_max_entries {
-                            self.index_buffer_pool.push_back((ib_bytes, entry.index_buffer));
-                        } else {
-                            entry.index_buffer.destroy();
-                        }
-                        self.mesh_cache_bytes = self.mesh_cache_bytes.saturating_sub(entry_bytes);
+            if let Some(entry) = self.mesh_cache.remove(&key) {
+                let entry_bytes = entry.total_bytes();
+                // If this was a placeholder (shared empty buffers), do not destroy the buffer
+                // as it is owned globally. Only destroy buffers for normal entries.
+                if !entry.is_placeholder {
+                    // push back to pool instead of destroying to reduce GPU allocation churn
+                    let vb_bytes = entry.vertex_bytes;
+                    let ib_bytes = entry.index_bytes;
+                    if self.vertex_buffer_pool.len() < self.mesh_buffer_pool_max_entries {
+                        self.vertex_buffer_pool
+                            .push_back((vb_bytes, entry.vertex_buffer));
+                    } else {
+                        entry.vertex_buffer.destroy();
                     }
+                    if self.index_buffer_pool.len() < self.mesh_buffer_pool_max_entries {
+                        self.index_buffer_pool
+                            .push_back((ib_bytes, entry.index_buffer));
+                    } else {
+                        entry.index_buffer.destroy();
+                    }
+                    self.mesh_cache_bytes = self.mesh_cache_bytes.saturating_sub(entry_bytes);
+                }
                 self.chunk_emitters.remove(&key);
                 // Also drop any cached Arc<Chunk> snapshot for this chunk to free memory
                 self.mesh_chunk_arc_cache.remove(&key);
@@ -4203,21 +4214,21 @@ impl App {
         }
         let grouping_time = grouping_start.elapsed();
 
-    let mesh_start = Instant::now();
-    let mut mesh_leaf_proc_time = std::time::Duration::ZERO;
-    let mut mesh_result_collect_time = std::time::Duration::ZERO;
-    let mut mesh_schedule_time = std::time::Duration::ZERO;
-    let mut mesh_pending_sort_time = std::time::Duration::ZERO;
-    let mut mesh_job_creation_time = std::time::Duration::ZERO;
-    let mut mesh_job_neighbors_time = std::time::Duration::ZERO;
+        let mesh_start = Instant::now();
+        let mut mesh_leaf_proc_time = std::time::Duration::ZERO;
+        let mut mesh_result_collect_time = std::time::Duration::ZERO;
+        let mut mesh_schedule_time = std::time::Duration::ZERO;
+        let mut mesh_pending_sort_time = std::time::Duration::ZERO;
+        let mut mesh_job_creation_time = std::time::Duration::ZERO;
+        let mut mesh_job_neighbors_time = std::time::Duration::ZERO;
         // Build mesh for any chunk present (near leaf chunk), and mark those chunks for drawing
         let mut cpu_mesh_keys: HashSet<(i64, i64, i64)> = HashSet::new();
         let mut new_meshes_created = 0;
         let mut chunks_not_found = 0;
         let mut missing_chunks: HashSet<(i64, i64, i64)> = HashSet::new();
 
-    let leaf_scan_start = std::time::Instant::now();
-    for &key in &leaf_chunks {
+        let leaf_scan_start = std::time::Instant::now();
+        for &key in &leaf_chunks {
             if self.mesh_cache.contains_key(&key) {
                 cpu_mesh_keys.insert(key);
             } else {
@@ -4226,7 +4237,7 @@ impl App {
                 if self.mesh_worker_count == 0 {
                     continue;
                 }
-                
+
                 if !self.pending_chunk_set.contains(&key) {
                     // Prioritize meshing for chunks that are within the LOD distance of the camera
                     let cam_pos = self.camera_controller.camera.position;
@@ -4249,9 +4260,9 @@ impl App {
             }
         }
 
-    mesh_leaf_proc_time += leaf_scan_start.elapsed();
-    let result_collect_start = std::time::Instant::now();
-    while let Ok(result) = self.mesh_result_rx.try_recv() {
+        mesh_leaf_proc_time += leaf_scan_start.elapsed();
+        let result_collect_start = std::time::Instant::now();
+        while let Ok(result) = self.mesh_result_rx.try_recv() {
             self.ready_chunk_meshes.push_back(result);
             if self.mesh_jobs_in_flight > 0 {
                 self.mesh_jobs_in_flight -= 1;
@@ -4260,8 +4271,8 @@ impl App {
         mesh_result_collect_time += result_collect_start.elapsed();
 
         let max_inflight = self.max_inflight_jobs();
-    let schedule_start = std::time::Instant::now();
-    while self.mesh_jobs_in_flight < max_inflight {
+        let schedule_start = std::time::Instant::now();
+        while self.mesh_jobs_in_flight < max_inflight {
             // Backpressure: don't schedule more worker jobs if the ready result queue is already
             // large. This avoids generating more meshes than we can upload and prevents a
             // runaway backlog that keeps workers busy indefinitely.
@@ -4331,7 +4342,9 @@ impl App {
                                 {
                                     let nk = (nx, ny, nz);
                                     // Reuse an Arc snapshot if available; otherwise clone and cache
-                                    let arc_neigh = if let Some(existing) = self.mesh_chunk_arc_cache.get(&nk) {
+                                    let arc_neigh = if let Some(existing) =
+                                        self.mesh_chunk_arc_cache.get(&nk)
+                                    {
                                         existing.clone()
                                     } else {
                                         let a = Arc::new(nc.clone());
@@ -4377,24 +4390,24 @@ impl App {
                     chunks_not_found += 1;
                 }
             }
-    }
-    mesh_schedule_time += schedule_start.elapsed();
+        }
+        mesh_schedule_time += schedule_start.elapsed();
 
-    let mut processed_meshes = 0;
-    // Decide per-frame upload limit and allow temporary boost when ready backlog accumulates
-    let mut frame_mesh_upload_limit = self.mesh_upload_limit;
-    if self.ready_chunk_meshes.len() > self.mesh_upload_limit * 4 {
-        // boost cap - allow draining faster when there's a large backlog
-        frame_mesh_upload_limit = self.mesh_upload_max;
-    }
-    // Detailed timing for mesh upload parts: vertex buffer creation, index buffer creation and cache insertion.
-    let mut mesh_upload_vbuf_time = std::time::Duration::ZERO;
-    let mut mesh_upload_ibuf_time = std::time::Duration::ZERO;
-    let mut mesh_upload_entry_time = std::time::Duration::ZERO;
-    let mut mesh_build_vb_time = std::time::Duration::ZERO;
-    let mut mesh_emitters_proc_time = std::time::Duration::ZERO;
-    let mesh_upload_total_start = std::time::Instant::now();
-    while processed_meshes < frame_mesh_upload_limit {
+        let mut processed_meshes = 0;
+        // Decide per-frame upload limit and allow temporary boost when ready backlog accumulates
+        let mut frame_mesh_upload_limit = self.mesh_upload_limit;
+        if self.ready_chunk_meshes.len() > self.mesh_upload_limit * 4 {
+            // boost cap - allow draining faster when there's a large backlog
+            frame_mesh_upload_limit = self.mesh_upload_max;
+        }
+        // Detailed timing for mesh upload parts: vertex buffer creation, index buffer creation and cache insertion.
+        let mut mesh_upload_vbuf_time = std::time::Duration::ZERO;
+        let mut mesh_upload_ibuf_time = std::time::Duration::ZERO;
+        let mut mesh_upload_entry_time = std::time::Duration::ZERO;
+        let mut mesh_build_vb_time = std::time::Duration::ZERO;
+        let mut mesh_emitters_proc_time = std::time::Duration::ZERO;
+        let mesh_upload_total_start = std::time::Instant::now();
+        while processed_meshes < frame_mesh_upload_limit {
             let Some(result) = self.ready_chunk_meshes.pop_front() else {
                 break;
             };
@@ -4519,7 +4532,8 @@ impl App {
             let (vbuf, _vcap) = self.allocate_vertex_buffer_from_pool(&device, &queue, &vb_data);
             mesh_upload_vbuf_time += vbuf_start.elapsed();
             let ibuf_start = std::time::Instant::now();
-            let (ibuf, _icap) = self.allocate_index_buffer_from_pool(&device, &queue, &mesh.indices);
+            let (ibuf, _icap) =
+                self.allocate_index_buffer_from_pool(&device, &queue, &mesh.indices);
             mesh_upload_ibuf_time += ibuf_start.elapsed();
             let vertex_bytes = (vb_data.len() * std::mem::size_of::<MeshVertexRaw>()) as u64;
             let index_bytes = (mesh.indices.len() * std::mem::size_of::<u32>()) as u64;
@@ -4552,8 +4566,8 @@ impl App {
                 missing_chunks.remove(&key);
             }
         }
-    let mesh_upload_total_time = mesh_upload_total_start.elapsed();
-    let mesh_time = mesh_start.elapsed();
+        let mesh_upload_total_time = mesh_upload_total_start.elapsed();
+        let mesh_time = mesh_start.elapsed();
 
         if self.mesh_cache_bytes > self.mesh_cache_byte_budget() {
             self.evict_mesh_cache();
@@ -4637,7 +4651,12 @@ impl App {
                                 // bbox does not touch any chunk edge so we don't create visible
                                 // gaps between adjacent chunks.
                                 let cfg_shrink = self.fallback_bbox_shrink;
-                                let touches_edge = xmin <= 0.0 || ymin <= 0.0 || zmin <= 0.0 || xmax >= 15.0 || ymax >= 15.0 || zmax >= 15.0;
+                                let touches_edge = xmin <= 0.0
+                                    || ymin <= 0.0
+                                    || zmin <= 0.0
+                                    || xmax >= 15.0
+                                    || ymax >= 15.0
+                                    || zmax >= 15.0;
                                 let shrink = if touches_edge { 1.0 } else { cfg_shrink };
 
                                 let new_x = size_x * shrink;
@@ -4842,8 +4861,8 @@ impl App {
         };
         let instance_time = instance_start.elapsed();
 
-    self.active_emitters.clear();
-    let mut draw_calls: usize = 0;
+        self.active_emitters.clear();
+        let mut draw_calls: usize = 0;
         for key in &draw_mesh_keys {
             if let Some(emitters) = self.chunk_emitters.get(key) {
                 self.active_emitters
@@ -5429,14 +5448,14 @@ impl App {
                 }
             }
 
-                if !instances.is_empty() {
+            if !instances.is_empty() {
                 shadow_pass.set_pipeline(shadow_pipeline);
                 shadow_pass.set_bind_group(0, shadow_bind_group, &[]);
                 shadow_pass
                     .set_vertex_buffer(0, self.cube_vertex_buffer.as_ref().unwrap().slice(..));
                 shadow_pass.set_vertex_buffer(1, self.instance_buffer.as_ref().unwrap().slice(..));
-                    shadow_pass.draw(0..36, 0..instances.len() as u32);
-                    draw_calls += 1;
+                shadow_pass.draw(0..36, 0..instances.len() as u32);
+                draw_calls += 1;
             }
         }
 
@@ -5967,7 +5986,9 @@ impl App {
             let jobs_in_flight = self.mesh_jobs_in_flight;
             let pending_set_count = self.pending_chunk_set.len();
             let jobs_per_sec = self.mesh_jobs_executed.swap(0, Ordering::Relaxed);
-            let mesh_idle = self.pending_chunk_meshes.is_empty() && self.ready_chunk_meshes.is_empty() && jobs_in_flight == 0;
+            let mesh_idle = self.pending_chunk_meshes.is_empty()
+                && self.ready_chunk_meshes.is_empty()
+                && jobs_in_flight == 0;
             println!(
                 "FPS: {}, Visible items: {}, Leaf chunks: {}, Meshed chunks: {}, Pending: {}, PendingSet: {}, Ready: {}, InFlight: {}, Fallback: {}, Mesh cache: {:.1}/{:.1} MiB, Process: {:.1} MiB, Cull: {:.2}ms, Group: {:.2}ms, Mesh: {:.2}ms, Instances: {:.2}ms, Draws: {}, Jobs/sec: {}, EmptyMeshes: {}, VReuse: {}, IReuse: {}, VPool: {}, IPool: {}, MeshIdle: {}, DoF Kawase: {} (iter={}, off={:.2}), MeshUp: {:.2}ms parts:(leaf:{:.2} sched:{:.2} sort:{:.2} res:{:.2} jobc:{:.2} jobn:{:.2}) vbld:{:.2} v:{:.2} i:{:.2} ins:{:.2} emit:{:.2} processed:{} limit:{}",
                 self.frame_count,

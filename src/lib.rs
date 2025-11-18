@@ -4,6 +4,7 @@ pub mod config;
 pub mod culling;
 pub mod lib_hierarchical;
 pub mod meshing;
+pub mod meshing_optimized;
 pub mod octree_format;
 pub mod palette;
 
@@ -15,5 +16,6 @@ pub use culling::{
 };
 pub use lib_hierarchical::{Chunk, Voxel, VoxelType, World, WorldPos};
 pub use meshing::{generate_chunk_mesh, ChunkEmitter, ChunkMesh, MeshVertex};
+pub use meshing_optimized::generate_chunk_mesh_optimized;
 pub use octree_format::{load_world, load_world_file, save_world, save_world_file};
 pub use palette::Palette;
