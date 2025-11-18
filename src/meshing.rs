@@ -252,8 +252,26 @@ pub fn generate_chunk_mesh(
         let axis_name = ["X", "Y", "Z"][axis];
         let mut faces_this_axis = 0;
 
+        // Get the marginal bitmap for this axis
+        let marginal = match axis {
+            0 => chunk.px,
+            1 => chunk.py,
+            _ => chunk.pz,
+        };
+
         // Iterate slices along the main axis
         for d in 0..=16 {
+            // Use marginal bitmap to skip empty slices
+            let has_voxels_in_slice = match d {
+                0 => (marginal & 1) != 0, // boundary at y=0 (or x=0,z=0)
+                1..=15 => (marginal & (1 << (d - 1))) != 0 || (marginal & (1 << d)) != 0,
+                16 => (marginal & (1 << 15)) != 0, // boundary at y=15 (or x=15,z=15)
+                _ => false,
+            };
+            if !has_voxels_in_slice {
+                continue;
+            }
+
             // note: d == 16 handles the outer boundary
             // Mask width/height along u and v axes
             let mut mask: [i32; 16 * 16] = [0; 16 * 16];
