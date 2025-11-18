@@ -4091,7 +4091,22 @@ impl App {
                 }
                 
                 if !self.pending_chunk_set.contains(&key) {
-                    self.pending_chunk_meshes.push_back(key);
+                    // Prioritize meshing for chunks that are within the LOD distance of the camera
+                    let cam_pos = self.camera_controller.camera.position;
+                    let chunk_center = [key.0 as f32 + 8.0, key.1 as f32 + 8.0, key.2 as f32 + 8.0];
+                    let dx = chunk_center[0] - cam_pos[0];
+                    let dy = chunk_center[1] - cam_pos[1];
+                    let dz = chunk_center[2] - cam_pos[2];
+                    let dist_sq = dx * dx + dy * dy + dz * dz;
+                    // Use squared LOD distance for speed
+                    let lod_sq = self.lod_distance * self.lod_distance;
+                    if dist_sq <= lod_sq {
+                        // Push to front so it's processed sooner
+                        self.pending_chunk_meshes.push_front(key);
+                    } else {
+                        // push to back as normal for background meshing
+                        self.pending_chunk_meshes.push_back(key);
+                    }
                     self.pending_chunk_set.insert(key);
                 }
             }
