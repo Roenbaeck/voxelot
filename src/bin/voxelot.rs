@@ -6221,108 +6221,97 @@ impl App {
             egui::Area::new(egui::Id::new("fps_counter"))
                 .fixed_pos(egui::pos2(10.0, 10.0))
                 .show(egui_ctx, |ui| {
-                    ui.label(
-                        egui::RichText::new(format!("FPS: {}", self.last_fps))
-                            .color(egui::Color32::WHITE)
-                            .size(10.0),
-                    );
-                    // Additional stats: mirror the console output but in overlay
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Visible: {}",
-                            self.visible_count
-                        ))
-                        .color(egui::Color32::WHITE)
-                        .size(10.0),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Meshed: {}",
-                            self.meshed_chunk_count
-                        ))
-                        .color(egui::Color32::WHITE)
-                        .size(10.0),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Pending: {}",
-                            self.pending_mesh_count
-                        ))
-                        .color(egui::Color32::WHITE)
-                        .size(10.0),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Jobs/s: {}",
-                            self.jobs_per_sec_snapshot
-                        ))
-                        .color(egui::Color32::WHITE)
-                        .size(10.0),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Mesh cache: {:.0}/{:.0} MiB",
-                            self.mesh_cache_mib, self.mesh_budget_mib
-                        ))
-                        .color(egui::Color32::WHITE)
-                        .size(10.0),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Envelopes: {:.0}/{:.0} MiB",
-                            self.envelope_cache_mib, self.mesh_budget_mib
-                        ))
-                        .color(egui::Color32::WHITE)
-                        .size(10.0),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Process: {:.0} MiB",
-                            self.process_mem_mib
-                        ))
-                        .color(egui::Color32::WHITE)
-                        .size(10.0),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Cull: {:.2}ms",
-                            self.cull_ms
-                        ))
-                        .color(egui::Color32::WHITE)
-                        .size(10.0),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Group: {:.2}ms",
-                            self.grouping_ms
-                        ))
-                        .color(egui::Color32::WHITE)
-                        .size(10.0),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Mesh: {:.2}ms",
-                            self.mesh_ms
-                        ))
-                        .color(egui::Color32::WHITE)
-                        .size(10.0),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Instancing: {:.2}ms",
-                            self.instance_ms
-                        ))
-                        .color(egui::Color32::WHITE)
-                        .size(10.0),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Draws: {}",
-                            self.draw_calls_count
-                        ))
-                        .color(egui::Color32::WHITE)
-                        .size(10.0),
-                    );
+                    egui::Frame::default()
+                        .fill(egui::Color32::from_black_alpha(50))
+                        .inner_margin(5.0)
+                        .corner_radius(5.0)
+                        .show(ui, |ui| {
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                            ui.label(
+                                egui::RichText::new(format!("FPS: {}", self.last_fps))
+                                    .color(egui::Color32::WHITE)
+                                    .size(10.0),
+                            );
+                            // Additional stats: mirror the console output but in overlay
+                            ui.label(
+                                egui::RichText::new(format!("Visible: {}", self.visible_count))
+                                    .color(egui::Color32::WHITE)
+                                    .size(10.0),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("Meshed: {}", self.meshed_chunk_count))
+                                    .color(egui::Color32::WHITE)
+                                    .size(10.0),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Pending: {}",
+                                    self.pending_mesh_count
+                                ))
+                                .color(egui::Color32::WHITE)
+                                .size(10.0),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Jobs/s: {}",
+                                    self.jobs_per_sec_snapshot
+                                ))
+                                .color(egui::Color32::WHITE)
+                                .size(10.0),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Mesh cache: {:.0}/{:.0} MiB",
+                                    self.mesh_cache_mib, self.mesh_budget_mib
+                                ))
+                                .color(egui::Color32::WHITE)
+                                .size(10.0),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Envelopes: {:.0}/{:.0} MiB",
+                                    self.envelope_cache_mib, self.mesh_budget_mib
+                                ))
+                                .color(egui::Color32::WHITE)
+                                .size(10.0),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Process: {:.0} MiB",
+                                    self.process_mem_mib
+                                ))
+                                .color(egui::Color32::WHITE)
+                                .size(10.0),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("Cull: {:.2}ms", self.cull_ms))
+                                    .color(egui::Color32::WHITE)
+                                    .size(10.0),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("Group: {:.2}ms", self.grouping_ms))
+                                    .color(egui::Color32::WHITE)
+                                    .size(10.0),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("Mesh: {:.2}ms", self.mesh_ms))
+                                    .color(egui::Color32::WHITE)
+                                    .size(10.0),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Instancing: {:.2}ms",
+                                    self.instance_ms
+                                ))
+                                .color(egui::Color32::WHITE)
+                                .size(10.0),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("Draws: {}", self.draw_calls_count))
+                                    .color(egui::Color32::WHITE)
+                                    .size(10.0),
+                            );
+                        });
                 });
 
             let full_output = egui_ctx.end_pass();
@@ -6470,7 +6459,13 @@ impl App {
             self.envelope_cache_mib = self.envelope_mesh_cache_bytes as f64 / (1024.0 * 1024.0);
             self.cull_ms = cull_time.as_secs_f64() * 1000.0;
             self.grouping_ms = grouping_time.as_secs_f64() * 1000.0;
-            self.mesh_ms = (if mesh_idle { std::time::Duration::from_secs(0) } else { mesh_time }).as_secs_f64() * 1000.0;
+            self.mesh_ms = (if mesh_idle {
+                std::time::Duration::from_secs(0)
+            } else {
+                mesh_time
+            })
+            .as_secs_f64()
+                * 1000.0;
             self.instance_ms = instance_time.as_secs_f64() * 1000.0;
             self.draw_calls_count = draw_calls;
 
