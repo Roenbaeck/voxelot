@@ -1051,7 +1051,9 @@ impl App {
             mesh_cache_bytes: 0,
             envelope_mesh_cache: HashMap::new(),
             envelope_mesh_cache_bytes: 0,
-            envelope_mesh_cache_budget_bytes: cfg.performance.mesh_cache_budget_mb as u64 * 1024 * 1024,
+            envelope_mesh_cache_budget_bytes: cfg.performance.mesh_cache_budget_mb as u64
+                * 1024
+                * 1024,
             envelope_distance: cfg.performance.envelope_distance,
             envelope_fade_range: cfg.performance.envelope_fade_range,
             vertex_buffer_pool: VecDeque::new(),
@@ -1348,7 +1350,12 @@ impl App {
             self.camera_controller.camera.near,
             self.camera_controller.camera.far,
         );
-        let inv_proj = projection.inverse();
+        // Match main renderer's projection transform (even if redundant for glam, it's what's in the depth buffer)
+        const OPENGL_TO_WGPU_MATRIX: Mat4 = Mat4::from_cols_array(&[
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5, 1.0,
+        ]);
+        let corrected_projection = OPENGL_TO_WGPU_MATRIX * projection;
+        let inv_proj = corrected_projection.inverse();
         SsaoUniformsRaw {
             sample_count: self.ssao_settings.sample_count as u32,
             slice_count: self.ssao_settings.slice_count as u32,
@@ -1749,10 +1756,10 @@ impl App {
         self.bloom_pong_view = Some(bloom_pong_view);
         self.bloom_pong_texture = Some(bloom_pong_texture);
 
-        // SSAO ping/pong textures (half-res like bloom)
+        // SSAO ping/pong textures (FULL-RES to match depth buffer)
         let ssao_extent = wgpu::Extent3d {
-            width: (config.width / 2).max(1),
-            height: (config.height / 2).max(1),
+            width: config.width,
+            height: config.height,
             depth_or_array_layers: 1,
         };
         let ssao_ping_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -2011,8 +2018,7 @@ impl App {
 
         // SSILVB uniforms
         if let Some(buffer) = self.ssilvb_uniform_buffer.as_ref() {
-            let data =
-                self.build_ssilvb_uniforms((config.width / 2).max(1), (config.height / 2).max(1));
+            let data = self.build_ssilvb_uniforms(config.width, config.height);
             queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[data]));
         }
     }
@@ -2462,9 +2468,8 @@ impl App {
                             .push_back((ib_bytes, entry.index_buffer));
                     }
                 }
-                self.envelope_mesh_cache_bytes = self
-                    .envelope_mesh_cache_bytes
-                    .saturating_sub(entry_bytes);
+                self.envelope_mesh_cache_bytes =
+                    self.envelope_mesh_cache_bytes.saturating_sub(entry_bytes);
                 freed_bytes += entry_bytes;
                 evicted += 1;
             }
@@ -4078,8 +4083,7 @@ impl App {
         // Don't create SSAO blur bind groups until ping/pong views exist; update later in update_bloom_bind_groups()
         self.composite_uniform_buffer = Some(composite_uniform_buffer);
         // SSILVB uniforms
-        let ssilvb_uniforms =
-            self.build_ssilvb_uniforms((config.width / 2).max(1), (config.height / 2).max(1));
+        let ssilvb_uniforms = self.build_ssilvb_uniforms(config.width, config.height);
         let ssilvb_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("SSILVB Uniform Buffer"),
             contents: bytemuck::cast_slice(&[ssilvb_uniforms]),

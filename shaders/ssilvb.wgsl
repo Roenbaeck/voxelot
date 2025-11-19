@@ -32,95 +32,233 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return out;
 }
 
+const PI: f32 = 3.14159265359;
+const HALF_PI: f32 = 1.57079632679;
+
 // Reconstruct view-space position from depth
 fn reconstruct_position(uv: vec2<f32>, depth: f32) -> vec3<f32> {
-    // depth is [0,1], convert to NDC [-1,1]
-    let ndc_z = depth * 2.0 - 1.0;
-    let ndc_xy = uv * 2.0 - vec2<f32>(1.0, 1.0);
+    let ndc_z = depth;
+    let ndc_xy = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     let ndc = vec4<f32>(ndc_xy, ndc_z, 1.0);
     let view_pos = ssao.inverse_projection * ndc;
     return view_pos.xyz / view_pos.w;
 }
 
-// bitcount helper using integer bit operations
-// `mut` is a reserved keyword in WGSL; avoid using reserved keywords in parameter names.
-fn popcount(value: u32) -> u32 {
-    var v: u32 = value;
+// Fetch depth directly from texture
+fn fetch_depth(coord: vec2<i32>) -> f32 {
+    return textureLoad(depth_tex, coord, 0);
+}
+
+// Reconstruct normal from depth buffer using central differences
+fn compute_normal_from_depth(uv: vec2<f32>) -> vec3<f32> {
+    let size = vec2<f32>(ssao.screen_width, ssao.screen_height);
+    let p = vec2<i32>(uv * size);
+    
+    let c0 = fetch_depth(p);
+    
+    // Check for edge cases
+    if (c0 >= 1.0) { return vec3<f32>(0.0, 0.0, 1.0); }
+
+    let l1 = fetch_depth(p - vec2<i32>(1, 0));
+    let r1 = fetch_depth(p + vec2<i32>(1, 0));
+    let b1 = fetch_depth(p - vec2<i32>(0, 1));
+    let t1 = fetch_depth(p + vec2<i32>(0, 1));
+    
+    let l2 = fetch_depth(p - vec2<i32>(2, 0));
+    let r2 = fetch_depth(p + vec2<i32>(2, 0));
+    let b2 = fetch_depth(p - vec2<i32>(0, 2));
+    let t2 = fetch_depth(p + vec2<i32>(0, 2));
+    
+    let dl = abs((2.0 * l1 - l2) - c0);
+    let dr = abs((2.0 * r1 - r2) - c0);
+    let db = abs((2.0 * b1 - b2) - c0);
+    let dt = abs((2.0 * t1 - t2) - c0);
+    
+    let ce = reconstruct_position(uv, c0);
+    
+    let dpdx = select(
+        -ce + reconstruct_position(uv + vec2<f32>(1.0 / size.x, 0.0), r1),
+        ce - reconstruct_position(uv - vec2<f32>(1.0 / size.x, 0.0), l1),
+        dl < dr
+    );
+    
+    let dpdy = select(
+        -ce + reconstruct_position(uv + vec2<f32>(0.0, 1.0 / size.y), t1),
+        ce - reconstruct_position(uv - vec2<f32>(0.0, 1.0 / size.y), b1),
+        db < dt
+    );
+
+    return normalize(cross(dpdx, dpdy));
+}
+
+// Interleaved Gradient Noise
+fn ign(uv: vec2<f32>) -> f32 {
+    return fract(52.9829189 * fract(dot(uv, vec2<f32>(0.06711056, 0.00583715))));
+}
+
+fn fast_acos(x: f32) -> f32 {
+    let out_val = -0.156583 * abs(x) + HALF_PI;
+    let res = out_val * sqrt(1.0 - abs(x));
+    return select(PI - res, res, x >= 0.0);
+}
+
+fn count_bits(value: u32) -> u32 {
+    var v = value;
     v = v - ((v >> 1u) & 0x55555555u);
     v = (v & 0x33333333u) + ((v >> 2u) & 0x33333333u);
     return (((v + (v >> 4u)) & 0x0F0F0F0Fu) * 0x01010101u) >> 24u;
 }
 
-// update bitmask sectors between min and max horizon
-fn update_sectors(minH: f32, maxH: f32, out: u32) -> u32 {
-    let sector_count = 32u;
-    let start_bit = u32(minH * f32(sector_count));
-    let horizon_angle = u32(ceil((maxH - minH) * f32(sector_count)));
-    let angle_bit = select(0u, 0xFFFFFFFFu >> (sector_count - horizon_angle), horizon_angle > 0u);
-    let current_bitfield = angle_bit << start_bit;
-    return out | current_bitfield;
-}
-
 @fragment
 fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    // Get center depth and position
-    let center_depth = textureSample(depth_tex, post_sampler, uv);
-    let pos = reconstruct_position(uv, center_depth);
-    let camera = normalize(-pos);
-
-    var occlusion_mask: u32 = 0u;
-    var visibility = 0.0;
-
-    let sample_radius = ssao.sample_radius;
-    let sample_count = f32(ssao.sample_count);
-    let slice_count = f32(ssao.slice_count);
-
-    // jitter per-fragment derived from uv
-    let jitter = fract(sin(dot(uv, vec2<f32>(12.9898, 78.233))) * 43758.5453123) - 0.5;
-
-    for (var slice = 0u; slice < ssao.slice_count; slice = slice + 1u) {
-        let phi = (2.0 * 3.14159) * (f32(slice) + jitter) / (slice_count);
-        let omega = vec2<f32>(cos(phi), sin(phi));
-
-        var occlusion_bits: u32 = 0u;
-
-        for (var s = 0u; s < ssao.sample_count; s = s + 1u) {
-            let step = (f32(s) + jitter) / sample_count + 0.01;
-            let offset_pixels = step * sample_radius;
-            let sampleUV = uv - vec2<f32>(offset_pixels / ssao.screen_width, offset_pixels / ssao.screen_height) * omega;
-
-            // clamp to screen
-            if (sampleUV.x < 0.0 || sampleUV.x > 1.0 || sampleUV.y < 0.0 || sampleUV.y > 1.0) { continue; }
-
-            // sample depth at the sample uv
-            let sd = textureSample(depth_tex, post_sampler, sampleUV);
-            let sample_pos = reconstruct_position(sampleUV, sd);
-            let sample_distance = sample_pos - pos;
-            let sample_length = length(sample_distance);
-            if (sample_length < 0.001) { continue; } // avoid self
-            let sample_horizon = sample_distance / sample_length;
-
-            // Compute horizons similar to SSILVB
-            var front_back_horizon = vec2<f32>(
-                dot(sample_horizon, camera),
-                dot(normalize(sample_distance - camera * ssao.hit_thickness), camera)
-            );
-            front_back_horizon = acos(front_back_horizon);
-            // Since no normal, set n = 0
-            let n = 0.0;
-            front_back_horizon = clamp((front_back_horizon + n + 1.57079632679) / 3.14159265359, vec2(0.0, 0.0), vec2(1.0, 1.0));
-
-            occlusion_bits = update_sectors(front_back_horizon.x, front_back_horizon.y, occlusion_bits);
-        }
-
-        // compute occlusion for this slice
-        let occluded = f32(popcount(occlusion_bits)) / 32.0;
-        visibility += 1.0 - occluded;
-        occlusion_mask = occlusion_mask | occlusion_bits;
+    let depth = textureSample(depth_tex, post_sampler, uv);
+    if (depth >= 1.0) {
+        return vec4<f32>(1.0, 1.0, 1.0, 1.0);
     }
 
-    visibility = visibility / f32(ssao.slice_count);
+    let view_pos = reconstruct_position(uv, depth);
+    let normal = compute_normal_from_depth(uv);
+    let view_vec = normalize(-view_pos); // View vector pointing to camera (0,0,0) in view space
 
-    // output AO in alpha channel (1.0 -> lit, 0.0 -> occluded)
+    let screen_size = vec2<f32>(ssao.screen_width, ssao.screen_height);
+    let frag_coord = uv * screen_size;
+    
+    // Random rotation
+    let noise = ign(frag_coord);
+    
+    let sample_count = f32(ssao.sample_count);
+    let slice_count = f32(ssao.slice_count);
+    let radius = ssao.sample_radius;
+    
+    var visibility = 0.0;
+    
+    for (var slice = 0u; slice < ssao.slice_count; slice = slice + 1u) {
+        let phi = (PI / slice_count) * (f32(slice) + noise);
+        let slice_dir = vec2<f32>(cos(phi), sin(phi));
+        
+        // Project normal onto slice plane
+        let slice_n = cross(vec3<f32>(slice_dir.x, slice_dir.y, 0.0), vec3<f32>(0.0, 0.0, 1.0)); // Simplified slice normal in screen space?
+        // Actually, let's follow the reference logic more closely for the slice construction
+        
+        // Reference uses search in 2D screen space along the slice direction
+        // UV Y is down, View Space Y is up. So we must flip Y for the search direction in UV space.
+        let search_dir = vec2<f32>(slice_dir.x, -slice_dir.y);
+        
+        // Calculate tangent angle of the surface in the slice plane
+        // We need to project the view-space normal onto the slice plane defined by view_vec and search_dir
+        // But simpler GTAO/SSILVB often just marches in screen space.
+        
+        // Let's use the reference's horizon search
+        
+        // Construct slice plane basis
+        // We are working in View Space mostly.
+        // Slice direction in view space (approximate)
+        let slice_dir_vs = vec3<f32>(slice_dir, 0.0);
+        
+        // Compute projected normal on the slice plane
+        let plane_n = normalize(cross(slice_dir_vs, view_vec));
+        let proj_n = normal - plane_n * dot(normal, plane_n);
+        let proj_n_len = length(proj_n);
+        
+        var cos_n = 0.0;
+        var sin_n = 1.0;
+        var n_angle = 0.0;
+
+        if (proj_n_len > 0.001) {
+            let pn = proj_n / proj_n_len;
+            cos_n = dot(pn, view_vec); // cos of angle between normal and view vector
+            // Calculate sign of angle
+            let t = cross(plane_n, pn);
+            let sgn = select(1.0, -1.0, dot(view_vec, t) < 0.0);
+            n_angle = sgn * fast_acos(cos_n);
+        }
+        
+        // Horizon search
+        var occlusion_bits = 0u;
+        
+        // Two directions: -1 and 1
+        for (var side = 0u; side < 2u; side = side + 1u) {
+            let direction = select(-1.0, 1.0, side == 0u);
+            let ray_dir = search_dir * direction;
+            
+            // Logarithmic stepping
+            let step_factor = pow(radius, 1.0 / sample_count);
+            var t = 1.0; // Start offset (pixels? or view space units?)
+            // Reference uses view space radius but steps in screen space.
+            // Let's map radius to screen space approximately.
+            // Screen space radius ~= radius / view_z * projection_scale
+            // For simplicity, let's treat radius as world/view units and project.
+            
+            // Approximate screen radius at this depth
+            // This is a simplification.
+            let proj_scale = ssao.inverse_projection[1][1] * ssao.screen_height; // Approx
+            let screen_radius = (radius * proj_scale) / -view_pos.z;
+            
+            // If screen radius is too small, skip
+            if (screen_radius < 2.0) { continue; }
+            
+            let step_ratio = pow(screen_radius, 1.0 / sample_count);
+            var current_step = 1.0; // Start at 1 pixel offset
+            
+            // Jitter starting position
+            // current_step *= pow(step_ratio, noise); 
+            // Actually reference does: t = pow(s, rnd); where s is step factor.
+            
+            current_step = pow(step_ratio, select(noise, 1.0 - noise, side == 1u));
+            
+            for (var s = 0u; s < ssao.sample_count; s = s + 1u) {
+                let sample_uv = uv + (ray_dir * current_step) / screen_size;
+                current_step *= step_ratio;
+                
+                if (sample_uv.x < 0.0 || sample_uv.x > 1.0 || sample_uv.y < 0.0 || sample_uv.y > 1.0) { break; }
+                
+                let sample_depth = textureSampleLevel(depth_tex, post_sampler, sample_uv, 0);
+                let sample_pos = reconstruct_position(sample_uv, sample_depth);
+                
+                let delta = sample_pos - view_pos;
+                let dist = length(delta);
+                let dist_vec = delta / dist;
+                
+                // Horizon angle
+                let horizon_cos = dot(dist_vec, view_vec);
+                let horizon_angle = fast_acos(horizon_cos) * direction;
+                
+                // Thickness heuristic
+                let back_horizon_cos = dot(normalize(delta - view_vec * ssao.hit_thickness), view_vec);
+                let back_horizon_angle = fast_acos(back_horizon_cos) * direction;
+                
+                // Convert to [0, 1] relative to normal
+                let h1 = clamp((horizon_angle + n_angle) / PI + 0.5, 0.0, 1.0);
+                let h2 = clamp((back_horizon_angle + n_angle) / PI + 0.5, 0.0, 1.0);
+                
+                let min_h = min(h1, h2);
+                let max_h = max(h1, h2);
+                
+                // Bitmask
+                // 32 bits represent [0, 1] range
+                let start_bit = u32(min_h * 32.0);
+                let end_bit = u32(max_h * 32.0);
+                
+                // Create mask for range [start_bit, end_bit]
+                // Be careful with shifts > 31
+                if (start_bit < 32u) {
+                    let count = min(end_bit - start_bit, 32u - start_bit);
+                    if (count > 0u) {
+                        let mask = (0xFFFFFFFFu >> (32u - count)) << start_bit;
+                        occlusion_bits = occlusion_bits | mask;
+                    }
+                }
+            }
+        }
+        
+        let occluded_fraction = f32(count_bits(occlusion_bits)) / 32.0;
+        visibility += 1.0 - occluded_fraction;
+    }
+    
+    visibility /= slice_count;
+    
+    // Apply strength/contrast
+    visibility = pow(visibility, 2.0); // Ad-hoc contrast
+    
     return vec4<f32>(0.0, 0.0, 0.0, visibility);
 }
