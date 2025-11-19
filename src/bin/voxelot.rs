@@ -6181,7 +6181,7 @@ impl App {
             (&self.egui_ctx, &mut self.egui_winit, &self.window)
         {
             let raw_input = egui_winit.take_egui_input(window);
-            egui_ctx.begin_frame(raw_input);
+            egui_ctx.begin_pass(raw_input);
 
             egui::Area::new(egui::Id::new("fps_counter"))
                 .fixed_pos(egui::pos2(10.0, 10.0))
@@ -6193,7 +6193,7 @@ impl App {
                     );
                 });
 
-            let full_output = egui_ctx.end_frame();
+            let full_output = egui_ctx.end_pass();
             let paint_jobs = egui_ctx.tessellate(full_output.shapes, egui_ctx.pixels_per_point());
             let screen_descriptor = egui_wgpu::ScreenDescriptor {
                 size_in_pixels: [
