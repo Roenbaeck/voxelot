@@ -786,6 +786,8 @@ struct App {
     composite_uniform_buffer: Option<wgpu::Buffer>,
     ssao_enabled: bool,
     ssao_debug: bool,
+    shadows_enabled: bool,
+    render_scale: f32,
 
     // DoF color buffer that stores blurred result before combine
     dof_color_texture: Option<wgpu::Texture>,
@@ -816,6 +818,7 @@ struct App {
     kawase_acc_frames: u64,
     bloom_settings: BloomSettings,
     bloom_enabled: bool,
+    postprocessing_enabled: bool,
     ssao_settings: SsaoSettings,
     shadow_map_size: u32,
     shadow_darkness: f32,
@@ -1172,6 +1175,7 @@ impl App {
                 blur_radius: cfg.effects.bloom.blur_radius,
             },
             bloom_enabled: cfg.effects.bloom.enabled,
+            postprocessing_enabled: true,
             ssao_settings: SsaoSettings {
                 sample_count: 8,
                 slice_count: 4,
@@ -1183,6 +1187,8 @@ impl App {
             },
             ssao_enabled: cfg.effects.ssao.enabled,
             ssao_debug: false,
+            shadows_enabled: true,
+            render_scale: 1.0,
             shadow_map_size: cfg.shadows.map_size,
             shadow_darkness: cfg.shadows.darkness,
             shadow_backface_scale: cfg.shadows.backface_ambient_scale,
@@ -1426,6 +1432,39 @@ impl App {
                     }
                 );
             }
+            KeyCode::KeyV => {
+                self.postprocessing_enabled = !self.postprocessing_enabled;
+                println!(
+                    "Post-processing {} (DoF, Bloom, SSAO)",
+                    if self.postprocessing_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+            }
+            KeyCode::KeyM => {
+                self.shadows_enabled = !self.shadows_enabled;
+                println!(
+                    "Shadows {} (shadow pass + PCF sampling)",
+                    if self.shadows_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+            }
+            KeyCode::KeyR => {
+                if self.render_scale > 0.9 {
+                    self.render_scale = 0.75;
+                } else if self.render_scale > 0.6 {
+                    self.render_scale = 0.5;
+                } else {
+                    self.render_scale = 1.0;
+                }
+                println!("Render scale: {:.0}%", self.render_scale * 100.0);
+                self.recreate_offscreen_targets();
+            }
             KeyCode::F1 => {
                 // decrease SSILVB sample count
                 if self.ssao_settings.sample_count > 1 {
@@ -1567,11 +1606,14 @@ impl App {
             return;
         };
 
+        let scaled_width = (config.width as f32 * self.render_scale) as u32;
+        let scaled_height = (config.height as f32 * self.render_scale) as u32;
+
         let color_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Offscreen Color Texture"),
             size: wgpu::Extent3d {
-                width: config.width,
-                height: config.height,
+                width: scaled_width,
+                height: scaled_height,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -1588,8 +1630,8 @@ impl App {
         let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Offscreen Depth Texture"),
             size: wgpu::Extent3d {
-                width: config.width,
-                height: config.height,
+                width: scaled_width,
+                height: scaled_height,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -5339,7 +5381,16 @@ impl App {
         let uniforms = Uniforms {
             mvp: mvp_cols,
             sun_view_proj: sun_view_proj_cols,
-            camera_shadow_strength: [camera_pos[0], camera_pos[1], camera_pos[2], shadow_strength],
+            camera_shadow_strength: [
+                camera_pos[0],
+                camera_pos[1],
+                camera_pos[2],
+                if self.shadows_enabled {
+                    shadow_strength
+                } else {
+                    0.0
+                },
+            ],
             sun_direction_shadow_bias: [
                 sun_direction_vec.x,
                 sun_direction_vec.y,
@@ -5406,56 +5457,60 @@ impl App {
             }
         }
 
-        if let (
-            Some(shadow_view),
-            Some(shadow_pipeline),
-            Some(shadow_mesh_pipeline),
-            Some(shadow_bind_group),
-        ) = (
-            self.shadow_view.as_ref(),
-            self.shadow_pipeline.as_ref(),
-            self.shadow_mesh_pipeline.as_ref(),
-            self.shadow_bind_group.as_ref(),
-        ) {
-            let mut shadow_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Shadow Pass"),
-                color_attachments: &[],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: shadow_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
+        // Skip shadow pass if shadows disabled (for performance testing)
+        if self.shadows_enabled {
+            if let (
+                Some(shadow_view),
+                Some(shadow_pipeline),
+                Some(shadow_mesh_pipeline),
+                Some(shadow_bind_group),
+            ) = (
+                self.shadow_view.as_ref(),
+                self.shadow_pipeline.as_ref(),
+                self.shadow_mesh_pipeline.as_ref(),
+                self.shadow_bind_group.as_ref(),
+            ) {
+                let mut shadow_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Shadow Pass"),
+                    color_attachments: &[],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: shadow_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
                     }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
 
-            if has_meshes_to_draw {
-                shadow_pass.set_pipeline(shadow_mesh_pipeline);
-                shadow_pass.set_bind_group(0, shadow_bind_group, &[]);
-                for key in draw_mesh_keys.iter() {
-                    if let Some(entry) = self.mesh_cache.get_mut(key) {
-                        shadow_pass.set_vertex_buffer(0, entry.vertex_buffer.slice(..));
-                        shadow_pass.set_index_buffer(
-                            entry.index_buffer.slice(..),
-                            wgpu::IndexFormat::Uint32,
-                        );
-                        shadow_pass.draw_indexed(0..entry.index_count, 0, 0..1);
-                        draw_calls += 1;
+                if has_meshes_to_draw {
+                    shadow_pass.set_pipeline(shadow_mesh_pipeline);
+                    shadow_pass.set_bind_group(0, shadow_bind_group, &[]);
+                    for key in draw_mesh_keys.iter() {
+                        if let Some(entry) = self.mesh_cache.get_mut(key) {
+                            shadow_pass.set_vertex_buffer(0, entry.vertex_buffer.slice(..));
+                            shadow_pass.set_index_buffer(
+                                entry.index_buffer.slice(..),
+                                wgpu::IndexFormat::Uint32,
+                            );
+                            shadow_pass.draw_indexed(0..entry.index_count, 0, 0..1);
+                            draw_calls += 1;
+                        }
                     }
                 }
-            }
 
-            if !instances.is_empty() {
-                shadow_pass.set_pipeline(shadow_pipeline);
-                shadow_pass.set_bind_group(0, shadow_bind_group, &[]);
-                shadow_pass
-                    .set_vertex_buffer(0, self.cube_vertex_buffer.as_ref().unwrap().slice(..));
-                shadow_pass.set_vertex_buffer(1, self.instance_buffer.as_ref().unwrap().slice(..));
-                shadow_pass.draw(0..36, 0..instances.len() as u32);
-                draw_calls += 1;
+                if !instances.is_empty() {
+                    shadow_pass.set_pipeline(shadow_pipeline);
+                    shadow_pass.set_bind_group(0, shadow_bind_group, &[]);
+                    shadow_pass
+                        .set_vertex_buffer(0, self.cube_vertex_buffer.as_ref().unwrap().slice(..));
+                    shadow_pass
+                        .set_vertex_buffer(1, self.instance_buffer.as_ref().unwrap().slice(..));
+                    shadow_pass.draw(0..36, 0..instances.len() as u32);
+                    draw_calls += 1;
+                }
             }
         }
 
@@ -5548,10 +5603,18 @@ impl App {
             self.update_bloom_bind_groups();
         }
 
-        // Early-out conditions: skip DoF when negligible effect
-        let skip_dof = !self.dof_enabled
+        // Early-out conditions: skip DoF when negligible effect or post-processing disabled
+        let skip_dof = !self.postprocessing_enabled
+            || !self.dof_enabled
             || self.dof_settings.blur_strength < 0.05
             || self.dof_settings.focal_range > 450.0;
+
+        if self.frame_count % 60 == 0 {
+            println!(
+                "GPU Candidates: {}, Draw Calls: {}",
+                gpu_candidate_count, draw_calls
+            );
+        }
 
         if !skip_dof {
             // If DoF is enabled we always run the cheap CoC copy pass to produce base color + CoC in alpha.
@@ -5775,7 +5838,7 @@ impl App {
                 }
             }
         }
-        if self.bloom_enabled {
+        if self.postprocessing_enabled && self.bloom_enabled {
             if let (
                 Some(bloom_extract_pipeline),
                 Some(bloom_extract_bind_group),
@@ -5786,7 +5849,7 @@ impl App {
                 self.bloom_ping_view.as_ref(),
             ) {
                 // SSILVB/SSAO: run before bloom so AO can affect later passes
-                if self.ssao_enabled {
+                if self.postprocessing_enabled && self.ssao_enabled {
                     if let (Some(ssilvb_pipeline), Some(ssilvb_bind_group), Some(ssao_ping_view)) = (
                         self.ssilvb_pipeline.as_ref(),
                         self.ssilvb_bind_group.as_ref(),

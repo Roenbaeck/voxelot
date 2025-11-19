@@ -2,10 +2,32 @@
 //! Based on https://github.com/TanTanDev/binary_greedy_mesher_demo
 
 use crate::lib_hierarchical::{Chunk, Voxel};
-use crate::meshing::{ChunkEmitter, ChunkMesh, MeshVertex};
 use crate::palette::Palette;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+#[derive(Copy, Clone, Debug)]
+pub struct MeshVertex {
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub color: [f32; 4],
+    pub emissive: [f32; 4],
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct ChunkEmitter {
+    pub position: [f32; 3],
+    pub color: [f32; 3],
+    pub intensity: f32,
+}
+
+/// Mesh output for a chunk
+#[derive(Clone, Debug, Default)]
+pub struct ChunkMesh {
+    pub vertices: Vec<MeshVertex>,
+    pub indices: Vec<u32>,
+    pub emitters: Vec<ChunkEmitter>,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct GreedyQuad {

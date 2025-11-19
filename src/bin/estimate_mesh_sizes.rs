@@ -1,5 +1,5 @@
 use std::env;
-use voxelot::{generate_chunk_mesh, load_world_file, Chunk, Palette};
+use voxelot::{generate_chunk_mesh_optimized, load_world_file, Chunk, Palette};
 
 fn collect_leaf_chunks<'a>(chunk: &'a Chunk, out: &mut Vec<&'a Chunk>) {
     // A leaf chunk is a chunk without any sub-chunks (i.e. contains only Solid voxels)
@@ -44,7 +44,7 @@ fn main() {
             continue;
         }
         nonempty += 1;
-        let mesh = generate_chunk_mesh(chunk, &palette, None);
+        let mesh = generate_chunk_mesh_optimized(chunk, &palette, None);
         total_vertices += mesh.vertices.len();
         total_indices += mesh.indices.len();
 
@@ -134,7 +134,8 @@ fn main() {
     }
     println!("Leaf chunks with presence>0: {}", nonzero_presence);
 
-    let vertex_bytes = total_vertices * std::mem::size_of::<voxelot::meshing::MeshVertex>();
+    let vertex_bytes =
+        total_vertices * std::mem::size_of::<voxelot::meshing_optimized::MeshVertex>();
     let index_bytes = total_indices * std::mem::size_of::<u32>();
     println!("Non-empty leaf chunks: {}", nonempty);
     println!(
