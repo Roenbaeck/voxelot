@@ -148,6 +148,10 @@ pub struct PerformanceConfig {
     pub mesh_worker_count: Option<usize>,
     #[serde(default = "default_mesh_upload_baseline")]
     pub mesh_upload_baseline: usize,
+    #[serde(default = "default_envelope_distance")]
+    pub envelope_distance: f32,
+    #[serde(default = "default_envelope_fade_range")]
+    pub envelope_fade_range: f32,
     #[serde(default = "default_fallback_detail_distance")]
     pub fallback_detail_distance: f32,
     #[serde(default = "default_fallback_bbox_shrink")]
@@ -333,6 +337,14 @@ fn default_mesh_upload_baseline() -> usize {
     4
 }
 
+fn default_envelope_distance() -> f32 {
+    256.0
+}
+
+fn default_envelope_fade_range() -> f32 {
+    32.0
+}
+
 fn default_fallback_detail_distance() -> f32 {
     500.0
 }
@@ -459,6 +471,8 @@ impl Default for PerformanceConfig {
             mesh_cache_budget_mb: default_mesh_cache_mb(),
             mesh_worker_count: default_mesh_workers(),
             mesh_upload_baseline: default_mesh_upload_baseline(),
+            envelope_distance: default_envelope_distance(),
+            envelope_fade_range: default_envelope_fade_range(),
             fallback_detail_distance: default_fallback_detail_distance(),
             fallback_bbox_shrink: default_fallback_bbox_shrink(),
             mesh_priority_sort_interval_frames: default_mesh_priority_sort_interval_frames(),

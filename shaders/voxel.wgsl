@@ -15,8 +15,8 @@ struct Uniforms {
     moon_color_pad: vec4<f32>,
     light_probe_count: u32,
     lod_distance: f32,
-    _pad1: u32,
-    _pad2: u32,
+    envelope_distance: f32,
+    envelope_fade_range: f32,
 }
 
 struct LightProbe {
@@ -345,7 +345,26 @@ fn fs_mesh(input: VertexOutputMesh) -> @location(0) vec4<f32> {
     }
     
     // Brighten colors as they approach fade region for fog-like appearance
-    let brightened = mix(final_color, fog_color, fade_factor * 0.6);
+    var brightened = mix(final_color, fog_color, fade_factor * 0.6);
+
+    // Envelope fade: if we are approaching the envelope distance, fade towards the envelope color (Type 0)
+    // This helps blend the detailed mesh into the simplified envelope mesh.
+    let env_dist = uniforms.envelope_distance;
+    let env_fade_range = uniforms.envelope_fade_range;
+    // Start fading before the envelope distance
+    let env_fade_start = env_dist - env_fade_range;
+    let env_fade_factor = smoothstep(env_fade_start, env_dist, distance);
+    
+    if (env_fade_factor > 0.0) {
+        // Get color of Type 0 (envelope color)
+        // We assume Type 0 is used for envelopes as per design
+        let env_color_base = get_voxel_color(0u);
+        // Apply lighting to envelope color so it matches the scene
+        let env_lit = env_color_base * (lighting * lighting_multiplier);
+        let env_fogged = mix(env_lit, fog_color + inscatter, fog_factor);
+        
+        brightened = mix(brightened, env_fogged, env_fade_factor);
+    }
     
     // Add gradual alpha fading for smoother transitions
     // Alpha fades 60-95% while dithering operates 80-95% on semi-transparent fragments

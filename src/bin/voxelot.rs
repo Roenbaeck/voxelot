@@ -188,8 +188,8 @@ struct Uniforms {
     moon_color_pad: [f32; 4],            // xyz = moon color
     light_probe_count: u32,
     lod_distance: f32, // LOD render distance for fade calculation
-    _pad1: u32,
-    _pad2: u32,
+    envelope_distance: f32,
+    envelope_fade_range: f32,
 }
 
 /// Depth-of-field runtime settings (CPU-side convenience)
@@ -684,6 +684,7 @@ struct App {
     envelope_mesh_cache_bytes: u64,
     envelope_mesh_cache_budget_bytes: u64,
     envelope_distance: f32,
+    envelope_fade_range: f32,
     /// Cached Arc<Chunk> snapshots for mesher jobs to avoid repeated deep clones
     mesh_chunk_arc_cache: HashMap<(i64, i64, i64), Arc<Chunk>>,
     /// Count of mesh jobs executed per second by worker threads (reset on FPS print)
@@ -1051,7 +1052,8 @@ impl App {
             envelope_mesh_cache: HashMap::new(),
             envelope_mesh_cache_bytes: 0,
             envelope_mesh_cache_budget_bytes: cfg.performance.mesh_cache_budget_mb as u64 * 1024 * 1024,
-            envelope_distance: 256.0,
+            envelope_distance: cfg.performance.envelope_distance,
+            envelope_fade_range: cfg.performance.envelope_fade_range,
             vertex_buffer_pool: VecDeque::new(),
             index_buffer_pool: VecDeque::new(),
             mesh_buffer_pool_max_entries: cfg.performance.mesh_buffer_pool_entries,
@@ -3878,8 +3880,8 @@ impl App {
             moon_color_pad: [0.2, 0.25, 0.35, 0.0],
             light_probe_count: 0,
             lod_distance: 800.0,
-            _pad1: 0,
-            _pad2: 0,
+            envelope_distance: 256.0,
+            envelope_fade_range: 32.0,
         };
 
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -5487,8 +5489,8 @@ impl App {
             moon_color_pad: [moon_color[0], moon_color[1], moon_color[2], 0.0],
             light_probe_count,
             lod_distance: self.lod_distance,
-            _pad1: 0,
-            _pad2: 0,
+            envelope_distance: self.envelope_distance,
+            envelope_fade_range: self.envelope_fade_range,
         };
 
         queue.write_buffer(

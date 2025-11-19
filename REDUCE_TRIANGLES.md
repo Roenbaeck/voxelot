@@ -12,3 +12,7 @@ That works beautifully, and gave a 30-40% FPS boost. I would like two things. Ex
 
 I'd also like for the colors (in the non-envelope region) to approach the color used for the envelopes as we get closer to the non-envelope / envelope boundary. That way the transition will become sort of "seamless". Do you understand what I would like to achieve?
 
+---
+
+Just one more thing, the non-meshed chunks are rendered using their dominant color right now, and it looks like they either aren't faded to the type 0 color or they are beyond the distance to begin with and therefore render with their dominant color. If they are already affected by fading when near the camera, the fix would be to set type 0 color if they're outside `envelope_distance`. Can you check and fix?
+
