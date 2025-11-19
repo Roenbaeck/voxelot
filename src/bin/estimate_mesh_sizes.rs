@@ -44,7 +44,7 @@ fn main() {
             continue;
         }
         nonempty += 1;
-        let mesh = generate_chunk_mesh_optimized(chunk, &palette, None);
+        let mesh = generate_chunk_mesh_optimized(chunk, &palette, None, false);
         total_vertices += mesh.vertices.len();
         total_indices += mesh.indices.len();
 

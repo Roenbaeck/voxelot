@@ -107,6 +107,7 @@ pub fn generate_chunk_mesh_optimized(
     chunk: &Chunk,
     palette: &Palette,
     neighbors: Option<&HashMap<(i8, i8, i8), Arc<Chunk>>>,
+    envelope: bool,
 ) -> ChunkMesh {
     let mut mesh = ChunkMesh::default();
 
@@ -268,7 +269,11 @@ pub fn generate_chunk_mesh_optimized(
                         _ => (j, i, k as usize),
                     };
 
-                    let voxel_type = chunk.get_type(x as u8, y as u8, z as u8).unwrap_or(1);
+                    let voxel_type = if envelope {
+                        0
+                    } else {
+                        chunk.get_type(x as u8, y as u8, z as u8).unwrap_or(1)
+                    };
                     let ao =
                         calculate_ao(chunk, neighbors, x as i32, y as i32, z as i32, face_axis);
                     let key = ((voxel_type as u32) << 8) | (ao as u32);
@@ -502,7 +507,7 @@ mod tests {
         let mut chunk = Chunk::new();
         chunk.set(8, 8, 8, 1);
 
-        let mesh = generate_chunk_mesh_optimized(&chunk, &palette, None);
+        let mesh = generate_chunk_mesh_optimized(&chunk, &palette, None, false);
 
         assert!(mesh.vertices.len() > 0);
         assert!(mesh.indices.len() > 0);

@@ -151,6 +151,7 @@ struct MeshJob {
     chunk: Arc<Chunk>,
     /// Neighbor chunks snapshot mapped by (-1..=1) offsets from this chunk
     neighbors: std::collections::HashMap<(i8, i8, i8), Arc<Chunk>>,
+    envelope: bool,
 }
 
 #[derive(Debug)]
@@ -158,6 +159,7 @@ struct MeshResult {
     key: (i64, i64, i64),
     mesh: ChunkMesh,
     voxel_count: u32,
+    is_envelope: bool,
 }
 
 /// Light probe for emissive indirect lighting
@@ -678,6 +680,10 @@ struct App {
     // Mesh cache: per-leaf-chunk mesh GPU buffers and metadata
     mesh_cache: HashMap<(i64, i64, i64), MeshCacheEntry>,
     mesh_cache_bytes: u64,
+    envelope_mesh_cache: HashMap<(i64, i64, i64), MeshCacheEntry>,
+    envelope_mesh_cache_bytes: u64,
+    envelope_mesh_cache_budget_bytes: u64,
+    envelope_distance: f32,
     /// Cached Arc<Chunk> snapshots for mesher jobs to avoid repeated deep clones
     mesh_chunk_arc_cache: HashMap<(i64, i64, i64), Arc<Chunk>>,
     /// Count of mesh jobs executed per second by worker threads (reset on FPS print)
@@ -956,12 +962,14 @@ impl App {
                             key,
                             chunk,
                             neighbors,
+                            envelope,
                         } = job;
 
                         let mesh = voxelot::generate_chunk_mesh_optimized(
                             &chunk,
                             &palette,
                             Some(&neighbors),
+                            envelope,
                         );
 
                         if result_tx
@@ -969,6 +977,7 @@ impl App {
                                 key,
                                 mesh,
                                 voxel_count: chunk.voxel_count,
+                                is_envelope: envelope,
                             })
                             .is_err()
                         {
@@ -1039,6 +1048,10 @@ impl App {
             mesh_cache: HashMap::new(),
             mesh_jobs_executed: mesh_jobs_executed.clone(),
             mesh_cache_bytes: 0,
+            envelope_mesh_cache: HashMap::new(),
+            envelope_mesh_cache_bytes: 0,
+            envelope_mesh_cache_budget_bytes: cfg.performance.mesh_cache_budget_mb as u64 * 1024 * 1024,
+            envelope_distance: 256.0,
             vertex_buffer_pool: VecDeque::new(),
             index_buffer_pool: VecDeque::new(),
             mesh_buffer_pool_max_entries: cfg.performance.mesh_buffer_pool_entries,
@@ -2407,6 +2420,62 @@ impl App {
 
     fn mesh_cache_byte_budget(&self) -> u64 {
         self.mesh_cache_budget_bytes
+    }
+
+    fn evict_envelope_mesh_cache(&mut self) {
+        let budget = self.envelope_mesh_cache_budget_bytes;
+        if self.envelope_mesh_cache_bytes <= budget {
+            return;
+        }
+
+        let mut entries: Vec<_> = self
+            .envelope_mesh_cache
+            .iter()
+            .map(|(key, entry)| (*key, entry.last_used_frame))
+            .collect();
+        entries.sort_by(|a, b| a.1.cmp(&b.1));
+
+        let mut freed_bytes = 0u64;
+        let mut evicted = 0usize;
+
+        for (key, _) in entries {
+            if self.envelope_mesh_cache_bytes <= budget {
+                break;
+            }
+
+            if let Some(entry) = self.envelope_mesh_cache.remove(&key) {
+                let entry_bytes = entry.total_bytes();
+                // If this was a placeholder (shared empty buffers), do not destroy the buffer
+                // as it is owned globally. Only destroy buffers for normal entries.
+                if !entry.is_placeholder {
+                    // push back to pool instead of destroying to reduce GPU allocation churn
+                    let vb_bytes = entry.vertex_bytes;
+                    let ib_bytes = entry.index_bytes;
+                    if self.vertex_buffer_pool.len() < self.mesh_buffer_pool_max_entries {
+                        self.vertex_buffer_pool
+                            .push_back((vb_bytes, entry.vertex_buffer));
+                    }
+                    if self.index_buffer_pool.len() < self.mesh_buffer_pool_max_entries {
+                        self.index_buffer_pool
+                            .push_back((ib_bytes, entry.index_buffer));
+                    }
+                }
+                self.envelope_mesh_cache_bytes = self
+                    .envelope_mesh_cache_bytes
+                    .saturating_sub(entry_bytes);
+                freed_bytes += entry_bytes;
+                evicted += 1;
+            }
+        }
+
+        if evicted > 0 {
+            println!(
+                "Evicted {} envelope meshes, freed {:.1} MB (current usage {:.1} MB)",
+                evicted,
+                freed_bytes as f64 / 1024.0 / 1024.0,
+                self.envelope_mesh_cache_bytes as f64 / 1024.0 / 1024.0
+            );
+        }
     }
 
     fn max_inflight_jobs(&self) -> usize {
@@ -4229,9 +4298,29 @@ impl App {
 
         let leaf_scan_start = std::time::Instant::now();
         for &key in &leaf_chunks {
-            if self.mesh_cache.contains_key(&key) {
+            let cam_pos = self.camera_controller.camera.position;
+            let chunk_center = [key.0 as f32 + 8.0, key.1 as f32 + 8.0, key.2 as f32 + 8.0];
+            let dx = chunk_center[0] - cam_pos[0];
+            let dy = chunk_center[1] - cam_pos[1];
+            let dz = chunk_center[2] - cam_pos[2];
+            let dist_sq = dx * dx + dy * dy + dz * dz;
+            let envelope_dist_sq = self.envelope_distance * self.envelope_distance;
+            let use_envelope = dist_sq > envelope_dist_sq;
+
+            let has_standard = self.mesh_cache.contains_key(&key);
+            let has_envelope = self.envelope_mesh_cache.contains_key(&key);
+
+            if has_standard || has_envelope {
                 cpu_mesh_keys.insert(key);
+            }
+
+            let needs_request = if use_envelope {
+                !has_envelope
             } else {
+                !has_standard
+            };
+
+            if needs_request {
                 missing_chunks.insert(key);
                 // If mesh workers are disabled (0), do not enqueue background meshing jobs
                 if self.mesh_worker_count == 0 {
@@ -4240,12 +4329,6 @@ impl App {
 
                 if !self.pending_chunk_set.contains(&key) {
                     // Prioritize meshing for chunks that are within the LOD distance of the camera
-                    let cam_pos = self.camera_controller.camera.position;
-                    let chunk_center = [key.0 as f32 + 8.0, key.1 as f32 + 8.0, key.2 as f32 + 8.0];
-                    let dx = chunk_center[0] - cam_pos[0];
-                    let dy = chunk_center[1] - cam_pos[1];
-                    let dz = chunk_center[2] - cam_pos[2];
-                    let dist_sq = dx * dx + dy * dy + dz * dz;
                     // Use squared LOD distance for speed
                     let lod_sq = self.lod_distance * self.lod_distance;
                     if dist_sq <= lod_sq {
@@ -4321,6 +4404,29 @@ impl App {
             };
             let job_create_start = std::time::Instant::now();
 
+            // Determine if we need an envelope or standard mesh
+            let cam_pos = self.camera_controller.camera.position;
+            let chunk_center = [key.0 as f32 + 8.0, key.1 as f32 + 8.0, key.2 as f32 + 8.0];
+            let dx = chunk_center[0] - cam_pos[0];
+            let dy = chunk_center[1] - cam_pos[1];
+            let dz = chunk_center[2] - cam_pos[2];
+            let dist_sq = dx * dx + dy * dy + dz * dz;
+            let envelope_dist_sq = self.envelope_distance * self.envelope_distance;
+            let use_envelope = dist_sq > envelope_dist_sq;
+
+            // Check if we already have the desired mesh type (it might have been completed since queuing)
+            if use_envelope {
+                if self.envelope_mesh_cache.contains_key(&key) {
+                    self.pending_chunk_set.remove(&key);
+                    continue;
+                }
+            } else {
+                if self.mesh_cache.contains_key(&key) {
+                    self.pending_chunk_set.remove(&key);
+                    continue;
+                }
+            }
+
             match self
                 .world
                 .get_leaf_chunk_at_origin(WorldPos::new(key.0, key.1, key.2))
@@ -4373,6 +4479,7 @@ impl App {
                             key,
                             chunk: chunk_arc,
                             neighbors,
+                            envelope: use_envelope,
                         })
                         .is_ok()
                     {
@@ -4416,31 +4523,34 @@ impl App {
                 key,
                 mesh,
                 voxel_count,
+                is_envelope,
             } = result;
             self.pending_chunk_set.remove(&key);
             processed_meshes += 1;
 
             let emitters_start = std::time::Instant::now();
-            if mesh.emitters.is_empty() {
-                self.chunk_emitters.remove(&key);
-            } else {
-                let world_emitters: Vec<ChunkEmitterWorld> = mesh
-                    .emitters
-                    .iter()
-                    .map(|emitter| ChunkEmitterWorld {
-                        position: [
-                            key.0 as f32 + emitter.position[0],
-                            key.1 as f32 + emitter.position[1],
-                            key.2 as f32 + emitter.position[2],
-                        ],
-                        color: emitter.color,
-                        intensity: emitter.intensity,
-                    })
-                    .collect();
-                if world_emitters.is_empty() {
+            if !is_envelope {
+                if mesh.emitters.is_empty() {
                     self.chunk_emitters.remove(&key);
                 } else {
-                    self.chunk_emitters.insert(key, world_emitters);
+                    let world_emitters: Vec<ChunkEmitterWorld> = mesh
+                        .emitters
+                        .iter()
+                        .map(|emitter| ChunkEmitterWorld {
+                            position: [
+                                key.0 as f32 + emitter.position[0],
+                                key.1 as f32 + emitter.position[1],
+                                key.2 as f32 + emitter.position[2],
+                            ],
+                            color: emitter.color,
+                            intensity: emitter.intensity,
+                        })
+                        .collect();
+                    if world_emitters.is_empty() {
+                        self.chunk_emitters.remove(&key);
+                    } else {
+                        self.chunk_emitters.insert(key, world_emitters);
+                    }
                 }
             }
 
@@ -4481,7 +4591,11 @@ impl App {
                     last_used_frame: self.frame_index,
                     is_placeholder: true,
                 };
-                self.mesh_cache.insert(key, entry);
+                if is_envelope {
+                    self.envelope_mesh_cache.insert(key, entry);
+                } else {
+                    self.mesh_cache.insert(key, entry);
+                }
                 self.fallback_chunk_instances.remove(&key);
                 new_meshes_created += 1;
                 self.stat_empty_meshes += 1;
@@ -4555,9 +4669,14 @@ impl App {
                 is_placeholder: false,
             };
             let entry_start = std::time::Instant::now();
-            self.mesh_cache.insert(key, entry);
+            if is_envelope {
+                self.envelope_mesh_cache.insert(key, entry);
+                self.envelope_mesh_cache_bytes += vertex_bytes + index_bytes;
+            } else {
+                self.mesh_cache.insert(key, entry);
+                self.mesh_cache_bytes += vertex_bytes + index_bytes;
+            }
             mesh_upload_entry_time += entry_start.elapsed();
-            self.mesh_cache_bytes += vertex_bytes + index_bytes;
             self.fallback_chunk_instances.remove(&key);
             new_meshes_created += 1;
 
@@ -4571,6 +4690,9 @@ impl App {
 
         if self.mesh_cache_bytes > self.mesh_cache_byte_budget() {
             self.evict_mesh_cache();
+        }
+        if self.envelope_mesh_cache_bytes > self.envelope_mesh_cache_budget_bytes {
+            self.evict_envelope_mesh_cache();
         }
 
         if chunks_not_found > 0 && self.frame_count == 0 {
@@ -5436,7 +5558,26 @@ impl App {
                 shadow_pass.set_pipeline(shadow_mesh_pipeline);
                 shadow_pass.set_bind_group(0, shadow_bind_group, &[]);
                 for key in draw_mesh_keys.iter() {
-                    if let Some(entry) = self.mesh_cache.get_mut(key) {
+                    let cam_pos = self.camera_controller.camera.position;
+                    let chunk_center = [key.0 as f32 + 8.0, key.1 as f32 + 8.0, key.2 as f32 + 8.0];
+                    let dx = chunk_center[0] - cam_pos[0];
+                    let dy = chunk_center[1] - cam_pos[1];
+                    let dz = chunk_center[2] - cam_pos[2];
+                    let dist_sq = dx * dx + dy * dy + dz * dz;
+                    let envelope_dist_sq = self.envelope_distance * self.envelope_distance;
+                    let use_envelope = dist_sq > envelope_dist_sq;
+
+                    let entry = if use_envelope {
+                        self.envelope_mesh_cache
+                            .get_mut(key)
+                            .or_else(|| self.mesh_cache.get_mut(key))
+                    } else {
+                        self.mesh_cache
+                            .get_mut(key)
+                            .or_else(|| self.envelope_mesh_cache.get_mut(key))
+                    };
+
+                    if let Some(entry) = entry {
                         shadow_pass.set_vertex_buffer(0, entry.vertex_buffer.slice(..));
                         shadow_pass.set_index_buffer(
                             entry.index_buffer.slice(..),
@@ -5503,7 +5644,26 @@ impl App {
                 render_pass.set_bind_group(0, self.bind_group.as_ref().unwrap(), &[]);
                 let mut drawn_meshes = 0;
                 for key in draw_mesh_keys.iter() {
-                    if let Some(entry) = self.mesh_cache.get_mut(key) {
+                    let cam_pos = self.camera_controller.camera.position;
+                    let chunk_center = [key.0 as f32 + 8.0, key.1 as f32 + 8.0, key.2 as f32 + 8.0];
+                    let dx = chunk_center[0] - cam_pos[0];
+                    let dy = chunk_center[1] - cam_pos[1];
+                    let dz = chunk_center[2] - cam_pos[2];
+                    let dist_sq = dx * dx + dy * dy + dz * dz;
+                    let envelope_dist_sq = self.envelope_distance * self.envelope_distance;
+                    let use_envelope = dist_sq > envelope_dist_sq;
+
+                    let entry = if use_envelope {
+                        self.envelope_mesh_cache
+                            .get_mut(key)
+                            .or_else(|| self.mesh_cache.get_mut(key))
+                    } else {
+                        self.mesh_cache
+                            .get_mut(key)
+                            .or_else(|| self.envelope_mesh_cache.get_mut(key))
+                    };
+
+                    if let Some(entry) = entry {
                         render_pass.set_vertex_buffer(0, entry.vertex_buffer.slice(..));
                         render_pass.set_index_buffer(
                             entry.index_buffer.slice(..),
