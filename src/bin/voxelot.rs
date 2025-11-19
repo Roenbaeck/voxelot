@@ -833,6 +833,12 @@ struct App {
     vertex_buffer_pool: VecDeque<(u64, wgpu::Buffer)>,
     index_buffer_pool: VecDeque<(u64, wgpu::Buffer)>,
     mesh_buffer_pool_max_entries: usize,
+
+    // egui UI state
+    egui_ctx: Option<egui::Context>,
+    egui_winit: Option<egui_winit::State>,
+    egui_renderer: Option<egui_wgpu::Renderer>,
+    last_fps: u32,
 }
 
 impl App {
@@ -1058,7 +1064,12 @@ impl App {
             envelope_fade_range: cfg.performance.envelope_fade_range,
             vertex_buffer_pool: VecDeque::new(),
             index_buffer_pool: VecDeque::new(),
-            mesh_buffer_pool_max_entries: cfg.performance.mesh_buffer_pool_entries,
+            mesh_buffer_pool_max_entries: 256, // Start with reasonable pool size
+
+            egui_ctx: None,
+            egui_winit: None,
+            egui_renderer: None,
+            last_fps: 0,
             mesh_chunk_arc_cache: HashMap::new(),
             empty_mesh_vertex_buffer: None,
             empty_mesh_index_buffer: None,
@@ -4147,6 +4158,32 @@ impl App {
         self.main_bind_group_layout = Some(main_bind_group_layout);
         self.shadow_bind_group_layout = Some(shadow_bind_group_layout);
         self.shadow_sampler = Some(shadow_sampler);
+
+        // Initialize egui
+        let egui_ctx = egui::Context::default();
+        let egui_winit = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            self.window.as_ref().unwrap(),
+            Some(self.window.as_ref().unwrap().scale_factor() as f32),
+            None, // theme
+            Some(
+                self.device
+                    .as_ref()
+                    .unwrap()
+                    .limits()
+                    .max_texture_dimension_2d as usize,
+            ),
+        );
+        let egui_renderer = egui_wgpu::Renderer::new(
+            self.device.as_ref().unwrap(),
+            self.config.as_ref().unwrap().format,
+            egui_wgpu::RendererOptions::default(),
+        );
+
+        self.egui_ctx = Some(egui_ctx);
+        self.egui_winit = Some(egui_winit);
+        self.egui_renderer = Some(egui_renderer);
         self.cube_vertex_buffer = Some(cube_vertex_buffer);
 
         self.update_shadow_bind_group();
@@ -6139,6 +6176,85 @@ impl App {
             eprintln!("Composite resources unavailable; skipping final pass!");
         }
 
+        // Egui rendering
+        if let (Some(egui_ctx), Some(egui_winit), Some(window)) =
+            (&self.egui_ctx, &mut self.egui_winit, &self.window)
+        {
+            let raw_input = egui_winit.take_egui_input(window);
+            egui_ctx.begin_frame(raw_input);
+
+            egui::Area::new(egui::Id::new("fps_counter"))
+                .fixed_pos(egui::pos2(10.0, 10.0))
+                .show(egui_ctx, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("FPS: {}", self.last_fps))
+                            .color(egui::Color32::WHITE)
+                            .size(14.0),
+                    );
+                });
+
+            let full_output = egui_ctx.end_frame();
+            let paint_jobs = egui_ctx.tessellate(full_output.shapes, egui_ctx.pixels_per_point());
+            let screen_descriptor = egui_wgpu::ScreenDescriptor {
+                size_in_pixels: [
+                    self.config.as_ref().unwrap().width,
+                    self.config.as_ref().unwrap().height,
+                ],
+                pixels_per_point: egui_ctx.pixels_per_point(),
+            };
+
+            // Take the renderer out to avoid mutable borrow issues
+            if let Some(mut egui_renderer) = self.egui_renderer.take() {
+                egui_winit.handle_platform_output(window, full_output.platform_output);
+
+                for (id, image_delta) in &full_output.textures_delta.set {
+                    egui_renderer.update_texture(
+                        self.device.as_ref().unwrap(),
+                        self.queue.as_ref().unwrap(),
+                        *id,
+                        image_delta,
+                    );
+                }
+
+                egui_renderer.update_buffers(
+                    self.device.as_ref().unwrap(),
+                    self.queue.as_ref().unwrap(),
+                    &mut encoder,
+                    &paint_jobs,
+                    &screen_descriptor,
+                );
+
+                {
+                    let egui_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("egui_pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            depth_slice: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+
+                    // Convert to 'static lifetime for egui-wgpu
+                    let mut egui_pass_static = egui_pass.forget_lifetime();
+
+                    egui_renderer.render(&mut egui_pass_static, &paint_jobs, &screen_descriptor);
+                }
+
+                for id in &full_output.textures_delta.free {
+                    egui_renderer.free_texture(id);
+                }
+
+                self.egui_renderer = Some(egui_renderer);
+            }
+        }
+
         queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
@@ -6155,6 +6271,7 @@ impl App {
                 .map(|p| p.memory() as f64 / (1024.0 * 1024.0))
                 .unwrap_or(0.0);
             let ready_count = self.ready_chunk_meshes.len();
+            self.last_fps = self.frame_count as u32;
             let jobs_in_flight = self.mesh_jobs_in_flight;
             let pending_set_count = self.pending_chunk_set.len();
             let jobs_per_sec = self.mesh_jobs_executed.swap(0, Ordering::Relaxed);
@@ -6251,6 +6368,15 @@ impl ApplicationHandler for App {
         _window_id: winit::window::WindowId,
         event: WindowEvent,
     ) {
+        // Let egui handle the event first
+        if let (Some(egui_winit), Some(window)) = (&mut self.egui_winit, &self.window) {
+            let response = egui_winit.on_window_event(window, &event);
+            if response.consumed {
+                // egui consumed the event, don't pass it to the game
+                return;
+            }
+        }
+
         match event {
             WindowEvent::CloseRequested => {
                 println!("Close requested");
