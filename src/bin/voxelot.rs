@@ -680,6 +680,24 @@ struct App {
     // Mesh cache: per-leaf-chunk mesh GPU buffers and metadata
     mesh_cache: HashMap<(i64, i64, i64), MeshCacheEntry>,
     mesh_cache_bytes: u64,
+    // Stats for UI overlay (refreshed each frame)
+    visible_count: usize,
+    leaf_chunk_count: usize,
+    meshed_chunk_count: usize,
+    pending_mesh_count: usize,
+    pending_mesh_set_count: usize,
+    ready_mesh_count: usize,
+    jobs_in_flight: usize,
+    jobs_per_sec_snapshot: usize,
+    process_mem_mib: f64,
+    mesh_cache_mib: f64,
+    mesh_budget_mib: f64,
+    envelope_cache_mib: f64,
+    cull_ms: f64,
+    grouping_ms: f64,
+    mesh_ms: f64,
+    instance_ms: f64,
+    draw_calls_count: usize,
     envelope_mesh_cache: HashMap<(i64, i64, i64), MeshCacheEntry>,
     envelope_mesh_cache_bytes: u64,
     envelope_mesh_cache_budget_bytes: u64,
@@ -1093,6 +1111,23 @@ impl App {
             mesh_worker_count,
             mesh_jobs_in_flight: 0,
             ready_chunk_meshes: VecDeque::new(),
+            visible_count: 0,
+            leaf_chunk_count: 0,
+            meshed_chunk_count: 0,
+            pending_mesh_count: 0,
+            pending_mesh_set_count: 0,
+            ready_mesh_count: 0,
+            jobs_in_flight: 0,
+            jobs_per_sec_snapshot: 0,
+            process_mem_mib: 0.0,
+            mesh_cache_mib: 0.0,
+            mesh_budget_mib: 0.0,
+            envelope_cache_mib: 0.0,
+            cull_ms: 0.0,
+            grouping_ms: 0.0,
+            mesh_ms: 0.0,
+            instance_ms: 0.0,
+            draw_calls_count: 0,
             mesh_upload_limit: mesh_upload_baseline,
             mesh_upload_baseline,
             mesh_upload_max,
@@ -6189,7 +6224,104 @@ impl App {
                     ui.label(
                         egui::RichText::new(format!("FPS: {}", self.last_fps))
                             .color(egui::Color32::WHITE)
-                            .size(14.0),
+                            .size(10.0),
+                    );
+                    // Additional stats: mirror the console output but in overlay
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Visible: {}",
+                            self.visible_count
+                        ))
+                        .color(egui::Color32::WHITE)
+                        .size(10.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Meshed: {}",
+                            self.meshed_chunk_count
+                        ))
+                        .color(egui::Color32::WHITE)
+                        .size(10.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Pending: {}",
+                            self.pending_mesh_count
+                        ))
+                        .color(egui::Color32::WHITE)
+                        .size(10.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Jobs/s: {}",
+                            self.jobs_per_sec_snapshot
+                        ))
+                        .color(egui::Color32::WHITE)
+                        .size(10.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Mesh cache: {:.0}/{:.0} MiB",
+                            self.mesh_cache_mib, self.mesh_budget_mib
+                        ))
+                        .color(egui::Color32::WHITE)
+                        .size(10.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Envelopes: {:.0}/{:.0} MiB",
+                            self.envelope_cache_mib, self.mesh_budget_mib
+                        ))
+                        .color(egui::Color32::WHITE)
+                        .size(10.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Process: {:.0} MiB",
+                            self.process_mem_mib
+                        ))
+                        .color(egui::Color32::WHITE)
+                        .size(10.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Cull: {:.2}ms",
+                            self.cull_ms
+                        ))
+                        .color(egui::Color32::WHITE)
+                        .size(10.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Group: {:.2}ms",
+                            self.grouping_ms
+                        ))
+                        .color(egui::Color32::WHITE)
+                        .size(10.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Mesh: {:.2}ms",
+                            self.mesh_ms
+                        ))
+                        .color(egui::Color32::WHITE)
+                        .size(10.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Instancing: {:.2}ms",
+                            self.instance_ms
+                        ))
+                        .color(egui::Color32::WHITE)
+                        .size(10.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Draws: {}",
+                            self.draw_calls_count
+                        ))
+                        .color(egui::Color32::WHITE)
+                        .size(10.0),
                     );
                 });
 
@@ -6322,6 +6454,35 @@ impl App {
                 , processed_meshes
                     , frame_mesh_upload_limit
             );
+
+            // Update UI overlay stats
+            self.visible_count = total_visible;
+            self.leaf_chunk_count = leaf_chunks.len();
+            self.meshed_chunk_count = draw_mesh_keys.len();
+            self.pending_mesh_count = self.pending_chunk_meshes.len();
+            self.pending_mesh_set_count = pending_set_count;
+            self.ready_mesh_count = ready_count;
+            self.jobs_in_flight = jobs_in_flight;
+            self.jobs_per_sec_snapshot = jobs_per_sec;
+            self.process_mem_mib = process_mem_mib;
+            self.mesh_cache_mib = mesh_cache_mib;
+            self.mesh_budget_mib = mesh_budget_mib;
+            self.envelope_cache_mib = self.envelope_mesh_cache_bytes as f64 / (1024.0 * 1024.0);
+            self.cull_ms = cull_time.as_secs_f64() * 1000.0;
+            self.grouping_ms = grouping_time.as_secs_f64() * 1000.0;
+            self.mesh_ms = (if mesh_idle { std::time::Duration::from_secs(0) } else { mesh_time }).as_secs_f64() * 1000.0;
+            self.instance_ms = instance_time.as_secs_f64() * 1000.0;
+            self.draw_calls_count = draw_calls;
+
+            // Update UI overlay stats
+            self.visible_count = total_visible;
+            self.leaf_chunk_count = leaf_chunks.len();
+            self.meshed_chunk_count = draw_mesh_keys.len();
+            self.pending_mesh_count = self.pending_chunk_meshes.len();
+            self.pending_mesh_set_count = pending_set_count;
+            self.ready_mesh_count = ready_count;
+            self.jobs_in_flight = jobs_in_flight;
+            self.jobs_per_sec_snapshot = jobs_per_sec;
             // Print Kawase timing ones per second to avoid spamming
             if self.kawase_acc_frames > 0 {
                 let avg_write =
