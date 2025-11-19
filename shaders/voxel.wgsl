@@ -240,9 +240,9 @@ fn fs_main(input: VertexOutputInstanced) -> @location(0) vec4<f32> {
     let brightened = mix(final_color, fog_color, fade_factor * 0.6);
     
     // Add gradual alpha fading for smoother transitions
-    // Start alpha fade early (at 60%) and end at dither start (80%) for aggressive fade
+    // Alpha fades 60-95% while dithering operates 80-95% on semi-transparent fragments
     let alpha_fade_start = uniforms.lod_distance * 0.60;
-    let alpha_fade_end = uniforms.lod_distance * 0.80;
+    let alpha_fade_end = uniforms.lod_distance * 0.95;
     let alpha = 1.0 - smoothstep(alpha_fade_start, alpha_fade_end, distance);
 
     return vec4<f32>(brightened, alpha);
@@ -348,9 +348,9 @@ fn fs_mesh(input: VertexOutputMesh) -> @location(0) vec4<f32> {
     let brightened = mix(final_color, fog_color, fade_factor * 0.6);
     
     // Add gradual alpha fading for smoother transitions
-    // Start alpha fade early (at 60%) and end at dither start (80%) for aggressive fade
+    // Alpha fades 60-95% while dithering operates 80-95% on semi-transparent fragments
     let alpha_fade_start = uniforms.lod_distance * 0.60;
-    let alpha_fade_end = uniforms.lod_distance * 0.80;
+    let alpha_fade_end = uniforms.lod_distance * 0.95;
     let alpha = 1.0 - smoothstep(alpha_fade_start, alpha_fade_end, distance);
     
     return vec4<f32>(brightened, alpha);
