@@ -16,3 +16,7 @@ I'd also like for the colors (in the non-envelope region) to approach the color 
 
 Just one more thing, the non-meshed chunks are rendered using their dominant color right now, and it looks like they either aren't faded to the type 0 color or they are beyond the distance to begin with and therefore render with their dominant color. If they are already affected by fading when near the camera, the fix would be to set type 0 color if they're outside `envelope_distance`. Can you check and fix?
 
+---
+
+If I quickly move into a "new" area of the city, I can see artifacts close to the camera, which stems from envelope-meshes still being visible and then re-rendered when the non-envelope mesh is ready. This is not supposed to happen. If I quickly move into an area I thought all non-meshed chunks would render as individual voxels (those within `lod_subdivide_distance` I believe, or maybe one of the other LOD variables). This worked before we introduced envelopes, so I think envelopes are not being replaced by full-voxel renders they way they should be. Can you check? Do you understand? 
+

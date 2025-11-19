@@ -4312,7 +4312,13 @@ impl App {
             let has_standard = self.mesh_cache.contains_key(&key);
             let has_envelope = self.envelope_mesh_cache.contains_key(&key);
 
-            if has_standard || has_envelope {
+            let can_draw_mesh = if use_envelope {
+                has_envelope || has_standard
+            } else {
+                has_standard
+            };
+
+            if can_draw_mesh {
                 cpu_mesh_keys.insert(key);
             }
 
