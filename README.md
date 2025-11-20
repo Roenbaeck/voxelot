@@ -200,3 +200,6 @@ struct World {
 - Spatial visibility caching
 
 
+# Skybox
+The skybox image is CC0, downloaded from [Polyhaven](https://polyhaven.com).
+
