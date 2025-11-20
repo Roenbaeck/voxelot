@@ -190,6 +190,8 @@ struct Uniforms {
     lod_distance: f32, // LOD render distance for fade calculation
     envelope_distance: f32,
     envelope_fade_range: f32,
+    inverse_view: [[f32; 4]; 4],
+    inverse_proj: [[f32; 4]; 4],
 }
 
 /// Depth-of-field runtime settings (CPU-side convenience)
@@ -857,6 +859,14 @@ struct App {
     egui_winit: Option<egui_winit::State>,
     egui_renderer: Option<egui_wgpu::Renderer>,
     last_fps: u32,
+
+    // Skybox
+    skybox_texture: Option<wgpu::Texture>,
+    skybox_view: Option<wgpu::TextureView>,
+    skybox_sampler: Option<wgpu::Sampler>,
+    skybox_bind_group: Option<wgpu::BindGroup>,
+    skybox_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    skybox_pipeline: Option<wgpu::RenderPipeline>,
 }
 
 impl App {
@@ -1251,6 +1261,13 @@ impl App {
             shadow_backface_scale: cfg.shadows.backface_ambient_scale,
             pcf_radius: cfg.shadows.pcf_radius,
             pcf_poisson_samples: cfg.shadows.pcf_poisson_samples,
+
+            skybox_texture: None,
+            skybox_view: None,
+            skybox_sampler: None,
+            skybox_bind_group: None,
+            skybox_bind_group_layout: None,
+            skybox_pipeline: None,
         }
     }
 
@@ -2637,6 +2654,179 @@ impl App {
         }
     }
 
+    fn init_skybox(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: &wgpu::SurfaceConfiguration,
+        main_bind_group_layout: &wgpu::BindGroupLayout,
+    ) {
+        // Load HDR image
+        let hdr_path = "worlds/skybox.hdr";
+        // Load HDR image using image crate
+        let hdr_image = match image::open(hdr_path) {
+            Ok(img) => img,
+            Err(e) => {
+                eprintln!("Failed to load skybox.hdr: {:?}", e);
+                return;
+            }
+        };
+
+        let width = hdr_image.width();
+        let height = hdr_image.height();
+        let rgb_image = hdr_image.to_rgb32f();
+
+        // Convert RGB F32 to RGBA F32
+        let mut rgba_data = Vec::with_capacity((width * height * 4) as usize);
+        for pixel in rgb_image.pixels() {
+            rgba_data.push(pixel.0[0]);
+            rgba_data.push(pixel.0[1]);
+            rgba_data.push(pixel.0[2]);
+            rgba_data.push(1.0); // Alpha
+        }
+
+        // Create texture
+        let texture_size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Skybox Texture"),
+            size: texture_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        // Write texture data using queue
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&rgba_data),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(16 * width), // 4 channels * 4 bytes per f32
+                rows_per_image: Some(height),
+            },
+            texture_size,
+        );
+
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Skybox Sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        // Create bind group layout
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Skybox Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        // Create bind group
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Skybox Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+
+        // Create shader
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Skybox Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/skybox.wgsl").into()),
+        });
+
+        // Create pipeline layout
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Skybox Pipeline Layout"),
+            bind_group_layouts: &[main_bind_group_layout, &bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        // Create pipeline
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Skybox Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        self.skybox_texture = Some(texture);
+        self.skybox_view = Some(view);
+        self.skybox_sampler = Some(sampler);
+        self.skybox_bind_group = Some(bind_group);
+        self.skybox_bind_group_layout = Some(bind_group_layout);
+        self.skybox_pipeline = Some(pipeline);
+    }
+
     fn voxel_to_raw(v: &VoxelInstance, palette: &Palette) -> VoxelInstanceRaw {
         let (custom_color_f32, ao_factor) = if let Some(rgba) = v.custom_color {
             (
@@ -2919,7 +3109,7 @@ impl App {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Main Device"),
-                required_features: wgpu::Features::empty(),
+                required_features: wgpu::Features::FLOAT32_FILTERABLE,
                 required_limits: limits,
                 memory_hints: wgpu::MemoryHints::Performance,
                 experimental_features: Default::default(),
@@ -3933,6 +4123,8 @@ impl App {
             lod_distance: 800.0,
             envelope_distance: 256.0,
             envelope_fade_range: 32.0,
+            inverse_view: [[0.0; 4]; 4],
+            inverse_proj: [[0.0; 4]; 4],
         };
 
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -4179,6 +4371,10 @@ impl App {
         self.ssilvb_bind_group_layout = Some(ssilvb_bind_group_layout);
 
         self.window = Some(window);
+
+        // Initialize skybox before moving values into self
+        self.init_skybox(&device, &queue, &config, &main_bind_group_layout);
+
         self.surface = Some(surface);
         self.device = Some(device);
         self.queue = Some(queue);
@@ -4188,6 +4384,7 @@ impl App {
         self.shadow_pipeline = Some(shadow_pipeline);
         self.shadow_mesh_pipeline = Some(shadow_mesh_pipeline);
         self.uniform_buffer = Some(uniform_buffer);
+
         self.light_probe_buffer = Some(light_probe_buffer);
         self.light_probe_capacity = light_probe_capacity;
         self.main_bind_group_layout = Some(main_bind_group_layout);
@@ -5187,6 +5384,12 @@ impl App {
         let mvp = OPENGL_TO_WGPU_MATRIX * projection * view_mat;
         let mvp_cols: [[f32; 4]; 4] = mvp.to_cols_array_2d();
 
+        // Calculate inverse matrices for skybox rendering
+        let inverse_view = view_mat.inverse();
+        let inverse_proj = projection.inverse();
+        let inverse_view_cols: [[f32; 4]; 4] = inverse_view.to_cols_array_2d();
+        let inverse_proj_cols: [[f32; 4]; 4] = inverse_proj.to_cols_array_2d();
+
         // Calculate lighting based on time of day
         // Offset the solar angle so that time_of_day ≈0.25 aligns with sunrise; trig handles wrapping
         let time_angle = (self.time_of_day - 0.25) * std::f32::consts::TAU;
@@ -5573,6 +5776,8 @@ impl App {
             lod_distance: self.lod_distance,
             envelope_distance: self.envelope_distance,
             envelope_fade_range: self.envelope_fade_range,
+            inverse_view: inverse_view_cols,
+            inverse_proj: inverse_proj_cols,
         };
 
         queue.write_buffer(
@@ -5721,6 +5926,17 @@ impl App {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+
+            // Draw skybox first (background)
+            if let (Some(pipeline), Some(bind_group)) = (
+                self.skybox_pipeline.as_ref(),
+                self.skybox_bind_group.as_ref(),
+            ) {
+                render_pass.set_pipeline(pipeline);
+                render_pass.set_bind_group(0, self.bind_group.as_ref().unwrap(), &[]);
+                render_pass.set_bind_group(1, bind_group, &[]);
+                render_pass.draw(0..3, 0..1); // Full screen triangle
+            }
 
             // Draw meshed chunks first
             if has_meshes_to_draw {

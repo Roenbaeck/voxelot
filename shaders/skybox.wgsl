@@ -1,0 +1,77 @@
+// This matches the Uniforms struct in voxelot.rs
+struct CameraUniforms {
+    mvp: mat4x4<f32>,
+    sun_view_proj: mat4x4<f32>,
+    camera_shadow_strength: vec4<f32>,
+    sun_direction_shadow_bias: vec4<f32>,
+    fog_time_pad: vec4<f32>,
+    sun_color_pad: vec4<f32>,
+    ambient_color_pad: vec4<f32>,
+    shadow_texel_size_pad: vec4<f32>,
+    shadow_darkness_pad: vec4<f32>,
+    moon_direction_intensity: vec4<f32>,
+    moon_color_pad: vec4<f32>,
+    light_probe_count: u32,
+    lod_distance: f32,
+    envelope_distance: f32,
+    envelope_fade_range: f32,
+    inverse_view: mat4x4<f32>,
+    inverse_proj: mat4x4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> camera: CameraUniforms;
+
+@group(1) @binding(0)
+var skybox_texture: texture_2d<f32>;
+@group(1) @binding(1)
+var skybox_sampler: sampler;
+
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
+    var out: VertexOutput;
+    // Full screen triangle
+    let uv = vec2<f32>(f32((in_vertex_index << 1u) & 2u), f32(in_vertex_index & 2u));
+    out.clip_position = vec4<f32>(uv * 2.0 - 1.0, 1.0, 1.0); // z = 1.0 (far plane)
+    out.uv = uv;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Calculate ray direction from camera
+    // We want the direction corresponding to the pixel on the far plane
+    
+    // Convert UV to NDC
+    let ndc = vec4<f32>(in.uv * 2.0 - 1.0, 1.0, 1.0);
+    
+    // Unproject to world space
+    // We only care about direction, so we can ignore translation part of view matrix
+    // But since we have inverse_view and inverse_proj, we can use them directly.
+    
+    // Note: camera.inverse_proj transforms from NDC to View space
+    // camera.inverse_view transforms from View space to World space
+    
+    let view_space_pos = camera.inverse_proj * ndc;
+    let view_space_dir = view_space_pos.xyz / view_space_pos.w;
+    
+    // We want direction, so set w=0 for view matrix transform (ignore translation)
+    let world_dir = (camera.inverse_view * vec4<f32>(view_space_dir, 0.0)).xyz;
+    let dir = normalize(world_dir);
+    
+    // Convert direction to equirectangular UV
+    // atan2(z, x) gives angle in [-PI, PI]. We want [0, 1].
+    // acos(y) gives angle in [0, PI]. We want [0, 1].
+    
+    let u = 0.5 + atan2(dir.z, dir.x) / (2.0 * 3.14159265);
+    let v = 0.5 - asin(dir.y) / 3.14159265; // y is up
+    
+    let color = textureSample(skybox_texture, skybox_sampler, vec2<f32>(u, v));
+    
+    return color;
+}
