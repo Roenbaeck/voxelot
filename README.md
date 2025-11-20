@@ -6,12 +6,12 @@ A high-performance sparse voxel engine using hierarchical chunks with Roaring Bi
 
 ## Key Features
 
-### 🧠 Recursive "Chunks All The Way"
+### Recursive "Chunks All The Way"
 Unlike traditional engines that separate "World", "Region", and "Chunk" classes, Voxelot uses a **uniform recursive structure**. The entire World is a Chunk, which contains sub-Chunks, down to the leaf level.
 - **Unified Logic**: Culling, raycasting, and storage work identically at all scales.
 - **Massive Scale**: A hierarchy depth of 4 gives you a **65,536³** voxel world (281 trillion potential voxels) addressable with simple integer coordinates.
 
-### 🚀 Bitwise Performance Pipeline
+### Bitwise Performance Pipeline
 Voxelot leverages **Roaring Bitmaps** and bitwise arithmetic for extreme performance:
 - **3-Stage Culling**:
     1. **Frustum AABB**: Standard intersection check.
@@ -22,14 +22,14 @@ Voxelot leverages **Roaring Bitmaps** and bitwise arithmetic for extreme perform
 - **Parallel Processing**: Multi-threaded chunk updates and culling using `rayon`.
 - **Visibility Caching**: Spatial hashing reuses visibility results to minimize per-frame work.
 
-### 🎨 Cinematic Rendering
+### Cinematic Rendering
 A modern rendering pipeline built on `wgpu` that goes beyond standard voxel looks:
 - **SSAO**: Horizon-based ambient occlusion for depth perception.
 - **Dual-Kawase Bloom**: High-quality, multi-pass bloom for glowing voxels.
 - **Cinematic Depth of Field**: Bokeh-style blur with focus control.
 - **Dynamic Atmosphere**: Day/night cycle with scattering-approximated fog and HDR skybox.
 
-### 💾 Optimal Sparsity
+### Optimal Sparsity
 Storage is proportional to *entropy*, not volume.
 - **Roaring Bitmaps**: Compressed bitmap indices mean empty space takes zero memory.
 - **Compact Storage**: An 85 million voxel world can be stored in just **~10MB** (`.oct` format).
