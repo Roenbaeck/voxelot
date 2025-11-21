@@ -10,7 +10,7 @@ The idea is that if we can keep chunks like that on the GPU, and say move the ca
 
 # TODO
 
-Use https://crates.io/crates/seahash for hash function. Faster? If our keys are u64, are there even faster hash functions?
+Use rustc-hash for hash maps and hash sets since we have integer keys. Must replace HashMap with FxHashMap and HashSet with FxHashSet.
 
 Can we implement a GPU occlusion culling shader that only works up until `envelope_dist_sq` so it culls most of the individual voxels?
 

@@ -21,7 +21,8 @@ use winit::{
     window::{Window, WindowAttributes},
 };
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::VecDeque;
 use sysinfo::{Pid, ProcessExt, System, SystemExt};
 use voxelot::{
     cull_visible_voxels_parallel, Camera, Chunk, ChunkMesh, Palette, RenderConfig, Voxel, World,
@@ -149,7 +150,7 @@ struct MeshJob {
     key: (i64, i64, i64),
     chunk: Arc<Chunk>,
     /// Neighbor chunks snapshot mapped by (-1..=1) offsets from this chunk
-    neighbors: std::collections::HashMap<(i8, i8, i8), Arc<Chunk>>,
+    neighbors: FxHashMap<(i8, i8, i8), Arc<Chunk>>,
     envelope: bool,
 }
 
@@ -682,7 +683,7 @@ struct App {
     fallback_instance_buffer: Option<wgpu::Buffer>,
     fallback_instance_capacity: usize,
     // Mesh cache: per-leaf-chunk mesh GPU buffers and metadata
-    mesh_cache: HashMap<(i64, i64, i64), MeshCacheEntry>,
+    mesh_cache: FxHashMap<(i64, i64, i64), MeshCacheEntry>,
     mesh_cache_bytes: u64,
     // Stats for UI overlay (refreshed each frame)
     visible_count: usize,
@@ -702,13 +703,13 @@ struct App {
     mesh_ms: f64,
     instance_ms: f64,
     draw_calls_count: usize,
-    envelope_mesh_cache: HashMap<(i64, i64, i64), MeshCacheEntry>,
+    envelope_mesh_cache: FxHashMap<(i64, i64, i64), MeshCacheEntry>,
     envelope_mesh_cache_bytes: u64,
     envelope_mesh_cache_budget_bytes: u64,
     envelope_distance: f32,
     envelope_fade_range: f32,
     /// Cached Arc<Chunk> snapshots for mesher jobs to avoid repeated deep clones
-    mesh_chunk_arc_cache: HashMap<(i64, i64, i64), Arc<Chunk>>,
+    mesh_chunk_arc_cache: FxHashMap<(i64, i64, i64), Arc<Chunk>>,
     /// Count of mesh jobs executed per second by worker threads (reset on FPS print)
     mesh_jobs_executed: Arc<AtomicUsize>,
     /// Empty placeholder buffers for chunks that have no geometry; reused by many entries
@@ -719,7 +720,7 @@ struct App {
     stat_vertex_buffers_reused: u64,
     stat_index_buffers_reused: u64,
 
-    chunk_emitters: HashMap<(i64, i64, i64), Vec<ChunkEmitterWorld>>,
+    chunk_emitters: FxHashMap<(i64, i64, i64), Vec<ChunkEmitterWorld>>,
     active_emitters: Vec<ActiveLight>,
     system_info: System,
     process_pid: Pid,
@@ -733,7 +734,7 @@ struct App {
     palette: Palette,
     camera_controller: CameraController,
     pending_chunk_meshes: VecDeque<(i64, i64, i64)>,
-    pending_chunk_set: HashSet<(i64, i64, i64)>,
+    pending_chunk_set: FxHashSet<(i64, i64, i64)>,
     mesh_job_tx: Sender<MeshJob>,
     mesh_result_rx: Receiver<MeshResult>,
     mesh_worker_count: usize,
@@ -1085,10 +1086,10 @@ impl App {
             fallback_indirect_buffer: None,
             fallback_instance_buffer: None,
             fallback_instance_capacity: 0,
-            mesh_cache: HashMap::new(),
+            mesh_cache: FxHashMap::default(),
             mesh_jobs_executed: mesh_jobs_executed.clone(),
             mesh_cache_bytes: 0,
-            envelope_mesh_cache: HashMap::new(),
+            envelope_mesh_cache: FxHashMap::default(),
             envelope_mesh_cache_bytes: 0,
             envelope_mesh_cache_budget_bytes: cfg.performance.mesh_cache_budget_mb as u64
                 * 1024
@@ -1103,14 +1104,14 @@ impl App {
             egui_winit: None,
             egui_renderer: None,
             last_fps: 0,
-            mesh_chunk_arc_cache: HashMap::new(),
+            mesh_chunk_arc_cache: FxHashMap::default(),
             empty_mesh_vertex_buffer: None,
             empty_mesh_index_buffer: None,
             stat_empty_meshes: 0,
             stat_vertex_buffers_reused: 0,
             stat_index_buffers_reused: 0,
 
-            chunk_emitters: HashMap::new(),
+            chunk_emitters: FxHashMap::default(),
             active_emitters: Vec::new(),
             system_info,
             process_pid,
@@ -1154,7 +1155,7 @@ impl App {
 
             camera_controller: CameraController::new(initial_camera, &cfg.rendering),
             pending_chunk_meshes: VecDeque::new(),
-            pending_chunk_set: HashSet::new(),
+            pending_chunk_set: FxHashSet::default(),
             last_frame: Instant::now(),
             frame_count: 0,
             frame_index: 0,
@@ -1251,8 +1252,8 @@ impl App {
             },
             bloom_enabled: cfg.effects.bloom.enabled,
             ssao_settings: SsaoSettings {
-                sample_count: 8,
-                slice_count: 4,
+                sample_count: cfg.effects.ssao.sample_count,
+                slice_count: cfg.effects.ssao.slice_count,
                 radius: 4.0,
                 thickness: 0.5,
                 strength: cfg.effects.ssao.strength,
@@ -4445,8 +4446,9 @@ impl App {
                 let dist_sq = dx * dx + dy * dy + dz * dz;
                 let envelope_dist_sq = self.envelope_distance * self.envelope_distance;
 
-                // If near and un-meshed, decompose into voxels (regardless of envelope)
-                if v.is_leaf_chunk && !has_mesh && dist_sq < envelope_dist_sq {
+                // If very near and un-meshed, decompose into voxels (regardless of envelope)
+                let fallback_dist_sq = self.fallback_detail_distance * self.fallback_detail_distance;
+                if v.is_leaf_chunk && !has_mesh && dist_sq < fallback_dist_sq {
                     voxel_expansion_attempts += 1;
                     if let Some(chunk) = self
                         .world
@@ -4656,7 +4658,7 @@ impl App {
 
         let grouping_start = Instant::now();
         // Collect unique leaf chunk origins flagged by the culler
-        let mut leaf_chunks: HashSet<(i64, i64, i64)> = HashSet::new();
+        let mut leaf_chunks: FxHashSet<(i64, i64, i64)> = FxHashSet::default();
         for v in &visible {
             if v.is_leaf_chunk {
                 leaf_chunks.insert((v.position[0], v.position[1], v.position[2]));
@@ -4666,7 +4668,7 @@ impl App {
         if cfg!(feature = "viewer-debug") && self.frame_count % 600 == 0 {
             // Top-level scale (root cell size)
             let root_scale = 16i64.pow(self.world.hierarchy_depth() as u32 - 1);
-            let mut root_positions: HashSet<(i64, i64, i64)> = HashSet::new();
+            let mut root_positions: FxHashSet<(i64, i64, i64)> = FxHashSet::default();
             for (x, y, z) in self.world.root().positions() {
                 root_positions.insert((x as i64, y as i64, z as i64));
             }
@@ -4703,10 +4705,10 @@ impl App {
         let mut mesh_job_creation_time = std::time::Duration::ZERO;
         let mut mesh_job_neighbors_time = std::time::Duration::ZERO;
         // Build mesh for any chunk present (near leaf chunk), and mark those chunks for drawing
-        let mut cpu_mesh_keys: HashSet<(i64, i64, i64)> = HashSet::new();
+        let mut cpu_mesh_keys: FxHashSet<(i64, i64, i64)> = FxHashSet::default();
         let mut new_meshes_created = 0;
         let mut chunks_not_found = 0;
-        let mut missing_chunks: HashSet<(i64, i64, i64)> = HashSet::new();
+        let mut missing_chunks: FxHashSet<(i64, i64, i64)> = FxHashSet::default();
 
         let leaf_scan_start = std::time::Instant::now();
         for &key in &leaf_chunks {
@@ -4852,8 +4854,7 @@ impl App {
                 Some(chunk) => {
                     // Snapshot neighbor chunks so AO can be computed across chunk bounds.
                     let neighbor_start = std::time::Instant::now();
-                    let mut neighbors: std::collections::HashMap<(i8, i8, i8), Arc<Chunk>> =
-                        std::collections::HashMap::new();
+                        let mut neighbors: FxHashMap<(i8, i8, i8), Arc<Chunk>> = FxHashMap::default();
                     for dx in -1i64..=1 {
                         for dy in -1i64..=1 {
                             for dz in -1i64..=1 {
@@ -5128,7 +5129,7 @@ impl App {
         // Convert remaining instances (exclude those belonging to meshed chunks)
         let instance_start = Instant::now();
 
-        let mut draw_mesh_keys = HashSet::new();
+        let mut draw_mesh_keys = FxHashSet::default();
         for v in &visible {
             if v.is_leaf_chunk {
                 let key = (v.position[0], v.position[1], v.position[2]);

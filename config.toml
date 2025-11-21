@@ -12,13 +12,13 @@ lod_subdivide_distance = 500.0
 lod_merge_distance = 750.0
 chunk_lod_distance = 1000.0
 fov_degrees = 70.0
-near_plane = 0.10000000149011612
+near_plane = 0.1
 far_plane = 4500.0
-camera_speed_multiplier = 4.76837158203125
+camera_speed_multiplier = 4.7683716
 
 [atmosphere]
-fog_density = 0.0004499999631661922
-time_of_day = 0.3849070072174072
+fog_density = 0.00044999996
+time_of_day = 0.2779789
 
 [effects.depth_of_field]
 enabled = true
@@ -31,13 +31,13 @@ kawase_enabled = true
 
 [effects.bloom]
 enabled = true
-threshold = 0.699999988079071
-knee = 0.6000000238418579
-intensity = 1.7999999523162842
-bloom_strength = 1.600000023841858
+threshold = 0.7
+knee = 0.6
+intensity = 1.8
+bloom_strength = 1.6
 saturation_boost = 1.5
-exposure = 1.1799999475479126
-blur_radius = 3.799999952316284
+exposure = 1.18
+blur_radius = 3.8
 
 [effects.ssao]
 enabled = true
@@ -63,7 +63,7 @@ mesh_upload_baseline = 4
 envelope_distance = 500.0
 envelope_fade_range = 200.0
 fallback_detail_distance = 500.0
-fallback_bbox_shrink = 0.6600000262260437
+fallback_bbox_shrink = 0.66
 mesh_priority_sort_interval_frames = 30
 mesh_buffer_pool_entries = 256
 

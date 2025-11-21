@@ -1,7 +1,7 @@
 //! Culling and visibility determination for hierarchical chunks
 
 use crate::lib_hierarchical::{Chunk, Voxel, VoxelType, World};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 /// Runtime configuration for rendering and LOD
 #[derive(Debug, Clone)]
@@ -56,7 +56,7 @@ pub struct VisibilityCache {
 impl VisibilityCache {
     pub fn new() -> Self {
         Self {
-            cache: HashMap::new(),
+            cache: HashMap::default(),
             last_camera_pos: [0.0, 0.0, 0.0],
             last_camera_forward: [0.0, 0.0, -1.0],
             dirty: true,

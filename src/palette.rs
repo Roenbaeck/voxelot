@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -61,7 +61,7 @@ impl Palette {
     /// - `index baseR baseG baseB baseA emitR emitG emitB emitStrength`
     /// Values are 0-255 integers.
     pub fn from_string(contents: &str) -> Option<Self> {
-        let mut map: HashMap<usize, Material> = HashMap::new();
+        let mut map: HashMap<usize, Material> = HashMap::default();
         for (line_idx, line) in contents.lines().enumerate() {
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {

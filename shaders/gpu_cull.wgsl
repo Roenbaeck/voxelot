@@ -99,6 +99,7 @@ fn cs_main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         
         let has_mesh = (instance.flags & 1u) != 0u;
         let has_envelope = (instance.flags & 2u) != 0u;
+        let cpu_prepopulated = (instance.flags & 4u) != 0u;
         
         // Priority:
         // 1. Detail Mesh (if near enough AND exists)
@@ -138,15 +139,18 @@ fn cs_main(@builtin(global_invocation_id) global_id : vec3<u32>) {
             }
         } else {
             // Add to fallback instances
-            let idx = atomicAdd(&fallback_indirect.instance_count, 1u);
-            var raw : VoxelInstanceRaw;
-            raw.position = instance.position;
-            raw.voxel_type = instance.voxel_type;
-            raw.scale = instance.scale;
-            raw.ao_factor = 1.0;
-            raw.custom_color = instance.custom_color;
-            raw.emissive = instance.emissive;
-            fallback_instances[idx] = raw;
+            if (!cpu_prepopulated) {
+                let idx = atomicAdd(&fallback_indirect.instance_count, 1u);
+                var raw : VoxelInstanceRaw;
+                raw.position = instance.position;
+                raw.voxel_type = instance.voxel_type;
+                raw.scale = instance.scale;
+                raw.ao_factor = 1.0;
+                raw.custom_color = instance.custom_color;
+                raw.emissive = instance.emissive;
+                fallback_instances[idx] = raw;
+            }
+            
             
             if (has_mesh) {
                 mesh_indirect[instance.mesh_index].instance_count = 0u;

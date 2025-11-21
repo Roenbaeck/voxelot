@@ -9,7 +9,7 @@
 //! - Bounded but huge worlds: 16^n units (e.g., 16^4 = 65,536³)
 
 use croaring::Bitmap;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::sync::Arc;
 
 use crate::palette::Palette;
@@ -275,7 +275,7 @@ impl Chunk {
         // We'll compute both a sum for legacy average and a dominant-type count.
         // Dominant type is preferable for per-chunk preview colors when mixed.
         let mut albedo_sum = [0.0f32; 4];
-        let mut counts: HashMap<u32, u32> = HashMap::new();
+        let mut counts: HashMap<u32, u32> = HashMap::default();
         let mut emissive_sum = [0.0f32; 3];
         let mut emissive_power = 0.0f32;
         let mut emissive_voxels = 0u32;
