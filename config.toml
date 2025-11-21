@@ -13,12 +13,12 @@ lod_merge_distance = 750.0
 chunk_lod_distance = 1000.0
 fov_degrees = 70.0
 near_plane = 0.10000000149011612
-far_plane = 3500.0
+far_plane = 4500.0
 camera_speed_multiplier = 4.76837158203125
 
 [atmosphere]
 fog_density = 0.0004499999631661922
-time_of_day = 0.3876536786556244
+time_of_day = 0.5052708387374878
 
 [effects.depth_of_field]
 enabled = true
