@@ -4427,6 +4427,8 @@ impl App {
         let visible = cull_visible_voxels_parallel(&self.world, &self.camera_controller.camera);
         let cull_time = cull_start.elapsed();
 
+        let mut voxel_expansion_count = 0;
+        let mut voxel_expansion_attempts = 0;
         let gpu_inputs: Vec<GpuInstanceInput> = visible
             .iter()
             .enumerate()
@@ -4443,8 +4445,9 @@ impl App {
                 let dist_sq = dx * dx + dy * dy + dz * dz;
                 let envelope_dist_sq = self.envelope_distance * self.envelope_distance;
 
-                // If near and un-meshed, decompose into voxels
+                // If near and un-meshed, decompose into voxels (regardless of envelope)
                 if v.is_leaf_chunk && !has_mesh && dist_sq < envelope_dist_sq {
+                    voxel_expansion_attempts += 1;
                     if let Some(chunk) = self
                         .world
                         .get_leaf_chunk_at_origin(WorldPos::new(key.0, key.1, key.2))
@@ -4476,6 +4479,7 @@ impl App {
                             }
                         }
                         if !voxels.is_empty() {
+                            voxel_expansion_count += 1;
                             return voxels;
                         }
                     }
