@@ -103,9 +103,9 @@ impl VisibilityCache {
         // Update cache - organize by chunk
         self.cache.clear();
         for instance in &instances {
-            let chunk_x = instance.position[0] / 16;
-            let chunk_y = instance.position[1] / 16;
-            let chunk_z = instance.position[2] / 16;
+            let chunk_x = instance.position[0] >> 4;
+            let chunk_y = instance.position[1] >> 4;
+            let chunk_z = instance.position[2] >> 4;
 
             self.cache
                 .entry((chunk_x, chunk_y, chunk_z))
@@ -157,8 +157,8 @@ impl CullingMasks {
                         for y in 0..16 {
                             // Add range [start + y*16 + z*256, end + y*16 + z*256)
                             // Since x is the LSB, a contiguous range in x is contiguous in index
-                            let range_start = (start + y * 16 + z * 256) as u32;
-                            let range_end = (end + y * 16 + z * 256) as u32;
+                            let range_start = (start | (y << 4) | (z << 8)) as u32;
+                            let range_end = (end + (y << 4) + (z << 8)) as u32;
                             bitmap.add_range(range_start..range_end);
                         }
                     }
@@ -187,8 +187,8 @@ impl CullingMasks {
                         // Yes, since X is 0..16, one full Y row is 16 indices.
                         // So Y range [start, end) covers contiguous indices [start*16, end*16) within each Z plane.
 
-                        let range_start = (start * 16 + z * 256) as u32;
-                        let range_end = (end * 16 + z * 256) as u32;
+                        let range_start = ((start << 4) | (z << 8)) as u32;
+                        let range_end = ((end << 4) + (z << 8)) as u32;
                         bitmap.add_range(range_start..range_end);
                     }
                     y_masks[start][end] = bitmap;
@@ -552,9 +552,9 @@ pub struct ChunkRenderInfo {
 impl ChunkRenderInfo {
     fn new(chunk_pos: (i64, i64, i64), camera_pos: [f32; 3]) -> Self {
         let chunk_center = [
-            (chunk_pos.0 * 16 + 8) as f32,
-            (chunk_pos.1 * 16 + 8) as f32,
-            (chunk_pos.2 * 16 + 8) as f32,
+            ((chunk_pos.0 << 4) + 8) as f32,
+            ((chunk_pos.1 << 4) + 8) as f32,
+            ((chunk_pos.2 << 4) + 8) as f32,
         ];
 
         let dx = chunk_center[0] - camera_pos[0];
@@ -593,7 +593,7 @@ fn collect_voxels_recursive(
         chunk_offset[1] as f32,
         chunk_offset[2] as f32,
     ];
-    let chunk_size = (scale * 16) as f32;
+    let chunk_size = (scale << 4) as f32;
     let chunk_max = [
         chunk_min[0] + chunk_size,
         chunk_min[1] + chunk_size,
@@ -687,11 +687,11 @@ fn collect_voxels_recursive(
         // Each Z plane is 256 indices (16x16).
         // Remove [0, min_z * 256)
         if local_min_z > 0 {
-            visible_voxels.remove_range(0..(local_min_z as u32 * 256));
+            visible_voxels.remove_range(0..((local_min_z as u32) << 8));
         }
         // Remove [max_z * 256, 16 * 256)
         if local_max_z < 16 {
-            visible_voxels.remove_range((local_max_z as u32 * 256)..(16 * 256));
+            visible_voxels.remove_range(((local_max_z as u32) << 8)..4096);
         }
 
         // If empty after Z culling, return
@@ -746,10 +746,9 @@ fn process_voxels<I>(
     // So we need: chunk.voxels[chunk.presence.rank(index) - 1]
 
     for index in indices {
-        let z = index / 256;
-        let rem = index % 256;
-        let y = rem / 16;
-        let x = rem % 16;
+        let z = index >> 8;
+        let y = (index >> 4) & 0xF;
+        let x = index & 0xF;
 
         let rank = chunk.presence.rank(index);
         let voxel = &chunk.voxels[(rank - 1) as usize];
@@ -807,7 +806,7 @@ fn process_voxels<I>(
                     continue;
                 }
 
-                let next_scale = scale / 16;
+                let next_scale = scale >> 4;
 
                 if next_scale > 1 {
                     collect_voxels_recursive(
@@ -976,7 +975,7 @@ pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> Vec<Voxel
                 }
                 Voxel::Chunk(chunk) => {
                     // Recursively collect from sub-chunk until bottom chunk level.
-                    let next_scale = scale / 16;
+                    let next_scale = scale >> 4;
                     if next_scale > 1 {
                         collect_voxels_recursive(
                             chunk,

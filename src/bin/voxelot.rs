@@ -4720,9 +4720,9 @@ impl App {
                     for dx in -1i64..=1 {
                         for dy in -1i64..=1 {
                             for dz in -1i64..=1 {
-                                let nx = key.0 + dx * 16;
-                                let ny = key.1 + dy * 16;
-                                let nz = key.2 + dz * 16;
+                                let nx = key.0 + (dx << 4);
+                                let ny = key.1 + (dy << 4);
+                                let nz = key.2 + (dz << 4);
                                 if let Some(nc) = self
                                     .world
                                     .get_leaf_chunk_at_origin(WorldPos::new(nx, ny, nz))

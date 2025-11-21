@@ -124,15 +124,15 @@ impl Chunk {
     #[inline]
     pub fn flat_index(x: u8, y: u8, z: u8) -> u32 {
         debug_assert!(x < 16 && y < 16 && z < 16);
-        (x as u32) + (y as u32) * 16 + (z as u32) * 256
+        (x as u32) | ((y as u32) << 4) | ((z as u32) << 8)
     }
 
     /// Convert flat index back to (x, y, z)
     #[inline]
     pub fn unflatten(idx: u32) -> (u8, u8, u8) {
-        let x = (idx % 16) as u8;
-        let y = ((idx / 16) % 16) as u8;
-        let z = (idx / 256) as u8;
+        let x = (idx & 0xF) as u8;
+        let y = ((idx >> 4) & 0xF) as u8;
+        let z = ((idx >> 8) & 0xF) as u8;
         (x, y, z)
     }
 

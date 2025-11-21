@@ -68,7 +68,7 @@ fn save_chunk(chunk: &Chunk, writer: &mut impl Write) -> io::Result<()> {
     // Write each position and its data
     for (x, y, z) in positions {
         // Encode position as u16 (z * 256 + y * 16 + x)
-        let pos_encoded = (z as u16) * 256 + (y as u16) * 16 + (x as u16);
+        let pos_encoded = ((z as u16) << 8) | ((y as u16) << 4) | (x as u16);
         writer.write_all(&pos_encoded.to_le_bytes())?;
 
         match chunk.get(x, y, z) {
@@ -155,9 +155,9 @@ fn load_chunk(chunk: &mut Chunk, reader: &mut impl Read) -> io::Result<()> {
     // Reserve capacity and then commit entries into presence/voxels in order
     chunk.voxels.reserve(entries.len());
     for (pos_encoded, voxel) in entries {
-        let x = (pos_encoded % 16) as u8;
-        let y = ((pos_encoded / 16) % 16) as u8;
-        let z = (pos_encoded / 256) as u8;
+        let x = (pos_encoded & 0xF) as u8;
+        let y = ((pos_encoded >> 4) & 0xF) as u8;
+        let z = ((pos_encoded >> 8) & 0xF) as u8;
 
         // Append presence and voxel in rank order
         chunk.presence.add(pos_encoded as u32);

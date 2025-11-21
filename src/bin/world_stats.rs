@@ -132,9 +132,9 @@ fn main() -> std::io::Result<()> {
             x,
             y,
             z,
-            (x as i64) * 16i64.pow(depth as u32 - 1),
-            (y as i64) * 16i64.pow(depth as u32 - 1),
-            (z as i64) * 16i64.pow(depth as u32 - 1)
+            (x as i64) << (4 * (depth as u32 - 1)),
+            (y as i64) << (4 * (depth as u32 - 1)),
+            (z as i64) << (4 * (depth as u32 - 1))
         );
     }
     println!("Leaf-equivalent voxel count: {}", leaf_voxel_count);
