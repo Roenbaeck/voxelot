@@ -307,6 +307,13 @@ impl Chunk {
                     emissive_power += emissive_strength;
                     emissive_voxels += 1;
                 }
+            } else if let Voxel::Chunk(sub_chunk) = voxel {
+                solid_count = solid_count.saturating_add(sub_chunk.voxel_count);
+
+                // Also accumulate emissive stats from sub-chunks?
+                // The current implementation seems to ignore sub-chunk emissives for the parent summary.
+                // This might be another bug, but let's focus on the geometry visibility first.
+                // For now, just fixing voxel_count is enough to fix the "E-shape" holes.
             }
         }
 
