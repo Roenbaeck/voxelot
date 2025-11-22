@@ -1,6 +1,6 @@
 struct InstanceInput {
     position : vec3<f32>,
-    scale : f32,
+    scale : vec3<f32>,
     custom_color : vec4<f32>,
     emissive : vec4<f32>,
     voxel_type : u32,
@@ -54,9 +54,8 @@ var<storage, read_write> fallback_indirect : DrawIndirectArgs;
 struct VoxelInstanceRaw {
     position : vec3<f32>,
     voxel_type : u32,
-    scale : f32,
+    scale : vec3<f32>,
     ao_factor : f32,
-    _padding : vec2<u32>,
     custom_color : vec4<f32>,
     emissive : vec4<f32>,
 };
@@ -75,7 +74,7 @@ fn cs_main(@builtin(global_invocation_id) global_id : vec3<u32>) {
     }
 
     let instance = candidates[index];
-    let half_scale = vec3<f32>(instance.scale * 0.5);
+    let half_scale = instance.scale * 0.5;
     let instance_center = instance.position + half_scale;
     let to_instance = instance_center - params.camera_position;
     // Avoid expensive length() by comparing squared distances
@@ -88,7 +87,9 @@ fn cs_main(@builtin(global_invocation_id) global_id : vec3<u32>) {
     let within_lod = dist_sq <= lod_sq;
 
     // Assume camera_forward is normalized by CPU-side camera; avoid normalize() in shader
-    let in_front = dot(params.camera_forward, to_instance) > -half_scale.x;
+    // Project half_scale onto forward vector to get effective radius along view direction
+    let radius = dot(abs(params.camera_forward), half_scale);
+    let in_front = dot(params.camera_forward, to_instance) > -radius;
 
     let visible = within_depth && within_lod && in_front;
 

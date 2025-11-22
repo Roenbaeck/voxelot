@@ -536,7 +536,7 @@ pub struct VoxelInstance {
     /// Optional: Custom RGBA color for LOD rendering (overrides voxel_type color if Some)
     pub custom_color: Option<[u8; 4]>,
     /// Scale factor for this voxel (1 = normal voxel, 16 = chunk-sized block, etc.)
-    pub scale: i64,
+    pub scale: [f32; 3],
     /// Whether this instance represents a leaf chunk that should be rendered via a cached mesh.
     pub is_leaf_chunk: bool,
 }
@@ -780,7 +780,7 @@ fn process_voxels<I>(
                         voxel_type: *voxel_type,
                         distance,
                         custom_color: None,
-                        scale,
+                        scale: [scale as f32, scale as f32, scale as f32],
                         is_leaf_chunk: false,
                     });
                 }
@@ -795,12 +795,28 @@ fn process_voxels<I>(
                 let distance = camera.distance_to(voxel_center);
 
                 if distance >= camera.config.lod_render_distance && sub_chunk.voxel_count > 0 {
+                    let (pos, size) = if let Some(bbox) = sub_chunk.bounding_box {
+                        let unit = scale / 16;
+                        let x = world_x + (bbox[0] as i64 * unit);
+                        let y = world_y + (bbox[1] as i64 * unit);
+                        let z = world_z + (bbox[2] as i64 * unit);
+                        let sx = (bbox[3] - bbox[0] + 1) as f32 * unit as f32;
+                        let sy = (bbox[4] - bbox[1] + 1) as f32 * unit as f32;
+                        let sz = (bbox[5] - bbox[2] + 1) as f32 * unit as f32;
+                        ([x, y, z], [sx, sy, sz])
+                    } else {
+                        (
+                            [world_x, world_y, world_z],
+                            [scale as f32, scale as f32, scale as f32],
+                        )
+                    };
+
                     result.push(VoxelInstance {
-                        position: [world_x, world_y, world_z],
+                        position: pos,
                         voxel_type: 0,
                         distance,
                         custom_color: Some(sub_chunk.average_color),
-                        scale,
+                        scale: size,
                         is_leaf_chunk: false,
                     });
                     continue;
@@ -819,12 +835,28 @@ fn process_voxels<I>(
                 } else {
                     if distance >= camera.config.lod_render_distance {
                         if sub_chunk.voxel_count > 0 {
+                            let (pos, size) = if let Some(bbox) = sub_chunk.bounding_box {
+                                let unit = scale / 16;
+                                let x = world_x + (bbox[0] as i64 * unit);
+                                let y = world_y + (bbox[1] as i64 * unit);
+                                let z = world_z + (bbox[2] as i64 * unit);
+                                let sx = (bbox[3] - bbox[0] + 1) as f32 * unit as f32;
+                                let sy = (bbox[4] - bbox[1] + 1) as f32 * unit as f32;
+                                let sz = (bbox[5] - bbox[2] + 1) as f32 * unit as f32;
+                                ([x, y, z], [sx, sy, sz])
+                            } else {
+                                (
+                                    [world_x, world_y, world_z],
+                                    [scale as f32, scale as f32, scale as f32],
+                                )
+                            };
+
                             result.push(VoxelInstance {
-                                position: [world_x, world_y, world_z],
+                                position: pos,
                                 voxel_type: 0,
                                 distance,
                                 custom_color: Some(sub_chunk.average_color),
-                                scale,
+                                scale: size,
                                 is_leaf_chunk: false,
                             });
                         }
@@ -844,7 +876,7 @@ fn process_voxels<I>(
                                     voxel_type: 0,
                                     distance,
                                     custom_color: None,
-                                    scale,
+                                    scale: [scale as f32, scale as f32, scale as f32],
                                     is_leaf_chunk: true,
                                 });
                             }
@@ -969,7 +1001,7 @@ pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> Vec<Voxel
                         voxel_type: *vtype,
                         distance,
                         custom_color: None,
-                        scale, // render as a block of current scale (no per-voxel descent)
+                        scale: [scale as f32, scale as f32, scale as f32],
                         is_leaf_chunk: false,
                     });
                 }
@@ -994,12 +1026,28 @@ pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> Vec<Voxel
                         let distance = camera.distance_to(center);
                         if distance >= camera.config.lod_render_distance {
                             if chunk.voxel_count > 0 {
+                                let (pos, size) = if let Some(bbox) = chunk.bounding_box {
+                                    let unit = scale / 16;
+                                    let x = world_x + (bbox[0] as i64 * unit);
+                                    let y = world_y + (bbox[1] as i64 * unit);
+                                    let z = world_z + (bbox[2] as i64 * unit);
+                                    let sx = (bbox[3] - bbox[0] + 1) as f32 * unit as f32;
+                                    let sy = (bbox[4] - bbox[1] + 1) as f32 * unit as f32;
+                                    let sz = (bbox[5] - bbox[2] + 1) as f32 * unit as f32;
+                                    ([x, y, z], [sx, sy, sz])
+                                } else {
+                                    (
+                                        [world_x, world_y, world_z],
+                                        [scale as f32, scale as f32, scale as f32],
+                                    )
+                                };
+
                                 cell_instances.push(VoxelInstance {
-                                    position: [world_x, world_y, world_z],
+                                    position: pos,
                                     voxel_type: 0,
                                     distance,
                                     custom_color: Some(chunk.average_color),
-                                    scale, // scale should be 16 here
+                                    scale: size,
                                     is_leaf_chunk: false,
                                 });
                             }
@@ -1010,7 +1058,7 @@ pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> Vec<Voxel
                                     voxel_type: 0,
                                     distance,
                                     custom_color: None,
-                                    scale,
+                                    scale: [scale as f32, scale as f32, scale as f32],
                                     is_leaf_chunk: true,
                                 });
                             }

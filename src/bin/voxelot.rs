@@ -54,11 +54,10 @@ const SHADOW_STRENGTH_MULTIPLIER: f32 = 1.75;
 struct VoxelInstanceRaw {
     position: [f32; 3],
     voxel_type: u32,
-    scale: f32,             // Scale factor (1.0 = 1x1x1, 16.0 = 16x16x16 chunk)
+    scale: [f32; 3],        // Scale factor (non-uniform)
     ao_factor: f32,         // Ambient occlusion / occupancy factor (0.0..=1.0)
     custom_color: [f32; 4], // RGBA custom color (if custom_color.a > 0, use this instead of voxel_type)
     emissive: [f32; 4],
-    _padding: [u32; 2],
 }
 
 /// Input layout for GPU culling compute pass (std430-friendly)
@@ -66,7 +65,9 @@ struct VoxelInstanceRaw {
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuInstanceInput {
     position: [f32; 3],
-    scale: f32,
+    _pad0: u32,
+    scale: [f32; 3],
+    _pad1: u32,
     custom_color: [f32; 4],
     emissive: [f32; 4],
     voxel_type: u32,
@@ -3316,7 +3317,7 @@ impl App {
                         attributes: &wgpu::vertex_attr_array![
                             0 => Float32x3,  // position
                             1 => Uint32,     // voxel_type
-                            2 => Float32,    // scale
+                            2 => Float32x3,  // scale
                             3 => Float32,    // ao_factor
                             7 => Float32x4,  // custom_color (RGBA) -- moved to avoid vertex attribute conflict
                             6 => Float32x4   // emissive (RGB + intensity)
@@ -3434,7 +3435,7 @@ impl App {
                         attributes: &wgpu::vertex_attr_array![
                             0 => Float32x3,
                             1 => Uint32,
-                            2 => Float32,
+                            2 => Float32x3,
                             3 => Float32,
                             7 => Float32x4,
                             6 => Float32x4
@@ -4633,9 +4634,8 @@ impl App {
                                     (key.2 + z as i64) as f32,
                                 ],
                                 voxel_type: *vtype as u32,
-                                scale: 1.0,
+                                scale: [1.0, 1.0, 1.0],
                                 ao_factor: 1.0,
-                                _padding: [0, 0],
                                 custom_color: [0.0, 0.0, 0.0, 0.0],
                                 emissive: [
                                     emissive_rgb[0],
@@ -4681,7 +4681,9 @@ impl App {
                                 v.position[1] as f32,
                                 v.position[2] as f32,
                             ],
-                            scale: v.scale as f32,
+                            _pad0: 0,
+                            scale: v.scale,
+                            _pad1: 0,
                             custom_color: if v.custom_color.is_some() {
                                 let rgba = v.custom_color.unwrap();
                                 [
@@ -4712,7 +4714,7 @@ impl App {
             } else if v.is_leaf_chunk && !has_mesh && !has_envelope {
                 // Distant leaf chunk without a mesh or envelope: draw a bounding-box cube to avoid holes
                 // Use CPU prepopulation buffer for a cube instance centered at chunk, with scale 16
-                let bb_scale = 16.0f32;
+                let bb_scale = [16.0f32, 16.0f32, 16.0f32];
                 let (emissive_rgb, emissive_intensity) = if v.custom_color.is_some() {
                     ([0.0, 0.0, 0.0], 0.0)
                 } else {
@@ -4732,7 +4734,6 @@ impl App {
                     ao_factor: 1.0,
                     custom_color: custom_color_f32,
                     emissive: [emissive_rgb[0], emissive_rgb[1], emissive_rgb[2], emissive_intensity],
-                    _padding: [0, 0],
                 });
                 // mark as prepopulated
                 // We don't set the CPU prepop flag on GPU input here; the CPU prepop seed is read separately
@@ -4776,7 +4777,9 @@ impl App {
                     v.position[1] as f32,
                     v.position[2] as f32,
                 ],
-                scale: v.scale as f32,
+                _pad0: 0,
+                scale: v.scale,
+                _pad1: 0,
                 custom_color: custom_color_f32,
                 emissive: [
                     emissive_rgb[0],
