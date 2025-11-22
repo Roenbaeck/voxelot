@@ -123,7 +123,7 @@ fn get_voxel_color(voxel_type: u32) -> vec3<f32> {
 fn vs_main(
     @location(0) instance_position: vec3<f32>,
     @location(1) instance_voxel_type: u32,
-    @location(2) instance_scale: f32,
+    @location(2) instance_scale: vec3<f32>,
     @location(3) instance_ao: f32,
     @location(7) instance_custom_color: vec4<f32>,
     @location(4) vertex_position: vec3<f32>,
@@ -474,7 +474,7 @@ fn compute_shadow(light_space_pos: vec4<f32>, normal: vec3<f32>, sun_dir: vec3<f
 fn vs_shadow_instanced(
     @location(0) instance_position: vec3<f32>,
     @location(1) _instance_voxel_type: u32,
-    @location(2) instance_scale: f32,
+    @location(2) instance_scale: vec3<f32>,
     @location(3) _instance_ao: f32,
     @location(7) _instance_custom_color: vec4<f32>,
     @location(4) vertex_position: vec3<f32>,

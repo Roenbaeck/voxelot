@@ -3,7 +3,7 @@
 
 use crate::lib_hierarchical::{Chunk, Voxel};
 use crate::palette::Palette;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::sync::Arc;
 
 #[derive(Copy, Clone, Debug)]
@@ -245,12 +245,12 @@ pub fn generate_chunk_mesh_optimized(
     // Map key: (VoxelType << 8) | AO_mask
     // Value: HashMap<depth, [u16; 16]>
     let mut planes_by_depth: [HashMap<u32, HashMap<u8, [u16; 16]>>; 6] = [
-        HashMap::new(),
-        HashMap::new(),
-        HashMap::new(),
-        HashMap::new(),
-        HashMap::new(),
-        HashMap::new(),
+        HashMap::default(),
+        HashMap::default(),
+        HashMap::default(),
+        HashMap::default(),
+        HashMap::default(),
+        HashMap::default(),
     ];
 
     for face_axis in 0..6 {

@@ -182,11 +182,11 @@ fn column_has_voxel(world: &World, axis: Axis, fixed: i64, var: i64, bounds: &Bo
 }
 
 fn instance_covers_axis(inst: &VoxelInstance, axis: Axis, coord: i64) -> bool {
-    let pos = match axis {
-        Axis::X => inst.position[0],
-        Axis::Z => inst.position[2],
+    let (pos, size) = match axis {
+        Axis::X => (inst.position[0], inst.scale[0] as i64),
+        Axis::Z => (inst.position[2], inst.scale[2] as i64),
     };
-    let max = pos + inst.scale - 1;
+    let max = pos + size - 1;
     pos <= coord && coord <= max
 }
 
@@ -296,7 +296,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .take(5)
             .map(|inst| inst.scale)
-            .collect::<Vec<i64>>()
+            .collect::<Vec<_>>()
     );
 
     for &coord in &x_boundaries {

@@ -54,7 +54,7 @@ cargo run --bin generate_world -- --help
 
 **Movement:**
 - `WASD` - Move forward/left/backward/right
-- `Space` / `Shift` - Move up/down
+- `Q` / `E` / `Space` - Move down/up/up
 - `Right Mouse + Drag` - Free-look
 
 **Rotation:**
@@ -66,7 +66,7 @@ cargo run --bin generate_world -- --help
 - `0` - Reset camera speed multiplier
 
 **Runtime Configuration:**
-- `Q` / `E` - Decrease/increase camera LOD subdivide distance
+- `R` / `T` - Decrease/increase camera LOD subdivide distance
 - `Z` / `C` - Decrease/increase draw distance (far plane)
 - `K` / `L` - Decrease/increase chunk LOD render distance (100-5000 units)
 - `T` - Toggle time of day cycle (pause/resume)

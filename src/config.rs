@@ -160,6 +160,12 @@ pub struct PerformanceConfig {
     pub mesh_priority_sort_interval_frames: u64,
     #[serde(default = "default_mesh_buffer_pool_entries")]
     pub mesh_buffer_pool_entries: usize,
+    #[serde(default = "default_mega_vertex_buffer_mb")]
+    pub mega_vertex_buffer_mb: u64,
+    #[serde(default = "default_mega_index_buffer_mb")]
+    pub mega_index_buffer_mb: u64,
+    #[serde(default = "default_max_draw_capacity")]
+    pub max_draw_capacity: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -361,6 +367,18 @@ fn default_mesh_buffer_pool_entries() -> usize {
     256
 }
 
+fn default_mega_vertex_buffer_mb() -> u64 {
+    512
+}
+
+fn default_mega_index_buffer_mb() -> u64 {
+    256
+}
+
+fn default_max_draw_capacity() -> usize {
+    10000
+}
+
 fn default_true() -> bool {
     true
 }
@@ -477,6 +495,9 @@ impl Default for PerformanceConfig {
             fallback_bbox_shrink: default_fallback_bbox_shrink(),
             mesh_priority_sort_interval_frames: default_mesh_priority_sort_interval_frames(),
             mesh_buffer_pool_entries: default_mesh_buffer_pool_entries(),
+            mega_vertex_buffer_mb: default_mega_vertex_buffer_mb(),
+            mega_index_buffer_mb: default_mega_index_buffer_mb(),
+            max_draw_capacity: default_max_draw_capacity(),
         }
     }
 }

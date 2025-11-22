@@ -9,7 +9,7 @@
 //! - Bounded but huge worlds: 16^n units (e.g., 16^4 = 65,536³)
 
 use croaring::Bitmap;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::sync::Arc;
 
 use crate::palette::Palette;
@@ -275,7 +275,7 @@ impl Chunk {
         // We'll compute both a sum for legacy average and a dominant-type count.
         // Dominant type is preferable for per-chunk preview colors when mixed.
         let mut albedo_sum = [0.0f32; 4];
-        let mut counts: HashMap<u32, u32> = HashMap::new();
+        let mut counts: HashMap<u32, u32> = HashMap::default();
         let mut emissive_sum = [0.0f32; 3];
         let mut emissive_power = 0.0f32;
         let mut emissive_voxels = 0u32;
@@ -307,6 +307,13 @@ impl Chunk {
                     emissive_power += emissive_strength;
                     emissive_voxels += 1;
                 }
+            } else if let Voxel::Chunk(sub_chunk) = voxel {
+                solid_count = solid_count.saturating_add(sub_chunk.voxel_count);
+
+                // Also accumulate emissive stats from sub-chunks?
+                // The current implementation seems to ignore sub-chunk emissives for the parent summary.
+                // This might be another bug, but let's focus on the geometry visibility first.
+                // For now, just fixing voxel_count is enough to fix the "E-shape" holes.
             }
         }
 
@@ -322,9 +329,14 @@ impl Chunk {
         let mut zmax: u8 = 0;
         let mut bbox_found = false;
 
-        // Iterate again to build min/max if we see any solid voxel
+        // Iterate again to build min/max if we see any solid voxel or non-empty chunk
         for ((x, y, z), voxel) in self.iter() {
-            if let Voxel::Solid(_) = voxel {
+            let is_occupied = match voxel {
+                Voxel::Solid(_) => true,
+                Voxel::Chunk(c) => !c.is_empty(),
+            };
+
+            if is_occupied {
                 bbox_found = true;
                 if x < xmin {
                     xmin = x;
