@@ -56,6 +56,7 @@ struct VoxelInstanceRaw {
     voxel_type : u32,
     scale : f32,
     ao_factor : f32,
+    _padding : vec2<u32>,
     custom_color : vec4<f32>,
     emissive : vec4<f32>,
 };

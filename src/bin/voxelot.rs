@@ -2472,7 +2472,8 @@ impl App {
                 size: (needed_capacity * std::mem::size_of::<VoxelInstanceRaw>()) as u64,
                 usage: wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::VERTEX
-                    | wgpu::BufferUsages::COPY_SRC,
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));
             self.fallback_instance_capacity = needed_capacity;
@@ -2972,14 +2973,15 @@ impl App {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         candidate_count: usize,
+        initial_fallback_instances: u32,
     ) {
         if candidate_count == 0 {
             return;
         }
 
-        // Reset fallback indirect buffer (instance count = 0)
+        // Reset fallback indirect buffer (seed instance count = initial_fallback_instances)
         if let Some(buffer) = &self.fallback_indirect_buffer {
-            let reset_data = [36u32, 0, 0, 0];
+            let reset_data = [36u32, initial_fallback_instances, 0, 0];
             queue.write_buffer(buffer, 0, bytemuck::cast_slice(&reset_data));
         }
 
@@ -4430,10 +4432,9 @@ impl App {
 
         let mut voxel_expansion_count = 0;
         let mut voxel_expansion_attempts = 0;
-        let gpu_inputs: Vec<GpuInstanceInput> = visible
-            .iter()
-            .enumerate()
-            .flat_map(|(i, v)| {
+        let mut cpu_prepopulated_instances: Vec<VoxelInstanceRaw> = Vec::new();
+        let mut gpu_inputs: Vec<GpuInstanceInput> = Vec::new();
+        for (i, v) in visible.iter().enumerate() {
                 let key = (v.position[0], v.position[1], v.position[2]);
                 let has_mesh = v.is_leaf_chunk && self.mesh_cache.contains_key(&key);
                 let has_envelope = v.is_leaf_chunk && self.envelope_mesh_cache.contains_key(&key);
@@ -4454,18 +4455,21 @@ impl App {
                         .world
                         .get_leaf_chunk_at_origin(WorldPos::new(key.0, key.1, key.2))
                     {
-                        let mut voxels = Vec::new();
+                        let mut voxels_written = 0usize;
                         for ((x, y, z), voxel) in chunk.iter() {
                             if let Voxel::Solid(vtype) = voxel {
                                 let (emissive_rgb, emissive_intensity) =
                                     self.palette.emissive(*vtype as u32);
-                                voxels.push(GpuInstanceInput {
+                                cpu_prepopulated_instances.push(VoxelInstanceRaw {
                                     position: [
                                         (key.0 + x as i64) as f32,
                                         (key.1 + y as i64) as f32,
                                         (key.2 + z as i64) as f32,
                                     ],
+                                    voxel_type: *vtype as u32,
                                     scale: 1.0,
+                                    ao_factor: 1.0,
+                                    _padding: [0, 0],
                                     custom_color: [0.0, 0.0, 0.0, 0.0],
                                     emissive: [
                                         emissive_rgb[0],
@@ -4473,16 +4477,66 @@ impl App {
                                         emissive_rgb[2],
                                         emissive_intensity,
                                     ],
-                                    voxel_type: *vtype as u32,
-                                    flags: 0,
-                                    mesh_index: i as u32,
-                                    envelope_index: i as u32,
                                 });
+                                voxels_written += 1;
                             }
                         }
-                        if !voxels.is_empty() {
+                        if voxels_written > 0 {
                             voxel_expansion_count += 1;
-                            return voxels;
+                            // Mark the chunk candidate as CPU prepopulated so shader won't append fallback instances
+                            let mut flags = 0u32;
+                            if has_mesh { flags |= 1; }
+                            if has_envelope { flags |= 2; }
+                            flags |= 4; // CPU prepopulated
+                            let custom_color_f32 = if let Some(rgba) = v.custom_color {
+                                [
+                                    rgba[0] as f32 / 255.0,
+                                    rgba[1] as f32 / 255.0,
+                                    rgba[2] as f32 / 255.0,
+                                    rgba[3] as f32 / 255.0,
+                                ]
+                            } else if v.is_leaf_chunk {
+                                [0.4, 0.4, 0.45, 0.6]
+                            } else {
+                                [0.0, 0.0, 0.0, 0.0]
+                            };
+                            let (emissive_rgb, emissive_intensity) = if v.custom_color.is_some() {
+                                ([0.0, 0.0, 0.0], 0.0)
+                            } else {
+                                self.palette.emissive(v.voxel_type as u32)
+                            };
+                            gpu_inputs.push(GpuInstanceInput {
+                                position: [
+                                    v.position[0] as f32,
+                                    v.position[1] as f32,
+                                    v.position[2] as f32,
+                                ],
+                                scale: v.scale as f32,
+                                custom_color: if v.custom_color.is_some() {
+                                    let rgba = v.custom_color.unwrap();
+                                    [
+                                        rgba[0] as f32 / 255.0,
+                                        rgba[1] as f32 / 255.0,
+                                        rgba[2] as f32 / 255.0,
+                                        rgba[3] as f32 / 255.0,
+                                    ]
+                                } else if v.is_leaf_chunk {
+                                    [0.4, 0.4, 0.45, 0.6]
+                                } else {
+                                    [0.0, 0.0, 0.0, 0.0]
+                                },
+                                emissive: [
+                                    emissive_rgb[0],
+                                    emissive_rgb[1],
+                                    emissive_rgb[2],
+                                    emissive_intensity,
+                                ],
+                                voxel_type: v.voxel_type as u32,
+                                flags,
+                                mesh_index: i as u32,
+                                envelope_index: i as u32,
+                            });
+                            continue;
                         }
                     }
                 }
@@ -4514,7 +4568,7 @@ impl App {
                     flags |= 2;
                 }
 
-                vec![GpuInstanceInput {
+                gpu_inputs.push(GpuInstanceInput {
                     position: [
                         v.position[0] as f32,
                         v.position[1] as f32,
@@ -4532,9 +4586,9 @@ impl App {
                     flags,
                     mesh_index: i as u32,
                     envelope_index: i as u32,
-                }]
-            })
-            .collect();
+                });
+            }
+        // Flatten any outputs (we pushed directly to gpu_inputs where needed)
 
         let gpu_candidate_count = gpu_inputs.len();
 
@@ -4622,11 +4676,21 @@ impl App {
                 queue.write_buffer(buffer, 0, bytemuck::cast_slice(&envelope_indirect_args));
             }
 
-            // Reset Fallback Indirect Args
+            // Write any CPU prepopulated fallback instances and ensure the fallback instance buffer is large enough
+            let cpu_prepopulated_count = cpu_prepopulated_instances.len();
+            if cpu_prepopulated_count > 0 {
+                // Ensure fallback instance buffer has room for prepopulated + new appended instances
+                self.ensure_gpu_input_buffer(&device, gpu_candidate_count + cpu_prepopulated_count);
+                if let Some(buffer) = self.fallback_instance_buffer.as_ref() {
+                    queue.write_buffer(buffer, 0, bytemuck::cast_slice(&cpu_prepopulated_instances));
+                }
+            }
+
+            // Reset Fallback Indirect Args (seed instance_count with CPU prepopulated count)
             if let Some(buffer) = self.fallback_indirect_buffer.as_ref() {
                 let reset_args = wgpu::util::DrawIndirectArgs {
                     vertex_count: 36,
-                    instance_count: 0,
+                    instance_count: cpu_prepopulated_count as u32,
                     first_vertex: 0,
                     first_instance: 0,
                 };
@@ -5123,7 +5187,12 @@ impl App {
         }
 
         if gpu_candidate_count > 0 {
-            self.run_gpu_culling(&device, &queue, gpu_candidate_count);
+            self.run_gpu_culling(
+                &device,
+                &queue,
+                gpu_candidate_count,
+                cpu_prepopulated_instances.len() as u32,
+            );
         }
 
         // Convert remaining instances (exclude those belonging to meshed chunks)
@@ -5653,21 +5722,7 @@ impl App {
             label: Some("Render Encoder"),
         });
 
-        if gpu_candidate_count > 0 {
-            if let (Some(cull_pipeline), Some(cull_bind_group)) =
-                (self.cull_pipeline.as_ref(), self.cull_bind_group.as_ref())
-            {
-                let dispatch_x = ((gpu_candidate_count as u32) + GPU_CULL_WORKGROUP_SIZE - 1)
-                    / GPU_CULL_WORKGROUP_SIZE;
-                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("GPU Cull Pass"),
-                    timestamp_writes: None,
-                });
-                compute_pass.set_pipeline(cull_pipeline);
-                compute_pass.set_bind_group(0, cull_bind_group, &[]);
-                compute_pass.dispatch_workgroups(dispatch_x, 1, 1);
-            }
-        }
+        // GPU cull invocation is handled via run_gpu_culling
 
         if let (
             Some(shadow_view),
@@ -6297,7 +6352,7 @@ impl App {
                 .fixed_pos(egui::pos2(10.0, 10.0))
                 .show(egui_ctx, |ui| {
                     egui::Frame::default()
-                        .fill(egui::Color32::from_black_alpha(50))
+                        .fill(egui::Color32::from_black_alpha(222))
                         .inner_margin(5.0)
                         .corner_radius(5.0)
                         .show(ui, |ui| {

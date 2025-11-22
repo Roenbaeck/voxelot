@@ -12,7 +12,11 @@ The idea is that if we can keep chunks like that on the GPU, and say move the ca
 
 Use rustc-hash for hash maps and hash sets since we have integer keys. Must replace HashMap with FxHashMap and HashSet with FxHashSet.
 
+Get rid of the scaling of the bounding box.
+
 Can we implement a GPU occlusion culling shader that only works up until `envelope_dist_sq` so it culls most of the individual voxels?
+
+Emissive color is wrong when we see an all voxel chunk.
 
 ---
 
