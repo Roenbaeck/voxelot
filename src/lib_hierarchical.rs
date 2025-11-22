@@ -322,9 +322,14 @@ impl Chunk {
         let mut zmax: u8 = 0;
         let mut bbox_found = false;
 
-        // Iterate again to build min/max if we see any solid voxel
+        // Iterate again to build min/max if we see any solid voxel or non-empty chunk
         for ((x, y, z), voxel) in self.iter() {
-            if let Voxel::Solid(_) = voxel {
+            let is_occupied = match voxel {
+                Voxel::Solid(_) => true,
+                Voxel::Chunk(c) => !c.is_empty(),
+            };
+
+            if is_occupied {
                 bbox_found = true;
                 if x < xmin {
                     xmin = x;
