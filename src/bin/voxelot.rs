@@ -53,8 +53,8 @@ const SHADOW_STRENGTH_MULTIPLIER: f32 = 1.75;
 struct VoxelInstanceRaw {
     position: [f32; 3],
     voxel_type: u32,
-    scale: f32,     // Scale factor (1.0 = 1x1x1, 16.0 = 16x16x16 chunk)
-    ao_factor: f32, // Ambient occlusion / occupancy factor (0.0..=1.0)
+    scale: f32,             // Scale factor (1.0 = 1x1x1, 16.0 = 16x16x16 chunk)
+    ao_factor: f32,         // Ambient occlusion / occupancy factor (0.0..=1.0)
     custom_color: [f32; 4], // RGBA custom color (if custom_color.a > 0, use this instead of voxel_type)
     emissive: [f32; 4],
     _padding: [u32; 2],
@@ -493,8 +493,8 @@ impl CameraController {
             KeyCode::KeyS => self.backward = pressed,
             KeyCode::KeyA => self.left = pressed,
             KeyCode::KeyD => self.right = pressed,
-            KeyCode::Space => self.up = pressed,
-            KeyCode::ShiftLeft | KeyCode::ShiftRight => self.down = pressed,
+            KeyCode::KeyQ => self.down = pressed,
+            KeyCode::KeyE => self.up = pressed,
             KeyCode::ArrowUp => self.rotate_up = pressed,
             KeyCode::ArrowDown => self.rotate_down = pressed,
             KeyCode::ArrowLeft => self.rotate_left = pressed,
@@ -514,7 +514,7 @@ impl CameraController {
                 println!("Camera speed multiplier reset to 1.00");
             }
             // Runtime config adjustments (only on key press, not release)
-            KeyCode::KeyQ if pressed => {
+            KeyCode::KeyR if pressed => {
                 self.camera.config.lod_subdivide_distance =
                     (self.camera.config.lod_subdivide_distance - 50.0).max(50.0);
                 println!(
@@ -522,7 +522,7 @@ impl CameraController {
                     self.camera.config.lod_subdivide_distance
                 );
             }
-            KeyCode::KeyE if pressed => {
+            KeyCode::KeyT if pressed => {
                 self.camera.config.lod_subdivide_distance =
                     (self.camera.config.lod_subdivide_distance + 50.0).min(2000.0);
                 println!(
@@ -1044,11 +1044,11 @@ impl App {
         );
 
         println!("\n=== Controls ===");
-        println!("Movement: WASD + Space/Shift (up/down)");
+        println!("Movement: WASD + Q/E (down/up)");
         println!("Look: Right Mouse + drag");
         println!("Rotate: Arrow Keys (Left/Right yaw, Up/Down pitch)");
         println!("Camera Speed: -/+ (decrease/increase multiplier), 0 reset");
-        println!("Camera LOD Distance: Q/E (decrease/increase)");
+        println!("Camera LOD Distance: R/T (decrease/increase)");
         println!("Draw Distance: Z/C (decrease/increase)");
         println!("Chunk LOD Distance: K/L (decrease/increase)");
         println!("Time of Day: T (cycle through day/night)");
@@ -4434,60 +4434,89 @@ impl App {
         let mut cpu_prepopulated_instances: Vec<VoxelInstanceRaw> = Vec::new();
         let mut gpu_inputs: Vec<GpuInstanceInput> = Vec::new();
         for (i, v) in visible.iter().enumerate() {
-                let key = (v.position[0], v.position[1], v.position[2]);
-                let has_mesh = v.is_leaf_chunk && self.mesh_cache.contains_key(&key);
-                let has_envelope = v.is_leaf_chunk && self.envelope_mesh_cache.contains_key(&key);
+            let key = (v.position[0], v.position[1], v.position[2]);
+            let has_mesh = v.is_leaf_chunk && self.mesh_cache.contains_key(&key);
+            let has_envelope = v.is_leaf_chunk && self.envelope_mesh_cache.contains_key(&key);
 
-                let cam_pos = self.camera_controller.camera.position;
-                let chunk_center = [key.0 as f32 + 8.0, key.1 as f32 + 8.0, key.2 as f32 + 8.0];
-                let dx = chunk_center[0] - cam_pos[0];
-                let dy = chunk_center[1] - cam_pos[1];
-                let dz = chunk_center[2] - cam_pos[2];
-                let dist_sq = dx * dx + dy * dy + dz * dz;
-                let envelope_dist_sq = self.envelope_distance * self.envelope_distance;
+            let cam_pos = self.camera_controller.camera.position;
+            let chunk_center = [key.0 as f32 + 8.0, key.1 as f32 + 8.0, key.2 as f32 + 8.0];
+            let dx = chunk_center[0] - cam_pos[0];
+            let dy = chunk_center[1] - cam_pos[1];
+            let dz = chunk_center[2] - cam_pos[2];
+            let dist_sq = dx * dx + dy * dy + dz * dz;
+            let envelope_dist_sq = self.envelope_distance * self.envelope_distance;
 
-                // If very near and un-meshed, decompose into voxels (regardless of envelope)
-                let fallback_dist_sq = self.fallback_detail_distance * self.fallback_detail_distance;
-                if v.is_leaf_chunk && !has_mesh && dist_sq < fallback_dist_sq {
-                    // Counting attempts is no longer used, keep metric in case we want to log it
-                    if let Some(chunk) = self
-                        .world
-                        .get_leaf_chunk_at_origin(WorldPos::new(key.0, key.1, key.2))
-                    {
-                        let mut voxels_written = 0usize;
-                        for ((x, y, z), voxel) in chunk.iter() {
-                            if let Voxel::Solid(vtype) = voxel {
-                                let (emissive_rgb, emissive_intensity) =
-                                    self.palette.emissive(*vtype as u32);
-                                cpu_prepopulated_instances.push(VoxelInstanceRaw {
-                                    position: [
-                                        (key.0 + x as i64) as f32,
-                                        (key.1 + y as i64) as f32,
-                                        (key.2 + z as i64) as f32,
-                                    ],
-                                    voxel_type: *vtype as u32,
-                                    scale: 1.0,
-                                    ao_factor: 1.0,
-                                    _padding: [0, 0],
-                                    custom_color: [0.0, 0.0, 0.0, 0.0],
-                                    emissive: [
-                                        emissive_rgb[0],
-                                        emissive_rgb[1],
-                                        emissive_rgb[2],
-                                        emissive_intensity,
-                                    ],
-                                });
-                                voxels_written += 1;
-                            }
+            // If very near and un-meshed, decompose into voxels (regardless of envelope)
+            let fallback_dist_sq = self.fallback_detail_distance * self.fallback_detail_distance;
+            if v.is_leaf_chunk && !has_mesh && dist_sq < fallback_dist_sq {
+                // Counting attempts is no longer used, keep metric in case we want to log it
+                if let Some(chunk) = self
+                    .world
+                    .get_leaf_chunk_at_origin(WorldPos::new(key.0, key.1, key.2))
+                {
+                    let mut voxels_written = 0usize;
+                    for ((x, y, z), voxel) in chunk.iter() {
+                        if let Voxel::Solid(vtype) = voxel {
+                            let (emissive_rgb, emissive_intensity) =
+                                self.palette.emissive(*vtype as u32);
+                            cpu_prepopulated_instances.push(VoxelInstanceRaw {
+                                position: [
+                                    (key.0 + x as i64) as f32,
+                                    (key.1 + y as i64) as f32,
+                                    (key.2 + z as i64) as f32,
+                                ],
+                                voxel_type: *vtype as u32,
+                                scale: 1.0,
+                                ao_factor: 1.0,
+                                _padding: [0, 0],
+                                custom_color: [0.0, 0.0, 0.0, 0.0],
+                                emissive: [
+                                    emissive_rgb[0],
+                                    emissive_rgb[1],
+                                    emissive_rgb[2],
+                                    emissive_intensity,
+                                ],
+                            });
+                            voxels_written += 1;
                         }
-                        if voxels_written > 0 {
-                            voxel_expansion_count += 1;
-                            // Mark the chunk candidate as CPU prepopulated so shader won't append fallback instances
-                            let mut flags = 0u32;
-                            if has_mesh { flags |= 1; }
-                            if has_envelope { flags |= 2; }
-                            flags |= 4; // CPU prepopulated
-                            let custom_color_f32 = if let Some(rgba) = v.custom_color {
+                    }
+                    if voxels_written > 0 {
+                        voxel_expansion_count += 1;
+                        // Mark the chunk candidate as CPU prepopulated so shader won't append fallback instances
+                        let mut flags = 0u32;
+                        if has_mesh {
+                            flags |= 1;
+                        }
+                        if has_envelope {
+                            flags |= 2;
+                        }
+                        flags |= 4; // CPU prepopulated
+                        let custom_color_f32 = if let Some(rgba) = v.custom_color {
+                            [
+                                rgba[0] as f32 / 255.0,
+                                rgba[1] as f32 / 255.0,
+                                rgba[2] as f32 / 255.0,
+                                rgba[3] as f32 / 255.0,
+                            ]
+                        } else if v.is_leaf_chunk {
+                            [0.4, 0.4, 0.45, 0.6]
+                        } else {
+                            [0.0, 0.0, 0.0, 0.0]
+                        };
+                        let (emissive_rgb, emissive_intensity) = if v.custom_color.is_some() {
+                            ([0.0, 0.0, 0.0], 0.0)
+                        } else {
+                            self.palette.emissive(v.voxel_type as u32)
+                        };
+                        gpu_inputs.push(GpuInstanceInput {
+                            position: [
+                                v.position[0] as f32,
+                                v.position[1] as f32,
+                                v.position[2] as f32,
+                            ],
+                            scale: v.scale as f32,
+                            custom_color: if v.custom_color.is_some() {
+                                let rgba = v.custom_color.unwrap();
                                 [
                                     rgba[0] as f32 / 255.0,
                                     rgba[1] as f32 / 255.0,
@@ -4498,95 +4527,70 @@ impl App {
                                 [0.4, 0.4, 0.45, 0.6]
                             } else {
                                 [0.0, 0.0, 0.0, 0.0]
-                            };
-                            let (emissive_rgb, emissive_intensity) = if v.custom_color.is_some() {
-                                ([0.0, 0.0, 0.0], 0.0)
-                            } else {
-                                self.palette.emissive(v.voxel_type as u32)
-                            };
-                            gpu_inputs.push(GpuInstanceInput {
-                                position: [
-                                    v.position[0] as f32,
-                                    v.position[1] as f32,
-                                    v.position[2] as f32,
-                                ],
-                                scale: v.scale as f32,
-                                custom_color: if v.custom_color.is_some() {
-                                    let rgba = v.custom_color.unwrap();
-                                    [
-                                        rgba[0] as f32 / 255.0,
-                                        rgba[1] as f32 / 255.0,
-                                        rgba[2] as f32 / 255.0,
-                                        rgba[3] as f32 / 255.0,
-                                    ]
-                                } else if v.is_leaf_chunk {
-                                    [0.4, 0.4, 0.45, 0.6]
-                                } else {
-                                    [0.0, 0.0, 0.0, 0.0]
-                                },
-                                emissive: [
-                                    emissive_rgb[0],
-                                    emissive_rgb[1],
-                                    emissive_rgb[2],
-                                    emissive_intensity,
-                                ],
-                                voxel_type: v.voxel_type as u32,
-                                flags,
-                                mesh_index: i as u32,
-                                envelope_index: i as u32,
-                            });
-                            continue;
-                        }
+                            },
+                            emissive: [
+                                emissive_rgb[0],
+                                emissive_rgb[1],
+                                emissive_rgb[2],
+                                emissive_intensity,
+                            ],
+                            voxel_type: v.voxel_type as u32,
+                            flags,
+                            mesh_index: i as u32,
+                            envelope_index: i as u32,
+                        });
+                        continue;
                     }
                 }
-
-                let custom_color_f32 = if let Some(rgba) = v.custom_color {
-                    [
-                        rgba[0] as f32 / 255.0,
-                        rgba[1] as f32 / 255.0,
-                        rgba[2] as f32 / 255.0,
-                        rgba[3] as f32 / 255.0,
-                    ]
-                } else if v.is_leaf_chunk {
-                    [0.4, 0.4, 0.45, 0.6]
-                } else {
-                    [0.0, 0.0, 0.0, 0.0]
-                };
-
-                let (emissive_rgb, emissive_intensity) = if v.custom_color.is_some() {
-                    ([0.0, 0.0, 0.0], 0.0)
-                } else {
-                    self.palette.emissive(v.voxel_type as u32)
-                };
-
-                let mut flags = 0u32;
-                if has_mesh {
-                    flags |= 1;
-                }
-                if has_envelope {
-                    flags |= 2;
-                }
-
-                gpu_inputs.push(GpuInstanceInput {
-                    position: [
-                        v.position[0] as f32,
-                        v.position[1] as f32,
-                        v.position[2] as f32,
-                    ],
-                    scale: v.scale as f32,
-                    custom_color: custom_color_f32,
-                    emissive: [
-                        emissive_rgb[0],
-                        emissive_rgb[1],
-                        emissive_rgb[2],
-                        emissive_intensity,
-                    ],
-                    voxel_type: v.voxel_type as u32,
-                    flags,
-                    mesh_index: i as u32,
-                    envelope_index: i as u32,
-                });
             }
+
+            let custom_color_f32 = if let Some(rgba) = v.custom_color {
+                [
+                    rgba[0] as f32 / 255.0,
+                    rgba[1] as f32 / 255.0,
+                    rgba[2] as f32 / 255.0,
+                    rgba[3] as f32 / 255.0,
+                ]
+            } else if v.is_leaf_chunk {
+                [0.4, 0.4, 0.45, 0.6]
+            } else {
+                [0.0, 0.0, 0.0, 0.0]
+            };
+
+            let (emissive_rgb, emissive_intensity) = if v.custom_color.is_some() {
+                ([0.0, 0.0, 0.0], 0.0)
+            } else {
+                self.palette.emissive(v.voxel_type as u32)
+            };
+
+            let mut flags = 0u32;
+            if has_mesh {
+                flags |= 1;
+            }
+            if has_envelope {
+                flags |= 2;
+            }
+
+            gpu_inputs.push(GpuInstanceInput {
+                position: [
+                    v.position[0] as f32,
+                    v.position[1] as f32,
+                    v.position[2] as f32,
+                ],
+                scale: v.scale as f32,
+                custom_color: custom_color_f32,
+                emissive: [
+                    emissive_rgb[0],
+                    emissive_rgb[1],
+                    emissive_rgb[2],
+                    emissive_intensity,
+                ],
+                voxel_type: v.voxel_type as u32,
+                flags,
+                mesh_index: i as u32,
+                envelope_index: i as u32,
+            });
+        }
         // Flatten any outputs (we pushed directly to gpu_inputs where needed)
 
         let gpu_candidate_count = gpu_inputs.len();
@@ -4681,7 +4685,11 @@ impl App {
                 // Ensure fallback instance buffer has room for prepopulated + new appended instances
                 self.ensure_gpu_input_buffer(&device, gpu_candidate_count + cpu_prepopulated_count);
                 if let Some(buffer) = self.fallback_instance_buffer.as_ref() {
-                    queue.write_buffer(buffer, 0, bytemuck::cast_slice(&cpu_prepopulated_instances));
+                    queue.write_buffer(
+                        buffer,
+                        0,
+                        bytemuck::cast_slice(&cpu_prepopulated_instances),
+                    );
                 }
             }
 
@@ -4917,7 +4925,7 @@ impl App {
                 Some(chunk) => {
                     // Snapshot neighbor chunks so AO can be computed across chunk bounds.
                     let neighbor_start = std::time::Instant::now();
-                        let mut neighbors: FxHashMap<(i8, i8, i8), Arc<Chunk>> = FxHashMap::default();
+                    let mut neighbors: FxHashMap<(i8, i8, i8), Arc<Chunk>> = FxHashMap::default();
                     for dx in -1i64..=1 {
                         for dy in -1i64..=1 {
                             for dz in -1i64..=1 {
