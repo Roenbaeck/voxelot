@@ -55,9 +55,9 @@ struct VoxelInstanceRaw {
     voxel_type: u32,
     scale: f32,     // Scale factor (1.0 = 1x1x1, 16.0 = 16x16x16 chunk)
     ao_factor: f32, // Ambient occlusion / occupancy factor (0.0..=1.0)
-    _padding: [u32; 2],
     custom_color: [f32; 4], // RGBA custom color (if custom_color.a > 0, use this instead of voxel_type)
     emissive: [f32; 4],
+    _padding: [u32; 2],
 }
 
 /// Input layout for GPU culling compute pass (std430-friendly)
@@ -4431,7 +4431,6 @@ impl App {
         let cull_time = cull_start.elapsed();
 
         let mut voxel_expansion_count = 0;
-        let mut voxel_expansion_attempts = 0;
         let mut cpu_prepopulated_instances: Vec<VoxelInstanceRaw> = Vec::new();
         let mut gpu_inputs: Vec<GpuInstanceInput> = Vec::new();
         for (i, v) in visible.iter().enumerate() {
@@ -4450,7 +4449,7 @@ impl App {
                 // If very near and un-meshed, decompose into voxels (regardless of envelope)
                 let fallback_dist_sq = self.fallback_detail_distance * self.fallback_detail_distance;
                 if v.is_leaf_chunk && !has_mesh && dist_sq < fallback_dist_sq {
-                    voxel_expansion_attempts += 1;
+                    // Counting attempts is no longer used, keep metric in case we want to log it
                     if let Some(chunk) = self
                         .world
                         .get_leaf_chunk_at_origin(WorldPos::new(key.0, key.1, key.2))

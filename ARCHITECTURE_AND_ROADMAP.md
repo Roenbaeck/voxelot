@@ -18,6 +18,8 @@ Can we implement a GPU occlusion culling shader that only works up until `envelo
 
 Emissive color is wrong when we see an all voxel chunk.
 
+Add a per-chunk offset approach so the compute shader can skip prepopulated buffers deterministically (a bit larger refactor).
+
 ---
 
 # Grok on our architecture
