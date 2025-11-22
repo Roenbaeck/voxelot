@@ -1,5 +1,6 @@
 //! Voxel Engine Library
 
+pub mod buffer_allocator;
 pub mod config;
 pub mod culling;
 pub mod lib_hierarchical;
@@ -8,6 +9,7 @@ pub mod octree_format;
 pub mod palette;
 
 // Re-export main types
+pub use buffer_allocator::{AllocationError, SlabAllocator};
 pub use config::Config;
 pub use culling::{
     cull_visible_voxels, cull_visible_voxels_parallel, cull_visible_voxels_with_occlusion,

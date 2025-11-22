@@ -26,8 +26,9 @@ use std::collections::VecDeque;
 use sysinfo::{Pid, ProcessExt, System, SystemExt};
 use voxelot::{
     cull_visible_voxels_parallel, Camera, Chunk, ChunkMesh, Palette, RenderConfig, Voxel, World,
-    WorldPos,
+    WorldPos, VoxelInstance,
 };
+use voxelot::SlabAllocator;
 
 macro_rules! viewer_debug {
     ($($arg:tt)*) => {
@@ -109,9 +110,11 @@ struct CubeVertex {
 }
 
 /// GPU buffers and bookkeeping for a meshed chunk
+#[allow(dead_code)]
 struct MeshCacheEntry {
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
+    vertex_offset: u64, // Byte offset in mega vertex buffer
+    vertex_count: u32,  // Number of vertices
+    index_offset: u64,  // Byte offset in mega index buffer
     index_count: u32,
     vertex_bytes: u64,
     index_bytes: u64,
@@ -712,9 +715,18 @@ struct App {
     mesh_chunk_arc_cache: FxHashMap<(i64, i64, i64), Arc<Chunk>>,
     /// Count of mesh jobs executed per second by worker threads (reset on FPS print)
     mesh_jobs_executed: Arc<AtomicUsize>,
-    /// Empty placeholder buffers for chunks that have no geometry; reused by many entries
-    empty_mesh_vertex_buffer: Option<wgpu::Buffer>,
-    empty_mesh_index_buffer: Option<wgpu::Buffer>,
+
+    // Mega-buffer infrastructure
+    mega_vertex_buffer: Option<wgpu::Buffer>,
+    mega_index_buffer: Option<wgpu::Buffer>,
+    vertex_allocator: voxelot::SlabAllocator,
+    index_allocator: voxelot::SlabAllocator,
+
+    // Multi-draw indirect buffers
+    multi_draw_indirect_buffer: Option<wgpu::Buffer>,
+    multi_draw_count_buffer: Option<wgpu::Buffer>,
+    max_draw_capacity: usize,
+
     /// Stat: number of empty meshes processed (non-geometric chunks)
     stat_empty_meshes: u64,
     stat_vertex_buffers_reused: u64,
@@ -852,10 +864,8 @@ struct App {
     shadow_backface_scale: f32,
     pcf_radius: f32,
     pcf_poisson_samples: u32,
-    // Mesh GPU buffer pooling to reduce create/destroy churn
-    vertex_buffer_pool: VecDeque<(u64, wgpu::Buffer)>,
-    index_buffer_pool: VecDeque<(u64, wgpu::Buffer)>,
-    mesh_buffer_pool_max_entries: usize,
+    // Mesh statistics
+    _mesh_buffer_pool_max_entries: usize,
 
     // egui UI state
     egui_ctx: Option<egui::Context>,
@@ -1096,20 +1106,24 @@ impl App {
                 * 1024,
             envelope_distance: cfg.performance.envelope_distance,
             envelope_fade_range: cfg.performance.envelope_fade_range,
-            vertex_buffer_pool: VecDeque::new(),
-            index_buffer_pool: VecDeque::new(),
-            mesh_buffer_pool_max_entries: 256, // Start with reasonable pool size
+            mega_vertex_buffer: None,
+            mega_index_buffer: None,
+            vertex_allocator: SlabAllocator::new(cfg.performance.mega_vertex_buffer_mb * 1024 * 1024),
+            index_allocator: SlabAllocator::new(cfg.performance.mega_index_buffer_mb * 1024 * 1024),
+            multi_draw_indirect_buffer: None,
+            multi_draw_count_buffer: None,
+            max_draw_capacity: cfg.performance.max_draw_capacity,
 
             egui_ctx: None,
             egui_winit: None,
             egui_renderer: None,
             last_fps: 0,
             mesh_chunk_arc_cache: FxHashMap::default(),
-            empty_mesh_vertex_buffer: None,
-            empty_mesh_index_buffer: None,
+            // empty_mesh buffers removed; placeholders use offsets into mega buffers
             stat_empty_meshes: 0,
             stat_vertex_buffers_reused: 0,
             stat_index_buffers_reused: 0,
+            _mesh_buffer_pool_max_entries: cfg.performance.mesh_buffer_pool_entries,
 
             chunk_emitters: FxHashMap::default(),
             active_emitters: Vec::new(),
@@ -1367,10 +1381,7 @@ impl App {
             knee: self.bloom_settings.knee,
             intensity: self.bloom_settings.intensity,
             _padding0: 0.0,
-            source_texel_size: [
-                1.0 / src_width.max(1) as f32,
-                1.0 / src_height.max(1) as f32,
-            ],
+            source_texel_size: [1.0 / src_width.max(1) as f32, 1.0 / src_height.max(1) as f32],
             _padding1: [0.0; 2],
         }
     }
@@ -2601,18 +2612,10 @@ impl App {
                 let entry_bytes = entry.total_bytes();
                 // If this was a placeholder (shared empty buffers), do not destroy the buffer
                 // as it is owned globally. Only destroy buffers for normal entries.
-                if !entry.is_placeholder {
-                    // push back to pool instead of destroying to reduce GPU allocation churn
-                    let vb_bytes = entry.vertex_bytes;
-                    let ib_bytes = entry.index_bytes;
-                    if self.vertex_buffer_pool.len() < self.mesh_buffer_pool_max_entries {
-                        self.vertex_buffer_pool
-                            .push_back((vb_bytes, entry.vertex_buffer));
-                    }
-                    if self.index_buffer_pool.len() < self.mesh_buffer_pool_max_entries {
-                        self.index_buffer_pool
-                            .push_back((ib_bytes, entry.index_buffer));
-                    }
+                    if !entry.is_placeholder {
+                    // Free regions in allocators
+                    self.vertex_allocator.free(entry.vertex_offset, entry.vertex_bytes);
+                    self.index_allocator.free(entry.index_offset, entry.index_bytes);
                 }
                 self.envelope_mesh_cache_bytes =
                     self.envelope_mesh_cache_bytes.saturating_sub(entry_bytes);
@@ -2700,22 +2703,10 @@ impl App {
                 let entry_bytes = entry.total_bytes();
                 // If this was a placeholder (shared empty buffers), do not destroy the buffer
                 // as it is owned globally. Only destroy buffers for normal entries.
-                if !entry.is_placeholder {
-                    // push back to pool instead of destroying to reduce GPU allocation churn
-                    let vb_bytes = entry.vertex_bytes;
-                    let ib_bytes = entry.index_bytes;
-                    if self.vertex_buffer_pool.len() < self.mesh_buffer_pool_max_entries {
-                        self.vertex_buffer_pool
-                            .push_back((vb_bytes, entry.vertex_buffer));
-                    } else {
-                        entry.vertex_buffer.destroy();
-                    }
-                    if self.index_buffer_pool.len() < self.mesh_buffer_pool_max_entries {
-                        self.index_buffer_pool
-                            .push_back((ib_bytes, entry.index_buffer));
-                    } else {
-                        entry.index_buffer.destroy();
-                    }
+                    if !entry.is_placeholder {
+                    // Free regions in allocators
+                    self.vertex_allocator.free(entry.vertex_offset, entry.vertex_bytes);
+                    self.index_allocator.free(entry.index_offset, entry.index_bytes);
                     self.mesh_cache_bytes = self.mesh_cache_bytes.saturating_sub(entry_bytes);
                 }
                 self.chunk_emitters.remove(&key);
@@ -2911,30 +2902,18 @@ impl App {
     }
 
     // Allocate or reuse a vertex buffer from the pool; returns (buffer, capacity_bytes)
+    #[allow(dead_code)]
     fn allocate_vertex_buffer_from_pool(
         &mut self,
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        _queue: &wgpu::Queue,
         vb_data: &[MeshVertexRaw],
     ) -> (wgpu::Buffer, u64) {
         let required_bytes = (vb_data.len() * std::mem::size_of::<MeshVertexRaw>()) as u64;
-        // Find a pool buffer with at least required capacity
-        if let Some(pos) = self
-            .vertex_buffer_pool
-            .iter()
-            .position(|(cap, _)| *cap >= required_bytes)
-        {
-            let (cap, buf) = self.vertex_buffer_pool.remove(pos).unwrap();
-            // Overwrite contents into the reused buffer
-            queue.write_buffer(&buf, 0, bytemuck::cast_slice(vb_data));
-            self.stat_vertex_buffers_reused += 1;
-            return (buf, cap);
-        }
-
-        // No suitable buffer - create a new one sized exactly to required bytes.
+        // Create a new buffer sized exactly to required bytes.
         let capacity = required_bytes;
         let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Chunk Mesh Vertex Buffer"),
+            label: Some("Chunk Mesh Vertex Buffer (temp)"),
             contents: bytemuck::cast_slice(vb_data),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
@@ -2942,23 +2921,15 @@ impl App {
     }
 
     // Allocate or reuse an index buffer from the pool; returns (buffer, capacity_bytes)
+    #[allow(dead_code)]
     fn allocate_index_buffer_from_pool(
         &mut self,
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        _queue: &wgpu::Queue,
         idx_data: &[u32],
     ) -> (wgpu::Buffer, u64) {
         let required_bytes = (idx_data.len() * std::mem::size_of::<u32>()) as u64;
-        if let Some(pos) = self
-            .index_buffer_pool
-            .iter()
-            .position(|(cap, _)| *cap >= required_bytes)
-        {
-            let (cap, buf) = self.index_buffer_pool.remove(pos).unwrap();
-            queue.write_buffer(&buf, 0, bytemuck::cast_slice(idx_data));
-            self.stat_index_buffers_reused += 1;
-            return (buf, cap);
-        }
+        // For now, always allocate a new index buffer
         let capacity = required_bytes;
         let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Chunk Mesh Index Buffer"),
@@ -2966,6 +2937,40 @@ impl App {
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
         });
         (ibuf, capacity)
+    }
+
+    fn allocate_mesh_in_megabuffer(
+        &mut self,
+        _device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        vb_data: &[MeshVertexRaw],
+        idx_data: &[u32],
+    ) -> Result<(u64, u64), voxelot::AllocationError> {
+        let vb_bytes = (vb_data.len() * std::mem::size_of::<MeshVertexRaw>()) as u64;
+        let ib_bytes = (idx_data.len() * std::mem::size_of::<u32>()) as u64;
+
+        if self.mega_vertex_buffer.is_none() || self.mega_index_buffer.is_none() {
+            return Err(voxelot::AllocationError::OutOfMemory);
+        }
+
+        let vertex_stride_bytes = std::mem::size_of::<MeshVertexRaw>() as u64;
+        let vertex_offset = self
+            .vertex_allocator
+            .allocate_aligned(vb_bytes, vertex_stride_bytes)?;
+        let index_offset = self.index_allocator.allocate_aligned(ib_bytes, 4)?; // u32 indices
+
+        queue.write_buffer(
+            self.mega_vertex_buffer.as_ref().unwrap(),
+            vertex_offset,
+            bytemuck::cast_slice(vb_data),
+        );
+        queue.write_buffer(
+            self.mega_index_buffer.as_ref().unwrap(),
+            index_offset,
+            bytemuck::cast_slice(idx_data),
+        );
+
+        Ok((vertex_offset, index_offset))
     }
 
     fn run_gpu_culling(
@@ -3007,6 +3012,131 @@ impl App {
         drop(compute_pass);
 
         queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    fn populate_multi_draw_indirects(&mut self, queue: &wgpu::Queue, visible: &Vec<VoxelInstance>) {
+        // Fill mesh and envelope indirect buffers from CPU-visible list
+        let mut mesh_args: Vec<wgpu::util::DrawIndexedIndirectArgs> = Vec::new();
+        let mut env_args: Vec<wgpu::util::DrawIndexedIndirectArgs> = Vec::new();
+
+        if self.mega_index_buffer.is_none() || self.mega_vertex_buffer.is_none() {
+            return;
+        }
+
+        let vertex_stride = std::mem::size_of::<MeshVertexRaw>();
+        let vertex_buf_size = self.vertex_allocator.total_size();
+        let index_buf_size = self.index_allocator.total_size();
+        let mut warned = false;
+        for v in visible.iter() {
+                    if !v.is_leaf_chunk {
+                continue;
+            }
+            let key = (v.position[0], v.position[1], v.position[2]);
+                    // If we don't have mesh/envelope and not in fallback range, log an info
+                    if cfg!(feature = "viewer-debug") {
+                        let has_mesh = self.mesh_cache.contains_key(&key);
+                        let has_envelope = self.envelope_mesh_cache.contains_key(&key);
+                        if !has_mesh && !has_envelope {
+                            // Compute distance squared for fallback decision
+                            let cam_pos = self.camera_controller.camera.position;
+                            let chunk_center = [key.0 as f32 + 8.0, key.1 as f32 + 8.0, key.2 as f32 + 8.0];
+                            let dx = chunk_center[0] - cam_pos[0];
+                            let dy = chunk_center[1] - cam_pos[1];
+                            let dz = chunk_center[2] - cam_pos[2];
+                            let dist_sq = dx*dx + dy*dy + dz*dz;
+                            let fallback_dist_sq = self.fallback_detail_distance * self.fallback_detail_distance;
+                            if dist_sq > fallback_dist_sq {
+                                viewer_debug!("MISSING DRAW (no mesh/envelope/fallback): key=({},{},{}) dist={} (> fallback {})", key.0, key.1, key.2, dist_sq, fallback_dist_sq);
+                            }
+                        }
+                    }
+            if let Some(entry) = self.mesh_cache.get_mut(&key) {
+                if entry.is_placeholder {
+                    // Skip placeholder entries (no geometry) silently
+                } else {
+                let idx_end = entry.index_offset + entry.index_bytes;
+                let vb_end = entry.vertex_offset + entry.vertex_bytes;
+                if entry.index_bytes == 0 || entry.vertex_bytes == 0 || idx_end > index_buf_size || vb_end > vertex_buf_size {
+                    if !warned {
+                        viewer_debug!("Validation warning on mesh cache entry: index_buf_size={}, vertex_buf_size={} entry: index_offset={}, index_bytes={}, vertex_offset={}, vertex_bytes={}", index_buf_size, vertex_buf_size, entry.index_offset, entry.index_bytes, entry.vertex_offset, entry.vertex_bytes);
+                        warned = true;
+                    }
+                } else {
+                    let first_index = (entry.index_offset / 4) as u32; // u32 indices
+                    let base_vertex = (entry.vertex_offset / vertex_stride as u64) as i32;
+                    mesh_args.push(wgpu::util::DrawIndexedIndirectArgs {
+                        index_count: entry.index_count as u32,
+                        instance_count: 1,
+                        first_index,
+                        base_vertex,
+                        first_instance: 0,
+                    });
+                        // Mark used so eviction won't yoink buffers used this frame
+                        entry.last_used_frame = self.frame_index;
+                    }
+                }
+            }
+            if let Some(entry) = self.envelope_mesh_cache.get_mut(&key) {
+                if entry.is_placeholder {
+                    // Skip placeholder entries silently
+                } else {
+                let idx_end = entry.index_offset + entry.index_bytes;
+                let vb_end = entry.vertex_offset + entry.vertex_bytes;
+                if entry.index_bytes == 0 || entry.vertex_bytes == 0 || idx_end > index_buf_size || vb_end > vertex_buf_size {
+                    if !warned {
+                        viewer_debug!("Validation warning on envelope cache entry: index_buf_size={}, vertex_buf_size={} entry: index_offset={}, index_bytes={}, vertex_offset={}, vertex_bytes={}", index_buf_size, vertex_buf_size, entry.index_offset, entry.index_bytes, entry.vertex_offset, entry.vertex_bytes);
+                        warned = true;
+                    }
+                } else {
+                    let first_index = (entry.index_offset / 4) as u32;
+                    let base_vertex = (entry.vertex_offset / vertex_stride as u64) as i32;
+                    env_args.push(wgpu::util::DrawIndexedIndirectArgs {
+                        index_count: entry.index_count as u32,
+                        instance_count: 1,
+                        first_index,
+                        base_vertex,
+                        first_instance: 0,
+                    });
+                        // Mark used so eviction won't yoink buffers used this frame
+                        entry.last_used_frame = self.frame_index;
+                    }
+                }
+            }
+        }
+
+        if let Some(buffer) = &self.mesh_indirect_buffer {
+            if mesh_args.len() as usize > self.max_draw_capacity {
+                viewer_debug!("Warning: mesh indirect args {} exceed max_draw_capacity {} => truncating", mesh_args.len(), self.max_draw_capacity);
+                mesh_args.truncate(self.max_draw_capacity);
+            }
+            if !mesh_args.is_empty() {
+                queue.write_buffer(buffer, 0, bytemuck::cast_slice(&mesh_args));
+            } else {
+                // zero-length doesn't matter, but clear first 4 bytes
+                let zero: [u8; 4] = [0; 4];
+                queue.write_buffer(buffer, 0, &zero);
+            }
+            viewer_debug!("Populated mesh indirects: {} entries", mesh_args.len());
+        }
+        if let Some(buffer) = &self.envelope_indirect_buffer {
+            if env_args.len() as usize > self.max_draw_capacity {
+                viewer_debug!("Warning: envelope indirect args {} exceed max_draw_capacity {} => truncating", env_args.len(), self.max_draw_capacity);
+                env_args.truncate(self.max_draw_capacity);
+            }
+            if !env_args.is_empty() {
+                queue.write_buffer(buffer, 0, bytemuck::cast_slice(&env_args));
+            } else {
+                let zero: [u8; 4] = [0; 4];
+                queue.write_buffer(buffer, 0, &zero);
+            }
+            viewer_debug!("Populated envelope indirects: {} entries", env_args.len());
+        }
+
+        // Write counts into multi_draw_count_buffer; offsets: 0=mesh_count, 4=envelope_count
+        if let Some(count_buf) = &self.multi_draw_count_buffer {
+            let counts = [mesh_args.len() as u32, env_args.len() as u32];
+            queue.write_buffer(count_buf, 0, bytemuck::cast_slice(&counts));
+        }
     }
 
     async fn init_wgpu(&mut self, window: Arc<Window>) {
@@ -4224,10 +4354,46 @@ impl App {
             usage: wgpu::BufferUsages::VERTEX,
         });
 
+        // Create Mega Buffers and multi-draw buffers
+        let mega_vertex_size = self.vertex_allocator.total_size();
+        let mega_index_size = self.index_allocator.total_size();
+        let mega_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Mega Vertex Buffer"),
+            size: mega_vertex_size,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mega_index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Mega Index Buffer"),
+            size: mega_index_size,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Multi-draw indirect buffers
+        let indirect_entry_size = std::mem::size_of::<wgpu::util::DrawIndexedIndirectArgs>() as u64;
+        let multi_draw_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Multi Draw Indirect Buffer"),
+            size: (self.max_draw_capacity as u64) * indirect_entry_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let multi_draw_count_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Multi Draw Count Buffer"),
+            // store two u32 counts (mesh count @ offset 0, envelope count @ offset 4)
+            size: (std::mem::size_of::<u32>() * 2) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
         self.cull_pipeline = Some(cull_pipeline);
         self.cull_bind_group_layout = Some(cull_bind_group_layout);
         self.cull_params_buffer = Some(cull_params_buffer);
         self.cull_bind_group = None;
+        self.mega_vertex_buffer = Some(mega_vertex_buffer);
+        self.mega_index_buffer = Some(mega_index_buffer);
+        self.multi_draw_indirect_buffer = Some(multi_draw_buf);
+        self.multi_draw_count_buffer = Some(multi_draw_count_buf);
 
         // fused DoF pipeline removed; use CoC copy + Kawase instead
         // DoF CoC copy pipeline (if Kawase is enabled, we use this cheap pass to produce CoC alpha + base color as input)
@@ -4430,13 +4596,14 @@ impl App {
         let visible = cull_visible_voxels_parallel(&self.world, &self.camera_controller.camera);
         let cull_time = cull_start.elapsed();
 
-        let mut voxel_expansion_count = 0;
+        let mut _voxel_expansion_count = 0;
         let mut cpu_prepopulated_instances: Vec<VoxelInstanceRaw> = Vec::new();
         let mut gpu_inputs: Vec<GpuInstanceInput> = Vec::new();
-        for (i, v) in visible.iter().enumerate() {
+                for (i, v) in visible.iter().enumerate() {
             let key = (v.position[0], v.position[1], v.position[2]);
             let has_mesh = v.is_leaf_chunk && self.mesh_cache.contains_key(&key);
             let has_envelope = v.is_leaf_chunk && self.envelope_mesh_cache.contains_key(&key);
+                    let mut cpu_prepop = false;
 
             let cam_pos = self.camera_controller.camera.position;
             let chunk_center = [key.0 as f32 + 8.0, key.1 as f32 + 8.0, key.2 as f32 + 8.0];
@@ -4444,7 +4611,7 @@ impl App {
             let dy = chunk_center[1] - cam_pos[1];
             let dz = chunk_center[2] - cam_pos[2];
             let dist_sq = dx * dx + dy * dy + dz * dz;
-            let envelope_dist_sq = self.envelope_distance * self.envelope_distance;
+            let _envelope_dist_sq = self.envelope_distance * self.envelope_distance;
 
             // If very near and un-meshed, decompose into voxels (regardless of envelope)
             let fallback_dist_sq = self.fallback_detail_distance * self.fallback_detail_distance;
@@ -4481,7 +4648,7 @@ impl App {
                         }
                     }
                     if voxels_written > 0 {
-                        voxel_expansion_count += 1;
+                        _voxel_expansion_count += 1;
                         // Mark the chunk candidate as CPU prepopulated so shader won't append fallback instances
                         let mut flags = 0u32;
                         if has_mesh {
@@ -4491,7 +4658,7 @@ impl App {
                             flags |= 2;
                         }
                         flags |= 4; // CPU prepopulated
-                        let custom_color_f32 = if let Some(rgba) = v.custom_color {
+                        let _custom_color_f32 = if let Some(rgba) = v.custom_color {
                             [
                                 rgba[0] as f32 / 255.0,
                                 rgba[1] as f32 / 255.0,
@@ -4542,6 +4709,35 @@ impl App {
                         continue;
                     }
                 }
+            } else if v.is_leaf_chunk && !has_mesh && !has_envelope {
+                // Distant leaf chunk without a mesh or envelope: draw a bounding-box cube to avoid holes
+                // Use CPU prepopulation buffer for a cube instance centered at chunk, with scale 16
+                let bb_scale = 16.0f32;
+                let (emissive_rgb, emissive_intensity) = if v.custom_color.is_some() {
+                    ([0.0, 0.0, 0.0], 0.0)
+                } else {
+                    self.palette.emissive(v.voxel_type as u32)
+                };
+                let custom_color_f32 = if let Some(rgba) = v.custom_color {
+                    [rgba[0] as f32 / 255.0, rgba[1] as f32 / 255.0, rgba[2] as f32 / 255.0, rgba[3] as f32 / 255.0]
+                } else if v.is_leaf_chunk {
+                    [0.4, 0.4, 0.45, 0.6]
+                } else {
+                    [0.0, 0.0, 0.0, 0.0]
+                };
+                cpu_prepopulated_instances.push(VoxelInstanceRaw {
+                    position: [chunk_center[0], chunk_center[1], chunk_center[2]],
+                    voxel_type: v.voxel_type as u32,
+                    scale: bb_scale,
+                    ao_factor: 1.0,
+                    custom_color: custom_color_f32,
+                    emissive: [emissive_rgb[0], emissive_rgb[1], emissive_rgb[2], emissive_intensity],
+                    _padding: [0, 0],
+                });
+                // mark as prepopulated
+                // We don't set the CPU prepop flag on GPU input here; the CPU prepop seed is read separately
+                _voxel_expansion_count += 1;
+                cpu_prepop = true;
             }
 
             let custom_color_f32 = if let Some(rgba) = v.custom_color {
@@ -4569,6 +4765,9 @@ impl App {
             }
             if has_envelope {
                 flags |= 2;
+            }
+            if cpu_prepop {
+                flags |= 4;
             }
 
             gpu_inputs.push(GpuInstanceInput {
@@ -4602,81 +4801,139 @@ impl App {
             }
 
             // Upload Mesh Indirect Args
-            let mesh_indirect_args: Vec<wgpu::util::DrawIndexedIndirectArgs> = visible
-                .iter()
-                .map(|v| {
-                    let key = (v.position[0], v.position[1], v.position[2]);
-                    if v.is_leaf_chunk {
-                        if let Some(mesh_entry) = self.mesh_cache.get(&key) {
-                            wgpu::util::DrawIndexedIndirectArgs {
-                                index_count: mesh_entry.index_count,
-                                instance_count: 0, // Shader will set to 1
-                                first_index: 0,
-                                base_vertex: 0,
-                                first_instance: 0,
+            let mut mesh_indirect_args: Vec<wgpu::util::DrawIndexedIndirectArgs> = Vec::with_capacity(visible.len());
+            for v in visible.iter() {
+                let key = (v.position[0], v.position[1], v.position[2]);
+                if cfg!(feature = "viewer-debug") {
+                    let has_mesh = self.mesh_cache.contains_key(&key);
+                    let has_envelope = self.envelope_mesh_cache.contains_key(&key);
+                    viewer_debug!("SCENE DRAW: key=({},{},{}) leaf={} has_mesh={} has_envelope={}", key.0, key.1, key.2, v.is_leaf_chunk, has_mesh, has_envelope);
+                    viewer_debug!("SHADOW DRAW: key=({},{},{}) leaf={} has_mesh={} has_envelope={}", key.0, key.1, key.2, v.is_leaf_chunk, has_mesh, has_envelope);
+                }
+                if v.is_leaf_chunk {
+                    if let Some(mesh_entry) = self.mesh_cache.get(&key) {
+                        let vertex_buf_size = self.vertex_allocator.total_size();
+                        let index_buf_size = self.index_allocator.total_size();
+                        let idx_end = mesh_entry.index_offset + mesh_entry.index_bytes;
+                        let vb_end = mesh_entry.vertex_offset + mesh_entry.vertex_bytes;
+                        if mesh_entry.index_bytes == 0 || mesh_entry.vertex_bytes == 0 || idx_end > index_buf_size || vb_end > vertex_buf_size {
+                            if cfg!(feature = "viewer-debug") {
+                                viewer_debug!("Validation warning on mesh cache entry (gpu prefill): index_buf_size={}, vertex_buf_size={} entry: index_offset={}, index_bytes={}, vertex_offset={}, vertex_bytes={}", index_buf_size, vertex_buf_size, mesh_entry.index_offset, mesh_entry.index_bytes, mesh_entry.vertex_offset, mesh_entry.vertex_bytes);
                             }
-                        } else {
-                            wgpu::util::DrawIndexedIndirectArgs {
+                            mesh_indirect_args.push(wgpu::util::DrawIndexedIndirectArgs {
                                 index_count: 0,
                                 instance_count: 0,
                                 first_index: 0,
                                 base_vertex: 0,
                                 first_instance: 0,
-                            }
+                            });
+                        } else {
+                            let vertex_stride = std::mem::size_of::<MeshVertexRaw>() as u64;
+                            let first_index = (mesh_entry.index_offset / 4) as u32;
+                            let base_vertex = (mesh_entry.vertex_offset / vertex_stride) as i32;
+                            mesh_indirect_args.push(wgpu::util::DrawIndexedIndirectArgs {
+                                index_count: mesh_entry.index_count,
+                                instance_count: 0, // Shader will set to 1
+                                first_index: first_index,
+                                base_vertex: base_vertex,
+                                first_instance: 0,
+                            });
                         }
                     } else {
-                        wgpu::util::DrawIndexedIndirectArgs {
+                        mesh_indirect_args.push(wgpu::util::DrawIndexedIndirectArgs {
                             index_count: 0,
                             instance_count: 0,
                             first_index: 0,
                             base_vertex: 0,
                             first_instance: 0,
-                        }
+                        });
                     }
-                })
-                .collect();
+                } else {
+                    mesh_indirect_args.push(wgpu::util::DrawIndexedIndirectArgs {
+                        index_count: 0,
+                        instance_count: 0,
+                        first_index: 0,
+                        base_vertex: 0,
+                        first_instance: 0,
+                    });
+                }
+            }
 
             if let Some(buffer) = self.mesh_indirect_buffer.as_ref() {
                 queue.write_buffer(buffer, 0, bytemuck::cast_slice(&mesh_indirect_args));
+                // Mark entries as used so eviction won't free them during this frame
+                for v in visible.iter() {
+                    if !v.is_leaf_chunk { continue; }
+                    let key = (v.position[0], v.position[1], v.position[2]);
+                    if let Some(entry) = self.mesh_cache.get_mut(&key) {
+                        entry.last_used_frame = self.frame_index;
+                    }
+                }
             }
 
             // Upload Envelope Indirect Args
-            let envelope_indirect_args: Vec<wgpu::util::DrawIndexedIndirectArgs> = visible
-                .iter()
-                .map(|v| {
-                    let key = (v.position[0], v.position[1], v.position[2]);
-                    if v.is_leaf_chunk {
-                        if let Some(mesh_entry) = self.envelope_mesh_cache.get(&key) {
-                            wgpu::util::DrawIndexedIndirectArgs {
-                                index_count: mesh_entry.index_count,
-                                instance_count: 0, // Shader will set to 1
-                                first_index: 0,
-                                base_vertex: 0,
-                                first_instance: 0,
+            let mut envelope_indirect_args: Vec<wgpu::util::DrawIndexedIndirectArgs> = Vec::with_capacity(visible.len());
+            for v in visible.iter() {
+                let key = (v.position[0], v.position[1], v.position[2]);
+                if v.is_leaf_chunk {
+                    if let Some(mesh_entry) = self.envelope_mesh_cache.get(&key) {
+                        let vertex_buf_size = self.vertex_allocator.total_size();
+                        let index_buf_size = self.index_allocator.total_size();
+                        let idx_end = mesh_entry.index_offset + mesh_entry.index_bytes;
+                        let vb_end = mesh_entry.vertex_offset + mesh_entry.vertex_bytes;
+                        if mesh_entry.index_bytes == 0 || mesh_entry.vertex_bytes == 0 || idx_end > index_buf_size || vb_end > vertex_buf_size {
+                            if cfg!(feature = "viewer-debug") {
+                                viewer_debug!("Validation warning on envelope cache entry (gpu prefill): index_buf_size={}, vertex_buf_size={} entry: index_offset={}, index_bytes={}, vertex_offset={}, vertex_bytes={}", index_buf_size, vertex_buf_size, mesh_entry.index_offset, mesh_entry.index_bytes, mesh_entry.vertex_offset, mesh_entry.vertex_bytes);
                             }
-                        } else {
-                            wgpu::util::DrawIndexedIndirectArgs {
+                            envelope_indirect_args.push(wgpu::util::DrawIndexedIndirectArgs {
                                 index_count: 0,
                                 instance_count: 0,
                                 first_index: 0,
                                 base_vertex: 0,
                                 first_instance: 0,
-                            }
+                            });
+                        } else {
+                            let vertex_stride = std::mem::size_of::<MeshVertexRaw>() as u64;
+                            let first_index = (mesh_entry.index_offset / 4) as u32;
+                            let base_vertex = (mesh_entry.vertex_offset / vertex_stride) as i32;
+                            envelope_indirect_args.push(wgpu::util::DrawIndexedIndirectArgs {
+                                index_count: mesh_entry.index_count,
+                                instance_count: 0, // Shader will set to 1
+                                first_index: first_index,
+                                base_vertex: base_vertex,
+                                first_instance: 0,
+                            });
                         }
                     } else {
-                        wgpu::util::DrawIndexedIndirectArgs {
+                        envelope_indirect_args.push(wgpu::util::DrawIndexedIndirectArgs {
                             index_count: 0,
                             instance_count: 0,
                             first_index: 0,
                             base_vertex: 0,
                             first_instance: 0,
-                        }
+                        });
                     }
-                })
-                .collect();
+                } else {
+                    envelope_indirect_args.push(wgpu::util::DrawIndexedIndirectArgs {
+                        index_count: 0,
+                        instance_count: 0,
+                        first_index: 0,
+                        base_vertex: 0,
+                        first_instance: 0,
+                    });
+                }
+            }
 
             if let Some(buffer) = self.envelope_indirect_buffer.as_ref() {
                 queue.write_buffer(buffer, 0, bytemuck::cast_slice(&envelope_indirect_args));
+                // Mark entries as used so eviction won't free them during this frame
+                for v in visible.iter() {
+                    if !v.is_leaf_chunk { continue; }
+                    let key = (v.position[0], v.position[1], v.position[2]);
+                    if let Some(entry) = self.envelope_mesh_cache.get_mut(&key) {
+                        entry.last_used_frame = self.frame_index;
+                    }
+                }
             }
 
             // Write any CPU prepopulated fallback instances and ensure the fallback instance buffer is large enough
@@ -5048,33 +5305,10 @@ impl App {
             if mesh.indices.is_empty() {
                 // Insert a placeholder (no-geometry) entry into the mesh cache so the chunk
                 // won't be re-scheduled every frame. Reuse a global empty buffer pair.
-                if self.empty_mesh_vertex_buffer.is_none() {
-                    let small_vb: Vec<MeshVertexRaw> = vec![MeshVertexRaw {
-                        position: [0.0, 0.0, 0.0],
-                        normal: [0.0, 1.0, 0.0],
-                        color: [1.0, 1.0, 1.0, 1.0],
-                        emissive: [0.0, 0.0, 0.0, 0.0],
-                    }];
-                    let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("Empty Chunk Vertex Buffer"),
-                        contents: bytemuck::cast_slice(&small_vb),
-                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    });
-                    self.empty_mesh_vertex_buffer = Some(vbuf);
-                }
-                if self.empty_mesh_index_buffer.is_none() {
-                    let small_ib: Vec<u32> = vec![0u32];
-                    let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("Empty Chunk Index Buffer"),
-                        contents: bytemuck::cast_slice(&small_ib),
-                        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-                    });
-                    self.empty_mesh_index_buffer = Some(ibuf);
-                }
-
                 let entry = MeshCacheEntry {
-                    vertex_buffer: self.empty_mesh_vertex_buffer.as_ref().unwrap().clone(),
-                    index_buffer: self.empty_mesh_index_buffer.as_ref().unwrap().clone(),
+                    vertex_offset: 0,
+                    vertex_count: 0,
+                    index_offset: 0,
                     index_count: 0,
                     vertex_bytes: 0,
                     index_bytes: 0,
@@ -5133,11 +5367,10 @@ impl App {
                 .collect();
             mesh_build_vb_time += vb_build_start.elapsed();
             let vbuf_start = std::time::Instant::now();
-            let (vbuf, _vcap) = self.allocate_vertex_buffer_from_pool(&device, &queue, &vb_data);
+            let (vertex_offset, index_offset) = self.allocate_mesh_in_megabuffer(&device, &queue, &vb_data, &mesh.indices).expect("Failed to allocate in mega-buffers");
             mesh_upload_vbuf_time += vbuf_start.elapsed();
             let ibuf_start = std::time::Instant::now();
-            let (ibuf, _icap) =
-                self.allocate_index_buffer_from_pool(&device, &queue, &mesh.indices);
+            mesh_upload_ibuf_time += ibuf_start.elapsed();
             mesh_upload_ibuf_time += ibuf_start.elapsed();
             let vertex_bytes = (vb_data.len() * std::mem::size_of::<MeshVertexRaw>()) as u64;
             let index_bytes = (mesh.indices.len() * std::mem::size_of::<u32>()) as u64;
@@ -5150,8 +5383,9 @@ impl App {
                 mesh.indices.len() / 3
             );
             let entry = MeshCacheEntry {
-                vertex_buffer: vbuf,
-                index_buffer: ibuf,
+                vertex_offset,
+                vertex_count: vb_data.len() as u32,
+                index_offset,
                 index_count: mesh.indices.len() as u32,
                 vertex_bytes,
                 index_bytes,
@@ -5200,6 +5434,12 @@ impl App {
                 gpu_candidate_count,
                 cpu_prepopulated_instances.len() as u32,
             );
+        }
+
+        // If GPU culling is not being used, populate the multi-draw buffers from CPU-visible list.
+        // Populate multi-draw buffers from CPU-visible list only if GPU culling is not used
+        if gpu_candidate_count == 0 || self.cull_pipeline.is_none() {
+            self.populate_multi_draw_indirects(&queue, &visible);
         }
 
         // Convert remaining instances (exclude those belonging to meshed chunks)
@@ -5761,33 +6001,70 @@ impl App {
                 shadow_pass.set_pipeline(shadow_mesh_pipeline);
                 shadow_pass.set_bind_group(0, shadow_bind_group, &[]);
 
-                for (i, v) in visible.iter().enumerate() {
-                    if !v.is_leaf_chunk {
-                        continue;
-                    }
-                    let key = (v.position[0], v.position[1], v.position[2]);
+                // Bind mega buffers once to reduce binding overhead
+                shadow_pass.set_vertex_buffer(0, self.mega_vertex_buffer.as_ref().unwrap().slice(..));
+                shadow_pass.set_index_buffer(
+                    self.mega_index_buffer.as_ref().unwrap().slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
 
-                    // Draw Detail Mesh
-                    if let Some(entry) = self.mesh_cache.get(&key) {
-                        shadow_pass.set_vertex_buffer(0, entry.vertex_buffer.slice(..));
-                        shadow_pass.set_index_buffer(
-                            entry.index_buffer.slice(..),
-                            wgpu::IndexFormat::Uint32,
+                let multi_draw_supported = device.features().contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT) && self.cull_pipeline.is_none();
+
+                if multi_draw_supported {
+                    if cfg!(feature = "viewer-debug") {
+                        viewer_debug!("Shader path: Using multi-draw indirect for shadow pass (CPU path)");
+                    }
+                    // Use the multi-draw indexed indirect count function
+                    if let (Some(count_buf), Some(mesh_indirect)) = (
+                        self.multi_draw_count_buffer.as_ref(),
+                        self.mesh_indirect_buffer.as_ref(),
+                    ) {
+                        shadow_pass.multi_draw_indexed_indirect_count(
+                            mesh_indirect,
+                            0,
+                            count_buf,
+                            0,
+                            self.max_draw_capacity as u32,
                         );
-                        shadow_pass.draw_indexed_indirect(mesh_indirect, (i * 20) as u64);
-                        draw_calls += 1;
+                        draw_calls += self.mesh_cache.len(); // approximate
                     }
+                    if let (Some(count_buf), Some(envelope_indirect)) = (
+                        self.multi_draw_count_buffer.as_ref(),
+                        self.envelope_indirect_buffer.as_ref(),
+                    ) {
+                        // envelope count is at offset 4
+                        shadow_pass.multi_draw_indexed_indirect_count(
+                            envelope_indirect,
+                            0,
+                            count_buf,
+                            4,
+                            self.max_draw_capacity as u32,
+                        );
+                        draw_calls += self.envelope_mesh_cache.len(); // approximate
+                    }
+                } else {
+                    if cfg!(feature = "viewer-debug") {
+                        viewer_debug!("Shader path: Using per-chunk indirect draws for shadow pass (maybe GPU cull active)");
+                    }
+                    // Fallback to per-chunk draws (but with buffers bound once)
+                    for (i, v) in visible.iter().enumerate() {
+                        if !v.is_leaf_chunk {
+                            continue;
+                        }
+                        let key = (v.position[0], v.position[1], v.position[2]);
 
-                    // Draw Envelope Mesh
-                    if let Some(envelope_indirect) = &self.envelope_indirect_buffer {
-                        if let Some(entry) = self.envelope_mesh_cache.get(&key) {
-                            shadow_pass.set_vertex_buffer(0, entry.vertex_buffer.slice(..));
-                            shadow_pass.set_index_buffer(
-                                entry.index_buffer.slice(..),
-                                wgpu::IndexFormat::Uint32,
-                            );
-                            shadow_pass.draw_indexed_indirect(envelope_indirect, (i * 20) as u64);
+                        // Draw Detail Mesh
+                        if self.mesh_cache.contains_key(&key) {
+                            shadow_pass.draw_indexed_indirect(mesh_indirect, (i * 20) as u64);
                             draw_calls += 1;
+                        }
+
+                        // Draw Envelope Mesh
+                        if let Some(envelope_indirect) = &self.envelope_indirect_buffer {
+                            if let Some(_entry) = self.envelope_mesh_cache.get(&key) {
+                                shadow_pass.draw_indexed_indirect(envelope_indirect, (i * 20) as u64);
+                                draw_calls += 1;
+                            }
                         }
                     }
                 }
@@ -5860,44 +6137,78 @@ impl App {
             if let Some(mesh_indirect) = &self.mesh_indirect_buffer {
                 render_pass.set_pipeline(self.mesh_pipeline.as_ref().unwrap());
                 render_pass.set_bind_group(0, self.bind_group.as_ref().unwrap(), &[]);
-                let mut drawn_meshes = 0;
 
-                for (i, v) in visible.iter().enumerate() {
-                    if !v.is_leaf_chunk {
-                        continue;
+                // Bind mega buffers once per pass
+                render_pass.set_vertex_buffer(0, self.mega_vertex_buffer.as_ref().unwrap().slice(..));
+                render_pass.set_index_buffer(
+                    self.mega_index_buffer.as_ref().unwrap().slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+
+                let multi_draw_supported = device.features().contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT) && self.cull_pipeline.is_none();
+
+                if multi_draw_supported {
+                    if cfg!(feature = "viewer-debug") {
+                        viewer_debug!("Shader path: Using multi-draw indirect for scene pass (CPU path)");
                     }
-                    let key = (v.position[0], v.position[1], v.position[2]);
-
-                    // Draw Detail Mesh
-                    if let Some(entry) = self.mesh_cache.get_mut(&key) {
-                        render_pass.set_vertex_buffer(0, entry.vertex_buffer.slice(..));
-                        render_pass.set_index_buffer(
-                            entry.index_buffer.slice(..),
-                            wgpu::IndexFormat::Uint32,
+                    if let (Some(count_buf), Some(mesh_indirect)) = (
+                        self.multi_draw_count_buffer.as_ref(),
+                        self.mesh_indirect_buffer.as_ref(),
+                    ) {
+                        render_pass.multi_draw_indexed_indirect_count(
+                            mesh_indirect,
+                            0,
+                            count_buf,
+                            0,
+                            self.max_draw_capacity as u32,
                         );
-                        render_pass.draw_indexed_indirect(mesh_indirect, (i * 20) as u64);
-                        draw_calls += 1;
-                        entry.last_used_frame = self.frame_index;
-                        drawn_meshes += 1;
+                        draw_calls += self.mesh_cache.len(); // approximate
                     }
+                    if let (Some(count_buf), Some(envelope_indirect)) = (
+                        self.multi_draw_count_buffer.as_ref(),
+                        self.envelope_indirect_buffer.as_ref(),
+                    ) {
+                        render_pass.multi_draw_indexed_indirect_count(
+                            envelope_indirect,
+                            0,
+                            count_buf,
+                            4,
+                            self.max_draw_capacity as u32,
+                        );
+                        draw_calls += self.envelope_mesh_cache.len();
+                    }
+                } else {
+                    if cfg!(feature = "viewer-debug") {
+                        viewer_debug!("Shader path: Using per-chunk indirect draws for scene pass (maybe GPU cull active)");
+                    }
+                    let mut drawn_meshes = 0;
+                    for (i, v) in visible.iter().enumerate() {
+                        if !v.is_leaf_chunk {
+                            continue;
+                        }
+                        let key = (v.position[0], v.position[1], v.position[2]);
 
-                    // Draw Envelope Mesh
-                    if let Some(envelope_indirect) = &self.envelope_indirect_buffer {
-                        if let Some(entry) = self.envelope_mesh_cache.get_mut(&key) {
-                            render_pass.set_vertex_buffer(0, entry.vertex_buffer.slice(..));
-                            render_pass.set_index_buffer(
-                                entry.index_buffer.slice(..),
-                                wgpu::IndexFormat::Uint32,
-                            );
-                            render_pass.draw_indexed_indirect(envelope_indirect, (i * 20) as u64);
+                        // Draw Detail Mesh
+                        if let Some(entry) = self.mesh_cache.get_mut(&key) {
+                            render_pass.draw_indexed_indirect(mesh_indirect, (i * 20) as u64);
                             draw_calls += 1;
                             entry.last_used_frame = self.frame_index;
                             drawn_meshes += 1;
                         }
+
+                        // Draw Envelope Mesh
+                        if let Some(envelope_indirect) = &self.envelope_indirect_buffer {
+                            if let Some(entry) = self.envelope_mesh_cache.get_mut(&key) {
+                                render_pass.draw_indexed_indirect(envelope_indirect, (i * 20) as u64);
+                                draw_calls += 1;
+                                entry.last_used_frame = self.frame_index;
+                                drawn_meshes += 1;
+                            }
+                        }
                     }
-                }
-                if cfg!(feature = "viewer-debug") && self.frame_count == 0 {
-                    viewer_debug!("DEBUG: Drew {} meshes (indirect)", drawn_meshes);
+                    if cfg!(feature = "viewer-debug") && self.frame_count == 0 {
+                        viewer_debug!("DEBUG: Drew {} meshes (indirect)", drawn_meshes);
+                    }
                 }
             }
 
@@ -6560,8 +6871,8 @@ impl App {
                 self.stat_vertex_buffers_reused,
                 self.stat_index_buffers_reused,
                 mesh_idle,
-                self.vertex_buffer_pool.len(),
-                self.index_buffer_pool.len(),
+                self.vertex_allocator.allocated_count(),
+                self.index_allocator.allocated_count(),
                 if self.dof_settings.kawase_enabled {"enabled"} else {"disabled"}
                 , self.dof_settings.kawase_iterations
                 , self.dof_settings.kawase_offset

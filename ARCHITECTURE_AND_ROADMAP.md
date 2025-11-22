@@ -272,3 +272,305 @@ Currently, `voxelot` creates a buffer for every chunk mesh.
 *   **Change:** Create a `ChunkMeshPool`.
 *   **Logic:** When a chunk needs a mesh, ask the pool for a slice of the big buffer. Write to it using `queue.write_buffer`.
 *   **Gain:** This will eliminate the "stutter" when loading new terrain.
+
+---
+
+Mega-Buffer + Multi-Draw-Indirect Architecture
+
+Implement a unified buffer allocation system and multi-draw-indirect rendering to eliminate per-chunk buffer binding overhead and reduce draw calls from thousands to single-digit per frame.
+
+User Review Required
+
+[!IMPORTANT]
+Breaking Change: Mesh Cache Structure
+This changes MeshCacheEntry from storing individual wgpu::Buffer objects to storing offsets into mega-buffers. The buffer pool system will be removed and replaced with a slab allocator.
+
+[!IMPORTANT]
+Major Rendering Pipeline Change
+The rendering loop will change from iterating visible chunks and binding buffers per-chunk to:
+
+1. Binding mega-buffers once
+2. Using draw_indexed_indirect_count to render all chunks in 1-2 draw calls
+
+This is a significant refactor but should be backward-compatible from a visual perspective.
+
+[!WARNING]
+Memory Trade-off
+Mega-buffers will be allocated at a fixed size (512MB vertex + 256MB index by default). This may waste memory compared to the current dynamic allocation, but provides better performance. Size will be configurable.
+
+Proposed Changes
+
+Core Components
+
+[NEW] buffer_allocator.rs
+
+A new module implementing a slab allocator for managing regions within the mega-buffers.
+
+Key structures:
+
+- SlabAllocator: Free-list based allocator tracking available slots
+- AllocationHandle: Represents an allocated region (offset + size)
+- Methods: allocate(size), free(handle), defragment() (optional for v1)
+
+Algorithm:
+
+- Maintain sorted free-list of (offset, size) regions
+- First-fit allocation strategy for simplicity
+- Coalesce adjacent free regions on deallocation
+- Track fragmentation statistics
+
+[MODIFY] voxelot.rs:112-120
+
+Update MeshCacheEntry to use buffer offsets instead of owned buffers:
+
+    struct MeshCacheEntry {
+        vertex_offset: u64,      // Byte offset in mega vertex buffer
+        vertex_count: u32,       // Number of vertices
+        index_offset: u64,       // Byte offset in mega index buffer
+        index_count: u32,
+        vertex_bytes: u64,
+        index_bytes: u64,
+        last_used_frame: u64,
+        is_placeholder: bool,
+    }
+
+[MODIFY] voxelot.rs:~650-900
+
+Add mega-buffer fields to App:
+
+    // Mega-buffers
+    mega_vertex_buffer: Option<wgpu::Buffer>,
+    mega_index_buffer: Option<wgpu::Buffer>,
+    vertex_allocator: SlabAllocator,
+    index_allocator: SlabAllocator,
+    
+    // Multi-draw indirect
+    multi_draw_indirect_buffer: Option<wgpu::Buffer>,  // Stores all DrawIndexedIndirectArgs
+    multi_draw_count_buffer: Option<wgpu::Buffer>,     // Atomic counter for draw count
+    max_draw_capacity: usize,                          // Preallocated indirect buffer size
+
+Remove old buffer pool fields:
+
+- vertex_buffer_pool
+- index_buffer_pool
+- empty_mesh_vertex_buffer / empty_mesh_index_buffer
+
+---
+
+Rendering Pipeline
+
+[MODIFY] voxelot.rs:2913-2969
+
+Replace allocate_vertex_buffer_from_pool and allocate_index_buffer_from_pool with:
+
+    fn allocate_mesh_in_megabuffer(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        vb_data: &[MeshVertexRaw],
+        idx_data: &[u32],
+    ) -> Result<(u64, u64), AllocationError> {
+        let vb_bytes = (vb_data.len() * size_of::<MeshVertexRaw>()) as u64;
+        let ib_bytes = (idx_data.len() * size_of::<u32>()) as u64;
+        
+        let vertex_offset = self.vertex_allocator.allocate(vb_bytes)?;
+        let index_offset = self.index_allocator.allocate(ib_bytes)?;
+        
+        // Write data at offsets
+        queue.write_buffer(
+            self.mega_vertex_buffer.as_ref().unwrap(),
+            vertex_offset,
+            bytemuck::cast_slice(vb_data),
+        );
+        queue.write_buffer(
+            self.mega_index_buffer.as_ref().unwrap(),
+            index_offset,
+            bytemuck::cast_slice(idx_data),
+        );
+        
+        Ok((vertex_offset, index_offset))
+    }
+
+[MODIFY] voxelot.rs:2678-2738
+
+Update evict_mesh_cache to free allocator slots instead of destroying buffers:
+
+    fn evict_mesh_cache(&mut self) {
+        // ... existing eviction logic ...
+        
+        if let Some(entry) = self.mesh_cache.remove(&key) {
+            if !entry.is_placeholder {
+                // Free the allocator regions
+                self.vertex_allocator.free(entry.vertex_offset, entry.vertex_bytes);
+                self.index_allocator.free(entry.index_offset, entry.index_bytes);
+            }
+            // ... rest of cleanup ...
+        }
+    }
+
+[MODIFY] voxelot.rs:5860-5915
+
+Replace per-chunk rendering loop with multi-draw-indirect:
+
+Before: Iterate visible chunks, bind buffers, call draw_indexed_indirect per chunk
+
+After:
+
+    // Bind mega-buffers once
+    render_pass.set_vertex_buffer(0, self.mega_vertex_buffer.as_ref().unwrap().slice(..));
+    render_pass.set_index_buffer(
+        self.mega_index_buffer.as_ref().unwrap().slice(..),
+        wgpu::IndexFormat::Uint32,
+    );
+    
+    // Populate multi-draw indirect buffer with all visible chunks
+    self.populate_multi_draw_buffer(queue, &visible);
+    
+    // Single draw call for all chunks
+    render_pass.multi_draw_indexed_indirect_count(
+        self.multi_draw_indirect_buffer.as_ref().unwrap(),
+        0,                                              // offset
+        self.multi_draw_count_buffer.as_ref().unwrap(),
+        0,                                              // count offset
+        self.max_draw_capacity as u32,
+    );
+
+Note: multi_draw_indexed_indirect_count requires the feature flag. Will fall back to loop with single mega-buffer binding if unavailable.
+
+[NEW] Method: populate_multi_draw_buffer
+
+    fn populate_multi_draw_buffer(
+        &mut self,
+        queue: &wgpu::Queue,
+        visible: &[ChunkRenderInfo],
+    ) {
+        let mut indirect_args = Vec::new();
+        
+        for v in visible {
+            if !v.is_leaf_chunk { continue; }
+            let key = (v.position[0], v.position[1], v.position[2]);
+            
+            if let Some(entry) = self.mesh_cache.get(&key) {
+                if entry.index_count > 0 {
+                    indirect_args.push(wgpu::util::DrawIndexedIndirectArgs {
+                        index_count: entry.index_count,
+                        instance_count: 1,
+                        first_index: (entry.index_offset / 4) as u32, // Convert bytes to u32 index
+                        base_vertex: (entry.vertex_offset / size_of::<MeshVertexRaw>() as u64) as i32,
+                        first_instance: 0,
+                    });
+                }
+            }
+        }
+        
+        // Write count to atomic buffer
+        let count = indirect_args.len() as u32;
+        queue.write_buffer(self.multi_draw_count_buffer.as_ref().unwrap(), 0, bytemuck::bytes_of(&count));
+        
+        // Write indirect args
+        queue.write_buffer(
+            self.multi_draw_indirect_buffer.as_ref().unwrap(),
+            0,
+            bytemuck::cast_slice(&indirect_args),
+        );
+    }
+
+---
+
+Configuration
+
+[MODIFY] config.rs
+
+Add mega-buffer configuration to PerformanceConfig:
+
+    #[serde(default = "default_mega_vertex_buffer_mb")]
+    pub mega_vertex_buffer_mb: u64,
+    #[serde(default = "default_mega_index_buffer_mb")]
+    pub mega_index_buffer_mb: u64,
+    #[serde(default = "default_max_draw_capacity")]
+    pub max_draw_capacity: usize,
+    
+    fn default_mega_vertex_buffer_mb() -> u64 { 512 }
+    fn default_mega_index_buffer_mb() -> u64 { 256 }
+    fn default_max_draw_capacity() -> usize { 10000 }
+
+Remove mesh_buffer_pool_entries (no longer needed).
+
+---
+
+Verification Plan
+
+Automated Tests
+
+Command: cargo run --release --bin voxelot
+
+Validation:
+
+1. Rendering Correctness: All chunks should render identically to before
+   - Meshes appear at correct positions
+   - No visual artifacts or missing geometry
+   - LOD transitions work (envelope vs detail meshes)
+2. Performance Gains: Measure via debug prints
+   - Print draw_calls count per frame (should drop from ~1000-5000 to ~1-2)
+   - Add timing for buffer binding vs rendering
+   - Expected: 15-30% reduction in CPU frame time
+3. Memory Management: Cache eviction still works
+   - Force eviction by loading many chunks
+   - Verify allocator free-list grows
+   - Check for memory leaks (process RSS via debug stats)
+4. Edge Cases:
+   - Empty meshes (placeholder entries)
+   - Rapid chunk loading/unloading
+   - Many small meshes vs few large meshes
+
+Manual Verification
+
+1. Load test world and fly around:
+   - cargo run --release --bin voxelot
+   - Press W/A/S/D to move, observe terrain loads smoothly
+   - No stuttering when new chunks appear
+2. Check stats output (printed every 60 frames if viewer-debug feature):
+   - Look for "Mesh stats" line showing draw call count
+   - Should see: draw_calls: 1 or 2 instead of 1000+
+3. Test mesh eviction:
+   - Fly far distances to trigger cache eviction
+   - Check debug output for "Mesh cache eviction" messages
+   - Verify chunks re-appear when returning
+
+Fallback Plan
+
+If multi_draw_indexed_indirect_count is not supported:
+
+- Detect at runtime via device.features()
+- Fall back to loop over draw_indexed_indirect but still use mega-buffers
+- This still provides ~60% of the performance gain (eliminates buffer binding overhead)
+
+---
+
+Implementation Phases
+
+Phase 1: Slab allocator + mega-buffer creation (~2 hours)
+
+- Write buffer_allocator.rs
+- Initialize mega-buffers in App::new
+- Add unit tests for allocator
+
+Phase 2: Mesh upload refactor (~2 hours)
+
+- Replace pool-based allocation with mega-buffer writes
+- Update MeshCacheEntry structure
+- Modify mesh upload code path
+
+Phase 3: Rendering pipeline update (~2 hours)
+
+- Implement populate_multi_draw_buffer
+- Replace render loop with single draw call
+- Handle shadow pass similarly
+
+Phase 4: Cleanup and optimization (~1 hour)
+
+- Remove old buffer pool code
+- Add configuration options
+- Performance profiling
+
+Total estimated time: 7-8 hours of focused work.
