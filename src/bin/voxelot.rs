@@ -26,8 +26,8 @@ use std::collections::VecDeque;
 use sysinfo::{Pid, ProcessExt, System, SystemExt};
 use voxelot::SlabAllocator;
 use voxelot::{
-    cull_visible_voxels_parallel, Camera, Chunk, ChunkMesh, Palette, RenderConfig, Voxel,
-    VoxelInstance, World, WorldPos, bbox_local_to_world,
+    bbox_local_to_world, cull_visible_voxels_parallel, Camera, Chunk, ChunkMesh, Palette,
+    RenderConfig, Voxel, VoxelInstance, World, WorldPos,
 };
 
 macro_rules! viewer_debug {
@@ -712,6 +712,7 @@ struct App {
     envelope_mesh_cache_budget_bytes: u64,
     envelope_distance: f32,
     envelope_fade_range: f32,
+    max_envelope_distance: f32,
     /// Cached Arc<Chunk> snapshots for mesher jobs to avoid repeated deep clones
     mesh_chunk_arc_cache: FxHashMap<(i64, i64, i64), Arc<Chunk>>,
     /// Count of mesh jobs executed per second by worker threads (reset on FPS print)
@@ -1107,6 +1108,7 @@ impl App {
                 * 1024,
             envelope_distance: cfg.performance.envelope_distance,
             envelope_fade_range: cfg.performance.envelope_fade_range,
+            max_envelope_distance: cfg.performance.max_envelope_distance,
             mega_vertex_buffer: None,
             mega_index_buffer: None,
             vertex_allocator: SlabAllocator::new(
@@ -5148,7 +5150,12 @@ impl App {
             let dz = chunk_center[2] - cam_pos[2];
             let dist_sq = dx * dx + dy * dy + dz * dz;
             let envelope_dist_sq = self.envelope_distance * self.envelope_distance;
+            let max_envelope_dist_sq = self.max_envelope_distance * self.max_envelope_distance;
             let use_envelope = dist_sq > envelope_dist_sq;
+
+            if use_envelope && dist_sq > max_envelope_dist_sq {
+                continue;
+            }
 
             let has_standard = self.mesh_cache.contains_key(&key);
             let has_envelope = self.envelope_mesh_cache.contains_key(&key);
@@ -5261,7 +5268,14 @@ impl App {
             let dz = chunk_center[2] - cam_pos[2];
             let dist_sq = dx * dx + dy * dy + dz * dz;
             let envelope_dist_sq = self.envelope_distance * self.envelope_distance;
+            let max_envelope_dist_sq = self.max_envelope_distance * self.max_envelope_distance;
             let use_envelope = dist_sq > envelope_dist_sq;
+
+            // If it's an envelope candidate but too far away, skip it entirely
+            if use_envelope && dist_sq > max_envelope_dist_sq {
+                self.pending_chunk_set.remove(&key);
+                continue;
+            }
 
             // Check if we already have the desired mesh type (it might have been completed since queuing)
             if use_envelope {
@@ -5828,13 +5842,23 @@ impl App {
             far_center - far_right_vec - far_up_vec,
         ];
 
-        let mut bounds_min = Vec3::splat(f32::INFINITY);
-        let mut bounds_max = Vec3::splat(f32::NEG_INFINITY);
-        for corner in frustum_corners.iter() {
-            let corner_ls = (light_view * corner.extend(1.0)).truncate();
-            bounds_min = bounds_min.min(corner_ls);
-            bounds_max = bounds_max.max(corner_ls);
+        // Calculate bounding sphere for stable shadows
+        let mut frustum_center = Vec3::ZERO;
+        for corner in &frustum_corners {
+            frustum_center += *corner;
         }
+        frustum_center /= 8.0;
+
+        let mut radius: f32 = 0.0;
+        for corner in &frustum_corners {
+            radius = radius.max(frustum_center.distance(*corner));
+        }
+
+        // Transform center to light space
+        let center_ls = (light_view * frustum_center.extend(1.0)).truncate();
+
+        let mut bounds_min = center_ls - Vec3::splat(radius);
+        let mut bounds_max = center_ls + Vec3::splat(radius);
 
         let xy_padding = 15.0;
         bounds_min.x -= xy_padding;

@@ -8,7 +8,7 @@ camera_position = [
 ]
 
 [rendering]
-lod_subdivide_distance = 550.0
+lod_subdivide_distance = 700.0
 lod_merge_distance = 750.0
 chunk_lod_distance = 1000.0
 fov_degrees = 70.0
@@ -18,7 +18,7 @@ camera_speed_multiplier = 4.7683716
 
 [atmosphere]
 fog_density = 0.00044999996
-time_of_day = 0.48827505
+time_of_day = 0.17711395
 
 [effects.depth_of_field]
 enabled = true
@@ -62,6 +62,7 @@ mesh_worker_count = 6
 mesh_upload_baseline = 4
 envelope_distance = 500.0
 envelope_fade_range = 200.0
+max_envelope_distance = 1000.0
 fallback_detail_distance = 500.0
 fallback_bbox_shrink = 0.66
 mesh_priority_sort_interval_frames = 30
