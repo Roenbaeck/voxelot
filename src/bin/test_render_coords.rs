@@ -1,4 +1,4 @@
-use voxelot::{Chunk, Palette};
+use voxelot::{Chunk, Palette, bbox_local_to_world};
 
 fn main() {
     println!("Testing Render Coordinate Calculations...");
@@ -19,17 +19,16 @@ fn main() {
     let scale = 1;
     let bbox = [15u8, 0, 0, 15, 0, 0];
     let world_x = 100;
-
-    let scale_f = scale as f32;
-    let x = world_x as f32 + (bbox[0] as f32 * scale_f);
+    let (pos_i64, _size) = bbox_local_to_world([world_x as i64, 0, 0], scale, bbox);
+    let x = pos_i64[0] as f32;
 
     println!("Scale: {}", scale);
     println!("BBox: {:?}", bbox);
     println!("Calculated X: {}", x);
     println!("Expected X: {}", world_x as f32 + 15.0);
 
-    if x != world_x as f32 + 15.0 {
-        println!("FAIL: Coordinate calculation is wrong!");
+    if (x - (world_x as f32 + 15.0)).abs() > 0.001 {
+        println!("FAIL: Coordinate calculation is wrong! ({} vs {})", x, world_x as f32 + 15.0);
     } else {
         println!("PASS: Coordinate calculation is correct.");
     }

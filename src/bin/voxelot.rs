@@ -27,7 +27,7 @@ use sysinfo::{Pid, ProcessExt, System, SystemExt};
 use voxelot::SlabAllocator;
 use voxelot::{
     cull_visible_voxels_parallel, Camera, Chunk, ChunkMesh, Palette, RenderConfig, Voxel,
-    VoxelInstance, World, WorldPos,
+    VoxelInstance, World, WorldPos, bbox_local_to_world,
 };
 
 macro_rules! viewer_debug {
@@ -4749,16 +4749,14 @@ impl App {
                     .get_leaf_chunk_at_origin(WorldPos::new(key.0, key.1, key.2))
                 {
                     let (pos, scale) = if let Some(bbox) = chunk.bounding_box {
-                        // BBox is 0..15. Scale is 1.0 for leaf chunks.
-                        let x = chunk_center[0] - 8.0 + bbox[0] as f32;
-                        let y = chunk_center[1] - 8.0 + bbox[1] as f32;
-                        let z = chunk_center[2] - 8.0 + bbox[2] as f32;
-
-                        let sx = (bbox[3] - bbox[0] + 1) as f32;
-                        let sy = (bbox[4] - bbox[1] + 1) as f32;
-                        let sz = (bbox[5] - bbox[2] + 1) as f32;
-
-                        ([x, y, z], [sx, sy, sz])
+                        // Use the standard bbox->world conversion helper, origin at chunk key, scale = 1
+                        // For leaf chunk bounding box, each local voxel maps to 1 world unit so
+                        // pass scale=16 (unit = scale/16 = 1).
+                        let (pos_i64, size) = bbox_local_to_world([key.0, key.1, key.2], 16, bbox);
+                        (
+                            [pos_i64[0] as f32, pos_i64[1] as f32, pos_i64[2] as f32],
+                            size,
+                        )
                     } else {
                         // Fallback to full chunk if no bbox (shouldn't happen if voxel_count > 0)
                         (

@@ -14,6 +14,30 @@ use std::sync::Arc;
 
 use crate::palette::Palette;
 
+/// Convert a local chunk bounding box (bbox in 0..15 coordinates) to world-space position and
+/// world-space size using the supplied scale for the current voxel.
+///
+/// - bbox: [xmin, ymin, zmin, xmax, ymax, zmax]
+/// - origin: world-space origin of the chunk (i64 coordinates) at which local pos 0,0,0 maps to
+/// - scale: size of a voxel at this level (e.g., 4096, 256, 16, 1). Note: the helper computes
+///   sub-element unit as `unit = scale / 16`; for converting bounding boxes of a leaf chunk
+///   to world coordinates pass `scale = 16` (so that `unit = 1.0`). For converting bounding boxes
+///   of a sub-chunk inside a chunk, pass the parent chunk's `scale` (e.g., 256 when iterating
+///   a parent chunk with `scale=256`).
+///
+/// Returns: (position_i64, size_f32)
+pub fn bbox_local_to_world(origin: [i64; 3], scale: i64, bbox: [u8; 6]) -> ([i64; 3], [f32; 3]) {
+    // Each sub-element has size unit = scale / 16.
+    let unit = scale / 16;
+    let x = origin[0] + (bbox[0] as i64 * unit);
+    let y = origin[1] + (bbox[1] as i64 * unit);
+    let z = origin[2] + (bbox[2] as i64 * unit);
+    let sx = (bbox[3] - bbox[0] + 1) as f32 * unit as f32;
+    let sy = (bbox[4] - bbox[1] + 1) as f32 * unit as f32;
+    let sz = (bbox[5] - bbox[2] + 1) as f32 * unit as f32;
+    ([x, y, z], [sx, sy, sz])
+}
+
 /// Voxel type identifier
 pub type VoxelType = u8;
 
@@ -983,5 +1007,14 @@ mod tests {
         world.set(WorldPos::new(-1, 0, 0), 4);
         assert_eq!(world.get(WorldPos::new(256, 0, 0)), None);
         assert_eq!(world.get(WorldPos::new(-1, 0, 0)), None);
+    }
+
+    #[test]
+    fn test_bbox_local_to_world_leaf() {
+        // Leaf chunk: scale=16 -> unit=1
+        let bbox = [7u8, 7, 7, 7, 7, 7];
+        let (pos, size) = crate::lib_hierarchical::bbox_local_to_world([0, 0, 0], 16, bbox);
+        assert_eq!(pos, [7, 7, 7]);
+        assert_eq!(size, [1.0, 1.0, 1.0]);
     }
 }
