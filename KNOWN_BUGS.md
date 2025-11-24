@@ -1,1 +1,1 @@
-None at the moment.
+1. Is there a bias (small adjustment) for any coordinates when indiviual voxels are drawn? I can see a small mismatch in position when a mesh replaces the contents on an unmeshed chunk (rendered as all voxels). I think we should remove that bias if it exists, since it was introduced when we believed we had z-fighting, which we don't. 
