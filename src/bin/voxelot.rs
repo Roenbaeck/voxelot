@@ -5842,23 +5842,28 @@ impl App {
             far_center - far_right_vec - far_up_vec,
         ];
 
-        // Calculate bounding sphere for stable shadows
-        let mut frustum_center = Vec3::ZERO;
-        for corner in &frustum_corners {
-            frustum_center += *corner;
+        // Transform all frustum corners to light space first
+        let mut frustum_corners_ls: [Vec3; 8] = [Vec3::ZERO; 8];
+        for (i, corner) in frustum_corners.iter().enumerate() {
+            frustum_corners_ls[i] = (light_view * corner.extend(1.0)).truncate();
         }
-        frustum_center /= 8.0;
 
+        // Calculate bounding sphere center in light space
+        let mut frustum_center_ls = Vec3::ZERO;
+        for corner_ls in &frustum_corners_ls {
+            frustum_center_ls += *corner_ls;
+        }
+        frustum_center_ls /= 8.0;
+
+        // Calculate radius in light space
         let mut radius: f32 = 0.0;
-        for corner in &frustum_corners {
-            radius = radius.max(frustum_center.distance(*corner));
+        for corner_ls in &frustum_corners_ls {
+            radius = radius.max(frustum_center_ls.distance(*corner_ls));
         }
 
-        // Transform center to light space
-        let center_ls = (light_view * frustum_center.extend(1.0)).truncate();
-
-        let mut bounds_min = center_ls - Vec3::splat(radius);
-        let mut bounds_max = center_ls + Vec3::splat(radius);
+        // Create bounds in light space
+        let mut bounds_min = frustum_center_ls - Vec3::splat(radius);
+        let mut bounds_max = frustum_center_ls + Vec3::splat(radius);
 
         let xy_padding = 15.0;
         bounds_min.x -= xy_padding;
@@ -6176,29 +6181,29 @@ impl App {
                         draw_calls += self.envelope_mesh_cache.len(); // approximate
                     }
                 } else {
-                    if cfg!(feature = "viewer-debug") {
-                        viewer_debug!("Shader path: Using per-chunk indirect draws for shadow pass (maybe GPU cull active)");
-                    }
-                    // Fallback to per-chunk draws (but with buffers bound once)
-                    for (i, v) in visible.iter().enumerate() {
-                        if !v.is_leaf_chunk {
-                            continue;
-                        }
-                        let key = (v.position[0], v.position[1], v.position[2]);
-
-                        // Draw Detail Mesh
-                        if self.mesh_cache.contains_key(&key) {
-                            shadow_pass.draw_indexed_indirect(mesh_indirect, (i * 20) as u64);
+                    // For shadows, always use direct draws for all leaf chunks (not just camera-visible ones)
+                    // This ensures objects just outside camera view still cast shadows correctly
+                    for &key in leaf_chunks.iter() {
+                        // Draw Detail Mesh directly if it exists
+                        if let Some(entry) = self.mesh_cache.get(&key) {
+                            let start_index = (entry.index_offset / 4) as u32;
+                            let end_index = start_index + entry.index_count;
+                            let base_vertex = (entry.vertex_offset
+                                / std::mem::size_of::<MeshVertexRaw>() as u64)
+                                as i32;
+                            shadow_pass.draw_indexed(start_index..end_index, base_vertex, 0..1);
                             draw_calls += 1;
                         }
 
-                        // Draw Envelope Mesh
-                        if let Some(envelope_indirect) = &self.envelope_indirect_buffer {
-                            if let Some(_entry) = self.envelope_mesh_cache.get(&key) {
-                                shadow_pass
-                                    .draw_indexed_indirect(envelope_indirect, (i * 20) as u64);
-                                draw_calls += 1;
-                            }
+                        // Draw Envelope Mesh directly if it exists
+                        if let Some(entry) = self.envelope_mesh_cache.get(&key) {
+                            let start_index = (entry.index_offset / 4) as u32;
+                            let end_index = start_index + entry.index_count;
+                            let base_vertex = (entry.vertex_offset
+                                / std::mem::size_of::<MeshVertexRaw>() as u64)
+                                as i32;
+                            shadow_pass.draw_indexed(start_index..end_index, base_vertex, 0..1);
+                            draw_calls += 1;
                         }
                     }
                 }
