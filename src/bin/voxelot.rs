@@ -877,14 +877,89 @@ struct App {
 
     // Skybox
     skybox_texture: Option<wgpu::Texture>,
+    skybox_texture_bytes: u64,
     skybox_view: Option<wgpu::TextureView>,
     skybox_sampler: Option<wgpu::Sampler>,
     skybox_bind_group: Option<wgpu::BindGroup>,
     skybox_bind_group_layout: Option<wgpu::BindGroupLayout>,
     skybox_pipeline: Option<wgpu::RenderPipeline>,
+    // GPU accounting (accurate tracked allocations)
+    gpu_buffer_bytes: u64,
+    gpu_texture_bytes: u64,
+    uniform_buffer_bytes: u64,
+    mega_vertex_buffer_bytes: u64,
+    mega_index_buffer_bytes: u64,
+    multi_draw_indirect_bytes: u64,
+    multi_draw_count_bytes: u64,
+    gpu_input_buffer_bytes: u64,
+    fallback_instance_buffer_bytes: u64,
+    fallback_indirect_bytes: u64,
+    mesh_indirect_bytes: u64,
+    envelope_indirect_bytes: u64,
+    cull_params_buffer_bytes: u64,
+    offscreen_color_texture_bytes: u64,
+    depth_texture_bytes: u64,
+    post_color_texture_bytes: u64,
+    dof_color_texture_bytes: u64,
+    bloom_ping_bytes: u64,
+    bloom_pong_bytes: u64,
+    kawase_ping_bytes: u64,
+    kawase_pong_bytes: u64,
+    ssao_ping_bytes: u64,
+    ssao_pong_bytes: u64,
+    shadow_map_bytes: u64,
+    cube_vertex_buffer_bytes: u64,
+    light_probe_buffer_bytes: u64,
 }
 
 impl App {
+
+    // Static helpers that avoid borrowing &mut self during the operation, allowing
+    // callers to pass distinct fields as &mut u64 without creating overlapping
+    // &mut self borrows which the Rust borrow-checker rejects.
+    fn replace_buffer_bytes_static(old: &mut u64, new: u64, agg: &mut u64) {
+        if *old > 0 {
+            *agg = agg.saturating_sub(*old);
+        }
+        *agg = agg.saturating_add(new);
+        *old = new;
+    }
+
+    fn replace_texture_bytes_static(old: &mut u64, new: u64, agg: &mut u64) {
+        if *old > 0 {
+            *agg = agg.saturating_sub(*old);
+        }
+        *agg = agg.saturating_add(new);
+        *old = new;
+    }
+
+    // Compute bytes occupied by a texture with mipmaps
+    fn compute_texture_bytes(
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+        depth_or_array_layers: u32,
+        mip_level_count: u32,
+    ) -> u64 {
+        let bpp: u64 = match format {
+            wgpu::TextureFormat::Rgba32Float => 16,
+            wgpu::TextureFormat::Rgba16Float => 8,
+            wgpu::TextureFormat::Rgba8Unorm
+            | wgpu::TextureFormat::Rgba8UnormSrgb
+            | wgpu::TextureFormat::Bgra8Unorm
+            | wgpu::TextureFormat::Bgra8UnormSrgb => 4,
+            wgpu::TextureFormat::Depth32Float => 4,
+            _ => 4,
+        };
+        let mut total: u64 = 0;
+        for level in 0..mip_level_count {
+            let w = (width >> level).max(1) as u64;
+            let h = (height >> level).max(1) as u64;
+            let layers = depth_or_array_layers as u64;
+            total = total.saturating_add(w.saturating_mul(h).saturating_mul(layers).saturating_mul(bpp));
+        }
+        total
+    }
     fn new() -> Self {
         let mut system_info = System::new();
         let process_pid = Pid::from(std::process::id() as usize);
@@ -1288,11 +1363,39 @@ impl App {
             pcf_poisson_samples: cfg.shadows.pcf_poisson_samples,
 
             skybox_texture: None,
+            skybox_texture_bytes: 0,
             skybox_view: None,
             skybox_sampler: None,
             skybox_bind_group: None,
             skybox_bind_group_layout: None,
             skybox_pipeline: None,
+            // GPU accounting init
+            gpu_buffer_bytes: 0,
+            gpu_texture_bytes: 0,
+            uniform_buffer_bytes: 0,
+            mega_vertex_buffer_bytes: 0,
+            mega_index_buffer_bytes: 0,
+            multi_draw_indirect_bytes: 0,
+            multi_draw_count_bytes: 0,
+            gpu_input_buffer_bytes: 0,
+            fallback_instance_buffer_bytes: 0,
+            fallback_indirect_bytes: 0,
+            mesh_indirect_bytes: 0,
+            envelope_indirect_bytes: 0,
+            cull_params_buffer_bytes: 0,
+            offscreen_color_texture_bytes: 0,
+            depth_texture_bytes: 0,
+            post_color_texture_bytes: 0,
+            dof_color_texture_bytes: 0,
+            bloom_ping_bytes: 0,
+            bloom_pong_bytes: 0,
+            kawase_ping_bytes: 0,
+            kawase_pong_bytes: 0,
+            ssao_ping_bytes: 0,
+            ssao_pong_bytes: 0,
+            shadow_map_bytes: 0,
+            cube_vertex_buffer_bytes: 0,
+            light_probe_buffer_bytes: 0,
         }
     }
 
@@ -1673,11 +1776,26 @@ impl App {
     }
 
     fn recreate_offscreen_targets(&mut self) {
-        let (Some(device), Some(config)) = (self.device.as_ref(), self.config.as_ref()) else {
-            return;
-        };
-
-        let color_texture = device.create_texture(&wgpu::TextureDescriptor {
+        let k_iterations: usize = self.dof_settings.kawase_iterations.min(6).max(1);
+        // Create textures with device/config in a local scope, store results in locals
+        let (
+            color_texture, color_view,
+            depth_texture, depth_view,
+            post_color_texture, post_color_view,
+            dof_color_texture, dof_color_view,
+            bloom_ping_texture, bloom_ping_view,
+            bloom_pong_texture, bloom_pong_view,
+            kawase_ping_textures_local, kawase_ping_views_local,
+            kawase_pong_textures_local, kawase_pong_views_local,
+            kawase_level_sizes_local,
+            ssao_ping_texture, ssao_ping_view,
+            ssao_pong_texture, ssao_pong_view
+            , offscreen_color_bytes, depth_bytes, post_color_bytes, dof_color_bytes, bloom_ping_bytes, bloom_pong_bytes, kawase_ping_total_loc, kawase_pong_total_loc, ssao_bytes
+        ) = {
+            let (Some(device), Some(config)) = (self.device.as_ref(), self.config.as_ref()) else {
+                return;
+            };
+            let color_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Offscreen Color Texture"),
             size: wgpu::Extent3d {
                 width: config.width,
@@ -1693,9 +1811,14 @@ impl App {
                 | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // Track bloom extract uniform buffer bytes
+        let bloom_extract_bytes = std::mem::size_of::<BloomExtractUniforms>() as u64;
+        App::replace_buffer_bytes_static(&mut self.uniform_buffer_bytes, bloom_extract_bytes, &mut self.gpu_buffer_bytes);
+            let color_view_loc = color_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
+        // Track offscreen color texture bytes
+            let offscreen_color_bytes = App::compute_texture_bytes(config.format, config.width, config.height, 1, 1);
 
-        let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+            let depth_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Offscreen Depth Texture"),
             size: wgpu::Extent3d {
                 width: config.width,
@@ -1709,9 +1832,12 @@ impl App {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bloom_blur_bytes = std::mem::size_of::<BloomBlurUniforms>() as u64;
+        App::replace_buffer_bytes_static(&mut self.uniform_buffer_bytes, bloom_blur_bytes, &mut self.gpu_buffer_bytes);
+            let depth_view_loc = depth_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
+            let depth_bytes = App::compute_texture_bytes(wgpu::TextureFormat::Depth32Float, config.width, config.height, 1, 1);
 
-        let post_color_texture = device.create_texture(&wgpu::TextureDescriptor {
+            let post_color_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Post DoF Color Texture"),
             size: wgpu::Extent3d {
                 width: config.width,
@@ -1727,13 +1853,14 @@ impl App {
                 | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        let post_color_view =
-            post_color_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        App::replace_buffer_bytes_static(&mut self.uniform_buffer_bytes, bloom_blur_bytes, &mut self.gpu_buffer_bytes);
+            let post_color_view_loc = post_color_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
+            let post_color_bytes = App::compute_texture_bytes(config.format, config.width, config.height, 1, 1);
 
         // Fused DoF blurred texture (half resolution) storing color + normalized CoC in alpha.
         let fused_width = (config.width / 2).max(1);
         let fused_height = (config.height / 2).max(1);
-        let dof_color_texture = device.create_texture(&wgpu::TextureDescriptor {
+            let dof_color_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("DoF Fused HalfRes Texture"),
             size: wgpu::Extent3d {
                 width: fused_width,
@@ -1747,7 +1874,10 @@ impl App {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        let dof_color_view = dof_color_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let composite_bytes = std::mem::size_of::<CompositeUniforms>() as u64;
+        App::replace_buffer_bytes_static(&mut self.uniform_buffer_bytes, composite_bytes, &mut self.gpu_buffer_bytes);
+            let dof_color_view_loc = dof_color_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
+            let dof_color_bytes = App::compute_texture_bytes(config.format, fused_width, fused_height, 1, 1);
 
         let bloom_extent = wgpu::Extent3d {
             width: (config.width / 2).max(1),
@@ -1755,7 +1885,7 @@ impl App {
             depth_or_array_layers: 1,
         };
 
-        let bloom_ping_texture = device.create_texture(&wgpu::TextureDescriptor {
+            let bloom_ping_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Bloom Ping Texture"),
             size: bloom_extent,
             mip_level_count: 1,
@@ -1765,10 +1895,11 @@ impl App {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        let bloom_ping_view =
-            bloom_ping_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let uniform_bytes = std::mem::size_of::<Uniforms>() as u64;
+        App::replace_buffer_bytes_static(&mut self.uniform_buffer_bytes, uniform_bytes, &mut self.gpu_buffer_bytes);
+            let bloom_ping_view_loc = bloom_ping_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let bloom_pong_texture = device.create_texture(&wgpu::TextureDescriptor {
+            let bloom_pong_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Bloom Pong Texture"),
             size: bloom_extent,
             mip_level_count: 1,
@@ -1778,101 +1909,126 @@ impl App {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        let bloom_pong_view =
-            bloom_pong_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let bloom_pong_view_loc = bloom_pong_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
+            let bloom_ping_bytes = App::compute_texture_bytes(config.format, bloom_extent.width, bloom_extent.height, 1, 1);
+            let bloom_pong_bytes = bloom_ping_bytes;
 
+            // Kawase chain creation: compute per-level ping/pong textures locally
+            let mut kawase_ping_textures_loc: Vec<Option<wgpu::Texture>> = Vec::new();
+            let mut kawase_ping_views_loc: Vec<Option<wgpu::TextureView>> = Vec::new();
+            let mut kawase_pong_textures_loc: Vec<Option<wgpu::Texture>> = Vec::new();
+            let mut kawase_pong_views_loc: Vec<Option<wgpu::TextureView>> = Vec::new();
+            let mut kawase_level_sizes_loc: Vec<(u32, u32)> = Vec::new();
+            let mut kawase_ping_total: u64 = 0;
+            let mut kawase_pong_total: u64 = 0;
+            for level in 0..k_iterations {
+                let w = (fused_width >> level).max(1);
+                let h = (fused_height >> level).max(1);
+                let ping_tex_loc = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(&format!("DoF Kawase Ping L{}", level)),
+                    size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: config.format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                });
+                let ping_view_loc = ping_tex_loc.create_view(&wgpu::TextureViewDescriptor::default());
+                let pong_tex_loc = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(&format!("DoF Kawase Pong L{}", level)),
+                    size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: config.format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                });
+                let pong_view_loc = pong_tex_loc.create_view(&wgpu::TextureViewDescriptor::default());
+                kawase_ping_textures_loc.push(Some(ping_tex_loc));
+                kawase_ping_views_loc.push(Some(ping_view_loc));
+                kawase_pong_textures_loc.push(Some(pong_tex_loc));
+                kawase_pong_views_loc.push(Some(pong_view_loc));
+                kawase_level_sizes_loc.push((w, h));
+                kawase_ping_total = kawase_ping_total.saturating_add(App::compute_texture_bytes(config.format, w, h, 1, 1));
+                kawase_pong_total = kawase_pong_total.saturating_add(App::compute_texture_bytes(config.format, w, h, 1, 1));
+            }
+            let ssao_ping_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("SSAO Ping Texture"),
+                size: wgpu::Extent3d { width: config.width, height: config.height, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: config.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let ssao_ping_view_loc = ssao_ping_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
+            let ssao_pong_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("SSAO Pong Texture"),
+                size: wgpu::Extent3d { width: config.width, height: config.height, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: config.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let ssao_pong_view_loc = ssao_pong_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
+            let ssao_bytes = App::compute_texture_bytes(config.format, config.width, config.height, 1, 1);
+
+            // Collect locals for assignment outside the scope
+            (
+                color_texture_loc, color_view_loc,
+                depth_texture_loc, depth_view_loc,
+                post_color_texture_loc, post_color_view_loc,
+                dof_color_texture_loc, dof_color_view_loc,
+                bloom_ping_texture_loc, bloom_ping_view_loc,
+                bloom_pong_texture_loc, bloom_pong_view_loc,
+                kawase_ping_textures_loc, kawase_ping_views_loc,
+                kawase_pong_textures_loc, kawase_pong_views_loc,
+                kawase_level_sizes_loc,
+                ssao_ping_texture_loc, ssao_ping_view_loc,
+                ssao_pong_texture_loc, ssao_pong_view_loc, offscreen_color_bytes, depth_bytes, post_color_bytes, dof_color_bytes, bloom_ping_bytes, bloom_pong_bytes, kawase_ping_total, kawase_pong_total, ssao_bytes
+            )
+        };
+
+        // Now that device/config borrows are dropped, update self with textures and tallies
+        App::replace_texture_bytes_static(&mut self.offscreen_color_texture_bytes, offscreen_color_bytes, &mut self.gpu_texture_bytes);
         self.offscreen_color_view = Some(color_view);
         self.offscreen_color_texture = Some(color_texture);
+        // Assign and track other created textures
+        App::replace_texture_bytes_static(&mut self.depth_texture_bytes, depth_bytes, &mut self.gpu_texture_bytes);
         self.offscreen_depth_view = Some(depth_view);
         self.offscreen_depth_texture = Some(depth_texture);
+        App::replace_texture_bytes_static(&mut self.post_color_texture_bytes, post_color_bytes, &mut self.gpu_texture_bytes);
         self.post_color_view = Some(post_color_view);
         self.post_color_texture = Some(post_color_texture);
-        self.dof_color_texture = Some(dof_color_texture);
+        App::replace_texture_bytes_static(&mut self.dof_color_texture_bytes, dof_color_bytes, &mut self.gpu_texture_bytes);
         self.dof_color_view = Some(dof_color_view);
+        self.dof_color_texture = Some(dof_color_texture);
+        App::replace_texture_bytes_static(&mut self.bloom_ping_bytes, bloom_ping_bytes, &mut self.gpu_texture_bytes);
+        App::replace_texture_bytes_static(&mut self.bloom_pong_bytes, bloom_pong_bytes, &mut self.gpu_texture_bytes);
 
-        // Dual Kawase ping/pong chain for DoF blur.
-        // Build textures for levels defined by dof_settings.kawase_iterations.
-        let k_iterations: usize = self.dof_settings.kawase_iterations.min(6).max(1); // clamp
-        self.kawase_ping_textures.clear();
-        self.kawase_ping_views.clear();
-        self.kawase_pong_textures.clear();
-        self.kawase_pong_views.clear();
-        self.kawase_level_sizes.clear();
-        for level in 0..k_iterations {
-            let w = (fused_width >> level).max(1);
-            let h = (fused_height >> level).max(1);
-            let ping_tex = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some(&format!("DoF Kawase Ping L{}", level)),
-                size: wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: config.format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            });
-            let ping_view = ping_tex.create_view(&wgpu::TextureViewDescriptor::default());
-            let pong_tex = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some(&format!("DoF Kawase Pong L{}", level)),
-                size: wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: config.format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            });
-            let pong_view = pong_tex.create_view(&wgpu::TextureViewDescriptor::default());
-            self.kawase_ping_textures.push(Some(ping_tex));
-            self.kawase_ping_views.push(Some(ping_view));
-            self.kawase_pong_textures.push(Some(pong_tex));
-            self.kawase_pong_views.push(Some(pong_view));
-            self.kawase_level_sizes.push((w, h));
-        }
+        // Kawase chain (filled from earlier locals)
+        self.kawase_ping_textures = kawase_ping_textures_local;
+        self.kawase_ping_views = kawase_ping_views_local;
+        self.kawase_pong_textures = kawase_pong_textures_local;
+        self.kawase_pong_views = kawase_pong_views_local;
+        self.kawase_level_sizes = kawase_level_sizes_local;
+        let new_kawase_ping_total: u64 = kawase_ping_total_loc;
+        let new_kawase_pong_total: u64 = kawase_pong_total_loc;
+        App::replace_texture_bytes_static(&mut self.kawase_ping_bytes, new_kawase_ping_total, &mut self.gpu_texture_bytes);
+        App::replace_texture_bytes_static(&mut self.kawase_pong_bytes, new_kawase_pong_total, &mut self.gpu_texture_bytes);
         self.bloom_ping_view = Some(bloom_ping_view);
         self.bloom_ping_texture = Some(bloom_ping_texture);
         self.bloom_pong_view = Some(bloom_pong_view);
         self.bloom_pong_texture = Some(bloom_pong_texture);
 
-        // SSAO ping/pong textures (FULL-RES to match depth buffer)
-        let ssao_extent = wgpu::Extent3d {
-            width: config.width,
-            height: config.height,
-            depth_or_array_layers: 1,
-        };
-        let ssao_ping_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("SSAO Ping Texture"),
-            size: ssao_extent,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: config.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let ssao_ping_view = ssao_ping_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let ssao_pong_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("SSAO Pong Texture"),
-            size: ssao_extent,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: config.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let ssao_pong_view = ssao_pong_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
+        // SSAO ping/pong textures assigned from locals
+        App::replace_texture_bytes_static(&mut self.ssao_ping_bytes, ssao_bytes, &mut self.gpu_texture_bytes);
+        App::replace_texture_bytes_static(&mut self.ssao_pong_bytes, ssao_bytes, &mut self.gpu_texture_bytes);
         self.ssao_ping_texture = Some(ssao_ping_texture);
         self.ssao_ping_view = Some(ssao_ping_view);
         self.ssao_pong_texture = Some(ssao_pong_texture);
@@ -1914,6 +2070,9 @@ impl App {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         self.shadow_texture = Some(texture);
+        // Track shadow map texture bytes
+        let shadow_bytes = App::compute_texture_bytes(wgpu::TextureFormat::Depth32Float, self.shadow_map_size, self.shadow_map_size, 1, 1);
+        App::replace_texture_bytes_static(&mut self.shadow_map_bytes, shadow_bytes, &mut self.gpu_texture_bytes);
         self.shadow_view = Some(view);
         self.update_main_bind_group();
     }
@@ -2358,6 +2517,9 @@ impl App {
                 contents: bytemuck::cast_slice(&ubo_data),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
+            // Track Kawase UBO bytes (4 floats)
+            let kawase_ubo_bytes = std::mem::size_of::<[f32; 4]>() as u64;
+            App::replace_buffer_bytes_static(&mut self.uniform_buffer_bytes, kawase_ubo_bytes, &mut self.gpu_buffer_bytes);
 
             self.kawase_uniform_buffers.push(Some(ubo));
             // Create empty placeholders for bind groups; we'll populate them now if we have the required resources
@@ -2462,6 +2624,9 @@ impl App {
                     | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             }));
+            // Track GPU input buffer bytes
+            let gpu_input_bytes = (self.gpu_input_capacity * std::mem::size_of::<GpuInstanceInput>()) as u64;
+            App::replace_buffer_bytes_static(&mut self.gpu_input_buffer_bytes, gpu_input_bytes, &mut self.gpu_buffer_bytes);
 
             // Create Mesh Indirect Buffer
             self.mesh_indirect_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
@@ -2473,6 +2638,7 @@ impl App {
                     | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));
+            App::replace_buffer_bytes_static(&mut self.mesh_indirect_bytes, (needed_capacity * std::mem::size_of::<wgpu::util::DrawIndexedIndirectArgs>()) as u64, &mut self.gpu_buffer_bytes);
 
             // Create Envelope Indirect Buffer
             self.envelope_indirect_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
@@ -2484,6 +2650,7 @@ impl App {
                     | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));
+            App::replace_buffer_bytes_static(&mut self.envelope_indirect_bytes, (needed_capacity * std::mem::size_of::<wgpu::util::DrawIndexedIndirectArgs>()) as u64, &mut self.gpu_buffer_bytes);
 
             // Create Fallback Instance Buffer
             self.fallback_instance_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
@@ -2495,6 +2662,7 @@ impl App {
                     | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));
+            App::replace_buffer_bytes_static(&mut self.fallback_instance_buffer_bytes, (needed_capacity * std::mem::size_of::<VoxelInstanceRaw>()) as u64, &mut self.gpu_buffer_bytes);
             self.fallback_instance_capacity = needed_capacity;
 
             self.cull_bind_group = None; // Force rebuild with new buffer
@@ -2510,6 +2678,7 @@ impl App {
                     | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));
+            App::replace_buffer_bytes_static(&mut self.fallback_indirect_bytes, std::mem::size_of::<wgpu::util::DrawIndirectArgs>() as u64, &mut self.gpu_buffer_bytes);
         }
     }
 
@@ -2911,6 +3080,9 @@ impl App {
         self.skybox_bind_group = Some(bind_group);
         self.skybox_bind_group_layout = Some(bind_group_layout);
         self.skybox_pipeline = Some(pipeline);
+        // Record and track skybox texture size
+        let skybox_bytes = (width as u64) * (height as u64) * 16; // RGBA32F = 16 bytes/pixel
+        App::replace_texture_bytes_static(&mut self.skybox_texture_bytes, skybox_bytes, &mut self.gpu_texture_bytes);
     }
 
     // Allocate or reuse a vertex buffer from the pool; returns (buffer, capacity_bytes)
@@ -3557,6 +3729,9 @@ impl App {
             contents: bytemuck::cast_slice(&initial_dof),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+        // Track DoF uniform buffer bytes
+        let dof_ubo_bytes = std::mem::size_of::<[f32; DOF_UNIFORM_FLOATS]>() as u64;
+        App::replace_buffer_bytes_static(&mut self.uniform_buffer_bytes, dof_ubo_bytes, &mut self.gpu_buffer_bytes);
 
         let dof_combine_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("DoF Combine Shader"),
@@ -4230,6 +4405,9 @@ impl App {
                 contents: bytemuck::cast_slice(&[ssao_blur_horizontal_uniforms]),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
+        // Track SSAO blur horizontal uniform buffer bytes
+        let ssao_blur_bytes = std::mem::size_of::<SsaoUniformsRaw>() as u64;
+        App::replace_buffer_bytes_static(&mut self.uniform_buffer_bytes, ssao_blur_bytes, &mut self.gpu_buffer_bytes);
 
         let ssao_blur_vertical_uniforms =
             self.build_ssao_blur_uniforms(ssao_width, ssao_height, [0.0, 1.0]);
@@ -4239,6 +4417,7 @@ impl App {
                 contents: bytemuck::cast_slice(&[ssao_blur_vertical_uniforms]),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
+        App::replace_buffer_bytes_static(&mut self.uniform_buffer_bytes, ssao_blur_bytes, &mut self.gpu_buffer_bytes);
 
         // Create light probe buffer (start with capacity for 64 probes)
         let light_probe_capacity = 64;
@@ -4255,6 +4434,9 @@ impl App {
             contents: bytemuck::cast_slice(&empty_probes),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
+        // Track light probe buffer bytes
+        let probes_size = (light_probe_capacity * std::mem::size_of::<LightProbe>()) as u64;
+        App::replace_buffer_bytes_static(&mut self.light_probe_buffer_bytes, probes_size, &mut self.gpu_buffer_bytes);
 
         let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Shadow Sampler"),
@@ -4375,6 +4557,9 @@ impl App {
             contents: bytemuck::bytes_of(&cull_params_init),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+        // Track cull params buffer bytes
+        let cull_params_size = std::mem::size_of::<GpuCullParams>() as u64;
+        App::replace_buffer_bytes_static(&mut self.cull_params_buffer_bytes, cull_params_size, &mut self.gpu_buffer_bytes);
 
         // Create cube vertex buffer with positions and normals
         let cube_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -4382,6 +4567,9 @@ impl App {
             contents: bytemuck::cast_slice(CUBE_VERTICES),
             usage: wgpu::BufferUsages::VERTEX,
         });
+        // Track cube vertex buffer bytes (small)
+        let cube_vertex_bytes = (CUBE_VERTICES.len() * std::mem::size_of::<MeshVertexRaw>()) as u64;
+        App::replace_buffer_bytes_static(&mut self.cube_vertex_buffer_bytes, cube_vertex_bytes, &mut self.gpu_buffer_bytes);
 
         // Create Mega Buffers and multi-draw buffers
         let mega_vertex_size = self.vertex_allocator.total_size();
@@ -4392,12 +4580,15 @@ impl App {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // Track mega buffer sizes
+        App::replace_buffer_bytes_static(&mut self.mega_vertex_buffer_bytes, mega_vertex_size, &mut self.gpu_buffer_bytes);
         let mega_index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Mega Index Buffer"),
             size: mega_index_size,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        App::replace_buffer_bytes_static(&mut self.mega_index_buffer_bytes, mega_index_size, &mut self.gpu_buffer_bytes);
 
         // Multi-draw indirect buffers
         let indirect_entry_size = std::mem::size_of::<wgpu::util::DrawIndexedIndirectArgs>() as u64;
@@ -4409,6 +4600,12 @@ impl App {
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // Track multi-draw indirect buffer
+        App::replace_buffer_bytes_static(
+            &mut self.multi_draw_indirect_bytes,
+            (self.max_draw_capacity as u64) * std::mem::size_of::<wgpu::util::DrawIndexedIndirectArgs>() as u64,
+            &mut self.gpu_buffer_bytes,
+        );
         let multi_draw_count_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Multi Draw Count Buffer"),
             // store two u32 counts (mesh count @ offset 0, envelope count @ offset 4)
@@ -4418,6 +4615,11 @@ impl App {
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+        App::replace_buffer_bytes_static(
+            &mut self.multi_draw_count_bytes,
+            (std::mem::size_of::<u32>() * 2) as u64,
+            &mut self.gpu_buffer_bytes,
+        );
 
         self.cull_pipeline = Some(cull_pipeline);
         self.cull_bind_group_layout = Some(cull_bind_group_layout);
@@ -4497,6 +4699,9 @@ impl App {
             contents: bytemuck::cast_slice(&[ssilvb_uniforms]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+        // Track ssilvb uniform buffer bytes
+        let ssilvb_bytes = std::mem::size_of::<SsaoUniformsRaw>() as u64;
+        App::replace_buffer_bytes_static(&mut self.uniform_buffer_bytes, ssilvb_bytes, &mut self.gpu_buffer_bytes);
         self.ssilvb_uniform_buffer = Some(ssilvb_uniform_buffer);
         self.bloom_extract_bind_group = None;
         self.bloom_blur_horizontal_bind_group = None;
@@ -6001,6 +6206,9 @@ impl App {
                     mapped_at_creation: false,
                 });
                 self.light_probe_buffer = Some(new_buffer);
+                // Track reallocated light probe buffer bytes
+                let new_probes_bytes = (self.light_probe_capacity * std::mem::size_of::<LightProbe>()) as u64;
+                App::replace_buffer_bytes_static(&mut self.light_probe_buffer_bytes, new_probes_bytes, &mut self.gpu_buffer_bytes);
                 self.bind_group = None; // Force bind group recreation
             }
 
@@ -6851,9 +7059,18 @@ impl App {
                                 .color(egui::Color32::WHITE)
                                 .size(10.0),
                             );
+                            // (Moved) Mesh cache and envelopes will be printed under 'Process' for clarity
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "Mesh cache: {:.0}/{:.0} MiB",
+                                    "Process: {:.0} MiB",
+                                    self.process_mem_mib
+                                ))
+                                .color(egui::Color32::WHITE)
+                                .size(10.0),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "  Mesh cache: {:.0}/{:.0} MiB",
                                     self.mesh_cache_mib, self.mesh_budget_mib
                                 ))
                                 .color(egui::Color32::WHITE)
@@ -6861,7 +7078,7 @@ impl App {
                             );
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "Envelopes: {:.0}/{:.0} MiB",
+                                    "  Envelopes: {:.0}/{:.0} MiB",
                                     self.envelope_cache_mib, self.mesh_budget_mib
                                 ))
                                 .color(egui::Color32::WHITE)
@@ -6869,8 +7086,89 @@ impl App {
                             );
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "Process: {:.0} MiB",
-                                    self.process_mem_mib
+                                    "GPU tracked: {:.0} MiB",
+                                    (self.gpu_buffer_bytes + self.gpu_texture_bytes) as f64
+                                        / (1024.0 * 1024.0)
+                                ))
+                                .color(egui::Color32::WHITE)
+                                .size(10.0),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "  Uniforms: {:.1} MiB",
+                                    (self.uniform_buffer_bytes as f64) / (1024.0 * 1024.0)
+                                ))
+                                .color(egui::Color32::WHITE)
+                                .size(10.0),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "  Mega VB/IB: {:.1}/{:.1} MiB",
+                                    (self.mega_vertex_buffer_bytes as f64) / (1024.0 * 1024.0),
+                                    (self.mega_index_buffer_bytes as f64) / (1024.0 * 1024.0)
+                                ))
+                                .color(egui::Color32::WHITE)
+                                .size(10.0),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "  GPU Input: {:.1} MiB",
+                                    (self.gpu_input_buffer_bytes as f64) / (1024.0 * 1024.0)
+                                ))
+                                .color(egui::Color32::WHITE)
+                                .size(10.0),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "  Indirects (mesh/env): {:.1}/{:.1} MiB",
+                                    (self.mesh_indirect_bytes as f64) / (1024.0 * 1024.0),
+                                    (self.envelope_indirect_bytes as f64) / (1024.0 * 1024.0)
+                                ))
+                                .color(egui::Color32::WHITE)
+                                .size(10.0),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "  Offscreen/Depth/Post: {:.1}/{:.1}/{:.1} MiB",
+                                    (self.offscreen_color_texture_bytes as f64) / (1024.0 * 1024.0),
+                                    (self.depth_texture_bytes as f64) / (1024.0 * 1024.0),
+                                    (self.post_color_texture_bytes as f64) / (1024.0 * 1024.0)
+                                ))
+                                .color(egui::Color32::WHITE)
+                                .size(10.0),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "  Kawase ping/pong: {:.1}/{:.1} MiB",
+                                    (self.kawase_ping_bytes as f64) / (1024.0 * 1024.0),
+                                    (self.kawase_pong_bytes as f64) / (1024.0 * 1024.0)
+                                ))
+                                .color(egui::Color32::WHITE)
+                                .size(10.0),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "  Bloom ping/pong: {:.1}/{:.1} MiB",
+                                    (self.bloom_ping_bytes as f64) / (1024.0 * 1024.0),
+                                    (self.bloom_pong_bytes as f64) / (1024.0 * 1024.0)
+                                ))
+                                .color(egui::Color32::WHITE)
+                                .size(10.0),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "  SSAO ping/pong: {:.1}/{:.1} MiB",
+                                    (self.ssao_ping_bytes as f64) / (1024.0 * 1024.0),
+                                    (self.ssao_pong_bytes as f64) / (1024.0 * 1024.0)
+                                ))
+                                .color(egui::Color32::WHITE)
+                                .size(10.0),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "  Shadow/Skybox: {:.1}/{:.1} MiB",
+                                    (self.shadow_map_bytes as f64) / (1024.0 * 1024.0),
+                                    (self.skybox_texture_bytes as f64) / (1024.0 * 1024.0)
                                 ))
                                 .color(egui::Color32::WHITE)
                                 .size(10.0),
@@ -6978,11 +7276,29 @@ impl App {
             let mesh_cache_mib = self.mesh_cache_bytes as f64 / (1024.0 * 1024.0);
             let mesh_budget_mib = self.mesh_cache_byte_budget() as f64 / (1024.0 * 1024.0);
             self.system_info.refresh_process(self.process_pid);
-            let process_mem_mib = self
+            let (process_mem_mib, process_vmem_mib) = self
                 .system_info
                 .process(self.process_pid)
-                .map(|p| p.memory() as f64 / (1024.0 * 1024.0))
-                .unwrap_or(0.0);
+                .map(|p| (
+                    p.memory() as f64 / (1024.0 * 1024.0),
+                    p.virtual_memory() as f64 / (1024.0 * 1024.0),
+                ))
+                .unwrap_or((0.0, 0.0));
+
+            // Track memory in major in-app categories (mesh caches + megabuffers + GPU input buffers)
+            let tracked_bytes: u64 = self
+                .mesh_cache_bytes
+                .saturating_add(self.envelope_mesh_cache_bytes)
+                .saturating_add(self.vertex_allocator.allocated_bytes())
+                .saturating_add(self.index_allocator.allocated_bytes())
+                .saturating_add((self.gpu_input_capacity as u64)
+                    * std::mem::size_of::<GpuInstanceInput>() as u64)
+                .saturating_add((self.fallback_instance_capacity as u64)
+                    * std::mem::size_of::<VoxelInstanceRaw>() as u64);
+            let tracked_mem_mib = tracked_bytes as f64 / (1024.0 * 1024.0);
+            // Tracked GPU reserved bytes collected from allocations:
+            let gpu_reserved_bytes = self.gpu_buffer_bytes.saturating_add(self.gpu_texture_bytes);
+            let gpu_reserved_mib = gpu_reserved_bytes as f64 / (1024.0 * 1024.0);
             let ready_count = self.ready_chunk_meshes.len();
             self.last_fps = self.frame_count as u32;
             let jobs_in_flight = self.mesh_jobs_in_flight;
@@ -6992,7 +7308,7 @@ impl App {
                 && self.ready_chunk_meshes.is_empty()
                 && jobs_in_flight == 0;
             println!(
-                "FPS: {}, Visible items: {}, Leaf chunks: {}, Meshed chunks: {}, Pending: {}, PendingSet: {}, Ready: {}, InFlight: {}, Fallback: {}, Mesh cache: {:.1}/{:.1} MiB, Process: {:.1} MiB, Cull: {:.2}ms, Group: {:.2}ms, Mesh: {:.2}ms, Instances: {:.2}ms, Draws: {}, Jobs/sec: {}, EmptyMeshes: {}, VReuse: {}, IReuse: {}, VPool: {}, IPool: {}, MeshIdle: {}, DoF Kawase: {} (iter={}, off={:.2}), MeshUp: {:.2}ms parts:(leaf:{:.2} sched:{:.2} sort:{:.2} res:{:.2} jobc:{:.2} jobn:{:.2}) vbld:{:.2} v:{:.2} i:{:.2} ins:{:.2} emit:{:.2} processed:{} limit:{}",
+                "FPS: {}, Visible items: {}, Leaf chunks: {}, Meshed chunks: {}, Pending: {}, PendingSet: {}, Ready: {}, InFlight: {}, Fallback: {}, Mesh cache: {:.1}/{:.1} MiB, Process (RSS/VM): {:.1}/{:.1} MiB, Tracked: {:.1} MiB, GPU reserved: {:.1} MiB, Cull: {:.2}ms, Group: {:.2}ms, Mesh: {:.2}ms, Instances: {:.2}ms, Draws: {}, Jobs/sec: {}, EmptyMeshes: {}, VReuse: {}, IReuse: {}, VPool: {}, IPool: {}, MeshIdle: {}, DoF Kawase: {} (iter={}, off={:.2}), MeshUp: {:.2}ms parts:(leaf:{:.2} sched:{:.2} sort:{:.2} res:{:.2} jobc:{:.2} jobn:{:.2}) vbld:{:.2} v:{:.2} i:{:.2} ins:{:.2} emit:{:.2} processed:{} limit:{}",
                 self.frame_count,
                 total_visible,
                 leaf_chunks.len(),
@@ -7005,6 +7321,9 @@ impl App {
                 mesh_cache_mib,
                 mesh_budget_mib,
                 process_mem_mib,
+                process_vmem_mib,
+                tracked_mem_mib,
+                gpu_reserved_mib,
                 cull_time.as_secs_f64() * 1000.0,
                 grouping_time.as_secs_f64() * 1000.0,
                     (if mesh_idle { std::time::Duration::from_secs(0) } else { mesh_time }).as_secs_f64() * 1000.0,

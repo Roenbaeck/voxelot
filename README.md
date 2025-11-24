@@ -199,6 +199,41 @@ struct World {
 - Rank-based indexing works identically for leaves and branches
 - Projection bits (px/py/pz) propagate up the hierarchy for efficient culling
 - No special-casing - same code handles all levels
+
+## GUI Overlay — Metrics & Explanations
+
+The viewer displays a lightweight real-time overlay (top-left) showing runtime and profiling information. Below is an explanation of each metric so you can interpret the numbers correctly.
+
+- FPS: Frames-per-second measured by the viewer. Lower FPS indicates heavier workload or GPU/CPU bottlenecks.
+- Visible: Number of visible chunk instances that reached the draw pass this frame (includes lod/displaced/instanced entries).
+- Meshed: The number of meshed chunks currently present in the mesh cache.
+- Pending: Number of chunk meshing jobs pending inside the pipeline/queue.
+- Jobs/s: Mesh-worker throughput — how many mesh jobs are completed per second.
+- Process: Process memory in MiB (Resident Set Size / RSS); this is what `sysinfo` reports for the voxelot process and represents main-process physical memory.
+    - Mesh cache: App-level mesh cache size (MiB) and the configured mesh cache budget. This is memory used by GPU mesh data that the app tracks (vertex/index buffers staged by the app), not the OS-size.
+    - Envelopes: Memory used by envelope meshes in the mesh cache (MiB) — these are the lower-detail meshes used as fallbacks.
+
+- GPU tracked: The in-app tracked estimate of GPU-resident allocations, shown in MiB.
+    - This equals `gpu_buffer_bytes + gpu_texture_bytes` (buffers + textures) and covers all resources we explicitly track in the app (mega vertex/index buffers, indirect buffers, uniform buffers, offscreen textures, ping/pong buffers, etc.).
+    - It is an estimate that includes any buffers and textures where we call the tracking helper (buffer+texture accounting). It does not always match the full OS-level GPU memory usage because the GPU driver and platform (e.g., Metal on macOS) often allocate additional driver-side memory (IOSurface/IOAccelerator) which is not accessible via `wgpu`.
+
+    The per-resource breakdown includes:
+    - Uniforms: Sum of UBO sizes (MiB) tracked by the app. This includes UBOs like `Uniforms`, Bloom/DoF/SSAO UBOs and Kawase level UBOs.
+    - Mega VB/IB: Size in MiB of the “mega” vertex and index buffers (slab-allocated storage used to hold combined chunk meshes).
+    - GPU Input: Size of the GPU-visible input buffer for culling / instance candidate information (MiB).
+    - Indirects (mesh/env): Size of draw-indirect buffers used by the rendering system to perform multi-draw calls for meshes and envelopes.
+    - Offscreen/Depth/Post: Sizes of the offscreen rendering targets (color), depth, and post-processing textures. These are commonly large contributors.
+    - Kawase ping/pong: The ping/pong texture chain used for Kawase DoF blur (per level). Each entry denotes a ping/pong pair's total sizes.
+    - Bloom ping/pong: The bloom texture pair used for multi-pass blur.
+    - SSAO ping/pong: SSAO intermediate textures.
+    - Shadow/Skybox: Shadow map bytes and skybox texture bytes. Shadow maps (especially large sizes like 8k or 16k) are one of the largest GPU allocations — reduce `shadow.map_size` if you're near VRAM limits.
+
+- Cull / Group / Mesh / Instancing (ms): Per-frame timings (in milliseconds) for major pipeline steps measured on the CPU side:
+    - Cull: Time it took to perform frustum + occlusion + GPU compute culling for this frame.
+    - Group: CPU grouping / batching work before issuing draws.
+    - Mesh: Total CPU time spent creating/generating meshes for this frame.
+    - Instancing: Time spent doing the per-instance drawing path (binding, instanced draws, etc.).
+- Draws: Number of actual draw calls issued in the frame.
+
 ## Credits
 The skybox image is CC0, downloaded from [Polyhaven](https://polyhaven.com).
-
