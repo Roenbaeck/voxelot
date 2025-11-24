@@ -127,6 +127,13 @@ fn cs_main(@builtin(global_invocation_id) global_id : vec3<u32>) {
             use_envelope = false;
         }
 
+        // CRITICAL FIX: If CPU has already prepopulated individual voxels for this chunk (fallback),
+        // we MUST NOT render the mesh or envelope, otherwise we get z-fighting artifacts.
+        if (cpu_prepopulated) {
+            use_detail = false;
+            use_envelope = false;
+        }
+
         if (use_detail) {
             // Enable mesh draw
             mesh_indirect[instance.mesh_index].instance_count = 1u;
