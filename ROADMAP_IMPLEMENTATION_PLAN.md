@@ -112,6 +112,22 @@ Traditional occlusion queries are slow (CPU readback). We need a GPU-driven appr
     - **Pass 2:** Render everything else.
     - *Recommendation:* Start with 1-frame latency. It's usually fine for terrain.
 
+### Progress update: HZB Prototype implemented (First pass)
+
+What has been implemented in the codebase:
+- A same-frame HZB prototype exists in `src/bin/voxelot.rs` with a compute shader `shaders/hzb_gen.wgsl` that performs a depth -> `R32` storage texture copy (level 0). The HZB texture is created with a mipmap chain and a set of per-mip storage views is allocated.
+- `gpu_cull.wgsl` is wired to accept the HZB texture and performs a conservative occlusion test. The compute shader now includes camera right/up vectors, FOV/aspect and screen dimensions inside `GpuCullParams` to compute projection on-GPU.
+- A runtime toggle exists in the `config.toml` (`performance.hzb_enabled`) and keyboard `H` to enable/disable HZB at runtime. When disabled a 1x1 dummy `R32` texture is used to keep bind group structures stable. The application tracks `hzb_texture_bytes` for in-app GPU accounting.
+
+Short-term next steps (to be implemented):
+1. Generate the min-reduction mipchain using a compute reduction pass for HZB levels (per-mip store writes).
+2. Replace center-point sampling with projected AABB sampling and proper mip-level selection to make occlusion decisions robust.
+3. Add instrumentation to measure occlusion success and performance impact (draw count, overdraw, culling ratio).
+
+Long-term improvements (post-prototype):
+- Reprojection of previous frame depth or use same-frame generated depth with occluder pre-pass to reduce popping.
+- A hybrid occluder selection: prefer large occluders in HZB generation to improve occlusion fidelity.
+- Alternate strategies toggles (last-frame HZB vs same-frame per-chunk bounding box pass) for profiling comparisons.
 ### Alternative: "Rough" Grid Culling (Simpler)
 - Divide the world into large macro-cells (e.g., 32x32 chunks).
 - If a macro-cell is fully occluded (e.g., by a wall of chunks), cull all chunks inside.

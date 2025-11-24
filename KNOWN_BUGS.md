@@ -1,3 +1,1 @@
-1. Is there a bias (small adjustment) for any coordinates when indiviual voxels are drawn? I can see a small mismatch in position when a mesh replaces the contents on an unmeshed chunk (rendered as all voxels). I think we should remove that bias if it exists, since it was introduced when we believed we had z-fighting, which we don't. 
-2. HZB is using chunk corners, not the bounding box. We would get better results if we used the bounding box.   
-
+1. Mesh workers are a bit aggressively using up all CPU, can we dedidicate more to the CPU-GPU pipeline and less to the workers, to increase frame rate while they are running? 

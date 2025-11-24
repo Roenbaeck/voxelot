@@ -19,6 +19,20 @@
 - **Challenge:** Previous attempts hurt performance. Need to find a "rough" culling approach that is cheap enough to be a net win. Maybe hierarchical Z-buffer (HZB) or a simple coverage buffer?
 - **Implementation:** See `ROADMAP_IMPLEMENTATION_PLAN.md` for detailed design.
 
+**Update (HZB prototype implemented):**
+- **Prototype:** A same-frame Hierarchical Z-Buffer (HZB) prototype is now implemented.
+    - `hzb_gen.wgsl` (compute shader) performs an initial pass copying the depth buffer to a R32 storage texture (level 0). The shader and bindgroup are wired in `voxelot.rs`.
+    - `gpu_cull.wgsl` was augmented to sample an HZB texture (binding #6) during GPU culling. The current prototype performs an approximate occlusion check by projecting a chunk's center into screen space and sampling the HZB level 0.
+    - The cull UBO `GpuCullParams` now contains camera vectors and screen parameters so the compute shader can compute NDC/screen coordinates without extra CPU precomputation.
+    - Runtime toggle: `performance.hzb_enabled` in `config.toml` and `H` keyboard toggle enable/disable the HZB features at runtime.
+    - Resource management: a proper R32 mipmapped HZB texture is allocated when enabled; when disabled a 1x1 dummy R32 texture is used so bind groups remain stable. Per-resource GPU accounting includes `hzb_texture_bytes`.
+
+**Limitations / Next Steps:**
+- The HZB prototype currently writes depth into the level-0 R32 texture and samples it to perform the occlusion test. Full mipchain generation (min-reduction) and per-AABB testing across an appropriate mip level are planned.
+- Projected-screen-space AABB tests (instead of a center test) will reduce false positives/negatives. The plan is to compute a projected AABB, select an appropriate HZB mip level, and compare minimum near depth against the HZB sample.
+- Reduce artifacts and add reprojection (if desired) to use last frame's HZB with reprojected depths on camera movement.
+- Performance validation: run end-to-end benchmarks to compare basic culling vs. HZB-aided culling and iterate.
+
 ### 3. General Improvements
 - **Deterministic Skipping:** Add a per-chunk offset approach so the compute shader can skip prepopulated buffers deterministically.
 

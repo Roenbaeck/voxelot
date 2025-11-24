@@ -368,7 +368,7 @@ fn default_fallback_detail_distance() -> f32 {
 }
 
 fn default_fallback_bbox_shrink() -> f32 {
-    0.92
+    1.0 // No shrinkage - prevents position mismatch between fallback voxels and meshes
 }
 
 fn default_mesh_priority_sort_interval_frames() -> u64 {

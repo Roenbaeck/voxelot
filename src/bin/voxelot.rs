@@ -2264,7 +2264,7 @@ impl App {
         // Create HZB texture (after we dropped the device/config borrow from the local closure)
         if let Some(device) = self.device.as_ref() {
             let hzb_bytes: u64;
-            let mut hzb_mips: u32 = 1;
+            let hzb_mips: u32;
             let mut hzb_texture_opt: Option<wgpu::Texture> = None;
             let mut hzb_view_opt: Option<wgpu::TextureView> = None;
             let mut hzb_mip_views_local: Vec<wgpu::TextureView> = Vec::new();
