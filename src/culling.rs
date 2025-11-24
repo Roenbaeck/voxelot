@@ -738,6 +738,8 @@ fn process_voxels<I>(
 ) where
     I: Iterator<Item = u32>,
 {
+    // NOTE: bbox_local_to_world is available at module scope for consistent conversions.
+
     // We need to map index back to x,y,z.
     // Assuming index = x + y*16 + z*256
 
@@ -796,18 +798,8 @@ fn process_voxels<I>(
 
                 if distance >= camera.config.lod_render_distance && sub_chunk.voxel_count > 0 {
                     let (pos, size) = if let Some(bbox) = sub_chunk.bounding_box {
-                        // The bounding box is in local coordinates (0..15).
-                        // To get world coordinates, we multiply by the scale of the sub-elements (voxels/sub-chunks).
-                        let scale_f = scale as f32;
-                        let x = world_x as f32 + (bbox[0] as f32 * scale_f);
-                        let y = world_y as f32 + (bbox[1] as f32 * scale_f);
-                        let z = world_z as f32 + (bbox[2] as f32 * scale_f);
-
-                        let size_x = (bbox[3] - bbox[0] + 1) as f32 * scale_f;
-                        let size_y = (bbox[4] - bbox[1] + 1) as f32 * scale_f;
-                        let size_z = (bbox[5] - bbox[2] + 1) as f32 * scale_f;
-
-                        ([x as i64, y as i64, z as i64], [size_x, size_y, size_z])
+                        // Convert local bbox (0..15) to world coordinates + size in world units.
+                        bbox_local_to_world(bbox, world_x, world_y, world_z, scale)
                     } else {
                         // Fallback to full chunk size if bounding_box is None
                         let size = [scale as f32, scale as f32, scale as f32];
@@ -997,14 +989,7 @@ pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> Vec<Voxel
                         if distance >= camera.config.lod_render_distance {
                             if chunk.voxel_count > 0 {
                                 let (pos, size) = if let Some(bbox) = chunk.bounding_box {
-                                    let unit = scale / 16;
-                                    let x = world_x + (bbox[0] as i64 * unit);
-                                    let y = world_y + (bbox[1] as i64 * unit);
-                                    let z = world_z + (bbox[2] as i64 * unit);
-                                    let sx = (bbox[3] - bbox[0] + 1) as f32 * unit as f32;
-                                    let sy = (bbox[4] - bbox[1] + 1) as f32 * unit as f32;
-                                    let sz = (bbox[5] - bbox[2] + 1) as f32 * unit as f32;
-                                    ([x, y, z], [sx, sy, sz])
+                                        bbox_local_to_world(bbox, world_x, world_y, world_z, scale)
                                 } else {
                                     (
                                         [world_x, world_y, world_z],
@@ -1136,4 +1121,51 @@ fn add(a: &[f32; 3], b: &[f32; 3]) -> [f32; 3] {
 
 fn mul_scalar(v: &[f32; 3], s: f32) -> [f32; 3] {
     [v[0] * s, v[1] * s, v[2] * s]
+}
+
+/// Convert a local chunk bounding box (bbox in 0..15 coordinates) to world-space position and
+/// world-space size using the supplied scale for the current voxel.
+///
+/// - bbox: [xmin, ymin, zmin, xmax, ymax, zmax]
+/// - world_x/y/z: the world-space base position of the current voxel/chunk
+/// - scale: size of a voxel at this level (e.g., 256, 4096, ...)
+fn bbox_local_to_world(
+    bbox: [u8; 6],
+    world_x: i64,
+    world_y: i64,
+    world_z: i64,
+    scale: i64,
+) -> ([i64; 3], [f32; 3]) {
+    let unit = scale / 16; // integral division is exact since scale = 16^n
+    let x = world_x + (bbox[0] as i64 * unit);
+    let y = world_y + (bbox[1] as i64 * unit);
+    let z = world_z + (bbox[2] as i64 * unit);
+    let sx = (bbox[3] - bbox[0] + 1) as f32 * unit as f32;
+    let sy = (bbox[4] - bbox[1] + 1) as f32 * unit as f32;
+    let sz = (bbox[5] - bbox[2] + 1) as f32 * unit as f32;
+    ([x, y, z], [sx, sy, sz])
+}
+
+#[cfg(test)]
+mod tests_culling {
+    use super::bbox_local_to_world;
+
+    #[test]
+    fn test_bbox_local_to_world() {
+        // scale = 16 -> unit = 1
+        let bbox = [7u8, 7, 7, 7, 7, 7];
+        let (pos, size) = bbox_local_to_world(bbox, 100, 200, 300, 16);
+        assert_eq!(pos, [107, 207, 307]);
+        assert_eq!(size, [1.0, 1.0, 1.0]);
+
+        // scale = 256 -> unit = 16
+        let (pos2, size2) = bbox_local_to_world(bbox, 0, 0, 0, 256);
+        assert_eq!(pos2, [7 * 16, 7 * 16, 7 * 16]);
+        assert_eq!(size2, [16.0, 16.0, 16.0]);
+
+        // scale = 4096 -> unit = 256
+        let (pos3, size3) = bbox_local_to_world([0, 0, 0, 15, 15, 15], 0, 0, 0, 4096);
+        assert_eq!(pos3, [0, 0, 0]);
+        assert_eq!(size3, [4096.0, 4096.0, 4096.0]);
+    }
 }
