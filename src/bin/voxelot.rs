@@ -6141,12 +6141,11 @@ impl App {
                     wgpu::IndexFormat::Uint32,
                 );
 
-                let multi_draw_supported = device
-                    .features()
-                    .contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT)
-                    && self.cull_pipeline.is_none();
+                // For shadows, always use direct draws (not multi-draw indirect)
+                // This allows us to render all leaf chunks, not just camera-visible ones
+                let use_multi_draw_for_shadows = false;
 
-                if multi_draw_supported {
+                if use_multi_draw_for_shadows {
                     if cfg!(feature = "viewer-debug") {
                         viewer_debug!(
                             "Shader path: Using multi-draw indirect for shadow pass (CPU path)"
@@ -6181,30 +6180,29 @@ impl App {
                         draw_calls += self.envelope_mesh_cache.len(); // approximate
                     }
                 } else {
-                    // For shadows, always use direct draws for all leaf chunks (not just camera-visible ones)
-                    // This ensures objects just outside camera view still cast shadows correctly
-                    for &key in leaf_chunks.iter() {
-                        // Draw Detail Mesh directly if it exists
-                        if let Some(entry) = self.mesh_cache.get(&key) {
-                            let start_index = (entry.index_offset / 4) as u32;
-                            let end_index = start_index + entry.index_count;
-                            let base_vertex = (entry.vertex_offset
-                                / std::mem::size_of::<MeshVertexRaw>() as u64)
-                                as i32;
-                            shadow_pass.draw_indexed(start_index..end_index, base_vertex, 0..1);
-                            draw_calls += 1;
-                        }
+                    // For shadows, render ALL cached meshes (not just camera-visible leaf_chunks)
+                    // This ensures complete shadow coverage for all loaded geometry
 
-                        // Draw Envelope Mesh directly if it exists
-                        if let Some(entry) = self.envelope_mesh_cache.get(&key) {
-                            let start_index = (entry.index_offset / 4) as u32;
-                            let end_index = start_index + entry.index_count;
-                            let base_vertex = (entry.vertex_offset
-                                / std::mem::size_of::<MeshVertexRaw>() as u64)
-                                as i32;
-                            shadow_pass.draw_indexed(start_index..end_index, base_vertex, 0..1);
-                            draw_calls += 1;
-                        }
+                    // Draw all detail meshes
+                    for (key, entry) in self.mesh_cache.iter() {
+                        let start_index = (entry.index_offset / 4) as u32;
+                        let end_index = start_index + entry.index_count;
+                        let base_vertex = (entry.vertex_offset
+                            / std::mem::size_of::<MeshVertexRaw>() as u64)
+                            as i32;
+                        shadow_pass.draw_indexed(start_index..end_index, base_vertex, 0..1);
+                        draw_calls += 1;
+                    }
+
+                    // Draw all envelope meshes
+                    for (key, entry) in self.envelope_mesh_cache.iter() {
+                        let start_index = (entry.index_offset / 4) as u32;
+                        let end_index = start_index + entry.index_count;
+                        let base_vertex = (entry.vertex_offset
+                            / std::mem::size_of::<MeshVertexRaw>() as u64)
+                            as i32;
+                        shadow_pass.draw_indexed(start_index..end_index, base_vertex, 0..1);
+                        draw_calls += 1;
                     }
                 }
             }
