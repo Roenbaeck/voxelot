@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::path::Path;
-use voxelot::{load_world_file, Chunk, Voxel, World, WorldPos};
+use voxelot::{load_world_file, Chunk, Voxel, World};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();

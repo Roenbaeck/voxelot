@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use voxelot::{Chunk, Palette};
 
 fn main() {

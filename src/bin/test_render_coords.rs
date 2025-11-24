@@ -1,4 +1,4 @@
-use voxelot::{Chunk, Palette, bbox_local_to_world};
+use voxelot::bbox_local_to_world;
 
 fn main() {
     println!("Testing Render Coordinate Calculations...");

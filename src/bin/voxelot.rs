@@ -6129,7 +6129,7 @@ impl App {
                 occlusion_query_set: None,
             });
 
-            if let Some(mesh_indirect) = &self.mesh_indirect_buffer {
+            if let Some(_mesh_indirect) = &self.mesh_indirect_buffer {
                 shadow_pass.set_pipeline(shadow_mesh_pipeline);
                 shadow_pass.set_bind_group(0, shadow_bind_group, &[]);
 
@@ -6184,7 +6184,7 @@ impl App {
                     // This ensures complete shadow coverage for all loaded geometry
 
                     // Draw all detail meshes
-                    for (key, entry) in self.mesh_cache.iter() {
+                    for (_, entry) in self.mesh_cache.iter() {
                         let start_index = (entry.index_offset / 4) as u32;
                         let end_index = start_index + entry.index_count;
                         let base_vertex = (entry.vertex_offset
@@ -6195,7 +6195,7 @@ impl App {
                     }
 
                     // Draw all envelope meshes
-                    for (key, entry) in self.envelope_mesh_cache.iter() {
+                    for (_, entry) in self.envelope_mesh_cache.iter() {
                         let start_index = (entry.index_offset / 4) as u32;
                         let end_index = start_index + entry.index_count;
                         let base_vertex = (entry.vertex_offset
