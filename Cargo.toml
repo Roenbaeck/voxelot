@@ -39,15 +39,15 @@ egui-winit = "0.33"
 [dev-dependencies]
 anyhow = "1"
 
-[profile.release]
+#[profile.release]
 # Keep debug symbols for profiling builds by default (useful for profiling tools).
-debug = true
+#debug = true
 # Optimize for speed
-opt-level = 3
+#opt-level = 3
 # Whole-program optimization; "thin" gives a good trade-off between
 # performance and link time. Use "fat" for maximum runtime throughput.
-lto = "thin"
+#lto = "thin"
 # Fewer codegen units improves optimization at the cost of parallel compile time
-codegen-units = 1
+#codegen-units = 1
 # Abort on panic to reduce binary size and avoid unwinding overhead
-panic = "abort"
+#panic = "abort"

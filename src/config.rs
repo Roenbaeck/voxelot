@@ -154,6 +154,8 @@ pub struct PerformanceConfig {
     pub envelope_fade_range: f32,
     #[serde(default = "default_max_envelope_distance")]
     pub max_envelope_distance: f32,
+    #[serde(default = "default_hzb_enabled")]
+    pub hzb_enabled: bool,
     #[serde(default = "default_fallback_detail_distance")]
     pub fallback_detail_distance: f32,
     #[serde(default = "default_fallback_bbox_shrink")]
@@ -357,6 +359,10 @@ fn default_max_envelope_distance() -> f32 {
     1000.0
 }
 
+fn default_hzb_enabled() -> bool {
+    false
+}
+
 fn default_fallback_detail_distance() -> f32 {
     500.0
 }
@@ -498,6 +504,7 @@ impl Default for PerformanceConfig {
             envelope_distance: default_envelope_distance(),
             envelope_fade_range: default_envelope_fade_range(),
             max_envelope_distance: default_max_envelope_distance(),
+            hzb_enabled: default_hzb_enabled(),
             fallback_detail_distance: default_fallback_detail_distance(),
             fallback_bbox_shrink: default_fallback_bbox_shrink(),
             mesh_priority_sort_interval_frames: default_mesh_priority_sort_interval_frames(),
