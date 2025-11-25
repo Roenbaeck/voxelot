@@ -8,7 +8,7 @@ camera_position = [
 ]
 
 [rendering]
-lod_subdivide_distance = 1550.0
+lod_subdivide_distance = 1600.0
 lod_merge_distance = 750.0
 chunk_lod_distance = 1000.0
 fov_degrees = 70.0
@@ -18,7 +18,7 @@ camera_speed_multiplier = 4.7683716
 
 [atmosphere]
 fog_density = 0.00044999996
-time_of_day = 0.9476387
+time_of_day = 0.37296212
 
 [effects.depth_of_field]
 enabled = true

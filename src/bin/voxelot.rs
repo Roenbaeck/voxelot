@@ -749,6 +749,12 @@ struct App {
     multi_draw_count_buffer: Option<wgpu::Buffer>,
     max_draw_capacity: usize,
 
+    // Shadow pass indirect buffers (separate from main culling buffers)
+    shadow_indirect_buffer: Option<wgpu::Buffer>,
+    shadow_envelope_indirect_buffer: Option<wgpu::Buffer>,
+    shadow_indirect_bytes: u64,
+    shadow_envelope_indirect_bytes: u64,
+
     /// Stat: number of empty meshes processed (non-geometric chunks)
     stat_empty_meshes: u64,
     stat_vertex_buffers_reused: u64,
@@ -1232,7 +1238,11 @@ impl App {
             index_allocator: SlabAllocator::new(cfg.performance.mega_index_buffer_mb * 1024 * 1024),
             multi_draw_indirect_buffer: None,
             multi_draw_count_buffer: None,
-            max_draw_capacity: cfg.performance.max_draw_capacity,
+            max_draw_capacity: 1_000_000, // Default capacity, will be resized if needed
+            shadow_indirect_buffer: None,
+            shadow_envelope_indirect_buffer: None,
+            shadow_indirect_bytes: 0,
+            shadow_envelope_indirect_bytes: 0,
 
             egui_ctx: None,
             egui_winit: None,
@@ -3939,10 +3949,27 @@ impl App {
         limits.max_buffer_size = 1_073_741_824; // 1 GB (up from 256 MB default)
         limits.max_storage_buffer_binding_size = 536_870_912; // 512 MB (up from 128 MB default)
 
+        // Check if multi-draw indirect count is supported by the adapter
+        let adapter_features = adapter.features();
+        let multi_draw_supported =
+            adapter_features.contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT);
+
+        if multi_draw_supported {
+            println!("Multi-draw indirect count: SUPPORTED (will use optimized path)");
+        } else {
+            println!("Multi-draw indirect count: NOT SUPPORTED (will use fallback path)");
+        }
+
+        // Build required features based on what's supported
+        let mut required_features = wgpu::Features::FLOAT32_FILTERABLE;
+        if multi_draw_supported {
+            required_features |= wgpu::Features::MULTI_DRAW_INDIRECT_COUNT;
+        }
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Main Device"),
-                required_features: wgpu::Features::FLOAT32_FILTERABLE,
+                required_features,
                 required_limits: limits,
                 memory_hints: wgpu::MemoryHints::Performance,
                 experimental_features: Default::default(),
@@ -5333,8 +5360,12 @@ impl App {
         );
         let multi_draw_count_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Multi Draw Count Buffer"),
-            // store two u32 counts (mesh count @ offset 0, envelope count @ offset 4)
-            size: (std::mem::size_of::<u32>() * 2) as u64,
+            // store four u32 counts:
+            // offset 0: scene mesh count
+            // offset 4: scene envelope count
+            // offset 8: shadow mesh count
+            // offset 12: shadow envelope count
+            size: (std::mem::size_of::<u32>() * 4) as u64,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
@@ -5346,6 +5377,34 @@ impl App {
             &mut self.gpu_buffer_bytes,
         );
 
+        // Shadow indirect buffers (same size as main indirect buffers)
+        let shadow_indirect_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Shadow Indirect Buffer"),
+            size: (self.max_draw_capacity as u64) * indirect_entry_size,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        App::replace_buffer_bytes_static(
+            &mut self.shadow_indirect_bytes,
+            (self.max_draw_capacity as u64) * indirect_entry_size,
+            &mut self.gpu_buffer_bytes,
+        );
+        let shadow_envelope_indirect_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Shadow Envelope Indirect Buffer"),
+            size: (self.max_draw_capacity as u64) * indirect_entry_size,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        App::replace_buffer_bytes_static(
+            &mut self.shadow_envelope_indirect_bytes,
+            (self.max_draw_capacity as u64) * indirect_entry_size,
+            &mut self.gpu_buffer_bytes,
+        );
+
         self.cull_pipeline = Some(cull_pipeline);
         self.cull_bind_group_layout = Some(cull_bind_group_layout);
         self.cull_params_buffer = Some(cull_params_buffer);
@@ -5354,6 +5413,8 @@ impl App {
         self.mega_index_buffer = Some(mega_index_buffer);
         self.multi_draw_indirect_buffer = Some(multi_draw_buf);
         self.multi_draw_count_buffer = Some(multi_draw_count_buf);
+        self.shadow_indirect_buffer = Some(shadow_indirect_buf);
+        self.shadow_envelope_indirect_buffer = Some(shadow_envelope_indirect_buf);
 
         // fused DoF pipeline removed; use CoC copy + Kawase instead
         // DoF CoC copy pipeline (if Kawase is enabled, we use this cheap pass to produce CoC alpha + base color as input)
@@ -7082,11 +7143,91 @@ impl App {
             label: Some("Render Encoder"),
         });
 
+        // Populate shadow indirect buffers (CPU side)
+        // We do this before the render pass because we cannot write to buffers during the pass
+        if let (Some(shadow_indirect), Some(shadow_envelope_indirect)) = (
+            &self.shadow_indirect_buffer,
+            &self.shadow_envelope_indirect_buffer,
+        ) {
+            let mut mesh_args = Vec::with_capacity(self.mesh_cache.len());
+            let vertex_stride = std::mem::size_of::<MeshVertexRaw>() as u64;
+
+            for (_, entry) in self.mesh_cache.iter() {
+                if entry.index_count > 0 {
+                    let first_index = (entry.index_offset / 4) as u32;
+                    let base_vertex = (entry.vertex_offset / vertex_stride) as i32;
+                    mesh_args.push(wgpu::util::DrawIndexedIndirectArgs {
+                        index_count: entry.index_count,
+                        instance_count: 1,
+                        first_index,
+                        base_vertex,
+                        first_instance: 0,
+                    });
+                }
+            }
+
+            let mut envelope_args = Vec::with_capacity(self.envelope_mesh_cache.len());
+            for (_, entry) in self.envelope_mesh_cache.iter() {
+                if entry.index_count > 0 {
+                    let first_index = (entry.index_offset / 4) as u32;
+                    let base_vertex = (entry.vertex_offset / vertex_stride) as i32;
+                    envelope_args.push(wgpu::util::DrawIndexedIndirectArgs {
+                        index_count: entry.index_count,
+                        instance_count: 1,
+                        first_index,
+                        base_vertex,
+                        first_instance: 0,
+                    });
+                }
+            }
+
+            queue.write_buffer(shadow_indirect, 0, bytemuck::cast_slice(&mesh_args));
+            queue.write_buffer(
+                shadow_envelope_indirect,
+                0,
+                bytemuck::cast_slice(&envelope_args),
+            );
+
+            // Update count buffer for shadows (we can reuse the multi_draw_count_buffer if we are careful with offsets,
+            // or just write to a specific section. The count buffer expects u32 counts at 4-byte aligned offsets.
+            // Let's assume we use offset 8 for shadow meshes and 12 for shadow envelopes to avoid conflict with scene pass (0 and 4).
+            // Wait, scene pass uses 0 and 4.
+            if let Some(count_buf) = &self.multi_draw_count_buffer {
+                let _counts = [
+                    0, // Scene Mesh (overwritten by GPU cull or CPU scene populator)
+                    0, // Scene Envelope (overwritten by GPU cull or CPU scene populator)
+                    mesh_args.len() as u32,
+                    envelope_args.len() as u32,
+                ];
+                // We only want to write the shadow counts (indices 2 and 3, i.e., offsets 8 and 12).
+                // But queue.write_buffer writes a slice.
+                // If we write the whole thing we might overwrite Scene counts if they were already set?
+                // Scene counts are set by:
+                // 1. GPU Cull: writes to 0 and 4 via storage buffer binding.
+                // 2. CPU Fallback: writes to 0 and 4 via write_buffer.
+                // GPU cull runs via `run_gpu_culling` which submits a compute pass.
+                // If we write to the buffer here via `queue.write_buffer`, it happens on the queue.
+                // If GPU cull was submitted before, this write might race or overwrite if not synchronized?
+                // Actually, `queue.write_buffer` schedules a write.
+                // If `run_gpu_culling` was called, it submitted work to the queue.
+                // If we write now, it might happen after the compute pass?
+                // But the compute pass writes to the buffer as a storage buffer.
+                // `queue.write_buffer` is a CPU-to-GPU copy.
+                // We should probably use separate offsets or a separate count buffer to be safe.
+                // Or just write the specific u32s.
+                queue.write_buffer(
+                    count_buf,
+                    8,
+                    bytemuck::cast_slice(&[mesh_args.len() as u32, envelope_args.len() as u32]),
+                );
+            }
+        }
+
         // GPU cull invocation is handled via run_gpu_culling
 
         if let (
             Some(shadow_view),
-            Some(shadow_pipeline),
+            Some(_shadow_pipeline),
             Some(shadow_mesh_pipeline),
             Some(shadow_bind_group),
         ) = (
@@ -7110,7 +7251,11 @@ impl App {
                 occlusion_query_set: None,
             });
 
-            if let Some(_mesh_indirect) = &self.mesh_indirect_buffer {
+            if let (Some(_mesh_indirect), Some(shadow_indirect), Some(shadow_envelope_indirect)) = (
+                &self.mesh_indirect_buffer,
+                &self.shadow_indirect_buffer,
+                &self.shadow_envelope_indirect_buffer,
+            ) {
                 shadow_pass.set_pipeline(shadow_mesh_pipeline);
                 shadow_pass.set_bind_group(0, shadow_bind_group, &[]);
 
@@ -7122,74 +7267,64 @@ impl App {
                     wgpu::IndexFormat::Uint32,
                 );
 
-                // For shadows, always use direct draws (not multi-draw indirect)
-                // This allows us to render all leaf chunks, not just camera-visible ones
-                let use_multi_draw_for_shadows = false;
+                // Check if multi-draw is supported at runtime
+                let multi_draw_supported = device
+                    .features()
+                    .contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT);
 
-                if use_multi_draw_for_shadows {
-                    if cfg!(feature = "viewer-debug") {
-                        viewer_debug!(
-                            "Shader path: Using multi-draw indirect for shadow pass (CPU path)"
-                        );
-                    }
+                if multi_draw_supported {
                     // Use the multi-draw indexed indirect count function
-                    if let (Some(count_buf), Some(mesh_indirect)) = (
-                        self.multi_draw_count_buffer.as_ref(),
-                        self.mesh_indirect_buffer.as_ref(),
-                    ) {
+                    if let Some(count_buf) = self.multi_draw_count_buffer.as_ref() {
                         shadow_pass.multi_draw_indexed_indirect_count(
-                            mesh_indirect,
+                            shadow_indirect,
                             0,
                             count_buf,
-                            0,
+                            8, // Offset 8 for shadow mesh count
                             self.max_draw_capacity as u32,
                         );
                         draw_calls += self.mesh_cache.len(); // approximate
-                    }
-                    if let (Some(count_buf), Some(envelope_indirect)) = (
-                        self.multi_draw_count_buffer.as_ref(),
-                        self.envelope_indirect_buffer.as_ref(),
-                    ) {
-                        // envelope count is at offset 4
+
                         shadow_pass.multi_draw_indexed_indirect_count(
-                            envelope_indirect,
+                            shadow_envelope_indirect,
                             0,
                             count_buf,
-                            4,
+                            12, // Offset 12 for shadow envelope count
                             self.max_draw_capacity as u32,
                         );
                         draw_calls += self.envelope_mesh_cache.len(); // approximate
                     }
                 } else {
-                    // For shadows, render ALL cached meshes (not just camera-visible leaf_chunks)
-                    // This ensures complete shadow coverage for all loaded geometry
-
-                    // Draw all detail meshes
+                    // Fallback: render all cached meshes individually
                     for (_, entry) in self.mesh_cache.iter() {
-                        let start_index = (entry.index_offset / 4) as u32;
-                        let end_index = start_index + entry.index_count;
-                        let base_vertex = (entry.vertex_offset
-                            / std::mem::size_of::<MeshVertexRaw>() as u64)
-                            as i32;
-                        shadow_pass.draw_indexed(start_index..end_index, base_vertex, 0..1);
-                        draw_calls += 1;
+                        if entry.index_count > 0 {
+                            let start_index = (entry.index_offset / 4) as u32;
+                            let end_index = start_index + entry.index_count;
+                            let base_vertex = (entry.vertex_offset
+                                / std::mem::size_of::<MeshVertexRaw>() as u64)
+                                as i32;
+                            shadow_pass.draw_indexed(start_index..end_index, base_vertex, 0..1);
+                            draw_calls += 1;
+                        }
                     }
 
                     // Draw all envelope meshes
                     for (_, entry) in self.envelope_mesh_cache.iter() {
-                        let start_index = (entry.index_offset / 4) as u32;
-                        let end_index = start_index + entry.index_count;
-                        let base_vertex = (entry.vertex_offset
-                            / std::mem::size_of::<MeshVertexRaw>() as u64)
-                            as i32;
-                        shadow_pass.draw_indexed(start_index..end_index, base_vertex, 0..1);
-                        draw_calls += 1;
+                        if entry.index_count > 0 {
+                            let start_index = (entry.index_offset / 4) as u32;
+                            let end_index = start_index + entry.index_count;
+                            let base_vertex = (entry.vertex_offset
+                                / std::mem::size_of::<MeshVertexRaw>() as u64)
+                                as i32;
+                            shadow_pass.draw_indexed(start_index..end_index, base_vertex, 0..1);
+                            draw_calls += 1;
+                        }
                     }
                 }
             }
 
+            // Render fallback voxels for shadows (unmeshed chunks)
             if let Some(fallback_indirect) = &self.fallback_indirect_buffer {
-                shadow_pass.set_pipeline(shadow_pipeline);
+                shadow_pass.set_pipeline(self.shadow_pipeline.as_ref().unwrap());
                 shadow_pass.set_bind_group(0, shadow_bind_group, &[]);
                 shadow_pass
                     .set_vertex_buffer(0, self.cube_vertex_buffer.as_ref().unwrap().slice(..));
@@ -7266,14 +7401,11 @@ impl App {
 
                 let multi_draw_supported = device
                     .features()
-                    .contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT)
-                    && self.cull_pipeline.is_none();
+                    .contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT);
 
                 if multi_draw_supported {
                     if cfg!(feature = "viewer-debug") {
-                        viewer_debug!(
-                            "Shader path: Using multi-draw indirect for scene pass (CPU path)"
-                        );
+                        viewer_debug!("Shader path: Using multi-draw indirect for scene pass");
                     }
                     if let (Some(count_buf), Some(mesh_indirect)) = (
                         self.multi_draw_count_buffer.as_ref(),
