@@ -153,13 +153,33 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let alpha = mix(water.water_color.a, 1.0, fresnel * 0.5);
     
     // Soft shore fade
-    // Calculate depth difference
-    // We need linear depth for this to be accurate, but raw depth diff might suffice for visual hack
-    // Linearize depth: z_linear = (2.0 * near * far) / (far + near - z_ndc * (far - near)); 
-    // ... or just use the raw difference and tune a magic number.
-    // Let's try raw diff first.
-    let depth_diff = scene_depth_raw - water_depth;
-    let shore_fade = smoothstep(0.0, 0.001, depth_diff); // Tune 0.001 based on scene scale/projection
+    // Reconstruct scene world position to get actual distance
+    // scene_depth_raw is 0..1 (wgpu default)
+    // inverse_proj expects -1..1 (OpenGL convention used in voxelot.rs)
+    let z_ndc = scene_depth_raw * 2.0 - 1.0;
+    
+    let scene_ndc = vec4<f32>(
+        screen_uv.x * 2.0 - 1.0,
+        1.0 - 2.0 * screen_uv.y,
+        z_ndc,
+        1.0
+    );
+    
+    let scene_view_pos_unnorm = camera.inverse_proj * scene_ndc;
+    let scene_view_pos = scene_view_pos_unnorm.xyz / scene_view_pos_unnorm.w;
+    let scene_world_pos = (camera.inverse_view * vec4<f32>(scene_view_pos, 1.0)).xyz;
+    
+    // Calculate vertical depth difference
+    // Water is at y = water_level
+    // If scene is underwater, scene_world_pos.y < water_level
+    let depth_diff = water_level - scene_world_pos.y;
+    
+    var shore_fade = smoothstep(0.0, 1.0, depth_diff); // Fade over 1.0 unit
+    
+    // Don't fade against the skybox (far plane)
+    if (scene_depth_raw >= 0.9999) {
+        shore_fade = 1.0;
+    }
     
     return vec4<f32>(final_rgb, alpha * shore_fade);
 }
