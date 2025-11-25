@@ -6034,7 +6034,7 @@ impl App {
                 }
             }
 
-            // Write any CPU prepopulated fallback instances and ensure the fallback instance buffer is large enough
+            // Write any CPU prepopulated fallback instances for Scene Pass / GPU culling
             let cpu_prepopulated_count = cpu_prepopulated_instances.len();
             if cpu_prepopulated_count > 0 {
                 // Ensure fallback instance buffer has room for prepopulated + new appended instances
@@ -6048,16 +6048,8 @@ impl App {
                 }
             }
 
-            // Reset Fallback Indirect Args (seed instance_count with CPU prepopulated count)
-            if let Some(buffer) = self.fallback_indirect_buffer.as_ref() {
-                let reset_args = wgpu::util::DrawIndirectArgs {
-                    vertex_count: 36,
-                    instance_count: cpu_prepopulated_count as u32,
-                    first_vertex: 0,
-                    first_instance: 0,
-                };
-                queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[reset_args]));
-            }
+            // NOTE: Shadow Pass fallback population happens later (line ~7168)
+            // for synchronization with mesh shadows to prevent shadow holes
         }
 
         if let Some(params_buffer) = self.cull_params_buffer.as_ref() {
@@ -7145,6 +7137,7 @@ impl App {
 
         // Populate shadow indirect buffers (CPU side)
         // We do this before the render pass because we cannot write to buffers during the pass
+        // ALSO populate fallback buffers here for perfect synchronization (prevents shadow holes)
         if let (Some(shadow_indirect), Some(shadow_envelope_indirect)) = (
             &self.shadow_indirect_buffer,
             &self.shadow_envelope_indirect_buffer,
@@ -7187,6 +7180,10 @@ impl App {
                 0,
                 bytemuck::cast_slice(&envelope_args),
             );
+
+            // NOTE: Fallback buffers are already populated earlier (line ~6043)
+            // for Scene Pass. Shadow Pass reuses the same data.
+            // This prevents overwriting Scene Pass fallbacks which would cause missing geometry.
 
             // Update count buffer for shadows (we can reuse the multi_draw_count_buffer if we are careful with offsets,
             // or just write to a specific section. The count buffer expects u32 counts at 4-byte aligned offsets.
@@ -7294,28 +7291,27 @@ impl App {
                         draw_calls += self.envelope_mesh_cache.len(); // approximate
                     }
                 } else {
-                    // Fallback: render all cached meshes individually
-                    for (_, entry) in self.mesh_cache.iter() {
+                    // Fallback: render all cached meshes using indirect draws
+                    // This has lower CPU overhead than direct draws
+                    let indirect_stride =
+                        std::mem::size_of::<wgpu::util::DrawIndexedIndirectArgs>() as u64;
+
+                    for (i, (_, entry)) in self.mesh_cache.iter().enumerate() {
                         if entry.index_count > 0 {
-                            let start_index = (entry.index_offset / 4) as u32;
-                            let end_index = start_index + entry.index_count;
-                            let base_vertex = (entry.vertex_offset
-                                / std::mem::size_of::<MeshVertexRaw>() as u64)
-                                as i32;
-                            shadow_pass.draw_indexed(start_index..end_index, base_vertex, 0..1);
+                            let offset = (i as u64) * indirect_stride;
+                            shadow_pass.draw_indexed_indirect(shadow_indirect, offset);
                             draw_calls += 1;
                         }
                     }
 
-                    // Draw all envelope meshes
-                    for (_, entry) in self.envelope_mesh_cache.iter() {
+                    // Draw all envelope meshes using indirect draws
+                    let indirect_stride =
+                        std::mem::size_of::<wgpu::util::DrawIndexedIndirectArgs>() as u64;
+
+                    for (i, (_, entry)) in self.envelope_mesh_cache.iter().enumerate() {
                         if entry.index_count > 0 {
-                            let start_index = (entry.index_offset / 4) as u32;
-                            let end_index = start_index + entry.index_count;
-                            let base_vertex = (entry.vertex_offset
-                                / std::mem::size_of::<MeshVertexRaw>() as u64)
-                                as i32;
-                            shadow_pass.draw_indexed(start_index..end_index, base_vertex, 0..1);
+                            let offset = (i as u64) * indirect_stride;
+                            shadow_pass.draw_indexed_indirect(shadow_envelope_indirect, offset);
                             draw_calls += 1;
                         }
                     }
