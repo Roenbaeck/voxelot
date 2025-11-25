@@ -135,12 +135,26 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     
     // Reflection (Skybox)
     // Reflect view vector around normal
-    let reflect_dir = reflect(world_dir, normal);
+    let reflect_dir_raw = reflect(world_dir, normal);
+
+    // Apply skybox rotation to reflection vector
+    let angle = camera.fog_time_pad.z;
+    let c = cos(angle);
+    let s = sin(angle);
+    let reflect_dir = vec3<f32>(
+        reflect_dir_raw.x * c + reflect_dir_raw.z * s,
+        reflect_dir_raw.y,
+        reflect_dir_raw.x * -s + reflect_dir_raw.z * c
+    );
     
     // Sample skybox (equirectangular)
     let u = 0.5 + atan2(reflect_dir.z, reflect_dir.x) / (2.0 * 3.14159265);
     let v = 0.5 - asin(reflect_dir.y) / 3.14159265;
-    let reflection_color = textureSample(skybox_texture, skybox_sampler, vec2<f32>(u, v)).rgb;
+    
+    // Sample and apply brightness
+    let sky_sample = textureSample(skybox_texture, skybox_sampler, vec2<f32>(u, v)).rgb;
+    let brightness = camera.fog_time_pad.w;
+    let reflection_color = sky_sample * brightness;
     
     // Base water color
     let base_color = water.water_color.rgb;
