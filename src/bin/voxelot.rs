@@ -798,6 +798,7 @@ struct App {
     last_frame: Instant,
     frame_count: u64,
     frame_index: u64,
+    skybox_angle: f32,
     last_fps_print: Instant,
 
     mouse_pressed: bool,
@@ -1309,6 +1310,7 @@ impl App {
             last_frame: Instant::now(),
             frame_count: 0,
             frame_index: 0,
+            skybox_angle: 0.0,
             last_fps_print: Instant::now(),
             mouse_pressed: false,
             last_mouse_pos: None,
@@ -5732,6 +5734,9 @@ impl App {
         // Auto-advance time of day: full cycle in 120 seconds (60s sun, 60s moon)
         if !self.time_paused {
             self.time_of_day = (self.time_of_day + dt / 120.0) % 1.0;
+            // Rotate skybox very slowly (e.g. 1 full rotation every ~20 minutes = 1200 seconds)
+            // 2*PI / 1200 ≈ 0.005 radians per second
+            self.skybox_angle = (self.skybox_angle + dt * 0.005) % std::f32::consts::TAU;
         }
 
         self.camera_controller.update(dt);
@@ -7204,6 +7209,22 @@ impl App {
             ]
         };
 
+        // Calculate skybox brightness based on time of day
+        // Day (0.25 to 0.75): 1.0
+        // Night (0.75 to 0.25): Dips to 0.05 at midnight (0.0/1.0)
+        let skybox_brightness = if sun_height > 0.0 {
+            // Sun above horizon: full brightness
+            1.0
+        } else {
+            // Sun below horizon: fade to dark
+            // sun_height goes from 0.0 to -1.0 (midnight) back to 0.0
+            // We want 1.0 at 0.0, and 0.05 at -1.0
+            // Linear interpolation: 1.0 + sun_height * (1.0 - 0.05)
+            // At 0.0: 1.0
+            // At -1.0: 1.0 - 0.95 = 0.05
+            (1.0 + sun_height * 0.95).max(0.05)
+        };
+
         let uniforms = Uniforms {
             mvp: mvp_cols,
             sun_view_proj: sun_view_proj_cols,
@@ -7214,7 +7235,12 @@ impl App {
                 sun_direction_vec.z,
                 SHADOW_BIAS,
             ],
-            fog_time_pad: [self.fog_density, self.time_of_day, 0.0, 0.0],
+            fog_time_pad: [
+                self.fog_density,
+                self.time_of_day,
+                self.skybox_angle,
+                skybox_brightness,
+            ],
             sun_color_pad: [sun_color[0], sun_color[1], sun_color[2], 0.0],
             ambient_color_pad: [ambient_color[0], ambient_color[1], ambient_color[2], 0.0],
             shadow_texel_size_pad: [
