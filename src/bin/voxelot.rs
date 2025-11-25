@@ -814,6 +814,9 @@ struct App {
     // LOD state
     lod_distance: f32,
 
+    // Water state
+    water_level: f32,
+
     // Post-processing state
     dof_coc_pipeline: Option<wgpu::RenderPipeline>,
     dof_bind_group_layout: Option<wgpu::BindGroupLayout>,
@@ -1320,6 +1323,7 @@ impl App {
             light_probe_buffer: None,
             light_probe_capacity: 0,
             lod_distance: cfg.rendering.chunk_lod_distance,
+            water_level: 16.0,
             dof_coc_pipeline: None,
             dof_bind_group_layout: None,
             dof_bind_group: None,
@@ -1860,6 +1864,14 @@ impl App {
                     (self.dof_settings.kawase_iterations + 1).min(6);
                 println!("Kawase iterations: {}", self.dof_settings.kawase_iterations);
                 self.update_kawase_bind_groups();
+            }
+            KeyCode::KeyY => {
+                self.water_level = (self.water_level - 0.5).max(0.0);
+                println!("Water level: {:.1}", self.water_level);
+            }
+            KeyCode::KeyM => {
+                self.water_level = (self.water_level + 0.5).min(100.0);
+                println!("Water level: {:.1}", self.water_level);
             }
             _ => {}
         }
@@ -7270,6 +7282,18 @@ impl App {
             0,
             bytemuck::cast_slice(&[uniforms]),
         );
+
+        // Update water uniforms
+        if let Some(water_buffer) = self.water_uniform_buffer.as_ref() {
+            let water_uniforms = WaterUniforms {
+                water_level: self.water_level,
+                wave_strength: 0.1,
+                speed: 1.0,
+                _pad0: 0.0,
+                water_color: [0.0, 0.3, 0.5, 0.6],
+            };
+            queue.write_buffer(water_buffer, 0, bytemuck::bytes_of(&water_uniforms));
+        }
 
         if self.shadow_view.is_none() {
             self.recreate_shadow_map();
