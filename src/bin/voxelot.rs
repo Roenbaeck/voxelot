@@ -284,6 +284,16 @@ struct SsaoSettings {
     strength: f32,
     blur_enabled: bool,
     blur_radius: f32,
+    bias: f32,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct SSRSettings {
+    max_steps: u32,
+    max_binary_steps: u32,
+    step_size: f32,
+    thickness: f32,
+    enabled: bool,
 }
 
 #[repr(C)]
@@ -886,8 +896,20 @@ struct App {
     hzb_copy_bind_group: Option<wgpu::BindGroup>, // For mip 0 copy
     hzb_downsample_bind_groups: Vec<wgpu::BindGroup>, // Per-mip downsample bind groups
     hzb_bind_group_layout: Option<wgpu::BindGroupLayout>,
-    hzb_bind_groups: Vec<Option<wgpu::BindGroup>>,
+    hzb_gen_downsample_bind_groups: Vec<Option<wgpu::BindGroup>>,
     hzb_enabled: bool,
+    // Frame timing
+    frame_times: VecDeque<f32>,
+
+    // SSR state
+    ssr_settings: SSRSettings,
+    ssr_pipeline: Option<wgpu::RenderPipeline>,
+    ssr_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    ssr_bind_group: Option<wgpu::BindGroup>,
+    ssr_uniform_buffer: Option<wgpu::Buffer>,
+    ssr_camera_uniform_buffer: Option<wgpu::Buffer>,
+    ssr_texture: Option<wgpu::Texture>,
+    ssr_texture_view: Option<wgpu::TextureView>,
 
     dof_combine_pipeline: Option<wgpu::RenderPipeline>,
     dof_combine_bind_group_layout: Option<wgpu::BindGroupLayout>,
@@ -1384,9 +1406,10 @@ impl App {
             hzb_copy_bind_group: None,
             hzb_downsample_bind_groups: Vec::new(),
             hzb_bind_group_layout: None,
-            hzb_bind_groups: Vec::new(),
+            hzb_gen_downsample_bind_groups: Vec::new(),
             hzb_params_buffer: None,
             hzb_enabled: cfg.performance.hzb_enabled,
+            frame_times: VecDeque::with_capacity(60),
             dof_combine_pipeline: None,
             dof_combine_bind_group_layout: None,
             dof_combine_bind_group: None,
@@ -1428,12 +1451,27 @@ impl App {
             ssao_settings: SsaoSettings {
                 sample_count: cfg.effects.ssao.sample_count,
                 slice_count: cfg.effects.ssao.slice_count,
-                radius: 4.0,
-                thickness: 0.5,
+                radius: cfg.effects.ssao.radius,
+                thickness: cfg.effects.ssao.thickness,
                 strength: cfg.effects.ssao.strength,
                 blur_enabled: cfg.effects.ssao.blur_enabled,
                 blur_radius: cfg.effects.ssao.blur_radius,
+                bias: 0.01,
             },
+            ssr_settings: SSRSettings {
+                max_steps: 32,
+                max_binary_steps: 4,
+                step_size: 0.5,
+                thickness: 0.5,
+                enabled: true,
+            },
+            ssr_pipeline: None,
+            ssr_bind_group_layout: None,
+            ssr_bind_group: None,
+            ssr_uniform_buffer: None,
+            ssr_camera_uniform_buffer: None,
+            ssr_texture: None,
+            ssr_texture_view: None,
             ssao_enabled: cfg.effects.ssao.enabled,
             ssao_debug: false,
             shadow_map_size: cfg.shadows.map_size,
@@ -1865,6 +1903,17 @@ impl App {
                 println!("Kawase iterations: {}", self.dof_settings.kawase_iterations);
                 self.update_kawase_bind_groups();
             }
+            KeyCode::KeyR => {
+                self.ssr_settings.enabled = !self.ssr_settings.enabled;
+                println!(
+                    "SSR: {}",
+                    if self.ssr_settings.enabled {
+                        "ENABLED"
+                    } else {
+                        "DISABLED"
+                    }
+                );
+            }
             KeyCode::KeyY => {
                 self.water_level = (self.water_level - 0.5).max(0.0);
                 println!("Water level: {:.1}", self.water_level);
@@ -1889,28 +1938,30 @@ impl App {
             post_color_view,
             dof_color_texture,
             dof_color_view,
-            bloom_ping_texture,
-            bloom_ping_view,
-            bloom_pong_texture,
-            bloom_pong_view,
-            kawase_ping_textures_local,
-            kawase_ping_views_local,
-            kawase_pong_textures_local,
-            kawase_pong_views_local,
-            kawase_level_sizes_local,
-            ssao_ping_texture,
-            ssao_ping_view,
-            ssao_pong_texture,
-            ssao_pong_view,
+            bloom_ping_texture_loc,
+            bloom_ping_view_loc,
+            bloom_pong_texture_loc,
+            bloom_pong_view_loc,
+            kawase_ping_textures_loc,
+            kawase_ping_views_loc,
+            kawase_pong_textures_loc,
+            kawase_pong_views_loc,
+            kawase_level_sizes_loc,
+            ssao_ping_texture_loc,
+            ssao_ping_view_loc,
+            ssao_pong_texture_loc,
+            ssao_pong_view_loc,
             offscreen_color_bytes,
             depth_bytes,
             post_color_bytes,
             dof_color_bytes,
             bloom_ping_bytes,
             bloom_pong_bytes,
-            kawase_ping_total_loc,
-            kawase_pong_total_loc,
+            kawase_ping_total,
+            kawase_pong_total,
             ssao_bytes,
+            ssr_texture_loc,
+            ssr_texture_view_loc,
         ) =
             {
                 let (Some(device), Some(config)) = (self.device.as_ref(), self.config.as_ref())
@@ -2172,6 +2223,25 @@ impl App {
                 let ssao_bytes =
                     App::compute_texture_bytes(config.format, config.width, config.height, 1, 1);
 
+                // SSR texture
+                let ssr_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("SSR Texture"),
+                    size: wgpu::Extent3d {
+                        width: config.width,
+                        height: config.height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                });
+                let ssr_texture_view_loc =
+                    ssr_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
+
                 // Collect locals for assignment outside the scope
                 (
                     color_texture_loc,
@@ -2204,6 +2274,8 @@ impl App {
                     kawase_ping_total,
                     kawase_pong_total,
                     ssao_bytes,
+                    ssr_texture_loc,
+                    ssr_texture_view_loc,
                 )
             };
 
@@ -2215,6 +2287,8 @@ impl App {
         );
         self.offscreen_color_view = Some(color_view);
         self.offscreen_color_texture = Some(color_texture);
+        self.ssr_texture = Some(ssr_texture_loc);
+        self.ssr_texture_view = Some(ssr_texture_view_loc);
         // Assign and track other created textures
         App::replace_texture_bytes_static(
             &mut self.depth_texture_bytes,
@@ -2249,13 +2323,13 @@ impl App {
         );
 
         // Kawase chain (filled from earlier locals)
-        self.kawase_ping_textures = kawase_ping_textures_local;
-        self.kawase_ping_views = kawase_ping_views_local;
-        self.kawase_pong_textures = kawase_pong_textures_local;
-        self.kawase_pong_views = kawase_pong_views_local;
-        self.kawase_level_sizes = kawase_level_sizes_local;
-        let new_kawase_ping_total: u64 = kawase_ping_total_loc;
-        let new_kawase_pong_total: u64 = kawase_pong_total_loc;
+        self.kawase_ping_textures = kawase_ping_textures_loc;
+        self.kawase_ping_views = kawase_ping_views_loc;
+        self.kawase_pong_textures = kawase_pong_textures_loc;
+        self.kawase_pong_views = kawase_pong_views_loc;
+        self.kawase_level_sizes = kawase_level_sizes_loc;
+        let new_kawase_ping_total: u64 = kawase_ping_total;
+        let new_kawase_pong_total: u64 = kawase_pong_total;
         App::replace_texture_bytes_static(
             &mut self.kawase_ping_bytes,
             new_kawase_ping_total,
@@ -2266,10 +2340,10 @@ impl App {
             new_kawase_pong_total,
             &mut self.gpu_texture_bytes,
         );
-        self.bloom_ping_view = Some(bloom_ping_view);
-        self.bloom_ping_texture = Some(bloom_ping_texture);
-        self.bloom_pong_view = Some(bloom_pong_view);
-        self.bloom_pong_texture = Some(bloom_pong_texture);
+        self.bloom_ping_view = Some(bloom_ping_view_loc);
+        self.bloom_ping_texture = Some(bloom_ping_texture_loc);
+        self.bloom_pong_view = Some(bloom_pong_view_loc);
+        self.bloom_pong_texture = Some(bloom_pong_texture_loc);
 
         // SSAO ping/pong textures assigned from locals
         App::replace_texture_bytes_static(
@@ -2282,10 +2356,11 @@ impl App {
             ssao_bytes,
             &mut self.gpu_texture_bytes,
         );
-        self.ssao_ping_texture = Some(ssao_ping_texture);
-        self.ssao_ping_view = Some(ssao_ping_view);
-        self.ssao_pong_texture = Some(ssao_pong_texture);
-        self.ssao_pong_view = Some(ssao_pong_view);
+        self.ssao_ping_texture = Some(ssao_ping_texture_loc);
+        self.ssao_ping_view = Some(ssao_ping_view_loc);
+        self.ssao_pong_texture = Some(ssao_pong_texture_loc);
+        self.ssao_pong_view = Some(ssao_pong_view_loc);
+
         // HZB will be created after closure to avoid borrow conflicts
 
         self.update_dof_bind_group();
@@ -2512,7 +2587,7 @@ impl App {
                 ) {
                     let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("HZB Cull Bind Group"),
-                        layout: layout,
+                        layout,
                         entries: &[
                             wgpu::BindGroupEntry {
                                 binding: 0,
@@ -2528,7 +2603,6 @@ impl App {
                             },
                         ],
                     });
-                    self.hzb_bind_groups = vec![Some(bg)];
                 }
             }
         }
@@ -2540,7 +2614,7 @@ impl App {
         };
         if self.shadow_sampler.is_none() {
             return;
-        }
+        };
 
         let extent = wgpu::Extent3d {
             width: self.shadow_map_size,
@@ -2561,19 +2635,6 @@ impl App {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         self.shadow_texture = Some(texture);
-        // Track shadow map texture bytes
-        let shadow_bytes = App::compute_texture_bytes(
-            wgpu::TextureFormat::Depth32Float,
-            self.shadow_map_size,
-            self.shadow_map_size,
-            1,
-            1,
-        );
-        App::replace_texture_bytes_static(
-            &mut self.shadow_map_bytes,
-            shadow_bytes,
-            &mut self.gpu_texture_bytes,
-        );
         self.shadow_view = Some(view);
         self.update_main_bind_group();
     }
@@ -3777,6 +3838,121 @@ impl App {
             });
             self.water_bind_group = Some(bind_group);
         }
+    }
+
+    fn create_ssr_pipeline(&mut self, device: &wgpu::Device) {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("SSR Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/ssr.wgsl").into()),
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("SSR Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("SSR Pipeline"),
+            layout: Some(
+                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("SSR Pipeline Layout"),
+                    bind_group_layouts: &[&bind_group_layout],
+                    push_constant_ranges: &[],
+                }),
+            ),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        use wgpu::util::DeviceExt;
+        let ssr_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("SSR Uniform Buffer"),
+            contents: bytemuck::bytes_of(&[
+                self.ssr_settings.max_steps,
+                self.ssr_settings.max_binary_steps,
+                self.ssr_settings.step_size.to_bits(),
+                self.ssr_settings.thickness.to_bits(),
+            ]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let ssr_camera_uniform_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("SSR Camera Uniform Buffer"),
+                contents: &[0u8; 256],
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+
+        self.ssr_pipeline = Some(pipeline);
+        self.ssr_bind_group_layout = Some(bind_group_layout);
+        self.ssr_uniform_buffer = Some(ssr_uniform_buffer);
+        self.ssr_camera_uniform_buffer = Some(ssr_camera_uniform_buffer);
     }
 
     // Allocate or reuse a vertex buffer from the pool; returns (buffer, capacity_bytes)
@@ -5670,6 +5846,7 @@ impl App {
         // Initialize skybox before moving values into self
         self.init_skybox(&device, &queue, &config, &main_bind_group_layout);
         self.create_water_pipeline(&device, &config, &main_bind_group_layout);
+        self.create_ssr_pipeline(&device);
 
         self.surface = Some(surface);
         self.device = Some(device);

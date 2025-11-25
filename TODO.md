@@ -3,4 +3,4 @@
 ✅ The sky reflected in the water should also be dark at night.
 ✅ Can we reduce the amount of light as we get closer to midnight, so there’s no “moonlight” at midnight? The whole scene is too bright at night.
 ✅ Can we add keys to raise and lower water level?
-- SSRS for the water
+- Can we implement screen space reflections (SSR) for the water? It would be good if we later can set a material in the palette.txt to be reflective as well, so the SSR isn't limited to water.
