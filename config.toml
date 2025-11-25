@@ -18,7 +18,7 @@ camera_speed_multiplier = 4.7683716
 
 [atmosphere]
 fog_density = 0.00044999996
-time_of_day = 0.9476387
+time_of_day = 0.68717736
 
 [effects.depth_of_field]
 enabled = true

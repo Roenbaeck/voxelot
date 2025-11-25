@@ -300,6 +300,16 @@ struct SsaoUniformsRaw {
     inverse_projection: [[f32; 4]; 4],
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct WaterUniforms {
+    water_level: f32,
+    wave_strength: f32,
+    speed: f32,
+    _pad0: f32,
+    water_color: [f32; 4],
+}
+
 const DOF_UNIFORM_FLOATS: usize = 12;
 
 const CUBE_VERTICES: &[CubeVertex] = &[
@@ -848,6 +858,12 @@ struct App {
     ssao_blur_vertical_uniform_buffer: Option<wgpu::Buffer>,
     ssao_blur_horizontal_bind_group: Option<wgpu::BindGroup>,
     ssao_blur_vertical_bind_group: Option<wgpu::BindGroup>,
+
+    // Water rendering
+    water_pipeline: Option<wgpu::RenderPipeline>,
+    water_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    water_bind_group: Option<wgpu::BindGroup>,
+    water_uniform_buffer: Option<wgpu::Buffer>,
     composite_uniform_buffer: Option<wgpu::Buffer>,
     ssao_enabled: bool,
     ssao_debug: bool,
@@ -1340,6 +1356,11 @@ impl App {
             ssao_blur_vertical_uniform_buffer: None,
             ssao_blur_horizontal_bind_group: None,
             ssao_blur_vertical_bind_group: None,
+            // Water rendering
+            water_pipeline: None,
+            water_bind_group_layout: None,
+            water_bind_group: None,
+            water_uniform_buffer: None,
             composite_uniform_buffer: None,
             ssilvb_pipeline: None,
             ssilvb_bind_group_layout: None,
@@ -2952,6 +2973,8 @@ impl App {
                     ],
                 }));
         }
+
+        self.update_water_bind_group();
     }
 
     // Readbacks are disabled — use the debug overlay for immediate inspection
@@ -3586,6 +3609,160 @@ impl App {
             skybox_bytes,
             &mut self.gpu_texture_bytes,
         );
+    }
+
+    fn create_water_pipeline(
+        &mut self,
+        device: &wgpu::Device,
+        config: &wgpu::SurfaceConfiguration,
+        main_bind_group_layout: &wgpu::BindGroupLayout,
+    ) {
+        // Create water uniforms buffer
+        let water_uniforms = WaterUniforms {
+            water_level: 16.0,
+            wave_strength: 0.1,
+            speed: 1.0,
+            _pad0: 0.0,
+            water_color: [0.0, 0.3, 0.5, 0.6],
+        };
+        let water_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Water Uniform Buffer"),
+            contents: bytemuck::bytes_of(&water_uniforms),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Create bind group layout
+        // Group 1: Water uniforms, Skybox texture, Skybox sampler, Depth texture
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Water Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        // Create shader
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Water Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/water.wgsl").into()),
+        });
+
+        // Create pipeline layout
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Water Pipeline Layout"),
+            bind_group_layouts: &[main_bind_group_layout, &bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        // Create pipeline
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Water Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        self.water_uniform_buffer = Some(water_uniform_buffer);
+        self.water_bind_group_layout = Some(bind_group_layout);
+        self.water_pipeline = Some(pipeline);
+    }
+
+    fn update_water_bind_group(&mut self) {
+        if let (
+            Some(device),
+            Some(layout),
+            Some(uniform_buffer),
+            Some(skybox_view),
+            Some(skybox_sampler),
+            Some(depth_view),
+        ) = (
+            self.device.as_ref(),
+            self.water_bind_group_layout.as_ref(),
+            self.water_uniform_buffer.as_ref(),
+            self.skybox_view.as_ref(),
+            self.skybox_sampler.as_ref(),
+            self.offscreen_depth_view.as_ref(),
+        ) {
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Water Bind Group"),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniform_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(skybox_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(skybox_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(depth_view),
+                    },
+                ],
+            });
+            self.water_bind_group = Some(bind_group);
+        }
     }
 
     // Allocate or reuse a vertex buffer from the pool; returns (buffer, capacity_bytes)
@@ -5478,6 +5655,7 @@ impl App {
 
         // Initialize skybox before moving values into self
         self.init_skybox(&device, &queue, &config, &main_bind_group_layout);
+        self.create_water_pipeline(&device, &config, &main_bind_group_layout);
 
         self.surface = Some(surface);
         self.device = Some(device);
@@ -7348,6 +7526,34 @@ impl App {
                 );
                 render_pass.draw_indirect(fallback_indirect, 0);
                 draw_calls += 1;
+            }
+        }
+
+        // Water Pass (Transparent, reads depth buffer)
+        {
+            let mut water_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Water Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: offscreen_color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None, // No depth attachment, we sample it manually
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            if let (Some(pipeline), Some(bind_group)) =
+                (self.water_pipeline.as_ref(), self.water_bind_group.as_ref())
+            {
+                water_pass.set_pipeline(pipeline);
+                water_pass.set_bind_group(0, self.bind_group.as_ref().unwrap(), &[]);
+                water_pass.set_bind_group(1, bind_group, &[]);
+                water_pass.draw(0..3, 0..1);
             }
         }
 
