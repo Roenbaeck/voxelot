@@ -206,7 +206,9 @@ fn fs_main(input: VertexOutputInstanced) -> @location(0) vec4<f32> {
     let ao = input.ao; // AO passed separately from instance AO attribute
     let color = input.color.rgb * (lighting * lighting_multiplier) * ao;
 
-    let fog_color = vec3<f32>(0.7, 0.8, 0.9);
+    // Fog color modulated by ambient (darkens at night)
+    let base_fog_color = vec3<f32>(0.7, 0.8, 0.9);
+    let fog_color = base_fog_color * uniforms.ambient_color_pad.xyz * 3.0;
     // Use world-space distance from camera (input.world_pos contains world-space position)
     // uniforms.camera_shadow_strength.xyz stores camera world position (see Rust binding comment)
     let relative_pos = input.world_pos - uniforms.camera_shadow_strength.xyz;
@@ -237,7 +239,7 @@ fn fs_main(input: VertexOutputInstanced) -> @location(0) vec4<f32> {
     }
     
     // Brighten colors as they approach fade region for fog-like appearance
-    var brightened = mix(final_color, fog_color, fade_factor * 0.6);
+    var brightened = mix(final_color, fog_color, fade_factor * 0.3);
 
     // Envelope fade: if we are approaching the envelope distance, fade towards the envelope color (Type 0)
     // This helps blend the detailed mesh into the simplified envelope mesh.
@@ -334,7 +336,9 @@ fn fs_mesh(input: VertexOutputMesh) -> @location(0) vec4<f32> {
     let lighting_multiplier = mix(1.0, 0.3, emissive_strength);
         let color = input.color.rgb * (lighting * lighting_multiplier) * input.color.a;
     
-    let fog_color = vec3<f32>(0.7, 0.8, 0.9);
+    // Fog color modulated by ambient (darkens at night)
+    let base_fog_color = vec3<f32>(0.7, 0.8, 0.9);
+    let fog_color = base_fog_color * uniforms.ambient_color_pad.xyz * 3.0;
     // Use world-space distance from camera for mesh pipeline as well
     let relative_pos = input.world_pos - uniforms.camera_shadow_strength.xyz;
     let distance = length(relative_pos);
@@ -364,7 +368,7 @@ fn fs_mesh(input: VertexOutputMesh) -> @location(0) vec4<f32> {
     }
     
     // Brighten colors as they approach fade region for fog-like appearance
-    var brightened = mix(final_color, fog_color, fade_factor * 0.6);
+    var brightened = mix(final_color, fog_color, fade_factor * 0.3);
 
     // Envelope fade: if we are approaching the envelope distance, fade towards the envelope color (Type 0)
     // This helps blend the detailed mesh into the simplified envelope mesh.

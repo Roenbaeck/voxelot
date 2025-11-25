@@ -62,7 +62,22 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     
     // We want direction, so set w=0 for view matrix transform (ignore translation)
     let world_dir = (camera.inverse_view * vec4<f32>(view_space_dir, 0.0)).xyz;
-    let dir = normalize(world_dir);
+    
+    // Apply skybox rotation (around Y axis)
+    let angle = camera.fog_time_pad.z;
+    let c = cos(angle);
+    let s = sin(angle);
+    // Rotation matrix around Y:
+    // [ c  0  s ]
+    // [ 0  1  0 ]
+    // [-s  0  c ]
+    let rotated_dir = vec3<f32>(
+        world_dir.x * c + world_dir.z * s,
+        world_dir.y,
+        world_dir.x * -s + world_dir.z * c
+    );
+    
+    let dir = normalize(rotated_dir);
     
     // Convert direction to equirectangular UV
     // atan2(z, x) gives angle in [-PI, PI]. We want [0, 1].
@@ -73,5 +88,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     
     let color = textureSample(skybox_texture, skybox_sampler, vec2<f32>(u, v));
     
-    return color;
+    // Apply brightness (dim at night)
+    let brightness = camera.fog_time_pad.w;
+    return vec4<f32>(color.rgb * brightness, color.a);
 }
