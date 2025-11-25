@@ -156,8 +156,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let brightness = camera.fog_time_pad.w;
     let reflection_color = sky_sample * brightness;
     
-    // Base water color
-    let base_color = water.water_color.rgb;
+    // Base water color (darken at night)
+    let base_color = water.water_color.rgb * brightness;
     
     // Mix based on reflection
     let final_rgb = mix(base_color, reflection_color, reflection_strength);

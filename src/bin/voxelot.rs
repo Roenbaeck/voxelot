@@ -6844,7 +6844,7 @@ impl App {
             // Define key times and colors
             // Midnight is at 0.0, darkest point
             let midnight_moon = [0.15, 0.18, 0.25];
-            let midnight_ambient = [0.02, 0.025, 0.05];
+            let midnight_ambient = [0.002, 0.002, 0.005];
             // Dusk/dawn has some light
             let twilight_moon = [0.35, 0.35, 0.5];
             let twilight_ambient = [0.08, 0.08, 0.15];
@@ -7187,11 +7187,11 @@ impl App {
             // Daytime: faint moon, almost invisible
             (0.05 * (1.0 - sun_height.clamp(0.0, 1.0))).clamp(0.0, 0.05)
         } else {
-            // Night: ramp from horizon to zenith
-            let ramp = (moon_height / 1.0).clamp(0.0, 1.0);
-            // Slight boost near midnight
-            let midnight_boost = (moon_height - 0.3).max(0.0) * 0.15;
-            (0.25 * ramp + midnight_boost).clamp(0.02, 0.4)
+            // Night: fade out as it gets higher (darker at midnight)
+            // moon_height goes from 0.0 (horizon) to 1.0 (zenith/midnight)
+            // We want max intensity at horizon (0.0) and 0.0 at zenith (1.0)
+            let fade = (1.0 - moon_height).clamp(0.0, 1.0);
+            (0.2 * fade).max(0.0)
         };
 
         // Derive moon color: cooler at night, slight warm tint near twilight

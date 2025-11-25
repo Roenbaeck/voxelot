@@ -206,7 +206,9 @@ fn fs_main(input: VertexOutputInstanced) -> @location(0) vec4<f32> {
     let ao = input.ao; // AO passed separately from instance AO attribute
     let color = input.color.rgb * (lighting * lighting_multiplier) * ao;
 
-    let fog_color = vec3<f32>(0.7, 0.8, 0.9);
+    // Fog color modulated by ambient (darkens at night)
+    let base_fog_color = vec3<f32>(0.7, 0.8, 0.9);
+    let fog_color = base_fog_color * uniforms.ambient_color_pad.xyz * 3.0;
     // Use world-space distance from camera (input.world_pos contains world-space position)
     // uniforms.camera_shadow_strength.xyz stores camera world position (see Rust binding comment)
     let relative_pos = input.world_pos - uniforms.camera_shadow_strength.xyz;
