@@ -8,9 +8,9 @@ camera_position = [
 ]
 
 [rendering]
-lod_subdivide_distance = 1950.0
+lod_subdivide_distance = 300.0
 lod_merge_distance = 750.0
-chunk_lod_distance = 1000.0
+chunk_lod_distance = 1500.0
 fov_degrees = 70.0
 near_plane = 0.1
 far_plane = 4500.0
@@ -18,15 +18,15 @@ camera_speed_multiplier = 4.7683716
 
 [atmosphere]
 fog_density = 0.00044999996
-time_of_day = 0.03901433
+time_of_day = 0.9223307
 
 [effects.depth_of_field]
 enabled = true
 focal_distance = 240.0
 focal_range = 85.0
-blur_strength = 2.5
+blur_strength = 2.4
 kawase_iterations = 3
-kawase_offset = 1.0
+kawase_offset = 0.25
 kawase_enabled = true
 
 [effects.bloom]

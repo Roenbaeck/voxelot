@@ -218,6 +218,16 @@ struct Uniforms {
     inverse_proj: [[f32; 4]; 4],
 }
 
+// SSR camera uniform buffer (matches shaders/ssr.wgsl CameraUniforms)
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct SsrCameraUniforms {
+    inverse_view: [[f32; 4]; 4],
+    inverse_proj: [[f32; 4]; 4],
+    view_proj: [[f32; 4]; 4],
+    camera_pos: [f32; 4],
+}
+
 /// Depth-of-field runtime settings (CPU-side convenience)
 #[derive(Copy, Clone, Debug)]
 struct DoFSettings {
@@ -259,6 +269,7 @@ struct CompositeUniforms {
     ssao_enabled: f32,
     ssao_debug: f32,
     ssao_strength: f32,
+    ssr_debug: f32,
     _padding0: f32,
     _padding1: f32,
     _padding2: f32,
@@ -910,6 +921,11 @@ struct App {
     ssr_camera_uniform_buffer: Option<wgpu::Buffer>,
     ssr_texture: Option<wgpu::Texture>,
     ssr_texture_view: Option<wgpu::TextureView>,
+    ssr_debug: bool,
+
+    // Scene color copy for water reflections (avoids read-while-write conflict)
+    scene_copy_texture: Option<wgpu::Texture>,
+    scene_copy_view: Option<wgpu::TextureView>,
 
     dof_combine_pipeline: Option<wgpu::RenderPipeline>,
     dof_combine_bind_group_layout: Option<wgpu::BindGroupLayout>,
@@ -1472,6 +1488,9 @@ impl App {
             ssr_camera_uniform_buffer: None,
             ssr_texture: None,
             ssr_texture_view: None,
+            ssr_debug: false,
+            scene_copy_texture: None,
+            scene_copy_view: None,
             ssao_enabled: cfg.effects.ssao.enabled,
             ssao_debug: false,
             shadow_map_size: cfg.shadows.map_size,
@@ -1692,6 +1711,7 @@ impl App {
             ssao_enabled: if self.ssao_enabled { 1.0 } else { 0.0 },
             ssao_debug: if self.ssao_debug { 1.0 } else { 0.0 },
             ssao_strength: self.ssao_settings.strength,
+            ssr_debug: if self.ssr_debug { 1.0 } else { 0.0 },
             _padding0: 0.0,
             _padding1: 0.0,
             _padding2: 0.0,
@@ -1914,6 +1934,10 @@ impl App {
                     }
                 );
             }
+            KeyCode::KeyV => {
+                self.ssr_debug = !self.ssr_debug;
+                println!("SSR DEBUG overlay: {}", self.ssr_debug);
+            }
             KeyCode::KeyY => {
                 self.water_level = (self.water_level - 0.5).max(0.0);
                 println!("Water level: {:.1}", self.water_level);
@@ -1962,6 +1986,8 @@ impl App {
             ssao_bytes,
             ssr_texture_loc,
             ssr_texture_view_loc,
+            scene_copy_texture_loc,
+            scene_copy_view_loc,
         ) =
             {
                 let (Some(device), Some(config)) = (self.device.as_ref(), self.config.as_ref())
@@ -2223,7 +2249,7 @@ impl App {
                 let ssao_bytes =
                     App::compute_texture_bytes(config.format, config.width, config.height, 1, 1);
 
-                // SSR texture
+                // SSR texture (also used as scene color copy for water reflections)
                 let ssr_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("SSR Texture"),
                     size: wgpu::Extent3d {
@@ -2241,6 +2267,24 @@ impl App {
                 });
                 let ssr_texture_view_loc =
                     ssr_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
+
+                // Scene color copy texture (for water reflections - same format as offscreen)
+                let scene_copy_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("Scene Copy Texture"),
+                    size: wgpu::Extent3d {
+                        width: config.width,
+                        height: config.height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: config.format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let scene_copy_view_loc =
+                    scene_copy_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
 
                 // Collect locals for assignment outside the scope
                 (
@@ -2276,6 +2320,8 @@ impl App {
                     ssao_bytes,
                     ssr_texture_loc,
                     ssr_texture_view_loc,
+                    scene_copy_texture_loc,
+                    scene_copy_view_loc,
                 )
             };
 
@@ -2289,6 +2335,8 @@ impl App {
         self.offscreen_color_texture = Some(color_texture);
         self.ssr_texture = Some(ssr_texture_loc);
         self.ssr_texture_view = Some(ssr_texture_view_loc);
+        self.scene_copy_texture = Some(scene_copy_texture_loc);
+        self.scene_copy_view = Some(scene_copy_view_loc);
         // Assign and track other created textures
         App::replace_texture_bytes_static(
             &mut self.depth_texture_bytes,
@@ -3015,10 +3063,11 @@ impl App {
             }
         }
 
-        if let (Some(composite_ubo), Some(sampler), Some(ssao_ping_view)) = (
+        if let (Some(composite_ubo), Some(sampler), Some(ssao_ping_view), Some(ssr_view)) = (
             self.composite_uniform_buffer.as_ref(),
             self.post_sampler.as_ref(),
             self.ssao_ping_view.as_ref(),
+            self.ssr_texture_view.as_ref(),
         ) {
             self.composite_bind_group =
                 Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3042,6 +3091,10 @@ impl App {
                             resource: wgpu::BindingResource::TextureView(ssao_ping_view),
                         },
                         wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: wgpu::BindingResource::TextureView(ssr_view),
+                        },
+                        wgpu::BindGroupEntry {
                             binding: 3,
                             resource: wgpu::BindingResource::Sampler(sampler),
                         },
@@ -3050,6 +3103,8 @@ impl App {
         }
 
         self.update_water_bind_group();
+        // Ensure SSR bind group exists after recreating offscreen targets
+        self.update_ssr_bind_group();
     }
 
     // Readbacks are disabled — use the debug overlay for immediate inspection
@@ -3170,6 +3225,31 @@ impl App {
             self.kawase_down_bind_groups[level] = Some(down_bg);
             self.kawase_up_bind_groups[level] = Some(up_bg);
         }
+    }
+
+    fn update_ssr_bind_group(&mut self) {
+        let Some(device) = self.device.as_ref() else { return };
+        let (Some(layout), Some(ssr_ubo), Some(ssr_cam_ubo), Some(scene_view), Some(depth_view), Some(sampler)) = (
+            self.ssr_bind_group_layout.as_ref(),
+            self.ssr_uniform_buffer.as_ref(),
+            self.ssr_camera_uniform_buffer.as_ref(),
+            self.offscreen_color_view.as_ref(),
+            self.offscreen_depth_view.as_ref(),
+            self.post_sampler.as_ref(),
+        ) else { return; };
+
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("SSR Bind Group"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: ssr_cam_ubo.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: ssr_ubo.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(scene_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(depth_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(sampler) },
+            ],
+        });
+        self.ssr_bind_group = Some(bg);
     }
 
     fn ensure_gpu_input_buffer(&mut self, device: &wgpu::Device, required: usize) {
@@ -3747,6 +3827,24 @@ impl App {
                     },
                     count: None,
                 },
+                // SSR texture (Rgba16Float) - binding 4
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // SSR sampler - binding 5 (linear)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
 
@@ -3806,6 +3904,8 @@ impl App {
             Some(skybox_view),
             Some(skybox_sampler),
             Some(depth_view),
+            Some(scene_color_view),
+            Some(post_sampler),
         ) = (
             self.device.as_ref(),
             self.water_bind_group_layout.as_ref(),
@@ -3813,6 +3913,8 @@ impl App {
             self.skybox_view.as_ref(),
             self.skybox_sampler.as_ref(),
             self.offscreen_depth_view.as_ref(),
+            self.scene_copy_view.as_ref(), // Use scene copy texture for reflection sampling
+            self.post_sampler.as_ref(),
         ) {
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Water Bind Group"),
@@ -3833,6 +3935,16 @@ impl App {
                     wgpu::BindGroupEntry {
                         binding: 3,
                         resource: wgpu::BindingResource::TextureView(depth_view),
+                    },
+                    // Scene color texture (for reflection sampling)
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(scene_color_view),
+                    },
+                    // Scene color sampler
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::Sampler(post_sampler),
                     },
                 ],
             });
@@ -5090,6 +5202,16 @@ impl App {
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
                             sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -7460,6 +7582,29 @@ impl App {
             bytemuck::cast_slice(&[uniforms]),
         );
 
+        // Update SSR camera UBO with inverse/view/proj matrices for SSR pass
+        if let Some(ssr_cam_buf) = self.ssr_camera_uniform_buffer.as_ref() {
+            let view_proj = (OPENGL_TO_WGPU_MATRIX * projection * view_mat).to_cols_array_2d();
+            let ssr_cam = SsrCameraUniforms {
+                inverse_view: inverse_view_cols,
+                inverse_proj: inverse_proj_cols,
+                view_proj,
+                camera_pos: [camera_pos[0], camera_pos[1], camera_pos[2], 0.0],
+            };
+            queue.write_buffer(ssr_cam_buf, 0, bytemuck::bytes_of(&ssr_cam));
+        }
+
+        // Update SSR params uniform (in case settings changed)
+        if let Some(ssr_params_buf) = self.ssr_uniform_buffer.as_ref() {
+            let params_arr: [u32; 4] = [
+                self.ssr_settings.max_steps,
+                self.ssr_settings.max_binary_steps,
+                self.ssr_settings.step_size.to_bits(),
+                self.ssr_settings.thickness.to_bits(),
+            ];
+            queue.write_buffer(ssr_params_buf, 0, bytemuck::bytes_of(&params_arr));
+        }
+
         // Update water uniforms
         if let Some(water_buffer) = self.water_uniform_buffer.as_ref() {
             let water_uniforms = WaterUniforms {
@@ -7754,6 +7899,59 @@ impl App {
                 render_pass.draw_indirect(fallback_indirect, 0);
                 draw_calls += 1;
             }
+        }
+
+        // SSR Pass (if enabled) -> writes SSR texture
+        if self.ssr_settings.enabled {
+            if let (Some(pipeline), Some(bind_group), Some(ssr_view)) = (
+                self.ssr_pipeline.as_ref(),
+                self.ssr_bind_group.as_ref(),
+                self.ssr_texture_view.as_ref(),
+            ) {
+                let mut ssr_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("SSR Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: ssr_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                ssr_pass.set_pipeline(pipeline);
+                ssr_pass.set_bind_group(0, bind_group, &[]);
+                ssr_pass.draw(0..3, 0..1);
+            }
+        }
+
+        // Copy offscreen color to scene_copy_texture for water reflection sampling
+        // Water pass writes to offscreen_color but needs to read scene color for reflections
+        if let (Some(offscreen_color), Some(scene_copy), Some(config)) = (
+            self.offscreen_color_texture.as_ref(),
+            self.scene_copy_texture.as_ref(),
+            self.config.as_ref(),
+        ) {
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: offscreen_color,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: scene_copy,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: config.width,
+                    height: config.height,
+                    depth_or_array_layers: 1,
+                },
+            );
         }
 
         // Water Pass (Transparent, reads depth buffer)

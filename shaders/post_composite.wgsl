@@ -6,6 +6,7 @@ struct CompositeUniforms {
     // Reserve a full vec4 for other per-pass state (debug and padding)
     ssao_debug: f32,
     ssao_strength: f32,
+    ssr_debug: f32,
     _pad0: f32,
     _pad1: f32,
     _pad2: f32,
@@ -20,6 +21,7 @@ struct VertexOutput {
 @group(0) @binding(1) var post_color: texture_2d<f32>;
 @group(0) @binding(2) var bloom_texture: texture_2d<f32>;
 @group(0) @binding(4) var ssao_texture: texture_2d<f32>;
+@group(0) @binding(5) var ssr_debug_texture: texture_2d<f32>;
 @group(0) @binding(3) var post_sampler: sampler;
 
 @vertex
@@ -54,6 +56,12 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     if (composite.ssao_debug > 0.5) {
         // Show raw AO as greyscale (white = occluded) for easier debugging.
         return vec4<f32>(vec3<f32>(raw_ao), 1.0);
+    }
+
+    // SSR Debug overlay: show SSR texture directly when enabled
+    if (composite.ssr_debug > 0.5) {
+        let ssr_col = textureSample(ssr_debug_texture, post_sampler, uv);
+        return vec4<f32>(ssr_col.rgb, 1.0);
     }
 
     let luma = dot(base, vec3<f32>(0.299, 0.587, 0.114));

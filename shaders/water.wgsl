@@ -41,10 +41,92 @@ var skybox_sampler: sampler;
 var depth_texture: texture_depth_2d;
 // We don't need a sampler for depth texture load
 
+@group(1) @binding(4)
+var scene_color_texture: texture_2d<f32>;
+@group(1) @binding(5)
+var scene_sampler: sampler;
+
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
 };
+
+// Project world position to screen UV coordinates
+fn world_to_screen_uv(world_pos: vec3<f32>) -> vec3<f32> {
+    let clip_pos = camera.mvp * vec4<f32>(world_pos, 1.0);
+    let ndc = clip_pos.xyz / clip_pos.w;
+    // Convert NDC to UV: x: [-1,1] -> [0,1], y: [-1,1] -> [1,0] (flip Y)
+    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    return vec3<f32>(uv, ndc.z);
+}
+
+// Reconstruct world position from UV and depth
+fn reconstruct_world_pos_uv(uv: vec2<f32>, depth: f32) -> vec3<f32> {
+    // Convert depth from [0,1] to NDC [-1,1] for inverse projection
+    let z_ndc = depth * 2.0 - 1.0;
+    let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - 2.0 * uv.y, z_ndc, 1.0);
+    let view_pos_unnorm = camera.inverse_proj * ndc;
+    let view_pos = view_pos_unnorm.xyz / view_pos_unnorm.w;
+    return (camera.inverse_view * vec4<f32>(view_pos, 1.0)).xyz;
+}
+
+// Simple ray march to find where reflection ray hits scene geometry
+// Returns: vec3(hit_uv.x, hit_uv.y, hit_valid) where hit_valid > 0 means valid hit
+fn trace_water_reflection(start_pos: vec3<f32>, ray_dir: vec3<f32>, cam_pos: vec3<f32>) -> vec3<f32> {
+    let max_steps = 32u;
+    let step_size = 2.0; // World units per step
+    let thickness = 1.5; // Tolerance for hit detection
+    
+    var current_pos = start_pos;
+    let step = ray_dir * step_size;
+    
+    // Get depth texture dimensions for bounds checking
+    let dim = textureDimensions(depth_texture);
+    
+    for (var i = 0u; i < max_steps; i++) {
+        current_pos += step;
+        
+        let screen = world_to_screen_uv(current_pos);
+        let uv = screen.xy;
+        
+        // Check screen bounds
+        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+            break;
+        }
+        
+        // Sample scene depth at this UV
+        let coords = vec2<i32>(vec2<f32>(dim) * uv);
+        if (coords.x < 0 || coords.x >= i32(dim.x) || coords.y < 0 || coords.y >= i32(dim.y)) {
+            break;
+        }
+        let scene_depth = textureLoad(depth_texture, coords, 0);
+        
+        // Skip sky pixels
+        if (scene_depth >= 0.9999) {
+            continue;
+        }
+        
+        // Get world position of scene surface at this UV
+        let surface_pos = reconstruct_world_pos_uv(uv, scene_depth);
+        
+        // Compare ray depth vs scene depth
+        let ray_depth = distance(cam_pos, current_pos);
+        let surface_depth = distance(cam_pos, surface_pos);
+        
+        // Hit detection: ray is behind surface and within thickness tolerance
+        if (ray_depth > surface_depth && ray_depth - surface_depth < thickness) {
+            // Edge fade for smoother blending near screen edges
+            let edge_fade = min(
+                min(uv.x, 1.0 - uv.x),
+                min(uv.y, 1.0 - uv.y)
+            );
+            let edge_factor = smoothstep(0.0, 0.1, edge_fade);
+            return vec3<f32>(uv, edge_factor);
+        }
+    }
+    
+    return vec3<f32>(0.0, 0.0, 0.0); // No hit
+}
 
 @vertex
 fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
@@ -159,8 +241,34 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Base water color (darken at night)
     let base_color = water.water_color.rgb * brightness;
     
-    // Mix based on reflection
-    let final_rgb = mix(base_color, reflection_color, reflection_strength);
+    // Distance from camera to water hit point (for SSR distance fade)
+    let dist = distance(cam_pos, hit_pos);
+    
+    // Trace reflection ray to find where it hits scene geometry
+    // Use the unrotated reflect_dir_raw since we need world-space coordinates
+    let ssr_hit = trace_water_reflection(hit_pos, reflect_dir_raw, cam_pos);
+    let ssr_hit_valid = ssr_hit.z;
+    
+    var combined_reflection = reflection_color; // Default to skybox
+    
+    if (ssr_hit_valid > 0.0) {
+        // Sample scene color at the hit UV
+        let scene_sample = textureSample(scene_color_texture, scene_sampler, ssr_hit.xy);
+        let ssr_color = scene_sample.rgb;
+        
+        // Distance-based fade: weaken SSR at long distances
+        let ssr_max_dist = 150.0;
+        let ssr_dist_fade = clamp((ssr_max_dist - dist) / ssr_max_dist, 0.0, 1.0);
+        
+        // Combine edge fade from ray march and distance fade
+        let ssr_effect = ssr_hit_valid * ssr_dist_fade;
+        
+        // Blend SSR with skybox reflection
+        combined_reflection = mix(reflection_color, ssr_color, ssr_effect);
+    }
+
+    // Mix based on reflection strength (Fresnel)
+    let final_rgb = mix(base_color, combined_reflection, reflection_strength);
     
     // Alpha
     // More opaque at grazing angles, more transparent looking down
