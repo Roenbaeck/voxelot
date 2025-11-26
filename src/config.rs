@@ -60,6 +60,10 @@ pub struct AtmosphereConfig {
     pub time_of_day: f32,
     #[serde(default = "default_night_skybox_brightness")]
     pub night_skybox_brightness: f32,
+    #[serde(default = "default_horizon_fade_up")]
+    pub horizon_fade_up: f32,
+    #[serde(default = "default_horizon_fade_down")]
+    pub horizon_fade_down: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,6 +243,14 @@ fn default_time_of_day() -> f32 {
 
 fn default_night_skybox_brightness() -> f32 {
     0.02
+}
+
+fn default_horizon_fade_up() -> f32 {
+    0.05
+}
+
+fn default_horizon_fade_down() -> f32 {
+    0.25
 }
 
 fn default_dof_focal_distance() -> f32 {
@@ -439,6 +451,8 @@ impl Default for AtmosphereConfig {
             fog_density: default_fog_density(),
             time_of_day: default_time_of_day(),
             night_skybox_brightness: default_night_skybox_brightness(),
+            horizon_fade_up: default_horizon_fade_up(),
+            horizon_fade_down: default_horizon_fade_down(),
         }
     }
 }

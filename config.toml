@@ -19,8 +19,10 @@ camera_speed_multiplier = 4.7683716
 
 [atmosphere]
 fog_density = 0.00044999996
-time_of_day = 0.27411956
+time_of_day = 0.9717355
 night_skybox_brightness = 0.02
+horizon_fade_up = 0.05
+horizon_fade_down = 0.25
 
 [effects.depth_of_field]
 enabled = true

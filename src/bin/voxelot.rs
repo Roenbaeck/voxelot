@@ -830,6 +830,9 @@ struct App {
     time_paused: bool,
     fog_density: f32,
     night_skybox_brightness: f32,
+    // Sun fade settings (how long sun persists above/below horizon)
+    horizon_fade_up: f32,
+    horizon_fade_down: f32,
     light_probe_buffer: Option<wgpu::Buffer>,
     light_probe_capacity: usize,
 
@@ -1363,6 +1366,8 @@ impl App {
             time_paused: false,
             fog_density: cfg.atmosphere.fog_density,
             night_skybox_brightness: cfg.atmosphere.night_skybox_brightness,
+            horizon_fade_up: cfg.atmosphere.horizon_fade_up,
+            horizon_fade_down: cfg.atmosphere.horizon_fade_down,
             light_probe_buffer: None,
             light_probe_capacity: 0,
             lod_distance: cfg.rendering.chunk_lod_distance,
@@ -7196,17 +7201,15 @@ impl App {
         let time_angle = (self.time_of_day - 0.25) * std::f32::consts::TAU;
         let sun_height = time_angle.sin();
 
-        // 2. ADJUSTED: Horizon Fade
-        // We now allow the sun to stay "on" until it is -0.15 units below the horizon.
-        // This allows light to hit the tops of buildings while the ground is in shadow.
-        let horizon_fade = if sun_height > 0.05 {
-            1.0
-        } else if sun_height > -0.15 {
-            // Fade out slowly as it drops from +0.05 to -0.15
-            ((sun_height + 0.15) / 0.20).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
+        // 2. HORIZON FADE: compute unified sun_fade using configurable up/down offsets
+        // `horizon_fade_up`: sun height above which sun is full (default ~0.05)
+        // `horizon_fade_down`: sun height below which sun is fully off (default ~0.25)
+        let hf_up = self.horizon_fade_up;
+        let hf_down = self.horizon_fade_down;
+        // Normalize sun_height into [0.0, 1.0] using the combined range
+        let sun_fade_raw = ((sun_height + hf_down) / (hf_up + hf_down)).clamp(0.0, 1.0);
+        // Smooth cubic fade for nicer transitions
+        let sun_fade = sun_fade_raw * sun_fade_raw * (3.0 - 2.0 * sun_fade_raw);
 
         // Sun moves in an arc: horizontal component (cos) and vertical (sin)
         // Use full range for horizontal to get proper shadow directions
@@ -7227,18 +7230,8 @@ impl App {
             // Interpolate between color phases
             let t = self.time_of_day;
             
-            // The key insight: only provide sun_color when sun is actually above horizon
-            // Use a smooth fade zone around the horizon to avoid hard transitions
-            let horizon_fade = if sun_height > 0.05 {
-                // Sun well above horizon - full strength
-                1.0
-            } else if sun_height > -0.05 {
-                // Near horizon - smooth fade
-                ((sun_height + 0.05) / 0.1).clamp(0.0, 1.0)
-            } else {
-                // Sun below horizon - no direct sunlight
-                0.0
-            };
+            // The key insight: only provide sun_color scaled by `sun_fade` to avoid
+            // hard transitions. `sun_fade` is computed from the config parameters.
             
             if t < 0.20 {
                 // Midnight -> Dawn
@@ -7250,18 +7243,18 @@ impl App {
                 ];
                 // KEY CHANGE: Apply sunrise color here, controlled by horizon_fade
                 let sun = [
-                    sunrise_sun[0] * horizon_fade * factor,
-                    sunrise_sun[1] * horizon_fade * factor,
-                    sunrise_sun[2] * horizon_fade * factor,
+                    sunrise_sun[0] * sun_fade * factor,
+                    sunrise_sun[1] * sun_fade * factor,
+                    sunrise_sun[2] * sun_fade * factor,
                 ];
                 (sun, ambient)
             } else if t < 0.25 {
                 // Dawn -> Sunrise
                 let factor = smooth_interp(0.20, 0.25, t);
                 let sun = [
-                    sunrise_sun[0] * horizon_fade,
-                    sunrise_sun[1] * horizon_fade,
-                    sunrise_sun[2] * horizon_fade,
+                    sunrise_sun[0] * sun_fade,
+                    sunrise_sun[1] * sun_fade,
+                    sunrise_sun[2] * sun_fade,
                 ];
                 let ambient = [
                     twilight_ambient[0] + (sunrise_ambient[0] - twilight_ambient[0]) * factor,
@@ -7274,9 +7267,9 @@ impl App {
             else if t < 0.5 {
                 let factor = smooth_interp(0.25, 0.5, t);
                 let sun = [
-                    (sunrise_sun[0] + (day_sun[0] - sunrise_sun[0]) * factor) * horizon_fade,
-                    (sunrise_sun[1] + (day_sun[1] - sunrise_sun[1]) * factor) * horizon_fade,
-                    (sunrise_sun[2] + (day_sun[2] - sunrise_sun[2]) * factor) * horizon_fade,
+                    (sunrise_sun[0] + (day_sun[0] - sunrise_sun[0]) * factor) * sun_fade,
+                    (sunrise_sun[1] + (day_sun[1] - sunrise_sun[1]) * factor) * sun_fade,
+                    (sunrise_sun[2] + (day_sun[2] - sunrise_sun[2]) * factor) * sun_fade,
                 ];
                 let ambient = [
                     sunrise_ambient[0] + (day_ambient[0] - sunrise_ambient[0]) * factor,
@@ -7287,9 +7280,9 @@ impl App {
             } else if t < 0.75 {
                 let factor = smooth_interp(0.5, 0.75, t);
                 let sun = [
-                    (day_sun[0] + (sunrise_sun[0] - day_sun[0]) * factor) * horizon_fade,
-                    (day_sun[1] + (sunrise_sun[1] - day_sun[1]) * factor) * horizon_fade,
-                    (day_sun[2] + (sunrise_sun[2] - day_sun[2]) * factor) * horizon_fade,
+                    (day_sun[0] + (sunrise_sun[0] - day_sun[0]) * factor) * sun_fade,
+                    (day_sun[1] + (sunrise_sun[1] - day_sun[1]) * factor) * sun_fade,
+                    (day_sun[2] + (sunrise_sun[2] - day_sun[2]) * factor) * sun_fade,
                 ];
                 let ambient = [
                     day_ambient[0] + (sunrise_ambient[0] - day_ambient[0]) * factor,
@@ -7303,9 +7296,9 @@ impl App {
                 // Sunset -> Dusk
                 let factor = smooth_interp(0.75, 0.80, t);
                 let sun = [
-                    sunrise_sun[0] * horizon_fade * (1.0 - factor),
-                    sunrise_sun[1] * horizon_fade * (1.0 - factor),
-                    sunrise_sun[2] * horizon_fade * (1.0 - factor),
+                    sunrise_sun[0] * sun_fade * (1.0 - factor),
+                    sunrise_sun[1] * sun_fade * (1.0 - factor),
+                    sunrise_sun[2] * sun_fade * (1.0 - factor),
                 ];
                 let ambient = [
                     sunrise_ambient[0] + (twilight_ambient[0] - sunrise_ambient[0]) * factor,
@@ -7324,9 +7317,9 @@ impl App {
                 // KEY CHANGE: Apply sunrise color here too, fading out with horizon_fade
                 // This prevents the "fade in middle of building" issue.
                 let sun = [
-                    sunrise_sun[0] * horizon_fade * (1.0 - factor),
-                    sunrise_sun[1] * horizon_fade * (1.0 - factor),
-                    sunrise_sun[2] * horizon_fade * (1.0 - factor),
+                    sunrise_sun[0] * sun_fade * (1.0 - factor),
+                    sunrise_sun[1] * sun_fade * (1.0 - factor),
+                    sunrise_sun[2] * sun_fade * (1.0 - factor),
                 ];
                 (sun, ambient)
             } 
@@ -7457,13 +7450,10 @@ impl App {
         let sun_direction_vec_raw = Vec3::from_array(shadow_calc_direction);
         let sun_direction_vec = sun_direction_vec_raw.normalize();
 
-        // Shadows should persist as long as there is light (horizon_fade > 0).
-        let shadow_strength = if sun_height > -0.15 {
-            // Fade shadows out exactly in sync with the sun light fading out
-            let fade_in = ((sun_height + 0.15) / 0.20).clamp(0.0, 1.0);
-            (fade_in * SHADOW_STRENGTH_MULTIPLIER).min(1.0)
-        } else {
-            // Moon shadow logic (same as before)
+        // Shadow strength: smoothly blend between sun shadow and moon shadow
+        // based on the previously computed `sun_fade`.
+        let sun_shadow_strength = (sun_fade * SHADOW_STRENGTH_MULTIPLIER).min(1.0);
+        let moon_shadow_strength_base = {
             let moon_height = -sun_height;
             if moon_height < 0.2 {
                 let fade = (moon_height / 0.2).clamp(0.0, 1.0);
@@ -7472,7 +7462,8 @@ impl App {
                 let moon_factor = ((moon_height - 0.2) / 0.8).clamp(0.0, 1.0);
                 0.4 + moon_factor * 0.3
             }
-        };        
+        };
+        let shadow_strength = sun_shadow_strength * sun_fade + moon_shadow_strength_base * (1.0 - sun_fade);
         let shadow_texel = 1.0 / self.shadow_map_size as f32;
 
         // Collect light probes from nearby emissive chunks
@@ -7584,6 +7575,9 @@ impl App {
             let fade = (1.0 - moon_height).clamp(0.0, 1.0);
             (0.2 * fade).max(0.0)
         };
+        // Reduce moon intensity when sun is present – smoothly blended using sun_fade so
+        // moonlight doesn't compete with sunlight during dusk/dawn.
+        let moon_intensity = moon_intensity * (1.0 - sun_fade);
 
         // Derive moon color: cooler at night, slight warm tint near twilight
         let moon_color = if sun_height > 0.0 {
@@ -7605,16 +7599,9 @@ impl App {
         // Night (0.75 to 0.25): Dips to 0.05 at midnight (0.0/1.0)
         let night_min = self.night_skybox_brightness;
 
-        let skybox_brightness = if sun_height > 0.0 {
-            // Sun above horizon: full brightness
-            1.0
-        } else {
-            // Sun below horizon: fade to dark using configurable minimum night brightness
-            // sun_height goes from 0.0 to -1.0 (midnight) back to 0.0
-            // We want 1.0 at 0.0, and `night_min` at -1.0
-            let scale = 1.0 - night_min; // e.g., 0.98 for night_min=0.02
-            (1.0 + sun_height * scale).max(night_min)
-        };
+        // Smoothly interpolate skybox brightness using the sun_fade value so the
+        // sky doesn't abruptly darken or brighten near the horizon.
+        let skybox_brightness = night_min + (1.0 - night_min) * sun_fade;
 
         let uniforms = Uniforms {
             mvp: mvp_cols,
@@ -7632,7 +7619,7 @@ impl App {
                 self.skybox_angle,
                 skybox_brightness,
             ],
-            sun_color_pad: [sun_color[0], sun_color[1], sun_color[2], 0.0],
+            sun_color_pad: [sun_color[0] * sun_fade, sun_color[1] * sun_fade, sun_color[2] * sun_fade, 0.0],
             ambient_color_pad: [ambient_color[0], ambient_color[1], ambient_color[2], 0.0],
             shadow_texel_size_pad: [
                 shadow_texel,
