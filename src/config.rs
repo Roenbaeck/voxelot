@@ -56,6 +56,8 @@ pub struct AtmosphereConfig {
     pub fog_density: f32,
     #[serde(default = "default_time_of_day")]
     pub time_of_day: f32,
+    #[serde(default = "default_night_skybox_brightness")]
+    pub night_skybox_brightness: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,6 +229,10 @@ fn default_fog_density() -> f32 {
 
 fn default_time_of_day() -> f32 {
     0.5
+}
+
+fn default_night_skybox_brightness() -> f32 {
+    0.02
 }
 
 fn default_dof_focal_distance() -> f32 {
@@ -425,6 +431,7 @@ impl Default for AtmosphereConfig {
         Self {
             fog_density: default_fog_density(),
             time_of_day: default_time_of_day(),
+            night_skybox_brightness: default_night_skybox_brightness(),
         }
     }
 }

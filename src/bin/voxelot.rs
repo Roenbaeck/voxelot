@@ -829,6 +829,7 @@ struct App {
     time_of_day: f32,
     time_paused: bool,
     fog_density: f32,
+    night_skybox_brightness: f32,
     light_probe_buffer: Option<wgpu::Buffer>,
     light_probe_capacity: usize,
 
@@ -1358,6 +1359,7 @@ impl App {
             time_of_day: cfg.atmosphere.time_of_day,
             time_paused: false,
             fog_density: cfg.atmosphere.fog_density,
+            night_skybox_brightness: cfg.atmosphere.night_skybox_brightness,
             light_probe_buffer: None,
             light_probe_capacity: 0,
             lod_distance: cfg.rendering.chunk_lod_distance,
@@ -7523,17 +7525,17 @@ impl App {
         // Calculate skybox brightness based on time of day
         // Day (0.25 to 0.75): 1.0
         // Night (0.75 to 0.25): Dips to 0.05 at midnight (0.0/1.0)
+        let night_min = self.night_skybox_brightness;
+
         let skybox_brightness = if sun_height > 0.0 {
             // Sun above horizon: full brightness
             1.0
         } else {
-            // Sun below horizon: fade to dark
+            // Sun below horizon: fade to dark using configurable minimum night brightness
             // sun_height goes from 0.0 to -1.0 (midnight) back to 0.0
-            // We want 1.0 at 0.0, and 0.05 at -1.0
-            // Linear interpolation: 1.0 + sun_height * (1.0 - 0.05)
-            // At 0.0: 1.0
-            // At -1.0: 1.0 - 0.95 = 0.05
-            (1.0 + sun_height * 0.95).max(0.05)
+            // We want 1.0 at 0.0, and `night_min` at -1.0
+            let scale = 1.0 - night_min; // e.g., 0.98 for night_min=0.02
+            (1.0 + sun_height * scale).max(night_min)
         };
 
         let uniforms = Uniforms {
