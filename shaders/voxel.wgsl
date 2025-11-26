@@ -405,9 +405,14 @@ fn compute_shadow(light_space_pos: vec4<f32>, normal: vec3<f32>, sun_dir: vec3<f
 
     let proj_coords = light_space_pos.xyz / light_space_pos.w;
     let uv = vec2<f32>(proj_coords.x * 0.5 + 0.5, 0.5 - proj_coords.y * 0.5);
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
-        return 1.0;
-    }
+    // If the projection falls outside the shadow map we still want a sensible
+    // fallback rather than returning fully unshadowed (1.0) which creates a
+    // visible horizontal 'cutoff' as the light or camera moves. Instead, clamp
+    // the UV to the shadow map edge and continue sampling; this produces a
+    // smoother transition at the shadow map boundary and avoids the hard
+    // brightness line seen at certain times of day.
+    let uv_clamped = clamp(uv, vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0));
+    let outside = (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0);
 
     let depth = clamp(proj_coords.z, 0.0, 1.0);
     let base_bias = uniforms.sun_direction_shadow_bias.w;
@@ -454,7 +459,10 @@ fn compute_shadow(light_space_pos: vec4<f32>, normal: vec3<f32>, sun_dir: vec3<f
             let base_off = poisson[i];
             let roff = rot * base_off;
             let off = roff * texel_size * radius;
-            shadow_val += textureSampleCompare(shadow_map, shadow_sampler, uv + off, depth_ref);
+            // Clamp sampling coordinates to avoid reading outside the shadow map
+            // when the fragment projects outside the shadow map. This helps
+            // remove the harsh transition between clamped/unclamped sampling.
+            shadow_val += textureSampleCompare(shadow_map, shadow_sampler, uv_clamped + off, depth_ref);
             count = count + 1;
         }
         return shadow_val / f32(count);
@@ -466,7 +474,7 @@ fn compute_shadow(light_space_pos: vec4<f32>, normal: vec3<f32>, sun_dir: vec3<f
         for (var y: i32 = -1; y <= 1; y = y + 1) {
             for (var x: i32 = -1; x <= 1; x = x + 1) {
                 let off = vec2<f32>(f32(x), f32(y)) * texel_size * radius;
-                shadow += weights[idx] * textureSampleCompare(shadow_map, shadow_sampler, uv + off, depth_ref);
+                shadow += weights[idx] * textureSampleCompare(shadow_map, shadow_sampler, uv_clamped + off, depth_ref);
                 idx = idx + 1;
             }
         }
