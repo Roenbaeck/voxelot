@@ -64,6 +64,10 @@ pub struct AtmosphereConfig {
     pub horizon_fade_up: f32,
     #[serde(default = "default_horizon_fade_down")]
     pub horizon_fade_down: f32,
+    #[serde(default = "default_skybox_fade_up")]
+    pub skybox_fade_up: f32,
+    #[serde(default = "default_skybox_fade_down")]
+    pub skybox_fade_down: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,6 +255,14 @@ fn default_horizon_fade_up() -> f32 {
 
 fn default_horizon_fade_down() -> f32 {
     0.25
+}
+
+fn default_skybox_fade_up() -> f32 {
+    0.05
+}
+
+fn default_skybox_fade_down() -> f32 {
+    0.6
 }
 
 fn default_dof_focal_distance() -> f32 {
@@ -453,6 +465,8 @@ impl Default for AtmosphereConfig {
             night_skybox_brightness: default_night_skybox_brightness(),
             horizon_fade_up: default_horizon_fade_up(),
             horizon_fade_down: default_horizon_fade_down(),
+            skybox_fade_up: default_skybox_fade_up(),
+            skybox_fade_down: default_skybox_fade_down(),
         }
     }
 }

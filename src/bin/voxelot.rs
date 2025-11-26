@@ -833,6 +833,9 @@ struct App {
     // Sun fade settings (how long sun persists above/below horizon)
     horizon_fade_up: f32,
     horizon_fade_down: f32,
+    // Skybox fade control (slower fade to black than sun fade)
+    skybox_fade_up: f32,
+    skybox_fade_down: f32,
     light_probe_buffer: Option<wgpu::Buffer>,
     light_probe_capacity: usize,
 
@@ -1368,6 +1371,8 @@ impl App {
             night_skybox_brightness: cfg.atmosphere.night_skybox_brightness,
             horizon_fade_up: cfg.atmosphere.horizon_fade_up,
             horizon_fade_down: cfg.atmosphere.horizon_fade_down,
+            skybox_fade_up: cfg.atmosphere.skybox_fade_up,
+            skybox_fade_down: cfg.atmosphere.skybox_fade_down,
             light_probe_buffer: None,
             light_probe_capacity: 0,
             lod_distance: cfg.rendering.chunk_lod_distance,
@@ -7211,6 +7216,12 @@ impl App {
         // Smooth cubic fade for nicer transitions
         let sun_fade = sun_fade_raw * sun_fade_raw * (3.0 - 2.0 * sun_fade_raw);
 
+        // SKYBOX: Use a longer/faster configurable fade, separate from sun fade.
+        let sbu = self.skybox_fade_up;
+        let sbd = self.skybox_fade_down;
+        let sky_fade_raw = ((sun_height + sbd) / (sbu + sbd)).clamp(0.0, 1.0);
+        let sky_fade = sky_fade_raw * sky_fade_raw * (3.0 - 2.0 * sky_fade_raw);
+
         // Sun moves in an arc: horizontal component (cos) and vertical (sin)
         // Use full range for horizontal to get proper shadow directions
         let sun_direction = [time_angle.cos(), sun_height, 0.2];
@@ -7601,7 +7612,7 @@ impl App {
 
         // Smoothly interpolate skybox brightness using the sun_fade value so the
         // sky doesn't abruptly darken or brighten near the horizon.
-        let skybox_brightness = night_min + (1.0 - night_min) * sun_fade;
+        let skybox_brightness = night_min + (1.0 - night_min) * sky_fade;
 
         let uniforms = Uniforms {
             mvp: mvp_cols,
