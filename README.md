@@ -69,9 +69,12 @@ cargo run --bin generate_world -- --help
 - `R` / `T` - Decrease/increase camera LOD subdivide distance
 - `Z` / `C` - Decrease/increase draw distance (far plane)
 - `K` / `L` - Decrease/increase chunk LOD render distance (100-5000 units)
-- `T` - Toggle time of day cycle (pause/resume)
 - `F` / `G` - Decrease/increase fog density
 - `ESC` - Save config and quit
+
+**Time & Environment:**
+- `T` - Cycle time of day (day → dusk → night → dawn)
+- `Y` / `M` - Lower/raise water level
 
 **Effects Controls:**
 - `B` - Toggle Bloom
@@ -86,6 +89,9 @@ cargo run --bin generate_world -- --help
 - `O` / `P` - Decrease/increase Kawase iterations
 - `F1` / `F2` - Decrease/increase SSAO sample count
 - `F3` / `F4` - Decrease/increase SSAO radius
+- `F5` - Toggle GUI overlay (FPS counter & debug stats)
+- `R` - Toggle SSR (Screen Space Reflections - experimental)
+- `J` - Toggle HZB (Hierarchical Z-Buffer) culling
 
 **Configuration:** The viewer uses `config.toml` for all settings including world file path, camera position, rendering options, and visual effects. Edit this file to customize your experience.
 

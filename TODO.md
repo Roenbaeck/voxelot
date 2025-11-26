@@ -7,6 +7,11 @@
 ✅ Can we make the water level configurable in config.toml (with save on exit)?
 
 ✅ Can we make a toggle for the GUI overlay? Perhaps the F5-key?
-- Update README with missing keybindings.
+✅ Can you update README with any missing keybindings?
+
+- I can see an issue during night. Some surfaces remain bright, even though I don't think they should. The building in the middle ought to be consistently dark green, but it is brighter up to a certain y-level, then distincly turns dark. I see this phenomenon on several buildings at night, and am not sure when this started to appear. Can you try to figure out what is causing this?
+
+I checked closer and at night, I can see the division line start from the bottom of the building, reach it's peak height at midnight, then decline back down and disappear completely in day time. The line moves consistently like this regardless of camera angle, and doesn't jump around or disappear. 
+
 - Reflections sometimes look weird from afar, no gradient, but great up close.
 - Reflections change when I turn the camera.
