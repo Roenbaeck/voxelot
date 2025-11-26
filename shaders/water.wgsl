@@ -235,10 +235,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let u = 0.5 + atan2(reflect_dir.z, reflect_dir.x) / (2.0 * 3.14159265);
     let v = 0.5 - asin(reflect_dir.y) / 3.14159265;
     
-    // Sample and apply brightness
+    // Sample and apply brightness + desaturation + tint (to match skybox pass)
     let sky_sample = textureSample(skybox_texture, skybox_sampler, vec2<f32>(u, v)).rgb;
     let brightness = camera.fog_time_pad.w;
-    let reflection_color = sky_sample * brightness;
+    let min_sat = camera.skybox_saturation_pad.x;
+    let sat = clamp(min_sat + (1.0 - min_sat) * brightness, 0.0, 1.0);
+    let luminance = dot(sky_sample, vec3<f32>(0.299, 0.587, 0.114));
+    let desaturated = mix(vec3<f32>(luminance), sky_sample, sat);
+    let tint = camera.skybox_tint_pad.xyz;
+    let tint_strength = camera.skybox_tint_pad.w;
+    let effect_strength = (1.0 - brightness) * tint_strength;
+    let tinted = mix(desaturated, desaturated * tint, effect_strength);
+    let reflection_color = tinted * brightness;
     
     // Base water color (darken at night)
     let base_color = water.water_color.rgb * brightness;
