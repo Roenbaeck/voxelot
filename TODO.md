@@ -6,8 +6,7 @@
 ✅ Can we implement screen space reflections (SSR) for the water? It would be good if we later can set a material in the palette.txt to be reflective as well, so the SSR isn't limited to water.
 ✅ Can we make the water level configurable in config.toml (with save on exit)?
 
-- Toggle for the GUI overlay.
+✅ Can we make a toggle for the GUI overlay? Perhaps the F5-key?
 - Update README with missing keybindings.
 - Reflections sometimes look weird from afar, no gradient, but great up close.
 - Reflections change when I turn the camera.
-

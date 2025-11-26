@@ -6,20 +6,20 @@ camera_position = [
     100.0,
     320.0,
 ]
-water_level = 2.5
+water_level = 2.0
 
 [rendering]
-lod_subdivide_distance = 400.0
+lod_subdivide_distance = 250.0
 lod_merge_distance = 750.0
 chunk_lod_distance = 1500.0
 fov_degrees = 70.0
 near_plane = 0.1
-far_plane = 5500.0
+far_plane = 7000.0
 camera_speed_multiplier = 4.7683716
 
 [atmosphere]
 fog_density = 0.00044999996
-time_of_day = 0.30988064
+time_of_day = 0.98065263
 night_skybox_brightness = 0.02
 
 [effects.depth_of_field]

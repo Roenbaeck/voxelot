@@ -849,6 +849,9 @@ struct App {
     offscreen_color_view: Option<wgpu::TextureView>,
     offscreen_depth_texture: Option<wgpu::Texture>,
     offscreen_depth_view: Option<wgpu::TextureView>,
+
+    // GUI state
+    gui_visible: bool,
     post_color_texture: Option<wgpu::Texture>,
     post_color_view: Option<wgpu::TextureView>,
     bloom_ping_texture: Option<wgpu::Texture>,
@@ -1373,6 +1376,7 @@ impl App {
             offscreen_color_view: None,
             offscreen_depth_texture: None,
             offscreen_depth_view: None,
+            gui_visible: true,
             post_color_texture: None,
             post_color_view: None,
             bloom_ping_texture: None,
@@ -1796,6 +1800,13 @@ impl App {
                 // increase SSILVB sample count
                 self.ssao_settings.sample_count = (self.ssao_settings.sample_count + 1).min(32);
                 println!("SSAO sample_count: {}", self.ssao_settings.sample_count);
+            }
+            KeyCode::F5 => {
+                self.gui_visible = !self.gui_visible;
+                println!(
+                    "GUI overlay: {}",
+                    if self.gui_visible { "ON" } else { "OFF" }
+                );
             }
             KeyCode::F3 => {
                 // decrease sampling radius
@@ -3233,25 +3244,52 @@ impl App {
     }
 
     fn update_ssr_bind_group(&mut self) {
-        let Some(device) = self.device.as_ref() else { return };
-        let (Some(layout), Some(ssr_ubo), Some(ssr_cam_ubo), Some(scene_view), Some(depth_view), Some(sampler)) = (
+        let Some(device) = self.device.as_ref() else {
+            return;
+        };
+        let (
+            Some(layout),
+            Some(ssr_ubo),
+            Some(ssr_cam_ubo),
+            Some(scene_view),
+            Some(depth_view),
+            Some(sampler),
+        ) = (
             self.ssr_bind_group_layout.as_ref(),
             self.ssr_uniform_buffer.as_ref(),
             self.ssr_camera_uniform_buffer.as_ref(),
             self.offscreen_color_view.as_ref(),
             self.offscreen_depth_view.as_ref(),
             self.post_sampler.as_ref(),
-        ) else { return; };
+        )
+        else {
+            return;
+        };
 
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("SSR Bind Group"),
             layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: ssr_cam_ubo.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: ssr_ubo.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(scene_view) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(depth_view) },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(sampler) },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: ssr_cam_ubo.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: ssr_ubo.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(scene_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
             ],
         });
         self.ssr_bind_group = Some(bg);
@@ -7918,7 +7956,10 @@ impl App {
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: ssr_view,
                         resolve_target: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
                         depth_slice: None,
                     })],
                     depth_stencil_attachment: None,
@@ -8421,257 +8462,274 @@ impl App {
         }
 
         // Egui rendering
-        if let (Some(egui_ctx), Some(egui_winit), Some(window)) =
-            (&self.egui_ctx, &mut self.egui_winit, &self.window)
-        {
-            let raw_input = egui_winit.take_egui_input(window);
-            egui_ctx.begin_pass(raw_input);
+        if self.gui_visible {
+            if let (Some(egui_ctx), Some(egui_winit), Some(window)) =
+                (&self.egui_ctx, &mut self.egui_winit, &self.window)
+            {
+                let raw_input = egui_winit.take_egui_input(window);
+                egui_ctx.begin_pass(raw_input);
 
-            egui::Area::new(egui::Id::new("fps_counter"))
-                .fixed_pos(egui::pos2(10.0, 10.0))
-                .show(egui_ctx, |ui| {
-                    egui::Frame::default()
-                        .fill(egui::Color32::from_black_alpha(222))
-                        .inner_margin(5.0)
-                        .corner_radius(5.0)
-                        .show(ui, |ui| {
-                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                            ui.label(
-                                egui::RichText::new(format!("FPS: {}", self.last_fps))
+                egui::Area::new(egui::Id::new("fps_counter"))
+                    .fixed_pos(egui::pos2(10.0, 10.0))
+                    .show(egui_ctx, |ui| {
+                        egui::Frame::default()
+                            .fill(egui::Color32::from_black_alpha(222))
+                            .inner_margin(5.0)
+                            .corner_radius(5.0)
+                            .show(ui, |ui| {
+                                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                                ui.label(
+                                    egui::RichText::new(format!("FPS: {}", self.last_fps))
+                                        .color(egui::Color32::WHITE)
+                                        .size(10.0),
+                                );
+                                // Additional stats: mirror the console output but in overlay
+                                ui.label(
+                                    egui::RichText::new(format!("Visible: {}", self.visible_count))
+                                        .color(egui::Color32::WHITE)
+                                        .size(10.0),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Meshed: {}",
+                                        self.meshed_chunk_count
+                                    ))
                                     .color(egui::Color32::WHITE)
                                     .size(10.0),
-                            );
-                            // Additional stats: mirror the console output but in overlay
-                            ui.label(
-                                egui::RichText::new(format!("Visible: {}", self.visible_count))
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Pending: {}",
+                                        self.pending_mesh_count
+                                    ))
                                     .color(egui::Color32::WHITE)
                                     .size(10.0),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!("Meshed: {}", self.meshed_chunk_count))
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Jobs/s: {}",
+                                        self.jobs_per_sec_snapshot
+                                    ))
                                     .color(egui::Color32::WHITE)
                                     .size(10.0),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "Pending: {}",
-                                    self.pending_mesh_count
-                                ))
-                                .color(egui::Color32::WHITE)
-                                .size(10.0),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "Jobs/s: {}",
-                                    self.jobs_per_sec_snapshot
-                                ))
-                                .color(egui::Color32::WHITE)
-                                .size(10.0),
-                            );
-                            // (Moved) Mesh cache and envelopes will be printed under 'Process' for clarity
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "Process: {:.0} MiB",
-                                    self.process_mem_mib
-                                ))
-                                .color(egui::Color32::WHITE)
-                                .size(10.0),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "  Mesh cache: {:.0}/{:.0} MiB",
-                                    self.mesh_cache_mib, self.mesh_budget_mib
-                                ))
-                                .color(egui::Color32::WHITE)
-                                .size(10.0),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "  Envelopes: {:.0}/{:.0} MiB",
-                                    self.envelope_cache_mib, self.mesh_budget_mib
-                                ))
-                                .color(egui::Color32::WHITE)
-                                .size(10.0),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "GPU tracked: {:.0} MiB",
-                                    (self.gpu_buffer_bytes + self.gpu_texture_bytes) as f64
-                                        / (1024.0 * 1024.0)
-                                ))
-                                .color(egui::Color32::WHITE)
-                                .size(10.0),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "  Uniforms: {:.1} MiB",
-                                    (self.uniform_buffer_bytes as f64) / (1024.0 * 1024.0)
-                                ))
-                                .color(egui::Color32::WHITE)
-                                .size(10.0),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "  Mega VB/IB: {:.1}/{:.1} MiB",
-                                    (self.mega_vertex_buffer_bytes as f64) / (1024.0 * 1024.0),
-                                    (self.mega_index_buffer_bytes as f64) / (1024.0 * 1024.0)
-                                ))
-                                .color(egui::Color32::WHITE)
-                                .size(10.0),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "  GPU Input: {:.1} MiB",
-                                    (self.gpu_input_buffer_bytes as f64) / (1024.0 * 1024.0)
-                                ))
-                                .color(egui::Color32::WHITE)
-                                .size(10.0),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "  Indirects (mesh/env): {:.1}/{:.1} MiB",
-                                    (self.mesh_indirect_bytes as f64) / (1024.0 * 1024.0),
-                                    (self.envelope_indirect_bytes as f64) / (1024.0 * 1024.0)
-                                ))
-                                .color(egui::Color32::WHITE)
-                                .size(10.0),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "  Offscreen/Depth/Post: {:.1}/{:.1}/{:.1} MiB",
-                                    (self.offscreen_color_texture_bytes as f64) / (1024.0 * 1024.0),
-                                    (self.depth_texture_bytes as f64) / (1024.0 * 1024.0),
-                                    (self.post_color_texture_bytes as f64) / (1024.0 * 1024.0)
-                                ))
-                                .color(egui::Color32::WHITE)
-                                .size(10.0),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "  Kawase ping/pong: {:.1}/{:.1} MiB",
-                                    (self.kawase_ping_bytes as f64) / (1024.0 * 1024.0),
-                                    (self.kawase_pong_bytes as f64) / (1024.0 * 1024.0)
-                                ))
-                                .color(egui::Color32::WHITE)
-                                .size(10.0),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "  Bloom ping/pong: {:.1}/{:.1} MiB",
-                                    (self.bloom_ping_bytes as f64) / (1024.0 * 1024.0),
-                                    (self.bloom_pong_bytes as f64) / (1024.0 * 1024.0)
-                                ))
-                                .color(egui::Color32::WHITE)
-                                .size(10.0),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "  SSAO ping/pong: {:.1}/{:.1} MiB",
-                                    (self.ssao_ping_bytes as f64) / (1024.0 * 1024.0),
-                                    (self.ssao_pong_bytes as f64) / (1024.0 * 1024.0)
-                                ))
-                                .color(egui::Color32::WHITE)
-                                .size(10.0),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "  Shadow/Skybox: {:.1}/{:.1} MiB",
-                                    (self.shadow_map_bytes as f64) / (1024.0 * 1024.0),
-                                    (self.skybox_texture_bytes as f64) / (1024.0 * 1024.0)
-                                ))
-                                .color(egui::Color32::WHITE)
-                                .size(10.0),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!("Cull: {:.2}ms", self.cull_ms))
+                                );
+                                // (Moved) Mesh cache and envelopes will be printed under 'Process' for clarity
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Process: {:.0} MiB",
+                                        self.process_mem_mib
+                                    ))
                                     .color(egui::Color32::WHITE)
                                     .size(10.0),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!("Group: {:.2}ms", self.grouping_ms))
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "  Mesh cache: {:.0}/{:.0} MiB",
+                                        self.mesh_cache_mib, self.mesh_budget_mib
+                                    ))
                                     .color(egui::Color32::WHITE)
                                     .size(10.0),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!("Mesh: {:.2}ms", self.mesh_ms))
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "  Envelopes: {:.0}/{:.0} MiB",
+                                        self.envelope_cache_mib, self.mesh_budget_mib
+                                    ))
                                     .color(egui::Color32::WHITE)
                                     .size(10.0),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "Instancing: {:.2}ms",
-                                    self.instance_ms
-                                ))
-                                .color(egui::Color32::WHITE)
-                                .size(10.0),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!("Draws: {}", self.draw_calls_count))
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "GPU tracked: {:.0} MiB",
+                                        (self.gpu_buffer_bytes + self.gpu_texture_bytes) as f64
+                                            / (1024.0 * 1024.0)
+                                    ))
                                     .color(egui::Color32::WHITE)
                                     .size(10.0),
-                            );
-                        });
-                });
-
-            let full_output = egui_ctx.end_pass();
-            let paint_jobs = egui_ctx.tessellate(full_output.shapes, egui_ctx.pixels_per_point());
-            let screen_descriptor = egui_wgpu::ScreenDescriptor {
-                size_in_pixels: [
-                    self.config.as_ref().unwrap().width,
-                    self.config.as_ref().unwrap().height,
-                ],
-                pixels_per_point: egui_ctx.pixels_per_point(),
-            };
-
-            // Take the renderer out to avoid mutable borrow issues
-            if let Some(mut egui_renderer) = self.egui_renderer.take() {
-                egui_winit.handle_platform_output(window, full_output.platform_output);
-
-                for (id, image_delta) in &full_output.textures_delta.set {
-                    egui_renderer.update_texture(
-                        self.device.as_ref().unwrap(),
-                        self.queue.as_ref().unwrap(),
-                        *id,
-                        image_delta,
-                    );
-                }
-
-                egui_renderer.update_buffers(
-                    self.device.as_ref().unwrap(),
-                    self.queue.as_ref().unwrap(),
-                    &mut encoder,
-                    &paint_jobs,
-                    &screen_descriptor,
-                );
-
-                {
-                    let egui_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("egui_pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &view,
-                            resolve_target: None,
-                            depth_slice: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Load,
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "  Uniforms: {:.1} MiB",
+                                        (self.uniform_buffer_bytes as f64) / (1024.0 * 1024.0)
+                                    ))
+                                    .color(egui::Color32::WHITE)
+                                    .size(10.0),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "  Mega VB/IB: {:.1}/{:.1} MiB",
+                                        (self.mega_vertex_buffer_bytes as f64) / (1024.0 * 1024.0),
+                                        (self.mega_index_buffer_bytes as f64) / (1024.0 * 1024.0)
+                                    ))
+                                    .color(egui::Color32::WHITE)
+                                    .size(10.0),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "  GPU Input: {:.1} MiB",
+                                        (self.gpu_input_buffer_bytes as f64) / (1024.0 * 1024.0)
+                                    ))
+                                    .color(egui::Color32::WHITE)
+                                    .size(10.0),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "  Indirects (mesh/env): {:.1}/{:.1} MiB",
+                                        (self.mesh_indirect_bytes as f64) / (1024.0 * 1024.0),
+                                        (self.envelope_indirect_bytes as f64) / (1024.0 * 1024.0)
+                                    ))
+                                    .color(egui::Color32::WHITE)
+                                    .size(10.0),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "  Offscreen/Depth/Post: {:.1}/{:.1}/{:.1} MiB",
+                                        (self.offscreen_color_texture_bytes as f64)
+                                            / (1024.0 * 1024.0),
+                                        (self.depth_texture_bytes as f64) / (1024.0 * 1024.0),
+                                        (self.post_color_texture_bytes as f64) / (1024.0 * 1024.0)
+                                    ))
+                                    .color(egui::Color32::WHITE)
+                                    .size(10.0),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "  Kawase ping/pong: {:.1}/{:.1} MiB",
+                                        (self.kawase_ping_bytes as f64) / (1024.0 * 1024.0),
+                                        (self.kawase_pong_bytes as f64) / (1024.0 * 1024.0)
+                                    ))
+                                    .color(egui::Color32::WHITE)
+                                    .size(10.0),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "  Bloom ping/pong: {:.1}/{:.1} MiB",
+                                        (self.bloom_ping_bytes as f64) / (1024.0 * 1024.0),
+                                        (self.bloom_pong_bytes as f64) / (1024.0 * 1024.0)
+                                    ))
+                                    .color(egui::Color32::WHITE)
+                                    .size(10.0),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "  SSAO ping/pong: {:.1}/{:.1} MiB",
+                                        (self.ssao_ping_bytes as f64) / (1024.0 * 1024.0),
+                                        (self.ssao_pong_bytes as f64) / (1024.0 * 1024.0)
+                                    ))
+                                    .color(egui::Color32::WHITE)
+                                    .size(10.0),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "  Shadow/Skybox: {:.1}/{:.1} MiB",
+                                        (self.shadow_map_bytes as f64) / (1024.0 * 1024.0),
+                                        (self.skybox_texture_bytes as f64) / (1024.0 * 1024.0)
+                                    ))
+                                    .color(egui::Color32::WHITE)
+                                    .size(10.0),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!("Cull: {:.2}ms", self.cull_ms))
+                                        .color(egui::Color32::WHITE)
+                                        .size(10.0),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Group: {:.2}ms",
+                                        self.grouping_ms
+                                    ))
+                                    .color(egui::Color32::WHITE)
+                                    .size(10.0),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!("Mesh: {:.2}ms", self.mesh_ms))
+                                        .color(egui::Color32::WHITE)
+                                        .size(10.0),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Instancing: {:.2}ms",
+                                        self.instance_ms
+                                    ))
+                                    .color(egui::Color32::WHITE)
+                                    .size(10.0),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Draws: {}",
+                                        self.draw_calls_count
+                                    ))
+                                    .color(egui::Color32::WHITE)
+                                    .size(10.0),
+                                );
+                            });
                     });
 
-                    // Convert to 'static lifetime for egui-wgpu
-                    let mut egui_pass_static = egui_pass.forget_lifetime();
+                let full_output = egui_ctx.end_pass();
+                let paint_jobs =
+                    egui_ctx.tessellate(full_output.shapes, egui_ctx.pixels_per_point());
+                let screen_descriptor = egui_wgpu::ScreenDescriptor {
+                    size_in_pixels: [
+                        self.config.as_ref().unwrap().width,
+                        self.config.as_ref().unwrap().height,
+                    ],
+                    pixels_per_point: egui_ctx.pixels_per_point(),
+                };
 
-                    egui_renderer.render(&mut egui_pass_static, &paint_jobs, &screen_descriptor);
+                // Take the renderer out to avoid mutable borrow issues
+                if let Some(mut egui_renderer) = self.egui_renderer.take() {
+                    egui_winit.handle_platform_output(window, full_output.platform_output);
+
+                    for (id, image_delta) in &full_output.textures_delta.set {
+                        egui_renderer.update_texture(
+                            self.device.as_ref().unwrap(),
+                            self.queue.as_ref().unwrap(),
+                            *id,
+                            image_delta,
+                        );
+                    }
+
+                    egui_renderer.update_buffers(
+                        self.device.as_ref().unwrap(),
+                        self.queue.as_ref().unwrap(),
+                        &mut encoder,
+                        &paint_jobs,
+                        &screen_descriptor,
+                    );
+
+                    {
+                        let egui_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("egui_pass"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &view,
+                                resolve_target: None,
+                                depth_slice: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Load,
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                        });
+
+                        // Convert to 'static lifetime for egui-wgpu
+                        let mut egui_pass_static = egui_pass.forget_lifetime();
+
+                        egui_renderer.render(
+                            &mut egui_pass_static,
+                            &paint_jobs,
+                            &screen_descriptor,
+                        );
+                    }
+
+                    for id in &full_output.textures_delta.free {
+                        egui_renderer.free_texture(id);
+                    }
+
+                    self.egui_renderer = Some(egui_renderer);
                 }
-
-                for id in &full_output.textures_delta.free {
-                    egui_renderer.free_texture(id);
-                }
-
-                self.egui_renderer = Some(egui_renderer);
             }
         }
 
