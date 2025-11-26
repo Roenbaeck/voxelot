@@ -1,1 +1,1 @@
-None at the moment.
+Reflected skybox doesn't respect skybox_min_saturation and skybox_night_tint.

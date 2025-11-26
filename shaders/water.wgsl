@@ -10,6 +10,8 @@ struct CameraUniforms {
     shadow_darkness_pad: vec4<f32>,
     moon_direction_intensity: vec4<f32>,
     moon_color_pad: vec4<f32>,
+    skybox_saturation_pad: vec4<f32>,
+    skybox_tint_pad: vec4<f32>,
     light_probe_count: u32,
     lod_distance: f32,
     envelope_distance: f32,
