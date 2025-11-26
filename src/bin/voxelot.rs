@@ -211,6 +211,7 @@ struct Uniforms {
     moon_direction_intensity: [f32; 4],  // xyz = moon dir, w = intensity scalar
     moon_color_pad: [f32; 4],            // xyz = moon color
     skybox_saturation_pad: [f32; 4],     // x = min skybox saturation at night
+    skybox_tint_pad: [f32; 4],           // xyz = tint color, w = tint strength
     light_probe_count: u32,
     lod_distance: f32, // LOD render distance for fade calculation
     envelope_distance: f32,
@@ -838,6 +839,8 @@ struct App {
     skybox_fade_up: f32,
     skybox_fade_down: f32,
     skybox_min_saturation: f32,
+    skybox_night_tint: [f32; 3],
+    skybox_tint_strength: f32,
     light_probe_buffer: Option<wgpu::Buffer>,
     light_probe_capacity: usize,
 
@@ -1376,6 +1379,8 @@ impl App {
             skybox_fade_up: cfg.atmosphere.skybox_fade_up,
             skybox_fade_down: cfg.atmosphere.skybox_fade_down,
             skybox_min_saturation: cfg.atmosphere.skybox_min_saturation,
+            skybox_night_tint: cfg.atmosphere.skybox_night_tint,
+            skybox_tint_strength: cfg.atmosphere.skybox_tint_strength,
             light_probe_buffer: None,
             light_probe_capacity: 0,
             lod_distance: cfg.rendering.chunk_lod_distance,
@@ -5506,6 +5511,7 @@ impl App {
             moon_direction_intensity: [-0.5, -1.0, -0.3, 0.2], // initial opposite dim moon
             moon_color_pad: [0.2, 0.25, 0.35, 0.0],
             skybox_saturation_pad: [0.16, 0.0, 0.0, 0.0],
+            skybox_tint_pad: [0.09, 0.12, 0.24, 0.5],
             light_probe_count: 0,
             lod_distance: 800.0,
             envelope_distance: 256.0,
@@ -7651,6 +7657,12 @@ impl App {
             ],
             moon_color_pad: [moon_color[0], moon_color[1], moon_color[2], 0.0],
             skybox_saturation_pad: [self.skybox_min_saturation, 0.0, 0.0, 0.0],
+            skybox_tint_pad: [
+                self.skybox_night_tint[0],
+                self.skybox_night_tint[1],
+                self.skybox_night_tint[2],
+                self.skybox_tint_strength,
+            ],
             light_probe_count,
             lod_distance: self.lod_distance,
             envelope_distance: self.envelope_distance,

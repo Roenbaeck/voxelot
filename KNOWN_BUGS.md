@@ -1,2 +1,1 @@
-- Reflections sometimes look weird from afar, no gradient, but great up close.
-- Reflections change when I turn the camera.
+None at the moment.

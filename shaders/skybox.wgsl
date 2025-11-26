@@ -12,6 +12,7 @@ struct CameraUniforms {
     moon_direction_intensity: vec4<f32>,
     moon_color_pad: vec4<f32>,
     skybox_saturation_pad: vec4<f32>,
+    skybox_tint_pad: vec4<f32>,
     light_probe_count: u32,
     lod_distance: f32,
     envelope_distance: f32,
@@ -97,5 +98,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Convert color to grayscale using luminance coefficients and mix with original
     let luminance = dot(color.rgb, vec3<f32>(0.299, 0.587, 0.114));
     let desaturated = mix(vec3<f32>(luminance), color.rgb, sat);
-    return vec4<f32>(desaturated * brightness, color.a);
+    // Apply tint towards `skybox_night_tint` with intensity scaled by how dark it is
+    let tint = camera.skybox_tint_pad.xyz;
+    let tint_strength = camera.skybox_tint_pad.w;
+    let effect_strength = (1.0 - brightness) * tint_strength; // stronger at night
+    let tinted = mix(desaturated, desaturated * tint, effect_strength);
+    return vec4<f32>(tinted * brightness, color.a);
 }

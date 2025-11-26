@@ -9,7 +9,7 @@ camera_position = [
 water_level = 2.0
 
 [rendering]
-lod_subdivide_distance = 450.0
+lod_subdivide_distance = 500.0
 lod_merge_distance = 750.0
 chunk_lod_distance = 1500.0
 fov_degrees = 70.0
@@ -19,13 +19,19 @@ camera_speed_multiplier = 4.7683716
 
 [atmosphere]
 fog_density = 0.00044999996
-time_of_day = 0.17162186
+time_of_day = 0.28723434
 night_skybox_brightness = 0.02
 horizon_fade_up = 0.05
 horizon_fade_down = 0.25
 skybox_fade_up = 0.05
 skybox_fade_down = 0.95
 skybox_min_saturation = 0.16
+skybox_night_tint = [
+    0.09,
+    0.12,
+    0.8,
+]
+skybox_tint_strength = 0.5
 
 [effects.depth_of_field]
 enabled = true

@@ -70,6 +70,10 @@ pub struct AtmosphereConfig {
     pub skybox_fade_down: f32,
     #[serde(default = "default_skybox_min_saturation")]
     pub skybox_min_saturation: f32,
+    #[serde(default = "default_skybox_tint")]
+    pub skybox_night_tint: [f32; 3],
+    #[serde(default = "default_skybox_tint_strength")]
+    pub skybox_tint_strength: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,6 +273,14 @@ fn default_skybox_fade_down() -> f32 {
 
 fn default_skybox_min_saturation() -> f32 {
     0.16
+}
+
+fn default_skybox_tint() -> [f32; 3] {
+    [0.09, 0.12, 0.24] // cool navy/indigo tint
+}
+
+fn default_skybox_tint_strength() -> f32 {
+    0.5 // half strength at full night fade
 }
 
 fn default_dof_focal_distance() -> f32 {
@@ -474,6 +486,8 @@ impl Default for AtmosphereConfig {
             skybox_fade_up: default_skybox_fade_up(),
             skybox_fade_down: default_skybox_fade_down(),
             skybox_min_saturation: default_skybox_min_saturation(),
+            skybox_night_tint: default_skybox_tint(),
+            skybox_tint_strength: default_skybox_tint_strength(),
         }
     }
 }
