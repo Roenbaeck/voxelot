@@ -11,6 +11,7 @@ struct CameraUniforms {
     shadow_darkness_pad: vec4<f32>,
     moon_direction_intensity: vec4<f32>,
     moon_color_pad: vec4<f32>,
+    skybox_saturation_pad: vec4<f32>,
     light_probe_count: u32,
     lod_distance: f32,
     envelope_distance: f32,
@@ -90,5 +91,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     
     // Apply brightness (dim at night)
     let brightness = camera.fog_time_pad.w;
-    return vec4<f32>(color.rgb * brightness, color.a);
+    // Compute saturation: as brightness drops toward 0, saturation approaches min sat.
+    let min_sat = camera.skybox_saturation_pad.x;
+    let sat = min_sat + (1.0 - min_sat) * brightness;
+    // Convert color to grayscale using luminance coefficients and mix with original
+    let luminance = dot(color.rgb, vec3<f32>(0.299, 0.587, 0.114));
+    let desaturated = mix(vec3<f32>(luminance), color.rgb, sat);
+    return vec4<f32>(desaturated * brightness, color.a);
 }

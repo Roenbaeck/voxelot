@@ -210,6 +210,7 @@ struct Uniforms {
     shadow_darkness_pad: [f32; 4],       // x = shadow darkness multiplier
     moon_direction_intensity: [f32; 4],  // xyz = moon dir, w = intensity scalar
     moon_color_pad: [f32; 4],            // xyz = moon color
+    skybox_saturation_pad: [f32; 4],     // x = min skybox saturation at night
     light_probe_count: u32,
     lod_distance: f32, // LOD render distance for fade calculation
     envelope_distance: f32,
@@ -836,6 +837,7 @@ struct App {
     // Skybox fade control (slower fade to black than sun fade)
     skybox_fade_up: f32,
     skybox_fade_down: f32,
+    skybox_min_saturation: f32,
     light_probe_buffer: Option<wgpu::Buffer>,
     light_probe_capacity: usize,
 
@@ -1373,6 +1375,7 @@ impl App {
             horizon_fade_down: cfg.atmosphere.horizon_fade_down,
             skybox_fade_up: cfg.atmosphere.skybox_fade_up,
             skybox_fade_down: cfg.atmosphere.skybox_fade_down,
+            skybox_min_saturation: cfg.atmosphere.skybox_min_saturation,
             light_probe_buffer: None,
             light_probe_capacity: 0,
             lod_distance: cfg.rendering.chunk_lod_distance,
@@ -2660,7 +2663,7 @@ impl App {
                     self.hzb_view.as_ref(),
                     self.hzb_params_buffer.as_ref(),
                 ) {
-                    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    let _bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("HZB Cull Bind Group"),
                         layout,
                         entries: &[
@@ -5502,6 +5505,7 @@ impl App {
             shadow_darkness_pad: [self.shadow_darkness, self.shadow_backface_scale, 0.0, 0.0],
             moon_direction_intensity: [-0.5, -1.0, -0.3, 0.2], // initial opposite dim moon
             moon_color_pad: [0.2, 0.25, 0.35, 0.0],
+            skybox_saturation_pad: [0.16, 0.0, 0.0, 0.0],
             light_probe_count: 0,
             lod_distance: 800.0,
             envelope_distance: 256.0,
@@ -7646,6 +7650,7 @@ impl App {
                 moon_intensity,
             ],
             moon_color_pad: [moon_color[0], moon_color[1], moon_color[2], 0.0],
+            skybox_saturation_pad: [self.skybox_min_saturation, 0.0, 0.0, 0.0],
             light_probe_count,
             lod_distance: self.lod_distance,
             envelope_distance: self.envelope_distance,
