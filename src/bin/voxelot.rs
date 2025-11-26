@@ -1732,7 +1732,8 @@ impl App {
             KeyCode::KeyT => {
                 // Toggle time pause
                 self.time_paused = !self.time_paused;
-                let phase = if self.time_of_day < 0.125 {
+                // UPDATED THRESHOLDS: 0.20 (was 0.125) and 0.80 (was 0.875)
+                let phase = if self.time_of_day < 0.20 {
                     "Midnight→Dawn"
                 } else if self.time_of_day < 0.25 {
                     "Dawn→Sunrise"
@@ -1740,7 +1741,7 @@ impl App {
                     "Sunrise→Noon"
                 } else if self.time_of_day < 0.75 {
                     "Noon→Sunset"
-                } else if self.time_of_day < 0.875 {
+                } else if self.time_of_day < 0.80 {
                     "Sunset→Dusk"
                 } else {
                     "Dusk→Midnight"
@@ -7185,10 +7186,28 @@ impl App {
         let inverse_view_cols: [[f32; 4]; 4] = inverse_view.to_cols_array_2d();
         let inverse_proj_cols: [[f32; 4]; 4] = inverse_proj.to_cols_array_2d();
 
-        // Calculate lighting based on time of day
-        // Offset the solar angle so that time_of_day ≈ 0.25 aligns with sunrise; trig handles wrapping
+        // 1. Keep the smoothstep helper
+        let smooth_interp = |start: f32, end: f32, val: f32| -> f32 {
+            let t = ((val - start) / (end - start)).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        };
+
+        // ... existing time_angle / sun_height calculation ...
         let time_angle = (self.time_of_day - 0.25) * std::f32::consts::TAU;
         let sun_height = time_angle.sin();
+
+        // 2. ADJUSTED: Horizon Fade
+        // We now allow the sun to stay "on" until it is -0.15 units below the horizon.
+        // This allows light to hit the tops of buildings while the ground is in shadow.
+        let horizon_fade = if sun_height > 0.05 {
+            1.0
+        } else if sun_height > -0.15 {
+            // Fade out slowly as it drops from +0.05 to -0.15
+            ((sun_height + 0.15) / 0.20).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
         // Sun moves in an arc: horizontal component (cos) and vertical (sin)
         // Use full range for horizontal to get proper shadow directions
         let sun_direction = [time_angle.cos(), sun_height, 0.2];
@@ -7221,15 +7240,15 @@ impl App {
                 0.0
             };
             
-            if t < 0.125 {
-                // Midnight to twilight (0.0 -> 0.125)
-                let factor = t / 0.125;
+            if t < 0.20 {
+                // Midnight -> Dawn
+                let factor = smooth_interp(0.0, 0.20, t);
                 let ambient = [
                     midnight_ambient[0] + (twilight_ambient[0] - midnight_ambient[0]) * factor,
                     midnight_ambient[1] + (twilight_ambient[1] - midnight_ambient[1]) * factor,
                     midnight_ambient[2] + (twilight_ambient[2] - midnight_ambient[2]) * factor,
                 ];
-                // Sun color fades in smoothly as we approach dawn
+                // KEY CHANGE: Apply sunrise color here, controlled by horizon_fade
                 let sun = [
                     sunrise_sun[0] * horizon_fade * factor,
                     sunrise_sun[1] * horizon_fade * factor,
@@ -7237,8 +7256,8 @@ impl App {
                 ];
                 (sun, ambient)
             } else if t < 0.25 {
-                // Twilight to sunrise (0.125 -> 0.25)
-                let factor = (t - 0.125) / 0.125;
+                // Dawn -> Sunrise
+                let factor = smooth_interp(0.20, 0.25, t);
                 let sun = [
                     sunrise_sun[0] * horizon_fade,
                     sunrise_sun[1] * horizon_fade,
@@ -7250,9 +7269,10 @@ impl App {
                     twilight_ambient[2] + (sunrise_ambient[2] - twilight_ambient[2]) * factor,
                 ];
                 (sun, ambient)
-            } else if t < 0.5 {
-                // Sunrise to day (0.25 -> 0.5)
-                let factor = (t - 0.25) / 0.25;
+            } 
+            // ... Day phases (0.25 to 0.75) remain the same ...
+            else if t < 0.5 {
+                let factor = smooth_interp(0.25, 0.5, t);
                 let sun = [
                     (sunrise_sun[0] + (day_sun[0] - sunrise_sun[0]) * factor) * horizon_fade,
                     (sunrise_sun[1] + (day_sun[1] - sunrise_sun[1]) * factor) * horizon_fade,
@@ -7265,8 +7285,7 @@ impl App {
                 ];
                 (sun, ambient)
             } else if t < 0.75 {
-                // Day to sunset (0.5 -> 0.75)
-                let factor = (t - 0.5) / 0.25;
+                let factor = smooth_interp(0.5, 0.75, t);
                 let sun = [
                     (day_sun[0] + (sunrise_sun[0] - day_sun[0]) * factor) * horizon_fade,
                     (day_sun[1] + (sunrise_sun[1] - day_sun[1]) * factor) * horizon_fade,
@@ -7278,9 +7297,11 @@ impl App {
                     day_ambient[2] + (sunrise_ambient[2] - day_ambient[2]) * factor,
                 ];
                 (sun, ambient)
-            } else if t < 0.875 {
-                // Sunset to twilight (0.75 -> 0.875)
-                let factor = (t - 0.75) / 0.125;
+            }
+            // ...
+            else if t < 0.80 {
+                // Sunset -> Dusk
+                let factor = smooth_interp(0.75, 0.80, t);
                 let sun = [
                     sunrise_sun[0] * horizon_fade * (1.0 - factor),
                     sunrise_sun[1] * horizon_fade * (1.0 - factor),
@@ -7293,18 +7314,23 @@ impl App {
                 ];
                 (sun, ambient)
             } else {
-                // Twilight to midnight (0.875 -> 1.0)
-                let factor = (t - 0.875) / 0.125;
+                // Dusk -> Midnight
+                let factor = smooth_interp(0.80, 1.0, t);
                 let ambient = [
                     twilight_ambient[0] + (midnight_ambient[0] - twilight_ambient[0]) * factor,
                     twilight_ambient[1] + (midnight_ambient[1] - twilight_ambient[1]) * factor,
                     twilight_ambient[2] + (midnight_ambient[2] - twilight_ambient[2]) * factor,
                 ];
-                // Sun fully below horizon at night
-                let sun = [0.0, 0.0, 0.0];
+                // KEY CHANGE: Apply sunrise color here too, fading out with horizon_fade
+                // This prevents the "fade in middle of building" issue.
+                let sun = [
+                    sunrise_sun[0] * horizon_fade * (1.0 - factor),
+                    sunrise_sun[1] * horizon_fade * (1.0 - factor),
+                    sunrise_sun[2] * horizon_fade * (1.0 - factor),
+                ];
                 (sun, ambient)
-            }
-        };
+            } 
+       };
 
         let sun_direction_vec_raw = Vec3::from_array(sun_direction);
         let sun_direction_vec = if sun_direction_vec_raw.length_squared() > 0.0001 {
@@ -7423,29 +7449,30 @@ impl App {
         let sun_view_proj = OPENGL_TO_WGPU_MATRIX * light_proj * light_view;
         let sun_view_proj_cols: [[f32; 4]; 4] = sun_view_proj.to_cols_array_2d();
 
-        // Shadow strength based on sun/moon position
-        // Smooth continuous transition between sun and moon shadows
-        // No discontinuities at horizon crossing
-        let shadow_strength = if sun_height > 0.0 {
-            // Sun is above horizon - full strength sun shadows
-            // Fade in from horizon to avoid sudden appearance
-            let fade_in = (sun_height / 0.2).clamp(0.0, 1.0);
+        let shadow_calc_direction = [
+            time_angle.cos(),
+            sun_height.max(0.05), // Force sun to stay slightly "up" for shadow calculations
+            0.2
+        ];
+        let sun_direction_vec_raw = Vec3::from_array(shadow_calc_direction);
+        let sun_direction_vec = sun_direction_vec_raw.normalize();
+
+        // Shadows should persist as long as there is light (horizon_fade > 0).
+        let shadow_strength = if sun_height > -0.15 {
+            // Fade shadows out exactly in sync with the sun light fading out
+            let fade_in = ((sun_height + 0.15) / 0.20).clamp(0.0, 1.0);
             (fade_in * SHADOW_STRENGTH_MULTIPLIER).min(1.0)
         } else {
-            // Sun is below horizon - use moon shadows
-            let moon_height = -sun_height; // Moon is on opposite side
-                                           // Continuous transition: moon shadows gradually appear as moon rises
+            // Moon shadow logic (same as before)
+            let moon_height = -sun_height;
             if moon_height < 0.2 {
-                // Moon just rising - fade in moon shadows gradually
                 let fade = (moon_height / 0.2).clamp(0.0, 1.0);
                 fade * 0.4
             } else {
-                // Moon well above horizon - stronger shadows at midnight
                 let moon_factor = ((moon_height - 0.2) / 0.8).clamp(0.0, 1.0);
-                // Moon shadows: 40-70% strength, peaking at midnight
                 0.4 + moon_factor * 0.3
             }
-        };
+        };        
         let shadow_texel = 1.0 / self.shadow_map_size as f32;
 
         // Collect light probes from nearby emissive chunks
