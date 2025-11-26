@@ -43,8 +43,7 @@ followed by:
             [0.0, 0.0, 0.0]
         };
 ```
-
-However, this caused a a non-smooth transition in lighting. It's quite jarring visually, and I loved sunrise and sunset the way they looked before. Is it possible to have the previous smooth sunrise and sunset, while still keeping the issue at bay?
+And if I use sun_color directly, the issue comes back, so it's the second piece of code that "fixes" it, but not in the way I want.This caused a a non-smooth transition in lighting. It's quite jarring visually, and I loved sunrise and sunset the way they looked before. Is it possible to have the previous smooth sunrise and sunset, while still keeping the issue at bay?
 
 - Reflections sometimes look weird from afar, no gradient, but great up close.
 - Reflections change when I turn the camera.
