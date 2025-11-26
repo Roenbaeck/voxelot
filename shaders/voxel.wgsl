@@ -208,17 +208,27 @@ fn fs_main(input: VertexOutputInstanced) -> @location(0) vec4<f32> {
     let ao = input.ao; // AO passed separately from instance AO attribute
     let color = input.color.rgb * (lighting * lighting_multiplier) * ao;
 
-    // Fog color modulated by ambient (darkens at night)
+    // Fog color modulated by ambient and sky brightness (darker at night)
     let base_fog_color = vec3<f32>(0.7, 0.8, 0.9);
-    let fog_color = base_fog_color * uniforms.ambient_color_pad.xyz * 3.0;
+    let skybox_brightness = uniforms.fog_time_pad.w;
+    // Mix between a very dark night fog and the ambient color scaled by `skybox_brightness`.
+    // This prevents the fog from becoming brighter than the scene when the sky is bright
+    // near the horizon during dawn/dusk.
+    let fog_base = mix(vec3<f32>(0.02, 0.02, 0.03), uniforms.ambient_color_pad.xyz, skybox_brightness);
+    let fog_color = base_fog_color * fog_base * 2.0;
     // Use world-space distance from camera (input.world_pos contains world-space position)
     // uniforms.camera_shadow_strength.xyz stores camera world position (see Rust binding comment)
     let relative_pos = input.world_pos - uniforms.camera_shadow_strength.xyz;
     let distance = length(relative_pos);
     let transmittance = exp(-uniforms.fog_time_pad.x * distance);
     let fog_factor = 1.0 - transmittance;
-    // Add volumetric scattering from sun
-    let inscatter = uniforms.sun_color_pad.xyz * 0.05 * fog_factor;
+    // Add directional volumetric scattering from sun so the brightening only occurs
+    // when looking toward the sun, and not globally. This prevents distant objects on
+    // the horizon from being unnaturally lit when the sun is near the horizon.
+    let view_dir = normalize(uniforms.camera_shadow_strength.xyz - input.world_pos);
+    let sun_dir_local = normalize(uniforms.sun_direction_shadow_bias.xyz);
+    let sun_view_dot = max(dot(view_dir, -sun_dir_local), 0.0);
+    let inscatter = uniforms.sun_color_pad.xyz * 0.15 * fog_factor * sun_view_dot;
     let fogged_color = mix(color, fog_color + inscatter, fog_factor);
     
     // Add emissive after fog so it stays bright
@@ -240,8 +250,9 @@ fn fs_main(input: VertexOutputInstanced) -> @location(0) vec4<f32> {
         discard;
     }
     
-    // Brighten colors as they approach fade region for fog-like appearance
-    var brightened = mix(final_color, fog_color, fade_factor * 0.3);
+    // Brighten colors as they approach fade region for fog-like appearance; reduce
+    // the brightening factor to avoid extreme brightening near the horizon.
+    var brightened = mix(final_color, fog_color, fade_factor * 0.18);
 
     // Envelope fade: if we are approaching the envelope distance, fade towards the envelope color (Type 0)
     // This helps blend the detailed mesh into the simplified envelope mesh.
@@ -338,16 +349,21 @@ fn fs_mesh(input: VertexOutputMesh) -> @location(0) vec4<f32> {
     let lighting_multiplier = mix(1.0, 0.3, emissive_strength);
         let color = input.color.rgb * (lighting * lighting_multiplier) * input.color.a;
     
-    // Fog color modulated by ambient (darkens at night)
+    // Fog color modulated by ambient and sky brightness (darker at night)
     let base_fog_color = vec3<f32>(0.7, 0.8, 0.9);
-    let fog_color = base_fog_color * uniforms.ambient_color_pad.xyz * 3.0;
+    let skybox_brightness = uniforms.fog_time_pad.w;
+    let fog_base = mix(vec3<f32>(0.02, 0.02, 0.03), uniforms.ambient_color_pad.xyz, skybox_brightness);
+    let fog_color = base_fog_color * fog_base * 2.0;
     // Use world-space distance from camera for mesh pipeline as well
     let relative_pos = input.world_pos - uniforms.camera_shadow_strength.xyz;
     let distance = length(relative_pos);
     let transmittance = exp(-uniforms.fog_time_pad.x * distance);
     let fog_factor = 1.0 - transmittance;
-    // Add volumetric scattering from sun
-    let inscatter = uniforms.sun_color_pad.xyz * 0.05 * fog_factor;
+    // Add directional volumetric scattering from sun (towards sun only)
+    let view_dir = normalize(uniforms.camera_shadow_strength.xyz - input.world_pos);
+    let sun_dir_local = normalize(uniforms.sun_direction_shadow_bias.xyz);
+    let sun_view_dot = max(dot(view_dir, -sun_dir_local), 0.0);
+    let inscatter = uniforms.sun_color_pad.xyz * 0.15 * fog_factor * sun_view_dot;
     let fogged_color = mix(color, fog_color + inscatter, fog_factor);
     
     // Add emissive after fog so it stays bright
@@ -370,7 +386,7 @@ fn fs_mesh(input: VertexOutputMesh) -> @location(0) vec4<f32> {
     }
     
     // Brighten colors as they approach fade region for fog-like appearance
-    var brightened = mix(final_color, fog_color, fade_factor * 0.3);
+    var brightened = mix(final_color, fog_color, fade_factor * 0.18);
 
     // Envelope fade: if we are approaching the envelope distance, fade towards the envelope color (Type 0)
     // This helps blend the detailed mesh into the simplified envelope mesh.

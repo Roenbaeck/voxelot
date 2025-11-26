@@ -10,11 +10,10 @@
 ✅ There's a non-smooth color transition just before time = 0.274 (I paused there).
 ✅ I would like the sun to shine longer, so we see shadows climbing higher up buildings at dusk before light fades away.
 ✅ Skybox should get colors washed out the darker it gets. Now it has a saturated yellow unnatural tint at midnight. 
+✅ Skybox needs a blueish tint. 
+✅ Distant objects look like they again get brighter closer to the horizon at early night and early morning. It’s making them look unnaturally lit up. 
 
-- Skybox needs a blueish tint. 
+🛑 Reflections from SSR are only visible if the camera is close to a reflective surface.
+🛑 Reflections should be stronger at night than in the day, since nothing is drowning out the light.
 
-- Distant objects look like they again get brighter closer to the horizon at early night and early morning. It’s making them look unnaturally lit up. 
-- Reflections from SSR are only visible if the camera is close to a reflective surface.
-- Reflections should be stronger at night than in the day, since nothing is drowning out the light.
-
-- Can all of our code be compiled as wasm?
+🛑 Can all of our code be compiled as wasm?
