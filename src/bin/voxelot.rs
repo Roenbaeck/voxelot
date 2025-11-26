@@ -7186,7 +7186,7 @@ impl App {
         let inverse_proj_cols: [[f32; 4]; 4] = inverse_proj.to_cols_array_2d();
 
         // Calculate lighting based on time of day
-        // Offset the solar angle so that time_of_day ≈0.25 aligns with sunrise; trig handles wrapping
+        // Offset the solar angle so that time_of_day ≈ 0.25 aligns with sunrise; trig handles wrapping
         let time_angle = (self.time_of_day - 0.25) * std::f32::consts::TAU;
         let sun_height = time_angle.sin();
         // Sun moves in an arc: horizontal component (cos) and vertical (sin)
@@ -7197,10 +7197,8 @@ impl App {
         let (sun_color, ambient_color) = {
             // Define key times and colors
             // Midnight is at 0.0, darkest point
-            let midnight_moon = [0.15, 0.18, 0.25];
             let midnight_ambient = [0.002, 0.002, 0.005];
             // Dusk/dawn has some light
-            let twilight_moon = [0.35, 0.35, 0.5];
             let twilight_ambient = [0.08, 0.08, 0.15];
             let sunrise_sun = [1.0, 0.6, 0.3];
             let sunrise_ambient = [0.3, 0.2, 0.2];
@@ -7209,27 +7207,42 @@ impl App {
 
             // Interpolate between color phases
             let t = self.time_of_day;
+            
+            // The key insight: only provide sun_color when sun is actually above horizon
+            // Use a smooth fade zone around the horizon to avoid hard transitions
+            let horizon_fade = if sun_height > 0.05 {
+                // Sun well above horizon - full strength
+                1.0
+            } else if sun_height > -0.05 {
+                // Near horizon - smooth fade
+                ((sun_height + 0.05) / 0.1).clamp(0.0, 1.0)
+            } else {
+                // Sun below horizon - no direct sunlight
+                0.0
+            };
+            
             if t < 0.125 {
                 // Midnight to twilight (0.0 -> 0.125)
                 let factor = t / 0.125;
-                let sun = [
-                    midnight_moon[0] + (twilight_moon[0] - midnight_moon[0]) * factor,
-                    midnight_moon[1] + (twilight_moon[1] - midnight_moon[1]) * factor,
-                    midnight_moon[2] + (twilight_moon[2] - midnight_moon[2]) * factor,
-                ];
                 let ambient = [
                     midnight_ambient[0] + (twilight_ambient[0] - midnight_ambient[0]) * factor,
                     midnight_ambient[1] + (twilight_ambient[1] - midnight_ambient[1]) * factor,
                     midnight_ambient[2] + (twilight_ambient[2] - midnight_ambient[2]) * factor,
+                ];
+                // Sun color fades in smoothly as we approach dawn
+                let sun = [
+                    sunrise_sun[0] * horizon_fade * factor,
+                    sunrise_sun[1] * horizon_fade * factor,
+                    sunrise_sun[2] * horizon_fade * factor,
                 ];
                 (sun, ambient)
             } else if t < 0.25 {
                 // Twilight to sunrise (0.125 -> 0.25)
                 let factor = (t - 0.125) / 0.125;
                 let sun = [
-                    twilight_moon[0] + (sunrise_sun[0] - twilight_moon[0]) * factor,
-                    twilight_moon[1] + (sunrise_sun[1] - twilight_moon[1]) * factor,
-                    twilight_moon[2] + (sunrise_sun[2] - twilight_moon[2]) * factor,
+                    sunrise_sun[0] * horizon_fade,
+                    sunrise_sun[1] * horizon_fade,
+                    sunrise_sun[2] * horizon_fade,
                 ];
                 let ambient = [
                     twilight_ambient[0] + (sunrise_ambient[0] - twilight_ambient[0]) * factor,
@@ -7241,9 +7254,9 @@ impl App {
                 // Sunrise to day (0.25 -> 0.5)
                 let factor = (t - 0.25) / 0.25;
                 let sun = [
-                    sunrise_sun[0] + (day_sun[0] - sunrise_sun[0]) * factor,
-                    sunrise_sun[1] + (day_sun[1] - sunrise_sun[1]) * factor,
-                    sunrise_sun[2] + (day_sun[2] - sunrise_sun[2]) * factor,
+                    (sunrise_sun[0] + (day_sun[0] - sunrise_sun[0]) * factor) * horizon_fade,
+                    (sunrise_sun[1] + (day_sun[1] - sunrise_sun[1]) * factor) * horizon_fade,
+                    (sunrise_sun[2] + (day_sun[2] - sunrise_sun[2]) * factor) * horizon_fade,
                 ];
                 let ambient = [
                     sunrise_ambient[0] + (day_ambient[0] - sunrise_ambient[0]) * factor,
@@ -7255,9 +7268,9 @@ impl App {
                 // Day to sunset (0.5 -> 0.75)
                 let factor = (t - 0.5) / 0.25;
                 let sun = [
-                    day_sun[0] + (sunrise_sun[0] - day_sun[0]) * factor,
-                    day_sun[1] + (sunrise_sun[1] - day_sun[1]) * factor,
-                    day_sun[2] + (sunrise_sun[2] - day_sun[2]) * factor,
+                    (day_sun[0] + (sunrise_sun[0] - day_sun[0]) * factor) * horizon_fade,
+                    (day_sun[1] + (sunrise_sun[1] - day_sun[1]) * factor) * horizon_fade,
+                    (day_sun[2] + (sunrise_sun[2] - day_sun[2]) * factor) * horizon_fade,
                 ];
                 let ambient = [
                     day_ambient[0] + (sunrise_ambient[0] - day_ambient[0]) * factor,
@@ -7269,9 +7282,9 @@ impl App {
                 // Sunset to twilight (0.75 -> 0.875)
                 let factor = (t - 0.75) / 0.125;
                 let sun = [
-                    sunrise_sun[0] + (twilight_moon[0] - sunrise_sun[0]) * factor,
-                    sunrise_sun[1] + (twilight_moon[1] - sunrise_sun[1]) * factor,
-                    sunrise_sun[2] + (twilight_moon[2] - sunrise_sun[2]) * factor,
+                    sunrise_sun[0] * horizon_fade * (1.0 - factor),
+                    sunrise_sun[1] * horizon_fade * (1.0 - factor),
+                    sunrise_sun[2] * horizon_fade * (1.0 - factor),
                 ];
                 let ambient = [
                     sunrise_ambient[0] + (twilight_ambient[0] - sunrise_ambient[0]) * factor,
@@ -7282,16 +7295,13 @@ impl App {
             } else {
                 // Twilight to midnight (0.875 -> 1.0)
                 let factor = (t - 0.875) / 0.125;
-                let sun = [
-                    twilight_moon[0] + (midnight_moon[0] - twilight_moon[0]) * factor,
-                    twilight_moon[1] + (midnight_moon[1] - twilight_moon[1]) * factor,
-                    twilight_moon[2] + (midnight_moon[2] - twilight_moon[2]) * factor,
-                ];
                 let ambient = [
                     twilight_ambient[0] + (midnight_ambient[0] - twilight_ambient[0]) * factor,
                     twilight_ambient[1] + (midnight_ambient[1] - twilight_ambient[1]) * factor,
                     twilight_ambient[2] + (midnight_ambient[2] - twilight_ambient[2]) * factor,
                 ];
+                // Sun fully below horizon at night
+                let sun = [0.0, 0.0, 0.0];
                 (sun, ambient)
             }
         };
