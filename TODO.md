@@ -4,8 +4,8 @@
 ✅ Can we reduce the amount of light as we get closer to midnight, so there’s no “moonlight” at midnight? The whole scene is too bright at night.
 ✅ Can we add keys to raise and lower water level?
 ✅ Can we implement screen space reflections (SSR) for the water? It would be good if we later can set a material in the palette.txt to be reflective as well, so the SSR isn't limited to water.
+✅ Can we make the water level configurable in config.toml (with save on exit)?
 
-- Configurable water level (save on exit).
 - Toggle for the GUI overlay.
 - Update README with missing keybindings.
 - Reflections sometimes look weird from afar, no gradient, but great up close.

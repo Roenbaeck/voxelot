@@ -30,6 +30,8 @@ pub struct WorldConfig {
     pub palette: String,
     #[serde(default = "default_camera_position")]
     pub camera_position: [f32; 3],
+    #[serde(default = "default_water_level")]
+    pub water_level: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,6 +195,10 @@ fn default_palette_file() -> String {
 
 fn default_camera_position() -> [f32; 3] {
     [320.0, 100.0, 320.0]
+}
+
+fn default_water_level() -> f32 {
+    16.0
 }
 
 fn default_lod_subdivide_distance() -> f32 {
@@ -408,6 +414,7 @@ impl Default for WorldConfig {
             file: default_world_file(),
             palette: default_palette_file(),
             camera_position: default_camera_position(),
+            water_level: default_water_level(),
         }
     }
 }

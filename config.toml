@@ -6,6 +6,7 @@ camera_position = [
     100.0,
     320.0,
 ]
+water_level = 2.5
 
 [rendering]
 lod_subdivide_distance = 400.0
@@ -18,7 +19,7 @@ camera_speed_multiplier = 4.7683716
 
 [atmosphere]
 fog_density = 0.00044999996
-time_of_day = 0.0839133
+time_of_day = 0.30988064
 night_skybox_brightness = 0.02
 
 [effects.depth_of_field]

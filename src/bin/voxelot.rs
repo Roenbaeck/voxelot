@@ -1363,7 +1363,7 @@ impl App {
             light_probe_buffer: None,
             light_probe_capacity: 0,
             lod_distance: cfg.rendering.chunk_lod_distance,
-            water_level: 16.0,
+            water_level: cfg.world.water_level,
             dof_coc_pipeline: None,
             dof_bind_group_layout: None,
             dof_bind_group: None,
@@ -1559,6 +1559,9 @@ impl App {
             // Atmosphere settings
             full_cfg.atmosphere.time_of_day = self.time_of_day;
             full_cfg.atmosphere.fog_density = self.fog_density;
+
+            // World settings
+            full_cfg.world.water_level = self.water_level;
 
             // DoF settings
             full_cfg.effects.depth_of_field.enabled = self.dof_enabled;
