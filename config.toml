@@ -19,7 +19,7 @@ camera_speed_multiplier = 5.9604645
 
 [atmosphere]
 fog_density = 0.00044999996
-time_of_day = 0.31663474
+time_of_day = 0.25630543
 night_skybox_brightness = 0.02
 horizon_fade_up = 0.05
 horizon_fade_down = 0.25
@@ -35,11 +35,11 @@ skybox_tint_strength = 0.5
 
 [effects.depth_of_field]
 enabled = true
-focal_distance = 250.0
-focal_range = 40.0
-blur_strength = 2.3000002
+focal_distance = 240.0
+focal_range = 85.0
+blur_strength = 2.5
 kawase_iterations = 3
-kawase_offset = 0.25
+kawase_offset = 1.0
 kawase_enabled = true
 
 [effects.bloom]

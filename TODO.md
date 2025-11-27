@@ -16,4 +16,5 @@
 🛑 Reflections from SSR are only visible if the camera is close to a reflective surface.
 🛑 Reflections should be stronger at night than in the day, since nothing is drowning out the light.
 
+🛑 Sliders instead of buttons to change settings.
 🛑 Can all of our code be compiled as wasm?

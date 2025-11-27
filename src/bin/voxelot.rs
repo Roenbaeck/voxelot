@@ -5950,12 +5950,14 @@ impl App {
         self.dof_coc_pipeline = Some(dof_coc_pipeline);
         self.dof_bind_group_layout = Some(dof_bind_group_layout);
         self.dof_uniform_buffer = Some(dof_uniform_buffer);
+        // DoF bind group will be recreated in render loop via update_dof_bind_group()
+        // when it detects dof_bind_group.is_none()
+        self.dof_bind_group = None;
         // Remove separate CoC pipeline/bind group (fused into blur pass)
         // CoC pipeline removed (fused)
         self.dof_combine_pipeline = Some(dof_combine_pipeline);
         self.dof_combine_bind_group_layout = Some(dof_combine_bind_group_layout);
         self.post_sampler = Some(post_sampler);
-        self.dof_bind_group = None;
         self.bloom_extract_pipeline = Some(bloom_extract_pipeline);
         self.bloom_blur_pipeline = Some(bloom_blur_pipeline);
         self.ssao_blur_pipeline = Some(ssao_blur_pipeline);
@@ -7250,10 +7252,10 @@ impl App {
 
             // Interpolate between color phases
             let t = self.time_of_day;
-            
+
             // The key insight: only provide sun_color scaled by `sun_fade` to avoid
             // hard transitions. `sun_fade` is computed from the config parameters.
-            
+
             if t < 0.20 {
                 // Midnight -> Dawn
                 let factor = smooth_interp(0.0, 0.20, t);
@@ -7283,7 +7285,7 @@ impl App {
                     twilight_ambient[2] + (sunrise_ambient[2] - twilight_ambient[2]) * factor,
                 ];
                 (sun, ambient)
-            } 
+            }
             // ... Day phases (0.25 to 0.75) remain the same ...
             else if t < 0.5 {
                 let factor = smooth_interp(0.25, 0.5, t);
@@ -7343,8 +7345,8 @@ impl App {
                     sunrise_sun[2] * sun_fade * (1.0 - factor),
                 ];
                 (sun, ambient)
-            } 
-       };
+            }
+        };
 
         let sun_direction_vec_raw = Vec3::from_array(sun_direction);
         let sun_direction_vec = if sun_direction_vec_raw.length_squared() > 0.0001 {
@@ -7466,7 +7468,7 @@ impl App {
         let shadow_calc_direction = [
             time_angle.cos(),
             sun_height.max(0.05), // Force sun to stay slightly "up" for shadow calculations
-            0.2
+            0.2,
         ];
         let sun_direction_vec_raw = Vec3::from_array(shadow_calc_direction);
         let sun_direction_vec = sun_direction_vec_raw.normalize();
@@ -7484,7 +7486,8 @@ impl App {
                 0.4 + moon_factor * 0.3
             }
         };
-        let shadow_strength = sun_shadow_strength * sun_fade + moon_shadow_strength_base * (1.0 - sun_fade);
+        let shadow_strength =
+            sun_shadow_strength * sun_fade + moon_shadow_strength_base * (1.0 - sun_fade);
         let shadow_texel = 1.0 / self.shadow_map_size as f32;
 
         // Collect light probes from nearby emissive chunks
@@ -7640,7 +7643,12 @@ impl App {
                 self.skybox_angle,
                 skybox_brightness,
             ],
-            sun_color_pad: [sun_color[0] * sun_fade, sun_color[1] * sun_fade, sun_color[2] * sun_fade, 0.0],
+            sun_color_pad: [
+                sun_color[0] * sun_fade,
+                sun_color[1] * sun_fade,
+                sun_color[2] * sun_fade,
+                0.0,
+            ],
             ambient_color_pad: [ambient_color[0], ambient_color[1], ambient_color[2], 0.0],
             shadow_texel_size_pad: [
                 shadow_texel,
