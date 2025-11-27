@@ -188,6 +188,8 @@ pub struct PerformanceConfig {
     pub mega_index_buffer_mb: u64,
     #[serde(default = "default_max_draw_capacity")]
     pub max_draw_capacity: usize,
+    #[serde(default = "default_render_scale")]
+    pub render_scale: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -442,7 +444,11 @@ fn default_mega_index_buffer_mb() -> u64 {
 }
 
 fn default_max_draw_capacity() -> usize {
-    10000
+    20_000
+}
+
+fn default_render_scale() -> f32 {
+    1.0
 }
 
 fn default_true() -> bool {
@@ -575,6 +581,7 @@ impl Default for PerformanceConfig {
             mega_vertex_buffer_mb: default_mega_vertex_buffer_mb(),
             mega_index_buffer_mb: default_mega_index_buffer_mb(),
             max_draw_capacity: default_max_draw_capacity(),
+            render_scale: default_render_scale(),
         }
     }
 }

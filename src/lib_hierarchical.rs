@@ -71,6 +71,21 @@ pub enum Voxel {
     Chunk(Arc<Chunk>),
 }
 
+/// A voxel on the surface of a chunk, with a bitmask of exposed faces
+#[derive(Copy, Clone, Debug)]
+pub struct ShellVoxel {
+    /// Packed position: x | (y << 4) | (z << 8)
+    pub packed_pos: u16,
+    /// Bitmask of exposed faces:
+    /// bit 0: +X (Right)
+    /// bit 1: -X (Left)
+    /// bit 2: +Y (Top)
+    /// bit 3: -Y (Bottom)
+    /// bit 4: +Z (Front)
+    /// bit 5: -Z (Back)
+    pub visible_faces: u8,
+}
+
 /// A hierarchical chunk ("chunks all the way")
 ///
 /// Structure is uniform at all levels:
@@ -544,6 +559,56 @@ impl Chunk {
                 Some(1 + max_depth)
             }
         }
+    }
+
+    /// Generate a shell of surface voxels for this chunk
+    /// Returns a list of voxels that have at least one face exposed to air (or chunk boundary)
+    pub fn generate_shell(&self) -> Vec<ShellVoxel> {
+        let mut shell = Vec::with_capacity(512); // Heuristic start size
+
+        for ((x, y, z), voxel) in self.iter() {
+            // Only consider solid voxels for the shell
+            if let Voxel::Solid(_) = voxel {
+                let mut mask = 0u8;
+
+                // Check 6 neighbors
+                // If neighbor is AIR (not contained) or boundary, set the bit.
+
+                // +X (Right)
+                if x == 15 || !self.contains(x + 1, y, z) {
+                    mask |= 1 << 0;
+                }
+                // -X (Left)
+                if x == 0 || !self.contains(x - 1, y, z) {
+                    mask |= 1 << 1;
+                }
+                // +Y (Top)
+                if y == 15 || !self.contains(x, y + 1, z) {
+                    mask |= 1 << 2;
+                }
+                // -Y (Bottom)
+                if y == 0 || !self.contains(x, y - 1, z) {
+                    mask |= 1 << 3;
+                }
+                // +Z (Front)
+                if z == 15 || !self.contains(x, y, z + 1) {
+                    mask |= 1 << 4;
+                }
+                // -Z (Back)
+                if z == 0 || !self.contains(x, y, z - 1) {
+                    mask |= 1 << 5;
+                }
+
+                if mask != 0 {
+                    let packed = (x as u16) | ((y as u16) << 4) | ((z as u16) << 8);
+                    shell.push(ShellVoxel {
+                        packed_pos: packed,
+                        visible_faces: mask,
+                    });
+                }
+            }
+        }
+        shell
     }
 }
 

@@ -741,6 +741,8 @@ struct App {
     fallback_instance_capacity: usize,
     // Mesh cache: per-leaf-chunk mesh GPU buffers and metadata
     mesh_cache: FxHashMap<(i64, i64, i64), MeshCacheEntry>,
+    /// Cache of surface voxels for un-meshed chunks (for optimized fallback rendering)
+    shell_cache: FxHashMap<(i64, i64, i64), Vec<voxelot::ShellVoxel>>,
     mesh_cache_bytes: u64,
     // Stats for UI overlay (refreshed each frame)
     visible_count: usize,
@@ -1287,6 +1289,7 @@ impl App {
             fallback_instance_buffer: None,
             fallback_instance_capacity: 0,
             mesh_cache: FxHashMap::default(),
+            shell_cache: FxHashMap::default(),
             mesh_jobs_executed: mesh_jobs_executed.clone(),
             mesh_cache_bytes: 0,
             envelope_mesh_cache: FxHashMap::default(),
@@ -6197,29 +6200,78 @@ impl App {
                     .world
                     .get_leaf_chunk_at_origin(WorldPos::new(key.0, key.1, key.2))
                 {
+                    // Calculate demand mask based on camera position relative to chunk center
+                    // Chunk center is at key + 8.0 (since chunk is 16x16x16)
+                    let chunk_center_x = key.0 as f32 + 8.0;
+                    let chunk_center_y = key.1 as f32 + 8.0;
+                    let chunk_center_z = key.2 as f32 + 8.0;
+
+                    let dx = cam_pos[0] - chunk_center_x;
+                    let dy = cam_pos[1] - chunk_center_y;
+                    let dz = cam_pos[2] - chunk_center_z;
+
+                    let mut demand_mask = 0u8;
+                    if dx > 0.0 {
+                        demand_mask |= 1 << 0;
+                    }
+                    // Camera is Right, show Right faces (+X)
+                    else {
+                        demand_mask |= 1 << 1;
+                    } // Camera is Left, show Left faces (-X)
+
+                    if dy > 0.0 {
+                        demand_mask |= 1 << 2;
+                    }
+                    // Camera is Top, show Top faces (+Y)
+                    else {
+                        demand_mask |= 1 << 3;
+                    } // Camera is Bottom, show Bottom faces (-Y)
+
+                    if dz > 0.0 {
+                        demand_mask |= 1 << 4;
+                    }
+                    // Camera is Front, show Front faces (+Z)
+                    else {
+                        demand_mask |= 1 << 5;
+                    } // Camera is Back, show Back faces (-Z)
+
+                    // Get or generate shell
+                    let shell = self
+                        .shell_cache
+                        .entry(key)
+                        .or_insert_with(|| chunk.generate_shell());
+
                     let mut voxels_written = 0usize;
-                    for ((x, y, z), voxel) in chunk.iter() {
-                        if let Voxel::Solid(vtype) = voxel {
-                            let (emissive_rgb, emissive_intensity) =
-                                self.palette.emissive(*vtype as u32);
-                            cpu_prepopulated_instances.push(VoxelInstanceRaw {
-                                position: [
-                                    (key.0 + x as i64) as f32,
-                                    (key.1 + y as i64) as f32,
-                                    (key.2 + z as i64) as f32,
-                                ],
-                                voxel_type: *vtype as u32,
-                                scale: [1.0, 1.0, 1.0],
-                                ao_factor: 1.0,
-                                custom_color: [0.0, 0.0, 0.0, 0.0],
-                                emissive: [
-                                    emissive_rgb[0],
-                                    emissive_rgb[1],
-                                    emissive_rgb[2],
-                                    emissive_intensity,
-                                ],
-                            });
-                            voxels_written += 1;
+                    for shell_voxel in shell {
+                        // Check visibility against demand mask
+                        if (shell_voxel.visible_faces & demand_mask) != 0 {
+                            let x = (shell_voxel.packed_pos & 0xF) as u8;
+                            let y = ((shell_voxel.packed_pos >> 4) & 0xF) as u8;
+                            let z = ((shell_voxel.packed_pos >> 8) & 0xF) as u8;
+
+                            // We know it's a solid voxel because it's in the shell
+                            if let Some(vtype) = chunk.get_type(x, y, z) {
+                                let (emissive_rgb, emissive_intensity) =
+                                    self.palette.emissive(vtype as u32);
+                                cpu_prepopulated_instances.push(VoxelInstanceRaw {
+                                    position: [
+                                        (key.0 + x as i64) as f32,
+                                        (key.1 + y as i64) as f32,
+                                        (key.2 + z as i64) as f32,
+                                    ],
+                                    voxel_type: vtype as u32,
+                                    scale: [1.0, 1.0, 1.0],
+                                    ao_factor: 1.0,
+                                    custom_color: [0.0, 0.0, 0.0, 0.0],
+                                    emissive: [
+                                        emissive_rgb[0],
+                                        emissive_rgb[1],
+                                        emissive_rgb[2],
+                                        emissive_intensity,
+                                    ],
+                                });
+                                voxels_written += 1;
+                            }
                         }
                     }
                     if voxels_written > 0 {
@@ -7016,6 +7068,8 @@ impl App {
                     self.envelope_mesh_cache.insert(key, entry);
                 } else {
                     self.mesh_cache.insert(key, entry);
+                    // Mesh is ready, so we don't need the shell fallback anymore
+                    self.shell_cache.remove(&key);
                 }
 
                 new_meshes_created += 1;
@@ -7097,6 +7151,8 @@ impl App {
                 self.envelope_mesh_cache_bytes += vertex_bytes + index_bytes;
             } else {
                 self.mesh_cache.insert(key, entry);
+                // Mesh is ready, so we don't need the shell fallback anymore
+                self.shell_cache.remove(&key);
                 self.mesh_cache_bytes += vertex_bytes + index_bytes;
             }
             mesh_upload_entry_time += entry_start.elapsed();
