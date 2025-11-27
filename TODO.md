@@ -1,20 +1,22 @@
-✅ Is it possible to rotate the skybox very slowly to make it look less static?
-✅ Can we make the skybox gradually darker during night, almost black at midnight?
-✅ The sky reflected in the water should also be dark at night.
-✅ Can we reduce the amount of light as we get closer to midnight, so there’s no “moonlight” at midnight? The whole scene is too bright at night.
-✅ Can we add keys to raise and lower water level?
-✅ Can we implement screen space reflections (SSR) for the water? It would be good if we later can set a material in the palette.txt to be reflective as well, so the SSR isn't limited to water.
-✅ Can we make the water level configurable in config.toml (with save on exit)?
-✅ Can we make a toggle for the GUI overlay? Perhaps the F5-key?
-✅ Can you update README with any missing keybindings?
-✅ There's a non-smooth color transition just before time = 0.274 (I paused there).
-✅ I would like the sun to shine longer, so we see shadows climbing higher up buildings at dusk before light fades away.
-✅ Skybox should get colors washed out the darker it gets. Now it has a saturated yellow unnatural tint at midnight. 
-✅ Skybox needs a blueish tint. 
-✅ Distant objects look like they again get brighter closer to the horizon at early night and early morning. It’s making them look unnaturally lit up. 
-✅ Reflections from SSR are only visible if the camera is close to a reflective surface.
+- ✅ Is it possible to rotate the skybox very slowly to make it look less static?
+- ✅ Can we make the skybox gradually darker during night, almost black at midnight?
+- ✅ The sky reflected in the water should also be dark at night.
+- ✅ Can we reduce the amount of light as we get closer to midnight, so there’s no “moonlight” at midnight? The whole scene is too bright at night.
+- ✅ Can we add keys to raise and lower water level?
+- ✅ Can we implement screen space reflections (SSR) for the water? It would be good if we later can set a material in the palette.txt to be reflective as well, so the SSR isn't limited to water.
+- ✅ Can we make the water level configurable in config.toml (with save on exit)?
+- ✅ Can we make a toggle for the GUI overlay? Perhaps the F5-key?
+- ✅ Can you update README with any missing keybindings?
+- ✅ There's a non-smooth color transition just before time = 0.274 (I paused there).
+- ✅ I would like the sun to shine longer, so we see shadows climbing higher up buildings at dusk before light fades away.
+- ✅ Skybox should get colors washed out the darker it gets. Now it has a saturated yellow unnatural tint at midnight. 
+- ✅ Skybox needs a blueish tint. 
+- ✅ Distant objects look like they again get brighter closer to the horizon at early night and early morning. It’s making them look unnaturally lit up. 
+- ✅ Reflections from SSR are only visible if the camera is close to a reflective surface.
 
-🛑 Reflections should be stronger at night than in the day, since nothing is drowning out the light.
-🛑 Why is the fullscreen render so much slower than the windowed render? It drops from 120FPS to 20FPS when I go fullscreen.
-🛑 Sliders instead of buttons to change settings.
-🛑 Can all of our code be compiled as wasm?
+- 🛑 Reflections should be stronger at night than in the day, since nothing is drowning out the light.
+- 🛑 Why is the fullscreen render so much slower than the windowed render? It drops from 120FPS to 20FPS when I go fullscreen.
+- 🛑 Sliders instead of buttons to change settings.
+- 🛑 Can all of our code be compiled as wasm?
+
+- Would it be a good idea to have a cache for unmeshed chunks as well where we "expand" the dense voxels array into an array with all 4096 positions? We could then reuse this whenever we need to iterate over the individual voxels in the chunk, instead of doing chunk.iter() which is likely more costly.
