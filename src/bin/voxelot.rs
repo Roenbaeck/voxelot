@@ -762,6 +762,10 @@ struct App {
     mesh_ms: f64,
     instance_ms: f64,
     draw_calls_count: usize,
+    // Accumulator for the number of items added to GPU buffers during this frame
+    gpu_buffer_items_frame: usize,
+    // Snapshot of the last frame's number of items added to GPU buffers shown in UI
+    gpu_buffer_items_count: usize,
     envelope_mesh_cache: FxHashMap<(i64, i64, i64), MeshCacheEntry>,
     envelope_mesh_cache_bytes: u64,
     envelope_mesh_cache_budget_bytes: u64,
@@ -1354,6 +1358,8 @@ impl App {
             mesh_ms: 0.0,
             instance_ms: 0.0,
             draw_calls_count: 0,
+            gpu_buffer_items_frame: 0,
+            gpu_buffer_items_count: 0,
             mesh_upload_limit: mesh_upload_baseline,
             mesh_upload_baseline,
             mesh_upload_max,
@@ -4261,6 +4267,9 @@ impl App {
             bytemuck::cast_slice(idx_data),
         );
 
+        // Count the mesh we added to the mega buffers as a single GPU item
+        self.gpu_buffer_items_frame = self.gpu_buffer_items_frame.saturating_add(1);
+
         Ok((vertex_offset, index_offset))
     }
 
@@ -4476,6 +4485,8 @@ impl App {
             }
             if !mesh_args.is_empty() {
                 queue.write_buffer(buffer, 0, bytemuck::cast_slice(&mesh_args));
+                // Count number of mesh indirect entries uploaded
+                self.gpu_buffer_items_frame = self.gpu_buffer_items_frame.saturating_add(mesh_args.len());
             } else {
                 // zero-length doesn't matter, but clear first 4 bytes
                 let zero: [u8; 4] = [0; 4];
@@ -4494,6 +4505,8 @@ impl App {
             }
             if !env_args.is_empty() {
                 queue.write_buffer(buffer, 0, bytemuck::cast_slice(&env_args));
+                // Count number of envelope indirect entries uploaded
+                self.gpu_buffer_items_frame = self.gpu_buffer_items_frame.saturating_add(env_args.len());
             } else {
                 let zero: [u8; 4] = [0; 4];
                 queue.write_buffer(buffer, 0, &zero);
@@ -6170,6 +6183,9 @@ impl App {
 
         self.camera_controller.update(dt);
 
+        // Reset accumulator for GPU buffer item counting this frame
+        self.gpu_buffer_items_frame = 0;
+
         // Gather candidate voxels for GPU culling using CPU hierarchy traversal
         let cull_start = Instant::now();
         let visible = cull_visible_voxels_parallel(&self.world, &self.camera_controller.camera);
@@ -6466,6 +6482,10 @@ impl App {
             self.ensure_gpu_input_buffer(&device, gpu_candidate_count);
             if let Some(buffer) = self.gpu_input_buffer.as_ref() {
                 queue.write_buffer(buffer, 0, bytemuck::cast_slice(&gpu_inputs));
+                // Count the number of instance entries uploaded to the GPU input buffer
+                self.gpu_buffer_items_frame = self
+                    .gpu_buffer_items_frame
+                    .saturating_add(gpu_candidate_count);
             }
 
             // Upload Mesh Indirect Args
@@ -6550,6 +6570,10 @@ impl App {
 
             if let Some(buffer) = self.mesh_indirect_buffer.as_ref() {
                 queue.write_buffer(buffer, 0, bytemuck::cast_slice(&mesh_indirect_args));
+                // Count the number of indirect draw entries uploaded for meshes
+                self.gpu_buffer_items_frame = self
+                    .gpu_buffer_items_frame
+                    .saturating_add(mesh_indirect_args.len());
                 // Mark entries as used so eviction won't free them during this frame
                 for v in visible.iter() {
                     if !v.is_leaf_chunk {
@@ -6622,6 +6646,10 @@ impl App {
 
             if let Some(buffer) = self.envelope_indirect_buffer.as_ref() {
                 queue.write_buffer(buffer, 0, bytemuck::cast_slice(&envelope_indirect_args));
+                // Count the number of indirect draw entries uploaded for envelopes
+                self.gpu_buffer_items_frame = self
+                    .gpu_buffer_items_frame
+                    .saturating_add(envelope_indirect_args.len());
                 // Mark entries as used so eviction won't free them during this frame
                 for v in visible.iter() {
                     if !v.is_leaf_chunk {
@@ -6645,6 +6673,10 @@ impl App {
                         0,
                         bytemuck::cast_slice(&cpu_prepopulated_instances),
                     );
+                    // Count the CPU-prepopulated instances written into the fallback instance buffer
+                    self.gpu_buffer_items_frame = self
+                        .gpu_buffer_items_frame
+                        .saturating_add(cpu_prepopulated_count);
                 }
             }
 
@@ -8821,8 +8853,8 @@ impl App {
                                 );
                                 ui.label(
                                     egui::RichText::new(format!(
-                                        "Draws: {}",
-                                        self.draw_calls_count
+                                        "GPU Items: {}",
+                                        self.gpu_buffer_items_count
                                     ))
                                     .color(egui::Color32::WHITE)
                                     .size(10.0),
@@ -8946,7 +8978,7 @@ impl App {
                 && self.ready_chunk_meshes.is_empty()
                 && jobs_in_flight == 0;
             println!(
-                "FPS: {}, Visible items: {}, Leaf chunks: {}, Meshed chunks: {}, Pending: {}, PendingSet: {}, Ready: {}, InFlight: {}, Fallback: {}, Mesh cache: {:.1}/{:.1} MiB, Process (RSS/VM): {:.1}/{:.1} MiB, Tracked: {:.1} MiB, GPU reserved: {:.1} MiB, Cull: {:.2}ms, Group: {:.2}ms, Mesh: {:.2}ms, Instances: {:.2}ms, Draws: {}, Jobs/sec: {}, EmptyMeshes: {}, VReuse: {}, IReuse: {}, VPool: {}, IPool: {}, MeshIdle: {}, DoF Kawase: {} (iter={}, off={:.2}), MeshUp: {:.2}ms parts:(leaf:{:.2} sched:{:.2} sort:{:.2} res:{:.2} jobc:{:.2} jobn:{:.2}) vbld:{:.2} v:{:.2} i:{:.2} ins:{:.2} emit:{:.2} processed:{} limit:{}",
+                "FPS: {}, Visible items: {}, Leaf chunks: {}, Meshed chunks: {}, Pending: {}, PendingSet: {}, Ready: {}, InFlight: {}, Fallback: {}, Mesh cache: {:.1}/{:.1} MiB, Process (RSS/VM): {:.1}/{:.1} MiB, Tracked: {:.1} MiB, GPU reserved: {:.1} MiB, Cull: {:.2}ms, Group: {:.2}ms, Mesh: {:.2}ms, Instances: {:.2}ms, Draws: {}, GPU items: {}, Jobs/sec: {}, EmptyMeshes: {}, VReuse: {}, IReuse: {}, VPool: {}, IPool: {}, MeshIdle: {}, DoF Kawase: {} (iter={}, off={:.2}), MeshUp: {:.2}ms parts:(leaf:{:.2} sched:{:.2} sort:{:.2} res:{:.2} jobc:{:.2} jobn:{:.2}) vbld:{:.2} v:{:.2} i:{:.2} ins:{:.2} emit:{:.2} processed:{} limit:{}",
                 self.frame_count,
                 total_visible,
                 leaf_chunks.len(),
@@ -8967,6 +8999,7 @@ impl App {
                     (if mesh_idle { std::time::Duration::from_secs(0) } else { mesh_time }).as_secs_f64() * 1000.0,
                 instance_time.as_secs_f64() * 1000.0,
                 draw_calls,
+                self.gpu_buffer_items_count,
                 jobs_per_sec,
                 self.stat_empty_meshes,
                 self.stat_vertex_buffers_reused,
@@ -9017,6 +9050,7 @@ impl App {
                 * 1000.0;
             self.instance_ms = instance_time.as_secs_f64() * 1000.0;
             self.draw_calls_count = draw_calls;
+            self.gpu_buffer_items_count = self.gpu_buffer_items_frame;
 
             // Update UI overlay stats
             self.visible_count = total_visible;
