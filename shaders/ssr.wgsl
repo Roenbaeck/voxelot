@@ -1,4 +1,4 @@
-// Screen Space Reflections shader
+// Screen Space Reflections shader with HZB acceleration
 
 struct CameraUniforms {
     inverse_view: mat4x4<f32>,
@@ -20,11 +20,13 @@ struct SSRParams {
 @group(0) @binding(2) var scene_color: texture_2d<f32>;
 @group(0) @binding(3) var scene_depth: texture_depth_2d;
 @group(0) @binding(4) var linear_sampler: sampler;
+@group(0) @binding(5) var hzb_texture: texture_2d<f32>;
+@group(0) @binding(6) var hzb_sampler: sampler;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
-}
+};
 
 @vertex
 fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
@@ -77,16 +79,24 @@ fn estimate_normal(uv: vec2<f32>, depth: f32, texel_size: vec2<f32>) -> vec3<f32
     return normalize(cross(dy, dx));
 }
 
-// Ray marching SSR
-fn trace_ray(start_pos: vec3<f32>, ray_dir: vec3<f32>) -> vec3<f32> {
+// Calculate max mip level for HZB
+fn get_max_mip_level() -> f32 {
+    let dims = vec2<f32>(textureDimensions(hzb_texture, 0));
+    let max_dim = max(dims.x, dims.y);
+    return floor(log2(max_dim));
+}
+
+// HZB-Accelerated Ray Marching
+fn hzb_ray_march(start_pos: vec3<f32>, ray_dir: vec3<f32>) -> vec3<f32> {
     var hit_uv = vec3<f32>(-1.0);
     
     var current_pos = start_pos;
-    let step = ray_dir * params.step_size;
+    let max_mip = get_max_mip_level();
+    var current_mip = min(4.0, max_mip); // Start at coarse level (mip 4 or max available)
     
-    // Coarse ray march
+    // Hierarchical ray march
     for (var i = 0u; i < params.max_steps; i++) {
-        current_pos += step;
+        current_pos += ray_dir * params.step_size;
         
         let screen_pos = world_to_screen(current_pos);
         let uv = screen_pos.xy;
@@ -96,40 +106,43 @@ fn trace_ray(start_pos: vec3<f32>, ray_dir: vec3<f32>) -> vec3<f32> {
             break;
         }
         
-        // Sample depth at this screen position
-        let depth_at_uv = textureSample(scene_depth, linear_sampler, uv);
-        let surface_pos = reconstruct_world_pos(uv, depth_at_uv);
+        // Sample HZB at current mip level
+        let hzb_depth = textureSampleLevel(hzb_texture, hzb_sampler, uv, current_mip).r;
+        let ray_depth = screen_pos.z;
         
-        // Check if ray is behind surface
-        let ray_depth = distance(camera.camera_pos, current_pos);
-        let surface_depth = distance(camera.camera_pos, surface_pos);
-        
-        if (ray_depth > surface_depth && ray_depth - surface_depth < params.thickness) {
-            hit_uv = vec3<f32>(uv, 1.0);
-            
-            // Binary refinement
-            var refined_pos = current_pos - step;
-            var refined_step = step;
-            
-            for (var j = 0u; j < params.max_binary_steps; j++) {
-                refined_step *= 0.5;
-                refined_pos += refined_step;
+        // Check if ray is behind surface (potential intersection)
+        if (ray_depth > hzb_depth && ray_depth - hzb_depth < params.thickness) {
+            if (current_mip <= 0.5) {
+                // At finest detail, perform binary refinement
+                var refined_pos = current_pos - ray_dir * params.step_size;
+                var refined_step = ray_dir * params.step_size;
                 
-                let refined_screen = world_to_screen(refined_pos);
-                let refined_uv = refined_screen.xy;
-                let refined_depth = textureSample(scene_depth, linear_sampler, refined_uv);
-                let refined_surface = reconstruct_world_pos(refined_uv, refined_depth);
-                
-                let refined_ray_depth = distance(camera.camera_pos, refined_pos);
-                let refined_surface_depth = distance(camera.camera_pos, refined_surface);
-                
-                if (refined_ray_depth > refined_surface_depth) {
-                    refined_pos -= refined_step;
+                for (var j = 0u; j < params.max_binary_steps; j++) {
+                    refined_step *= 0.5;
+                    refined_pos += refined_step;
+                    
+                    let refined_screen = world_to_screen(refined_pos);
+                    let refined_uv = refined_screen.xy;
+                    let refined_depth = textureSampleLevel(hzb_texture, hzb_sampler, refined_uv, 0.0).r;
+                    
+                    if (refined_screen.z > refined_depth) {
+                        refined_pos -= refined_step;
+                    }
                 }
+                
+                hit_uv = vec3<f32>(world_to_screen(refined_pos).xy, 1.0);
+                break;
+            } else {
+                // Descend to finer mip level
+                current_mip = max(0.0, current_mip - 1.0);
             }
-            
-            hit_uv = vec3<f32>(world_to_screen(refined_pos).xy, 1.0);
-            break;
+        } else {
+            // No intersection at this point
+            // Optionally ascend to coarser mip if we're far from surfaces
+            let depth_diff = abs(ray_depth - hzb_depth);
+            if (depth_diff > params.thickness * 4.0 && current_mip < max_mip) {
+                current_mip = min(max_mip, current_mip + 1.0);
+            }
         }
     }
     
@@ -153,8 +166,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Reflect view direction around normal
     let reflect_dir = reflect(view_dir, normal);
     
-    // Trace ray
-    let hit_uv = trace_ray(world_pos, reflect_dir);
+    // Trace ray using HZB acceleration
+    let hit_uv = hzb_ray_march(world_pos, reflect_dir);
     
     if (hit_uv.z > 0.0) {
         // Sample color at hit point

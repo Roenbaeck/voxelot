@@ -12,9 +12,8 @@
 ✅ Skybox should get colors washed out the darker it gets. Now it has a saturated yellow unnatural tint at midnight. 
 ✅ Skybox needs a blueish tint. 
 ✅ Distant objects look like they again get brighter closer to the horizon at early night and early morning. It’s making them look unnaturally lit up. 
+✅ Reflections from SSR are only visible if the camera is close to a reflective surface.
 
-🛑 Reflections from SSR are only visible if the camera is close to a reflective surface.
 🛑 Reflections should be stronger at night than in the day, since nothing is drowning out the light.
-
 🛑 Sliders instead of buttons to change settings.
 🛑 Can all of our code be compiled as wasm?

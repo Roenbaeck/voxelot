@@ -2625,9 +2625,35 @@ impl App {
 
                     // Create downsample bind groups (mip N-1 -> mip N)
                     let mut downsample_bgs = Vec::new();
-                    if let Some(hzb_view) = self.hzb_view.as_ref() {
+                    if let (Some(depth_view), Some(cfg)) =
+                        (self.offscreen_depth_view.as_ref(), self.config.as_ref())
+                    {
                         for dst_mip in 1..(self.hzb_mip_levels as usize) {
-                            if let Some(dst_view) = self.hzb_mip_views.get(dst_mip) {
+                            if let (Some(dst_view), Some(src_view)) = (
+                                self.hzb_mip_views.get(dst_mip),
+                                self.hzb_mip_views.get(dst_mip - 1),
+                            ) {
+                                // Calculate mip dimensions
+                                let mip_width = (cfg.width >> dst_mip).max(1);
+                                let mip_height = (cfg.height >> dst_mip).max(1);
+
+                                // Create per-mip params buffer (immutable)
+                                // src_mip is ALWAYS 0 because we bind the specific source mip view
+                                let params = HzbParams {
+                                    width: mip_width,
+                                    height: mip_height,
+                                    src_mip: 0,
+                                    dst_mip: dst_mip as u32,
+                                };
+
+                                use wgpu::util::DeviceExt;
+                                let params_buf =
+                                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                        label: Some(&format!("HZB Params Mip {}", dst_mip)),
+                                        contents: bytemuck::bytes_of(&params),
+                                        usage: wgpu::BufferUsages::UNIFORM,
+                                    });
+
                                 let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                                     label: Some(&format!(
                                         "HZB Downsample Bind Group Mip {}",
@@ -2637,7 +2663,10 @@ impl App {
                                     entries: &[
                                         wgpu::BindGroupEntry {
                                             binding: 0,
-                                            resource: wgpu::BindingResource::TextureView(hzb_view), // Unused in downsample
+                                            // Bind depth texture to satisfy layout (unused in downsample shader)
+                                            resource: wgpu::BindingResource::TextureView(
+                                                depth_view,
+                                            ),
                                         },
                                         wgpu::BindGroupEntry {
                                             binding: 1,
@@ -2649,7 +2678,8 @@ impl App {
                                         },
                                         wgpu::BindGroupEntry {
                                             binding: 3,
-                                            resource: wgpu::BindingResource::TextureView(hzb_view), // Source texture
+                                            // Bind SPECIFIC source mip view (avoids usage conflict)
+                                            resource: wgpu::BindingResource::TextureView(src_view),
                                         },
                                     ],
                                 });
@@ -3273,6 +3303,7 @@ impl App {
             Some(scene_view),
             Some(depth_view),
             Some(sampler),
+            Some(hzb_view),
         ) = (
             self.ssr_bind_group_layout.as_ref(),
             self.ssr_uniform_buffer.as_ref(),
@@ -3280,6 +3311,7 @@ impl App {
             self.offscreen_color_view.as_ref(),
             self.offscreen_depth_view.as_ref(),
             self.post_sampler.as_ref(),
+            self.hzb_view.as_ref(),
         )
         else {
             return;
@@ -3307,6 +3339,16 @@ impl App {
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                // HZB texture for hierarchical ray marching
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(hzb_view),
+                },
+                // HZB sampler (reuse post_sampler for now)
+                wgpu::BindGroupEntry {
+                    binding: 6,
                     resource: wgpu::BindingResource::Sampler(sampler),
                 },
             ],
@@ -4069,6 +4111,24 @@ impl App {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // HZB texture for hierarchical ray marching
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // HZB sampler (point sampling for mip levels)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
 
@@ -4261,27 +4321,16 @@ impl App {
                 }
 
                 // Pass 2-N: Downsample mip chain
-                if let (Some(downsample_pipeline), Some(params_buf), Some(queue)) = (
-                    self.hzb_gen_downsample_pipeline.as_ref(),
-                    self.hzb_params_buffer.as_ref(),
-                    self.queue.as_ref(),
-                ) {
+                if let Some(downsample_pipeline) = self.hzb_gen_downsample_pipeline.as_ref() {
                     for dst_mip in 1..(self.hzb_mip_levels as u32) {
                         if let Some(downsample_bg) =
                             self.hzb_downsample_bind_groups.get((dst_mip - 1) as usize)
                         {
-                            // Calculate mip dimensions
+                            // Calculate mip dimensions for dispatch count
                             let mip_width = (cfg.width >> dst_mip).max(1);
                             let mip_height = (cfg.height >> dst_mip).max(1);
 
-                            // Update params for this mip
-                            let params = HzbParams {
-                                width: mip_width,
-                                height: mip_height,
-                                src_mip: dst_mip - 1,
-                                dst_mip,
-                            };
-                            queue.write_buffer(params_buf, 0, bytemuck::bytes_of(&params));
+                            // Params are baked into the bind group, no need to update buffer!
 
                             let mut hzb_downsample_pass =
                                 encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {

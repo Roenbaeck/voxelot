@@ -9,7 +9,7 @@ camera_position = [
 water_level = 2.0
 
 [rendering]
-lod_subdivide_distance = 600.0
+lod_subdivide_distance = 650.0
 lod_merge_distance = 750.0
 chunk_lod_distance = 1500.0
 fov_degrees = 70.0
@@ -19,7 +19,7 @@ camera_speed_multiplier = 5.9604645
 
 [atmosphere]
 fog_density = 0.00044999996
-time_of_day = 0.25630543
+time_of_day = 0.111412615
 night_skybox_brightness = 0.02
 horizon_fade_up = 0.05
 horizon_fade_down = 0.25
@@ -76,7 +76,7 @@ mesh_upload_baseline = 4
 envelope_distance = 500.0
 envelope_fade_range = 200.0
 max_envelope_distance = 1000.0
-hzb_enabled = false
+hzb_enabled = true
 fallback_detail_distance = 500.0
 fallback_bbox_shrink = 0.66
 mesh_priority_sort_interval_frames = 30
