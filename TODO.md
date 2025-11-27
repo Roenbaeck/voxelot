@@ -15,5 +15,6 @@
 ✅ Reflections from SSR are only visible if the camera is close to a reflective surface.
 
 🛑 Reflections should be stronger at night than in the day, since nothing is drowning out the light.
+🛑 Why is the fullscreen render so much slower than the windowed render? It drops from 120FPS to 20FPS when I go fullscreen.
 🛑 Sliders instead of buttons to change settings.
 🛑 Can all of our code be compiled as wasm?
