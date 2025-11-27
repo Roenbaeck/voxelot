@@ -224,3 +224,143 @@ if let Some(shell) = self.fallback_cache.get(&chunk_pos) {
 2.  **Reduced Iterations:** The Main Thread loops over ~2,000 surface voxels instead of 32,768 raw voxels.
 3.  **Culling:** The `demand_mask` automatically culls 50% of the surface voxels that are facing away from you (Backface Culling for voxels).
 4.  **Memory:** Temporary. The moment the real mesh arrives, you drop this data.
+
+You are currently avoiding holes by **freezing the entire game loop** until the hole is filled.
+
+Here is exactly what happens in your current `render()` function:
+
+1.  **CPU Starts Frame:** You begin the render loop.
+2.  **The "Stutter" Loop:** You hit an unmeshed chunk. The code enters that `for ((x, y, z), voxel) in chunk.iter()` loop.
+3.  **Blocking:** While inside this loop, **nothing else happens**. Input handling stops, physics stops, and importantly, **no commands are sent to the GPU**.
+4.  **GPU Waiting:** The GPU is sitting idle (or finishing the previous frame), waiting for the CPU to tell it what to do.
+5.  **Completion:** Only after you have iterated every single voxel and pushed them into `cpu_prepopulated_instances` does the loop finish.
+6.  **Submission:** Finally, you call `queue.write_buffer` and `encoder.submit`.
+
+**Result:** The frame is "complete" (no holes), but it arrives late (stutter).
+
+---
+
+### The Problem with the "Background Shell" Optimization
+If you strictly follow the "Background Shell" optimization I proposed previously, **you will introduce holes.**
+
+If the `ShellJob` takes 10ms to finish on a background thread, but your frame renders in 5ms, you will render 2 frames where the chunk is invisible (a hole) before the shell data is ready.
+
+### How to get "No Holes" AND "High FPS"
+
+To maintain your strict "no holes" requirement while eliminating the stutter, you need a **Hybrid Approach**:
+
+**Logic:** "If the optimized cached shell is ready, use it. If it is NOT ready (first frame), panic and do a 'Fast Fallback' right here on the main thread."
+
+Here is the revised `render()` logic:
+
+```rust
+// Inside render() loop
+if !mesh_ready {
+    // 1. Check if we have the clean "Shell" from the worker thread
+    if let Some(shell) = self.fallback_cache.get(&chunk_pos) {
+        // FAST PATH: Use the cached shell (runs in microseconds)
+        self.render_from_shell(shell, camera_pos);
+    } 
+    else {
+        // 2. PANIC MODE (First frame only)
+        // The shell isn't ready yet, but we FORBID holes.
+        // We must generate data NOW, on the Main Thread.
+        
+        // OPTIMIZATION: Do not use the full loop. 
+        // Use the "Step-by-2" method. It is 8x faster than your current loop.
+        // It guarantees coverage (no holes), just slightly blocky for 1 frame.
+        self.generate_immediate_fallback_step_by_2(chunk);
+        
+        // Triggers the background job so next frame hits the Fast Path
+        self.trigger_shell_generation_job(chunk_pos); 
+    }
+}
+```
+
+### Why this is the winner:
+1.  **Frame 0 (The Pop-in):** You teleport. The chunk appears instantly. You pay a tiny CPU cost (using the `step_by(2)` optimization), so the FPS might dip from 144 to 120, but not to 10.
+2.  **Frame 1+:** The background thread finishes the clean "Shell". You switch to that. It looks perfect (1:1 resolution) and is extremely fast to render.
+3.  **Frame N:** The Mesh finishes. You switch to the Mesh.
+
+This strategy respects your **Zero Holes** rule but removes the massive loop that is currently killing your performance.
+
+I have a feeling the immediate fallback path (panic mode) will be the hot path here, so why even bother to have a ShellJob. Can't we rely on the panic mode alone? The only reasonable way for ShellJob to have a purpose would be if we send it chunks that are far in the distance from where we are. Is that what you were thinking?
+
+You are asking the right questions. You are distinguishing between **Latency** (time to first pixel) and **Throughput** (cost per frame).
+
+The answer depends on **how long your Meshing takes**.
+
+### The Scenario
+1.  **Frame 0:** You look at a new chunk.
+2.  **Panic Mode:** You iterate the chunk (on Main Thread) to avoid a hole.
+3.  **Frame 1:** Is the mesh ready?
+    *   **If YES:** Then `ShellJob` is useless. You used the fallback for 1 frame, then replaced it.
+    *   **If NO:** You have to run **Panic Mode** again. And again. And again.
+
+### Why ShellJob exists
+Greedy meshing (combining faces) is computationally expensive. It might take **10 to 50 frames** (depending on queue depth) for the mesh to actually arrive.
+
+If you rely **only** on Panic Mode, you are forcing the Main Thread to iterate voxels **every single frame** for those 50 frames.
+*   If you have 1 chunk waiting: It's fine.
+*   If you teleport and have 20 chunks waiting: You are re-iterating **160,000+ voxels per frame** on the main thread. This will drag your FPS down while you wait for the meshes.
+
+**The `ShellJob` is the bridge.** It is much faster than Meshing. It finishes in ~1 frame. It allows the Main Thread to stop doing work ("Panic Mode") and switch to a cheap, cached lookup ("Shell Mode") while waiting for the slow "Mesh Mode."
+
+---
+
+### However... The "Good Enough" Solution (Simplicity)
+
+If you want to keep your code simple and avoid managing a third state (`ShellCache`), you can stick to **Panic Mode Only**, provided you make it dirt cheap.
+
+If you optimize the Panic Loop enough, running it every frame for 50 frames might not hurt.
+
+**The "Just Panic" Strategy (Recommended for now):**
+
+Forget the background shell job. Optimize the Main Thread fallback loop so aggressively that running it every frame doesn't matter.
+
+**1. Use the `step_by(2)` strided iteration.**
+This reduces the workload by **8x** (87.5% reduction).
+
+**2. Optimize the Loop (Remove Vector Allocations).**
+Do not allocate `VoxelInstanceRaw` structs. Write directly to a pre-allocated GPU staging buffer if possible, or a persistent `Vec` that you clear every frame.
+
+**3. Frustum Cull.**
+Strictly ensure you only run this loop for chunks the camera actually sees.
+
+**The Code:**
+```rust
+// In render() - The "Just Panic" Approach
+if !mesh_ready && self.camera_sees(chunk_aabb) {
+    // Run this EVERY frame until mesh arrives.
+    // It must be extremely fast.
+    
+    // Step 2: Skip every other voxel (8x speedup)
+    for x in (0..32).step_by(2) {
+        for y in (0..32).step_by(2) {
+            for z in (0..32).step_by(2) {
+                // Direct array access (unsafe for speed if you trust bounds)
+                let voxel = chunk.get_fast(x, y, z); 
+                
+                if voxel.is_solid() {
+                    // Push 2x sized instance
+                    // Reuse a persistent vector, do NOT `Vec::new()`
+                    self.instance_cache.push(VoxelInstanceRaw {
+                        pos: [x_w, y_w, z_w],
+                        scale: 2.0, // Fills the gaps
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+    }
+}
+```
+
+### Conclusion
+Start with the **"Just Panic" (Optimized)** approach.
+
+1.  Implement `step_by(2)`.
+2.  See if the stutter disappears.
+3.  If you still see FPS drops when loading many chunks, **then** implement the `ShellJob` caching.
+
+Most likely, the `step_by(2)` optimization alone will make the loop fast enough that you don't need the complexity of a Shell Cache system.
