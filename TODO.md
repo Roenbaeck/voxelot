@@ -318,49 +318,8 @@ If you optimize the Panic Loop enough, running it every frame for 50 frames migh
 
 Forget the background shell job. Optimize the Main Thread fallback loop so aggressively that running it every frame doesn't matter.
 
-**1. Use the `step_by(2)` strided iteration.**
-This reduces the workload by **8x** (87.5% reduction).
-
-**2. Optimize the Loop (Remove Vector Allocations).**
+**Optimize the Loop (Remove Vector Allocations).**
 Do not allocate `VoxelInstanceRaw` structs. Write directly to a pre-allocated GPU staging buffer if possible, or a persistent `Vec` that you clear every frame.
-
-**3. Frustum Cull.**
-Strictly ensure you only run this loop for chunks the camera actually sees.
-
-**The Code:**
-```rust
-// In render() - The "Just Panic" Approach
-if !mesh_ready && self.camera_sees(chunk_aabb) {
-    // Run this EVERY frame until mesh arrives.
-    // It must be extremely fast.
-    
-    // Step 2: Skip every other voxel (8x speedup)
-    for x in (0..32).step_by(2) {
-        for y in (0..32).step_by(2) {
-            for z in (0..32).step_by(2) {
-                // Direct array access (unsafe for speed if you trust bounds)
-                let voxel = chunk.get_fast(x, y, z); 
-                
-                if voxel.is_solid() {
-                    // Push 2x sized instance
-                    // Reuse a persistent vector, do NOT `Vec::new()`
-                    self.instance_cache.push(VoxelInstanceRaw {
-                        pos: [x_w, y_w, z_w],
-                        scale: 2.0, // Fills the gaps
-                        ..Default::default()
-                    });
-                }
-            }
-        }
-    }
-}
-```
 
 ### Conclusion
 Start with the **"Just Panic" (Optimized)** approach.
-
-1.  Implement `step_by(2)`.
-2.  See if the stutter disappears.
-3.  If you still see FPS drops when loading many chunks, **then** implement the `ShellJob` caching.
-
-Most likely, the `step_by(2)` optimization alone will make the loop fast enough that you don't need the complexity of a Shell Cache system.
