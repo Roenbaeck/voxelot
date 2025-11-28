@@ -32,6 +32,7 @@ var skybox_sampler: sampler;
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
+    @location(1) rotated_dir: vec3<f32>,
 };
 
 @vertex
@@ -41,16 +42,12 @@ fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
     let uv = vec2<f32>(f32((in_vertex_index << 1u) & 2u), f32(in_vertex_index & 2u));
     out.clip_position = vec4<f32>(uv * 2.0 - 1.0, 1.0, 1.0); // z = 1.0 (far plane)
     out.uv = uv;
-    return out;
-}
 
-@fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Calculate ray direction from camera
     // We want the direction corresponding to the pixel on the far plane
     
     // Convert UV to NDC
-    let ndc = vec4<f32>(in.uv * 2.0 - 1.0, 1.0, 1.0);
+    let ndc = vec4<f32>(uv * 2.0 - 1.0, 1.0, 1.0);
     
     // Unproject to world space
     // We only care about direction, so we can ignore translation part of view matrix
@@ -73,13 +70,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // [ c  0  s ]
     // [ 0  1  0 ]
     // [-s  0  c ]
-    let rotated_dir = vec3<f32>(
+    out.rotated_dir = vec3<f32>(
         world_dir.x * c + world_dir.z * s,
         world_dir.y,
         world_dir.x * -s + world_dir.z * c
     );
-    
-    let dir = normalize(rotated_dir);
+
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let dir = normalize(in.rotated_dir);
     
     // Convert direction to equirectangular UV
     // atan2(z, x) gives angle in [-PI, PI]. We want [0, 1].

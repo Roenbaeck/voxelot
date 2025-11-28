@@ -2,15 +2,7 @@ Your shaders are generally well-structured and readable, but there are several "
 
 Here is a breakdown of specific improvements.
 
-### 1. Optimize Gaussian Blurs (`bloom_blur.wgsl`, `ssao_blur.wgsl`)
-**Issue:** You are performing a discrete 9-tap convolution (center + 4 pairs) by manually sampling every single texel center.
-**Improvement:** Use **Linear Sampling Hardware**.
-By sampling *between* two texels using a `linear` sampler, the GPU performs a weighted average for free. This allows you to approximate a 9-tap Gaussian blur with just **5 texture fetches** (or a 5-tap with 3 fetches).
 
-*   **Action:**
-    1.  Calculate "bilinear offsets" and "bilinear weights" on the CPU.
-    2.  Update the shader to sample at `uv + offset` instead of `uv + offset * texel_size`.
-    3.  This effectively halves the texture bandwidth for your blur passes.
 
 ### 2. Screen-Space Ray Marching (`ssr.wgsl`, `water.wgsl`)
 **Issue:** **Heavy Arithmetic inside Loops.**
@@ -80,7 +72,7 @@ You are using a 9-tap PCF (or Poisson) filter.
 | Priority | Shader | Optimization | Estimated Gain |
 | :--- | :--- | :--- | :--- |
 | **High** | `ssr.wgsl`, `water.wgsl` | Switch Ray Marching to Screen Space (remove Matrix Mul from loop). | High |
-| **High** | `bloom_blur`, `ssao_blur` | Use Linear Sampling (HW filtering) to halve texture fetches. | Medium |
+
 | **High** | `skybox.wgsl` | Move ray direction calculation to Vertex Shader. | Low/Medium |
 | **Medium** | `ssilvb`, `ssr` | Use a G-Buffer Normal texture instead of reconstructing from Depth. | Medium |
 | **Medium** | `hzb_gen.wgsl` | Implement Single Pass Downsampling (SPD). | Medium |
