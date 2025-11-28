@@ -33,7 +33,7 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 }
 
 @fragment
-fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let offsets = array<vec2<f32>, 4>(
         vec2<f32>(-0.5, -0.5),
         vec2<f32>(0.5, -0.5),
@@ -43,18 +43,32 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
 
     var sample_sum = vec3<f32>(0.0);
     sample_sum = sample_sum
-        + textureSample(scene_color, post_sampler, uv + offsets[0] * bloom.source_texel_size).rgb;
+        + textureSample(scene_color, post_sampler, in.uv + offsets[0] * bloom.source_texel_size).rgb;
     sample_sum = sample_sum
-        + textureSample(scene_color, post_sampler, uv + offsets[1] * bloom.source_texel_size).rgb;
+        + textureSample(scene_color, post_sampler, in.uv + offsets[1] * bloom.source_texel_size).rgb;
     sample_sum = sample_sum
-        + textureSample(scene_color, post_sampler, uv + offsets[2] * bloom.source_texel_size).rgb;
+        + textureSample(scene_color, post_sampler, in.uv + offsets[2] * bloom.source_texel_size).rgb;
     sample_sum = sample_sum
-        + textureSample(scene_color, post_sampler, uv + offsets[3] * bloom.source_texel_size).rgb;
+        + textureSample(scene_color, post_sampler, in.uv + offsets[3] * bloom.source_texel_size).rgb;
     let average_color = sample_sum * 0.25;
 
     let brightness = max(max(average_color.r, average_color.g), average_color.b);
-    let highlight = smoothstep(bloom.threshold, bloom.threshold + bloom.knee, brightness);
+    
+    // Add subtle dither to threshold to eliminate banding
+    let dither = interleaved_gradient_noise(in.position.xy);
+    let dither_amount = bloom.knee * 0.05; // Dither within the knee range
+    let dithered_brightness = brightness + dither * dither_amount;
+    
+    let highlight = smoothstep(bloom.threshold, bloom.threshold + bloom.knee, dithered_brightness);
     let weight = highlight * highlight * bloom.intensity;
     let bloom_color = average_color * weight;
     return vec4<f32>(bloom_color, 1.0);
 }
+
+// Interleaved gradient noise for dithering
+fn interleaved_gradient_noise(screen_pos: vec2<f32>) -> f32 {
+    let magic = vec3<f32>(0.06711056, 0.00583715, 52.9829189);
+    let noise = fract(magic.z * fract(dot(screen_pos, magic.xy)));
+    return noise - 0.5;
+}
+
