@@ -50,6 +50,18 @@ pub struct RenderingConfig {
     pub far_plane: f32,
     #[serde(default = "default_camera_speed")]
     pub camera_speed_multiplier: f32,
+    #[serde(default = "default_window_width")]
+    pub window_width: u32,
+    #[serde(default = "default_window_height")]
+    pub window_height: u32,
+}
+
+fn default_window_width() -> u32 {
+    1280
+}
+
+fn default_window_height() -> u32 {
+    720
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -477,6 +489,8 @@ impl Default for RenderingConfig {
             near_plane: default_near_plane(),
             far_plane: default_far_plane(),
             camera_speed_multiplier: default_camera_speed(),
+            window_width: default_window_width(),
+            window_height: default_window_height(),
         }
     }
 }

@@ -1611,6 +1611,13 @@ impl App {
             full_cfg.rendering.near_plane = self.camera_controller.camera.config.near_plane;
             full_cfg.rendering.far_plane = self.camera_controller.camera.config.far_plane;
             full_cfg.rendering.camera_speed_multiplier = self.camera_controller.speed_multiplier;
+            if let Some(window) = self.window.as_ref() {
+                let size = window.inner_size();
+                // Save logical dimensions (account for DPI scale) to keep config portable
+                let scale = window.scale_factor();
+                full_cfg.rendering.window_width = (size.width as f64 / scale) as u32;
+                full_cfg.rendering.window_height = (size.height as f64 / scale) as u32;
+            }
 
             // Atmosphere settings
             full_cfg.atmosphere.time_of_day = self.time_of_day;
@@ -9155,9 +9162,14 @@ impl App {
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
+            // Load config (fall back to defaults if missing) to determine initial window size
+            let cfg = voxelot::Config::load_or_default(CONFIG_FILE);
+            let window_width = cfg.rendering.window_width;
+            let window_height = cfg.rendering.window_height;
+
             let window_attrs = WindowAttributes::default()
                 .with_title("Hierarchical Voxel Viewer")
-                .with_inner_size(winit::dpi::PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
+                .with_inner_size(winit::dpi::LogicalSize::new(window_width, window_height));
 
             let window = Arc::new(event_loop.create_window(window_attrs).unwrap());
 
