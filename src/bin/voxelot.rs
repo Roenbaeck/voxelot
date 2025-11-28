@@ -27,7 +27,7 @@ use sysinfo::{Pid, ProcessExt, System, SystemExt};
 use voxelot::SlabAllocator;
 use voxelot::{
     bbox_local_to_world, cull_visible_voxels_parallel, Camera, Chunk, ChunkMesh, Palette,
-    RenderConfig, Voxel, VoxelInstance, World, WorldPos,
+    RenderConfig, VoxelInstance, World, WorldPos,
 };
 
 macro_rules! viewer_debug {
@@ -297,7 +297,7 @@ struct SsaoSettings {
     strength: f32,
     blur_enabled: bool,
     blur_radius: f32,
-    bias: f32,
+    _bias: f32,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -943,10 +943,10 @@ struct App {
     hzb_copy_bind_group: Option<wgpu::BindGroup>, // For mip 0 copy
     hzb_downsample_bind_groups: Vec<wgpu::BindGroup>, // Per-mip downsample bind groups
     hzb_bind_group_layout: Option<wgpu::BindGroupLayout>,
-    hzb_gen_downsample_bind_groups: Vec<Option<wgpu::BindGroup>>,
+    _hzb_gen_downsample_bind_groups: Vec<Option<wgpu::BindGroup>>,
     hzb_enabled: bool,
     // Frame timing
-    frame_times: VecDeque<f32>,
+    _frame_times: VecDeque<f32>,
 
     // SSR state
     ssr_settings: SSRSettings,
@@ -1480,10 +1480,10 @@ impl App {
             hzb_copy_bind_group: None,
             hzb_downsample_bind_groups: Vec::new(),
             hzb_bind_group_layout: None,
-            hzb_gen_downsample_bind_groups: Vec::new(),
+            _hzb_gen_downsample_bind_groups: Vec::new(),
             hzb_params_buffer: None,
             hzb_enabled: cfg.performance.hzb_enabled,
-            frame_times: VecDeque::with_capacity(60),
+            _frame_times: VecDeque::with_capacity(60),
             dof_combine_pipeline: None,
             dof_combine_bind_group_layout: None,
             dof_combine_bind_group: None,
@@ -1530,7 +1530,7 @@ impl App {
                 strength: cfg.effects.ssao.strength,
                 blur_enabled: cfg.effects.ssao.blur_enabled,
                 blur_radius: cfg.effects.ssao.blur_radius,
-                bias: 0.01,
+                _bias: 0.01,
             },
             ssr_settings: SSRSettings {
                 max_steps: 32,
@@ -6928,7 +6928,7 @@ impl App {
                 self.pending_chunk_sort_buf.clear();
                 self.pending_chunk_sort_buf
                     .extend(self.pending_chunk_meshes.iter().cloned());
-                let mut vec = &mut self.pending_chunk_sort_buf;
+                let vec = &mut self.pending_chunk_sort_buf;
                 vec.sort_by(|a, b| {
                     let ca = [a.0 as f32 + 8.0, a.1 as f32 + 8.0, a.2 as f32 + 8.0];
                     let cb = [b.0 as f32 + 8.0, b.1 as f32 + 8.0, b.2 as f32 + 8.0];
