@@ -33,8 +33,8 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 
 @fragment
 fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    let offsets = array<f32, 5>(0.0, 1.0, 2.0, 3.0, 4.0);
-    let weights = array<f32, 5>(0.227027, 0.1945946, 0.1216216, 0.054054, 0.016216);
+    let offsets = array<f32, 3>(0.0, 1.38461538, 3.23076923);
+    let weights = array<f32, 3>(0.227027, 0.3162162, 0.070270);
 
     var v = textureSample(ssao_texture, post_sampler, uv).a * weights[0];
 
@@ -49,18 +49,6 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
         + (textureSample(ssao_texture, post_sampler, uv + offset2).a
             + textureSample(ssao_texture, post_sampler, uv - offset2).a)
         * weights[2];
-
-    let offset3 = blur.direction * blur.texel_size * (offsets[3] * blur.radius);
-    v = v
-        + (textureSample(ssao_texture, post_sampler, uv + offset3).a
-            + textureSample(ssao_texture, post_sampler, uv - offset3).a)
-        * weights[3];
-
-    let offset4 = blur.direction * blur.texel_size * (offsets[4] * blur.radius);
-    v = v
-        + (textureSample(ssao_texture, post_sampler, uv + offset4).a
-            + textureSample(ssao_texture, post_sampler, uv - offset4).a)
-        * weights[4];
 
     // Write result into alpha channel to preserve existing composite usage.
     return vec4<f32>(vec3<f32>(0.0), v);
