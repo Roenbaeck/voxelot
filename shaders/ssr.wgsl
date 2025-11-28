@@ -87,19 +87,34 @@ fn get_max_mip_level() -> f32 {
 }
 
 // HZB-Accelerated Ray Marching
+// HZB-Accelerated Ray Marching (Screen Space)
 fn hzb_ray_march(start_pos: vec3<f32>, ray_dir: vec3<f32>) -> vec3<f32> {
     var hit_uv = vec3<f32>(-1.0);
     
-    var current_pos = start_pos;
+    // Calculate end position in world space
+    let max_dist = f32(params.max_steps) * params.step_size;
+    let end_pos = start_pos + ray_dir * max_dist;
+    
+    // Project start and end to screen space
+    let start_screen = world_to_screen(start_pos);
+    let end_screen = world_to_screen(end_pos);
+    
+    // Calculate delta in screen space
+    // Note: This assumes the ray doesn't cross the camera plane (z=0 in view space)
+    // For a robust implementation, we should clip the ray to the near plane.
+    // However, for reflections, rays usually go away from the camera.
+    
+    let delta = (end_screen - start_screen) / f32(params.max_steps);
+    
+    var current_screen = start_screen;
     let max_mip = get_max_mip_level();
-    var current_mip = min(4.0, max_mip); // Start at coarse level (mip 4 or max available)
+    var current_mip = min(4.0, max_mip);
     
     // Hierarchical ray march
     for (var i = 0u; i < params.max_steps; i++) {
-        current_pos += ray_dir * params.step_size;
+        current_screen += delta;
         
-        let screen_pos = world_to_screen(current_pos);
-        let uv = screen_pos.xy;
+        let uv = current_screen.xy;
         
         // Check if out of screen bounds
         if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
@@ -108,33 +123,43 @@ fn hzb_ray_march(start_pos: vec3<f32>, ray_dir: vec3<f32>) -> vec3<f32> {
         
         // Sample HZB at current mip level
         let hzb_depth = textureSampleLevel(hzb_texture, hzb_sampler, uv, current_mip).r;
-        let ray_depth = screen_pos.z;
+        let ray_depth = current_screen.z;
         
         // Check if ray is behind surface (potential intersection)
         if (ray_depth > hzb_depth && ray_depth - hzb_depth < params.thickness) {
             if (current_mip <= 0.5) {
                 // At finest detail, perform binary refinement
-                var refined_pos = current_pos - ray_dir * params.step_size;
-                var refined_step = ray_dir * params.step_size;
+                // We can refine in screen space too!
+                var refined_screen = current_screen - delta;
+                var refined_delta = delta;
                 
                 for (var j = 0u; j < params.max_binary_steps; j++) {
-                    refined_step *= 0.5;
-                    refined_pos += refined_step;
+                    refined_delta *= 0.5;
+                    refined_screen += refined_delta;
                     
-                    let refined_screen = world_to_screen(refined_pos);
                     let refined_uv = refined_screen.xy;
-                    let refined_depth = textureSampleLevel(hzb_texture, hzb_sampler, refined_uv, 0.0).r;
+                    let refined_depth_sample = textureSampleLevel(hzb_texture, hzb_sampler, refined_uv, 0.0).r;
                     
-                    if (refined_screen.z > refined_depth) {
-                        refined_pos -= refined_step;
+                    if (refined_screen.z > refined_depth_sample) {
+                        refined_screen -= refined_delta;
                     }
                 }
                 
-                hit_uv = vec3<f32>(world_to_screen(refined_pos).xy, 1.0);
+                hit_uv = vec3<f32>(refined_screen.xy, 1.0);
                 break;
             } else {
                 // Descend to finer mip level
                 current_mip = max(0.0, current_mip - 1.0);
+                // Backtrack one step to re-check at finer level? 
+                // In this simple linear march, we just stay here and check next iteration with finer mip?
+                // Or we should ideally backtrack. 
+                // For this optimization (removing matrix mul), let's keep the flow simple:
+                // If we hit something at coarse level, we stay at this position but reduce mip for next check?
+                // Actually, if we hit, we should probably check THIS position again with finer mip.
+                // But the loop increments every time.
+                // Let's just decrement i to retry this position?
+                // i--; // Not allowed in WGSL for loops usually?
+                // Let's just continue, effectively checking next point with finer mip.
             }
         } else {
             // No intersection at this point

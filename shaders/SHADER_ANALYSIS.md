@@ -20,15 +20,7 @@ Convert the ray's start point and direction into Screen Space (pixel coordinates
 
 **Bonus for `water.wgsl`:** It currently uses a linear search (32 steps). Since you already have an HZB texture (generated for SSR/Culling), you should use **HZB tracing** for water reflections too, exactly like you do in `ssr.wgsl`.
 
-### 3. Skybox Optimization (`skybox.wgsl`)
-**Issue 1: Expensive Math.**
-You are calculating `atan2` and `asin` for every pixel to sample the equirectangular texture. Inverse trigonometry is computationally expensive.
-**Issue 2: Per-Pixel Matrix Math.**
-You are calculating the view ray direction using `inverse_view` and `inverse_proj` in the **Fragment Shader**.
 
-**Improvement:**
-1.  **Move Ray Calculation to Vertex Shader:** Calculate the view-space ray direction for the 4 screen corners in the Vertex Shader and let the rasterizer interpolate it. In the Fragment shader, just `normalize(interpolated_ray)`. This removes 2 matrix multiplications per pixel.
-2.  **Use a Cubemap:** If possible, convert your equirectangular skybox to a **Cube Map**. Sampling a `texture_cube` via a vector is hardware-accelerated and requires no `atan2` math.
 
 ### 4. HZB Generation (`hzb_gen.wgsl`)
 **Issue:** **Bandwidth Overhead.**
@@ -73,7 +65,7 @@ You are using a 9-tap PCF (or Poisson) filter.
 | :--- | :--- | :--- | :--- |
 | **High** | `ssr.wgsl`, `water.wgsl` | Switch Ray Marching to Screen Space (remove Matrix Mul from loop). | High |
 
-| **High** | `skybox.wgsl` | Move ray direction calculation to Vertex Shader. | Low/Medium |
+
 | **Medium** | `ssilvb`, `ssr` | Use a G-Buffer Normal texture instead of reconstructing from Depth. | Medium |
 | **Medium** | `hzb_gen.wgsl` | Implement Single Pass Downsampling (SPD). | Medium |
 | **Medium** | `gpu_cull.wgsl` | Sort instances by mesh index on CPU to coalesce indirect buffer writes. | Low |

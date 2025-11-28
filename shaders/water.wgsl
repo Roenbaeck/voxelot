@@ -74,22 +74,31 @@ fn reconstruct_world_pos_uv(uv: vec2<f32>, depth: f32) -> vec3<f32> {
 
 // Simple ray march to find where reflection ray hits scene geometry
 // Returns: vec3(hit_uv.x, hit_uv.y, hit_valid) where hit_valid > 0 means valid hit
+// Simple ray march to find where reflection ray hits scene geometry
+// Returns: vec3(hit_uv.x, hit_uv.y, hit_valid) where hit_valid > 0 means valid hit
 fn trace_water_reflection(start_pos: vec3<f32>, ray_dir: vec3<f32>, cam_pos: vec3<f32>) -> vec3<f32> {
     let max_steps = 32u;
     let step_size = 2.0; // World units per step
     let thickness = 1.5; // Tolerance for hit detection
     
-    var current_pos = start_pos;
-    let step = ray_dir * step_size;
+    // Calculate end position
+    let max_dist = f32(max_steps) * step_size;
+    let end_pos = start_pos + ray_dir * max_dist;
+    
+    // Project to screen space
+    let start_screen = world_to_screen_uv(start_pos);
+    let end_screen = world_to_screen_uv(end_pos);
+    
+    let delta = (end_screen - start_screen) / f32(max_steps);
+    var current_screen = start_screen;
     
     // Get depth texture dimensions for bounds checking
     let dim = textureDimensions(depth_texture);
     
     for (var i = 0u; i < max_steps; i++) {
-        current_pos += step;
+        current_screen += delta;
         
-        let screen = world_to_screen_uv(current_pos);
-        let uv = screen.xy;
+        let uv = current_screen.xy;
         
         // Check screen bounds
         if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
@@ -108,22 +117,39 @@ fn trace_water_reflection(start_pos: vec3<f32>, ray_dir: vec3<f32>, cam_pos: vec
             continue;
         }
         
-        // Get world position of scene surface at this UV
-        let surface_pos = reconstruct_world_pos_uv(uv, scene_depth);
-        
         // Compare ray depth vs scene depth
-        let ray_depth = distance(cam_pos, current_pos);
-        let surface_depth = distance(cam_pos, surface_pos);
+        // Note: scene_depth is raw depth buffer value (0..1)
+        // current_screen.z is also projected depth (0..1)
         
-        // Hit detection: ray is behind surface and within thickness tolerance
-        if (ray_depth > surface_depth && ray_depth - surface_depth < thickness) {
-            // Edge fade for smoother blending near screen edges
-            let edge_fade = min(
-                min(uv.x, 1.0 - uv.x),
-                min(uv.y, 1.0 - uv.y)
-            );
-            let edge_factor = smoothstep(0.0, 0.1, edge_fade);
-            return vec3<f32>(uv, edge_factor);
+        let ray_depth = current_screen.z;
+        
+        // Check if ray is behind surface
+        // In standard depth (0=near, 1=far), larger value means further away
+        if (ray_depth > scene_depth) {
+            // We need to check thickness.
+            // Converting thickness to depth units is non-linear and tricky.
+            // For now, let's reconstruct world position for the thickness check to be safe,
+            // OR approximate thickness in depth units.
+            // Reconstructing world pos is expensive, which we want to avoid.
+            // But we only do it IF we hit something.
+            
+            let surface_pos = reconstruct_world_pos_uv(uv, scene_depth);
+            
+            // Reconstruct ray pos from screen pos? Or just use interpolated depth?
+            // We can reconstruct ray world pos from current_screen
+            let ray_world_pos = reconstruct_world_pos_uv(uv, ray_depth);
+            
+            let dist_diff = distance(ray_world_pos, surface_pos);
+            
+            if (dist_diff < thickness) {
+                // Edge fade for smoother blending near screen edges
+                let edge_fade = min(
+                    min(uv.x, 1.0 - uv.x),
+                    min(uv.y, 1.0 - uv.y)
+                );
+                let edge_factor = smoothstep(0.0, 0.1, edge_fade);
+                return vec3<f32>(uv, edge_factor);
+            }
         }
     }
     
