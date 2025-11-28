@@ -790,6 +790,12 @@ struct App {
     multi_draw_indirect_buffer: Option<wgpu::Buffer>,
     multi_draw_count_buffer: Option<wgpu::Buffer>,
     max_draw_capacity: usize,
+    // Reused temporary indirect argument buffers to avoid per-frame allocations
+    mesh_indirect_args_tmp: Vec<wgpu::util::DrawIndexedIndirectArgs>,
+    envelope_indirect_args_tmp: Vec<wgpu::util::DrawIndexedIndirectArgs>,
+    // Reused temp arrays for populate_multi_draw_indirects
+    multi_mesh_args_tmp: Vec<wgpu::util::DrawIndexedIndirectArgs>,
+    multi_env_args_tmp: Vec<wgpu::util::DrawIndexedIndirectArgs>,
 
     /// Stat: number of empty meshes processed (non-geometric chunks)
     stat_empty_meshes: u64,
@@ -800,6 +806,7 @@ struct App {
     active_emitters: Vec<ActiveLight>,
     system_info: System,
     process_pid: Pid,
+    light_probes: Vec<LightProbe>,
 
     cull_pipeline: Option<wgpu::ComputePipeline>,
     cull_bind_group_layout: Option<wgpu::BindGroupLayout>,
@@ -1096,7 +1103,7 @@ impl App {
             // Create test world (depth 3 = 4,096 units)
             world = World::new(3);
             initial_camera = [50.0, 15.0, 65.0];
-            viewer_debug!("Creating test block: 3x5x7 voxels at (50,10,50)");
+            viewer_debug!("Creating test block: 3x5x7 voxels at (50, 10, 50)");
             let mut count = 0;
             for x in 0..3 {
                 for y in 0..5 {
@@ -1318,6 +1325,10 @@ impl App {
             multi_draw_indirect_buffer: None,
             multi_draw_count_buffer: None,
             max_draw_capacity: cfg.performance.max_draw_capacity,
+            mesh_indirect_args_tmp: Vec::with_capacity(4096),
+            envelope_indirect_args_tmp: Vec::with_capacity(4096),
+            multi_mesh_args_tmp: Vec::with_capacity(4096),
+            multi_env_args_tmp: Vec::with_capacity(4096),
 
             egui_ctx: None,
             egui_winit: None,
@@ -1332,6 +1343,7 @@ impl App {
 
             chunk_emitters: FxHashMap::default(),
             active_emitters: Vec::new(),
+            light_probes: Vec::with_capacity(32),
             system_info,
             process_pid,
 
@@ -4382,8 +4394,10 @@ impl App {
 
     fn populate_multi_draw_indirects(&mut self, queue: &wgpu::Queue, visible: &Vec<VoxelInstance>) {
         // Fill mesh and envelope indirect buffers from CPU-visible list
-        let mut mesh_args: Vec<wgpu::util::DrawIndexedIndirectArgs> = Vec::new();
-        let mut env_args: Vec<wgpu::util::DrawIndexedIndirectArgs> = Vec::new();
+        self.multi_mesh_args_tmp.clear();
+        self.multi_env_args_tmp.clear();
+        self.multi_mesh_args_tmp.reserve(visible.len());
+        self.multi_env_args_tmp.reserve(visible.len());
 
         if self.mega_index_buffer.is_none() || self.mega_vertex_buffer.is_none() {
             return;
@@ -4435,7 +4449,7 @@ impl App {
                     } else {
                         let first_index = (entry.index_offset / 4) as u32; // u32 indices
                         let base_vertex = (entry.vertex_offset / vertex_stride as u64) as i32;
-                        mesh_args.push(wgpu::util::DrawIndexedIndirectArgs {
+                        self.multi_mesh_args_tmp.push(wgpu::util::DrawIndexedIndirectArgs {
                             index_count: entry.index_count as u32,
                             instance_count: 1,
                             first_index,
@@ -4465,7 +4479,7 @@ impl App {
                     } else {
                         let first_index = (entry.index_offset / 4) as u32;
                         let base_vertex = (entry.vertex_offset / vertex_stride as u64) as i32;
-                        env_args.push(wgpu::util::DrawIndexedIndirectArgs {
+                        self.multi_env_args_tmp.push(wgpu::util::DrawIndexedIndirectArgs {
                             index_count: entry.index_count as u32,
                             instance_count: 1,
                             first_index,
@@ -4480,48 +4494,48 @@ impl App {
         }
 
         if let Some(buffer) = &self.mesh_indirect_buffer {
-            if mesh_args.len() as usize > self.max_draw_capacity {
+            if self.multi_mesh_args_tmp.len() as usize > self.max_draw_capacity {
                 viewer_debug!(
                     "Warning: mesh indirect args {} exceed max_draw_capacity {} => truncating",
-                    mesh_args.len(),
+                    self.multi_mesh_args_tmp.len(),
                     self.max_draw_capacity
                 );
-                mesh_args.truncate(self.max_draw_capacity);
+                self.multi_mesh_args_tmp.truncate(self.max_draw_capacity);
             }
-            if !mesh_args.is_empty() {
-                queue.write_buffer(buffer, 0, bytemuck::cast_slice(&mesh_args));
+            if !self.multi_mesh_args_tmp.is_empty() {
+                queue.write_buffer(buffer, 0, bytemuck::cast_slice(&self.multi_mesh_args_tmp));
                 // Count number of mesh indirect entries uploaded
-                self.gpu_buffer_items_frame = self.gpu_buffer_items_frame.saturating_add(mesh_args.len());
+                self.gpu_buffer_items_frame = self.gpu_buffer_items_frame.saturating_add(self.multi_mesh_args_tmp.len());
             } else {
                 // zero-length doesn't matter, but clear first 4 bytes
                 let zero: [u8; 4] = [0; 4];
                 queue.write_buffer(buffer, 0, &zero);
             }
-            viewer_debug!("Populated mesh indirects: {} entries", mesh_args.len());
+            viewer_debug!("Populated mesh indirects: {} entries", self.multi_mesh_args_tmp.len());
         }
         if let Some(buffer) = &self.envelope_indirect_buffer {
-            if env_args.len() as usize > self.max_draw_capacity {
+            if self.multi_env_args_tmp.len() as usize > self.max_draw_capacity {
                 viewer_debug!(
                     "Warning: envelope indirect args {} exceed max_draw_capacity {} => truncating",
-                    env_args.len(),
+                    self.multi_env_args_tmp.len(),
                     self.max_draw_capacity
                 );
-                env_args.truncate(self.max_draw_capacity);
+                self.multi_env_args_tmp.truncate(self.max_draw_capacity);
             }
-            if !env_args.is_empty() {
-                queue.write_buffer(buffer, 0, bytemuck::cast_slice(&env_args));
+            if !self.multi_env_args_tmp.is_empty() {
+                queue.write_buffer(buffer, 0, bytemuck::cast_slice(&self.multi_env_args_tmp));
                 // Count number of envelope indirect entries uploaded
-                self.gpu_buffer_items_frame = self.gpu_buffer_items_frame.saturating_add(env_args.len());
+                self.gpu_buffer_items_frame = self.gpu_buffer_items_frame.saturating_add(self.multi_env_args_tmp.len());
             } else {
                 let zero: [u8; 4] = [0; 4];
                 queue.write_buffer(buffer, 0, &zero);
             }
-            viewer_debug!("Populated envelope indirects: {} entries", env_args.len());
+            viewer_debug!("Populated envelope indirects: {} entries", self.multi_env_args_tmp.len());
         }
 
         // Write counts into multi_draw_count_buffer; offsets: 0=mesh_count, 4=envelope_count
         if let Some(count_buf) = &self.multi_draw_count_buffer {
-            let counts = [mesh_args.len() as u32, env_args.len() as u32];
+            let counts = [self.multi_mesh_args_tmp.len() as u32, self.multi_env_args_tmp.len() as u32];
             queue.write_buffer(count_buf, 0, bytemuck::cast_slice(&counts));
         }
     }
@@ -6497,8 +6511,9 @@ impl App {
             }
 
             // Upload Mesh Indirect Args
-            let mut mesh_indirect_args: Vec<wgpu::util::DrawIndexedIndirectArgs> =
-                Vec::with_capacity(visible.len());
+            // Reuse temp buffer to avoid per-frame allocations
+            self.mesh_indirect_args_tmp.clear();
+            self.mesh_indirect_args_tmp.reserve(visible.len());
             for v in visible.iter() {
                 let key = (v.position[0], v.position[1], v.position[2]);
                 if cfg!(feature = "viewer-debug") {
@@ -6537,7 +6552,7 @@ impl App {
                             if cfg!(feature = "viewer-debug") {
                                 viewer_debug!("Validation warning on mesh cache entry (gpu prefill): index_buf_size={}, vertex_buf_size={} entry: index_offset={}, index_bytes={}, vertex_offset={}, vertex_bytes={}", index_buf_size, vertex_buf_size, mesh_entry.index_offset, mesh_entry.index_bytes, mesh_entry.vertex_offset, mesh_entry.vertex_bytes);
                             }
-                            mesh_indirect_args.push(wgpu::util::DrawIndexedIndirectArgs {
+                            self.mesh_indirect_args_tmp.push(wgpu::util::DrawIndexedIndirectArgs {
                                 index_count: 0,
                                 instance_count: 0,
                                 first_index: 0,
@@ -6548,7 +6563,7 @@ impl App {
                             let vertex_stride = std::mem::size_of::<MeshVertexRaw>() as u64;
                             let first_index = (mesh_entry.index_offset / 4) as u32;
                             let base_vertex = (mesh_entry.vertex_offset / vertex_stride) as i32;
-                            mesh_indirect_args.push(wgpu::util::DrawIndexedIndirectArgs {
+                            self.mesh_indirect_args_tmp.push(wgpu::util::DrawIndexedIndirectArgs {
                                 index_count: mesh_entry.index_count,
                                 instance_count: 0, // Shader will set to 1
                                 first_index: first_index,
@@ -6557,7 +6572,7 @@ impl App {
                             });
                         }
                     } else {
-                        mesh_indirect_args.push(wgpu::util::DrawIndexedIndirectArgs {
+                        self.mesh_indirect_args_tmp.push(wgpu::util::DrawIndexedIndirectArgs {
                             index_count: 0,
                             instance_count: 0,
                             first_index: 0,
@@ -6566,7 +6581,7 @@ impl App {
                         });
                     }
                 } else {
-                    mesh_indirect_args.push(wgpu::util::DrawIndexedIndirectArgs {
+                    self.mesh_indirect_args_tmp.push(wgpu::util::DrawIndexedIndirectArgs {
                         index_count: 0,
                         instance_count: 0,
                         first_index: 0,
@@ -6577,11 +6592,11 @@ impl App {
             }
 
             if let Some(buffer) = self.mesh_indirect_buffer.as_ref() {
-                queue.write_buffer(buffer, 0, bytemuck::cast_slice(&mesh_indirect_args));
+                queue.write_buffer(buffer, 0, bytemuck::cast_slice(&self.mesh_indirect_args_tmp));
                 // Count the number of indirect draw entries uploaded for meshes
                 self.gpu_buffer_items_frame = self
                     .gpu_buffer_items_frame
-                    .saturating_add(mesh_indirect_args.len());
+                    .saturating_add(self.mesh_indirect_args_tmp.len());
                 // Mark entries as used so eviction won't free them during this frame
                 for v in visible.iter() {
                     if !v.is_leaf_chunk {
@@ -6595,8 +6610,8 @@ impl App {
             }
 
             // Upload Envelope Indirect Args
-            let mut envelope_indirect_args: Vec<wgpu::util::DrawIndexedIndirectArgs> =
-                Vec::with_capacity(visible.len());
+            self.envelope_indirect_args_tmp.clear();
+            self.envelope_indirect_args_tmp.reserve(visible.len());
             for v in visible.iter() {
                 let key = (v.position[0], v.position[1], v.position[2]);
                 if v.is_leaf_chunk {
@@ -6613,7 +6628,7 @@ impl App {
                             if cfg!(feature = "viewer-debug") {
                                 viewer_debug!("Validation warning on envelope cache entry (gpu prefill): index_buf_size={}, vertex_buf_size={} entry: index_offset={}, index_bytes={}, vertex_offset={}, vertex_bytes={}", index_buf_size, vertex_buf_size, mesh_entry.index_offset, mesh_entry.index_bytes, mesh_entry.vertex_offset, mesh_entry.vertex_bytes);
                             }
-                            envelope_indirect_args.push(wgpu::util::DrawIndexedIndirectArgs {
+                            self.envelope_indirect_args_tmp.push(wgpu::util::DrawIndexedIndirectArgs {
                                 index_count: 0,
                                 instance_count: 0,
                                 first_index: 0,
@@ -6624,7 +6639,7 @@ impl App {
                             let vertex_stride = std::mem::size_of::<MeshVertexRaw>() as u64;
                             let first_index = (mesh_entry.index_offset / 4) as u32;
                             let base_vertex = (mesh_entry.vertex_offset / vertex_stride) as i32;
-                            envelope_indirect_args.push(wgpu::util::DrawIndexedIndirectArgs {
+                            self.envelope_indirect_args_tmp.push(wgpu::util::DrawIndexedIndirectArgs {
                                 index_count: mesh_entry.index_count,
                                 instance_count: 0, // Shader will set to 1
                                 first_index: first_index,
@@ -6633,7 +6648,7 @@ impl App {
                             });
                         }
                     } else {
-                        envelope_indirect_args.push(wgpu::util::DrawIndexedIndirectArgs {
+                        self.envelope_indirect_args_tmp.push(wgpu::util::DrawIndexedIndirectArgs {
                             index_count: 0,
                             instance_count: 0,
                             first_index: 0,
@@ -6642,7 +6657,7 @@ impl App {
                         });
                     }
                 } else {
-                    envelope_indirect_args.push(wgpu::util::DrawIndexedIndirectArgs {
+                    self.envelope_indirect_args_tmp.push(wgpu::util::DrawIndexedIndirectArgs {
                         index_count: 0,
                         instance_count: 0,
                         first_index: 0,
@@ -6653,11 +6668,11 @@ impl App {
             }
 
             if let Some(buffer) = self.envelope_indirect_buffer.as_ref() {
-                queue.write_buffer(buffer, 0, bytemuck::cast_slice(&envelope_indirect_args));
+                queue.write_buffer(buffer, 0, bytemuck::cast_slice(&self.envelope_indirect_args_tmp));
                 // Count the number of indirect draw entries uploaded for envelopes
                 self.gpu_buffer_items_frame = self
                     .gpu_buffer_items_frame
-                    .saturating_add(envelope_indirect_args.len());
+                    .saturating_add(self.envelope_indirect_args_tmp.len());
                 // Mark entries as used so eviction won't free them during this frame
                 for v in visible.iter() {
                     if !v.is_leaf_chunk {
@@ -7637,15 +7652,16 @@ impl App {
             sun_shadow_strength * sun_fade + moon_shadow_strength_base * (1.0 - sun_fade);
         let shadow_texel = 1.0 / self.shadow_map_size as f32;
 
-        // Collect light probes from nearby emissive chunks
-        let mut light_probes: Vec<LightProbe> = Vec::new();
+        // Collect light probes from nearby emissive chunks (reuse vector)
+        self.light_probes.clear();
+        self.light_probes.reserve(32);
         const MAX_LIGHT_PROBES: usize = 32;
         const LIGHT_RADIUS_SQ: f32 = 48.0 * 48.0; // Only consider chunks within 48 units (3 chunks)
         const MIN_EMISSIVE_POWER: f32 = 0.5; // Ignore weak emitters
 
         // Collect emitters from chunks with cached meshes
         for (chunk_key, emitters) in &self.chunk_emitters {
-            if light_probes.len() >= MAX_LIGHT_PROBES {
+            if self.light_probes.len() >= MAX_LIGHT_PROBES {
                 break;
             }
 
@@ -7676,7 +7692,7 @@ impl App {
             }
 
             if total_power > MIN_EMISSIVE_POWER {
-                light_probes.push(LightProbe {
+                self.light_probes.push(LightProbe {
                     position: chunk_center,
                     _pad0: 0.0,
                     color_power: [total_color[0], total_color[1], total_color[2], total_power],
@@ -7685,7 +7701,7 @@ impl App {
         }
 
         // Sort by distance and keep only nearest probes
-        light_probes.sort_by(|a, b| {
+        self.light_probes.sort_by(|a, b| {
             let dist_a_sq = (a.position[0] - camera_pos[0]).powi(2)
                 + (a.position[1] - camera_pos[1]).powi(2)
                 + (a.position[2] - camera_pos[2]).powi(2);
@@ -7694,14 +7710,14 @@ impl App {
                 + (b.position[2] - camera_pos[2]).powi(2);
             dist_a_sq.partial_cmp(&dist_b_sq).unwrap()
         });
-        light_probes.truncate(MAX_LIGHT_PROBES);
+        self.light_probes.truncate(MAX_LIGHT_PROBES);
 
         // Upload light probes to GPU
-        if !light_probes.is_empty() {
+        if !self.light_probes.is_empty() {
             // Ensure we have enough capacity
-            if light_probes.len() > self.light_probe_capacity {
+            if self.light_probes.len() > self.light_probe_capacity {
                 // Recreate buffer with more capacity
-                self.light_probe_capacity = (light_probes.len() * 2).max(64);
+                self.light_probe_capacity = (self.light_probes.len() * 2).max(64);
                 let new_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("Light Probe Buffer"),
                     size: (self.light_probe_capacity * std::mem::size_of::<LightProbe>())
@@ -7724,11 +7740,11 @@ impl App {
             queue.write_buffer(
                 self.light_probe_buffer.as_ref().unwrap(),
                 0,
-                bytemuck::cast_slice(&light_probes),
+                bytemuck::cast_slice(&self.light_probes),
             );
         }
 
-        let light_probe_count = light_probes.len() as u32;
+        let light_probe_count = self.light_probes.len() as u32;
 
         // Update uniforms with MVP and lighting data
         // Dual light parameters ---------------------------------------------------
