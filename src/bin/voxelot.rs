@@ -734,6 +734,9 @@ struct App {
     shadow_sampler: Option<wgpu::Sampler>,
     gpu_input_buffer: Option<wgpu::Buffer>,
     gpu_input_capacity: usize,
+    // Buffers reused across frames to reduce allocation churn
+    cpu_prepopulated_instances: Vec<VoxelInstanceRaw>,
+    gpu_inputs: Vec<GpuInstanceInput>,
     mesh_indirect_buffer: Option<wgpu::Buffer>,
     envelope_indirect_buffer: Option<wgpu::Buffer>,
     fallback_indirect_buffer: Option<wgpu::Buffer>,
@@ -1287,6 +1290,8 @@ impl App {
             shadow_sampler: None,
             gpu_input_buffer: None,
             gpu_input_capacity: 0,
+            cpu_prepopulated_instances: Vec::with_capacity(4096),
+            gpu_inputs: Vec::with_capacity(4096),
             mesh_indirect_buffer: None,
             envelope_indirect_buffer: None,
             fallback_indirect_buffer: None,
@@ -6192,8 +6197,11 @@ impl App {
         let cull_time = cull_start.elapsed();
 
         let mut _voxel_expansion_count = 0;
-        let mut cpu_prepopulated_instances: Vec<VoxelInstanceRaw> = Vec::new();
-        let mut gpu_inputs: Vec<GpuInstanceInput> = Vec::new();
+        // Reuse persistent allocation across frames to avoid heap churn
+        self.cpu_prepopulated_instances.clear();
+        self.gpu_inputs.clear();
+        // Reserve visibility-derived capacities for fewer reallocations
+        self.gpu_inputs.reserve(visible.len());
         for (i, v) in visible.iter().enumerate() {
             let key = (v.position[0], v.position[1], v.position[2]);
             let has_mesh = v.is_leaf_chunk && self.mesh_cache.contains_key(&key);
@@ -6269,7 +6277,7 @@ impl App {
                             if let Some(vtype) = chunk.get_type(x, y, z) {
                                 let (emissive_rgb, emissive_intensity) =
                                     self.palette.emissive(vtype as u32);
-                                cpu_prepopulated_instances.push(VoxelInstanceRaw {
+                                self.cpu_prepopulated_instances.push(VoxelInstanceRaw {
                                     position: [
                                         (key.0 + x as i64) as f32,
                                         (key.1 + y as i64) as f32,
@@ -6318,7 +6326,7 @@ impl App {
                         } else {
                             self.palette.emissive(v.voxel_type as u32)
                         };
-                        gpu_inputs.push(GpuInstanceInput {
+                        self.gpu_inputs.push(GpuInstanceInput {
                             position: [
                                 v.position[0] as f32,
                                 v.position[1] as f32,
@@ -6403,7 +6411,7 @@ impl App {
                         [0.0, 0.0, 0.0, 0.0]
                     };
 
-                    cpu_prepopulated_instances.push(VoxelInstanceRaw {
+                    self.cpu_prepopulated_instances.push(VoxelInstanceRaw {
                         position: pos,
                         voxel_type: v.voxel_type as u32,
                         scale: scale,
@@ -6452,7 +6460,7 @@ impl App {
                 flags |= 4;
             }
 
-            gpu_inputs.push(GpuInstanceInput {
+            self.gpu_inputs.push(GpuInstanceInput {
                 position: [
                     v.position[0] as f32,
                     v.position[1] as f32,
@@ -6476,12 +6484,12 @@ impl App {
         }
         // Flatten any outputs (we pushed directly to gpu_inputs where needed)
 
-        let gpu_candidate_count = gpu_inputs.len();
+        let gpu_candidate_count = self.gpu_inputs.len();
 
         if gpu_candidate_count > 0 {
             self.ensure_gpu_input_buffer(&device, gpu_candidate_count);
             if let Some(buffer) = self.gpu_input_buffer.as_ref() {
-                queue.write_buffer(buffer, 0, bytemuck::cast_slice(&gpu_inputs));
+                queue.write_buffer(buffer, 0, bytemuck::cast_slice(&self.gpu_inputs));
                 // Count the number of instance entries uploaded to the GPU input buffer
                 self.gpu_buffer_items_frame = self
                     .gpu_buffer_items_frame
@@ -6663,7 +6671,7 @@ impl App {
             }
 
             // Write any CPU prepopulated fallback instances and ensure the fallback instance buffer is large enough
-            let cpu_prepopulated_count = cpu_prepopulated_instances.len();
+            let cpu_prepopulated_count = self.cpu_prepopulated_instances.len();
             if cpu_prepopulated_count > 0 {
                 // Ensure fallback instance buffer has room for prepopulated + new appended instances
                 self.ensure_gpu_input_buffer(&device, gpu_candidate_count + cpu_prepopulated_count);
@@ -6671,7 +6679,7 @@ impl App {
                     queue.write_buffer(
                         buffer,
                         0,
-                        bytemuck::cast_slice(&cpu_prepopulated_instances),
+                        bytemuck::cast_slice(&self.cpu_prepopulated_instances),
                     );
                     // Count the CPU-prepopulated instances written into the fallback instance buffer
                     self.gpu_buffer_items_frame = self
@@ -7219,7 +7227,7 @@ impl App {
                 &device,
                 &queue,
                 gpu_candidate_count,
-                cpu_prepopulated_instances.len() as u32,
+                self.cpu_prepopulated_instances.len() as u32,
             );
         }
 
@@ -7241,7 +7249,9 @@ impl App {
                 }
             }
         }
-        let instances: Vec<VoxelInstanceRaw> = Vec::new();
+        // `instances` was previously a per-frame temporary; we intentionally
+        // reuse `cpu_prepopulated_instances` instead (already cleared earlier)
+        // so there's no need for a separate `instances` Vec here.
         let instance_time = instance_start.elapsed();
 
         self.active_emitters.clear();
@@ -7268,7 +7278,7 @@ impl App {
                 self.ready_chunk_meshes.len(),
                 self.mesh_jobs_in_flight,
                 self.mesh_upload_limit,
-                instances.len(),
+                self.cpu_prepopulated_instances.len(),
                 total_emitters,
                 self.active_emitters.len()
             );
@@ -7276,7 +7286,7 @@ impl App {
                 "GPU cull: candidates {} -> draw meshes {} -> instanced {}",
                 gpu_candidate_count,
                 draw_mesh_keys.len(),
-                instances.len()
+                self.cpu_prepopulated_instances.len()
             );
         }
 

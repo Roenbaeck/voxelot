@@ -1,25 +1,5 @@
 Based on the analysis of `voxelot.rs`, here are the specific performance bottlenecks and recommended improvements for your Rust code.
 
-### 1. Main Thread Stutter: Fallback Logic
-**The Bottleneck:**
-Inside `render()`, you iterate over visible chunks. If a chunk is close but not yet meshed, you iterate over **individual voxels** on the main thread to populate `cpu_prepopulated_instances`.
-```rust
-// In render()
-if v.is_leaf_chunk && !has_mesh && dist_sq < fallback_dist_sq {
-    if let Some(chunk) = self.world.get_leaf_chunk_at_origin(...) {
-        // CRITICAL: This loop runs on the Main Thread!
-        for ((x, y, z), voxel) in chunk.iter() {
-             cpu_prepopulated_instances.push(...);
-        }
-    }
-}
-```
-If you teleport or move quickly into a dense area, this loop can run for thousands of voxels across multiple chunks, causing a massive CPU spike and frame stutter.
-
-**The Fix:**
-*   **Worker Thread:** Offload the generation of "fallback instances" to your thread pool, just like you do for meshing.
-*   **Time Slicing:** Limit the number of chunks you generate fallbacks for per frame (e.g., max 2 chunks per frame). It is better to have a hole for 1 frame than to drop FPS to 10.
-
 ### 2. Allocation Churn in Render Loop
 **The Bottleneck:**
 You create new `Vec`s every frame inside `render()` for GPU inputs.
