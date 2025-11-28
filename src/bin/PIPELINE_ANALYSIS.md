@@ -1,19 +1,5 @@
 Based on the analysis of `voxelot.rs`, here are the specific performance bottlenecks and recommended improvements for your Rust code.
 
-### 2. Allocation Churn in Render Loop
-**The Bottleneck:**
-You create new `Vec`s every frame inside `render()` for GPU inputs.
-```rust
-// Inside render()
-let mut cpu_prepopulated_instances: Vec<VoxelInstanceRaw> = Vec::new();
-let mut gpu_inputs: Vec<GpuInstanceInput> = Vec::new();
-```
-As the world grows, `gpu_inputs` can contain thousands of items. Reallocating this heap memory every frame puts pressure on the allocator.
-
-**The Fix:**
-*   Promote these vectors to fields in your `App` struct.
-*   Call `.clear()` at the start of the frame. This reuses the underlying capacity and prevents heap thrashing.
-
 ### 3. Excessive `queue.write_buffer` Calls (Mesh Uploads)
 **The Bottleneck:**
 When meshes are ready, you process them in a loop:
@@ -65,3 +51,9 @@ Starting a render pass is expensive (pipeline barriers, load/store ops). Doing t
 2.  **High:** Reuse `gpu_inputs` and `cpu_prepopulated_instances` vectors (don't `Vec::new()` in loop).
 3.  **Medium:** Batch mesh uploads (reduce `queue.write_buffer` count).
 4.  **Medium:** Ensure `multi_draw_indirect` is working; fallback to standard `draw_indirect` loop instead of `draw_indexed` loop if possible.
+
+---
+
+Promote more ephemeral allocators to fields where they appear often:
+neighbors creation for meshing jobs — potentially reuse a HashMap field and .clear() it; this requires careful re-use due to concurrent job send.
+Consider chunk_emitters clone avoidance by using std::mem::replace when inserting the vector into chunk_emitters (swap / take semantics).
