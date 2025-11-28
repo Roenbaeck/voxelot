@@ -834,6 +834,11 @@ struct App {
     mesh_cache_budget_bytes: u64,
     fallback_detail_distance: f32,
 
+    // Reusable buffers for internal processing to avoid per-frame allocations
+    pending_chunk_sort_buf: Vec<(i64, i64, i64)>,
+    tmp_chunk_emitters: Vec<ChunkEmitterWorld>,
+    vb_data_tmp: Vec<MeshVertexRaw>,
+
     last_frame: Instant,
     frame_count: u64,
     frame_index: u64,
@@ -1385,6 +1390,9 @@ impl App {
             last_pending_mesh_sort_frame: 0,
             mesh_cache_budget_bytes: cfg.performance.mesh_cache_budget_mb as u64 * 1024 * 1024,
             fallback_detail_distance: cfg.performance.fallback_detail_distance,
+            pending_chunk_sort_buf: Vec::with_capacity(4096),
+            tmp_chunk_emitters: Vec::with_capacity(64),
+            vb_data_tmp: Vec::with_capacity(8192),
 
             camera_controller: CameraController::new(initial_camera, &cfg.rendering),
             pending_chunk_meshes: VecDeque::new(),
@@ -6917,7 +6925,10 @@ impl App {
             {
                 let sort_start = std::time::Instant::now();
                 let cam_pos = self.camera_controller.camera.position;
-                let mut vec: Vec<_> = self.pending_chunk_meshes.iter().cloned().collect();
+                self.pending_chunk_sort_buf.clear();
+                self.pending_chunk_sort_buf
+                    .extend(self.pending_chunk_meshes.iter().cloned());
+                let mut vec = &mut self.pending_chunk_sort_buf;
                 vec.sort_by(|a, b| {
                     let ca = [a.0 as f32 + 8.0, a.1 as f32 + 8.0, a.2 as f32 + 8.0];
                     let cb = [b.0 as f32 + 8.0, b.1 as f32 + 8.0, b.2 as f32 + 8.0];
@@ -6938,7 +6949,7 @@ impl App {
                     da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
                 });
                 self.pending_chunk_meshes.clear();
-                for k in vec {
+                for &k in vec.iter() {
                     self.pending_chunk_meshes.push_back(k);
                 }
                 self.last_pending_mesh_sort_frame = self.frame_index;
@@ -7084,10 +7095,9 @@ impl App {
                 if mesh.emitters.is_empty() {
                     self.chunk_emitters.remove(&key);
                 } else {
-                    let world_emitters: Vec<ChunkEmitterWorld> = mesh
-                        .emitters
-                        .iter()
-                        .map(|emitter| ChunkEmitterWorld {
+                    self.tmp_chunk_emitters.clear();
+                    self.tmp_chunk_emitters.extend(mesh.emitters.iter().map(|emitter| {
+                        ChunkEmitterWorld {
                             position: [
                                 key.0 as f32 + emitter.position[0],
                                 key.1 as f32 + emitter.position[1],
@@ -7095,12 +7105,12 @@ impl App {
                             ],
                             color: emitter.color,
                             intensity: emitter.intensity,
-                        })
-                        .collect();
-                    if world_emitters.is_empty() {
+                        }
+                    }));
+                    if self.tmp_chunk_emitters.is_empty() {
                         self.chunk_emitters.remove(&key);
                     } else {
-                        self.chunk_emitters.insert(key, world_emitters);
+                        self.chunk_emitters.insert(key, self.tmp_chunk_emitters.clone());
                     }
                 }
             }
@@ -7157,30 +7167,29 @@ impl App {
             }
 
             let vb_build_start = std::time::Instant::now();
-            let vb_data: Vec<MeshVertexRaw> = mesh
-                .vertices
-                .iter()
-                .map(|v| MeshVertexRaw {
-                    position: [
-                        v.position[0] + key.0 as f32,
-                        v.position[1] + key.1 as f32,
-                        v.position[2] + key.2 as f32,
-                    ],
-                    normal: v.normal,
-                    color: v.color,
-                    emissive: v.emissive,
-                })
-                .collect();
+            // Temporarily take ownership of the vb buffer so we don't hold a borrow to `self`
+            let mut vb_local = std::mem::take(&mut self.vb_data_tmp);
+            vb_local.clear();
+            vb_local.extend(mesh.vertices.iter().map(|v| MeshVertexRaw {
+                position: [
+                    v.position[0] + key.0 as f32,
+                    v.position[1] + key.1 as f32,
+                    v.position[2] + key.2 as f32,
+                ],
+                normal: v.normal,
+                color: v.color,
+                emissive: v.emissive,
+            }));
             mesh_build_vb_time += vb_build_start.elapsed();
             let vbuf_start = std::time::Instant::now();
             let (vertex_offset, index_offset) = self
-                .allocate_mesh_in_megabuffer(&device, &queue, &vb_data, &mesh.indices)
+                .allocate_mesh_in_megabuffer(&device, &queue, &vb_local, &mesh.indices)
                 .expect("Failed to allocate in mega-buffers");
             mesh_upload_vbuf_time += vbuf_start.elapsed();
             let ibuf_start = std::time::Instant::now();
             mesh_upload_ibuf_time += ibuf_start.elapsed();
             mesh_upload_ibuf_time += ibuf_start.elapsed();
-            let vertex_bytes = (vb_data.len() * std::mem::size_of::<MeshVertexRaw>()) as u64;
+            let vertex_bytes = (vb_local.len() * std::mem::size_of::<MeshVertexRaw>()) as u64;
             let index_bytes = (mesh.indices.len() * std::mem::size_of::<u32>()) as u64;
             viewer_debug!(
                 "Created mesh for chunk ({},{},{}): {} vertices, {} triangles",
@@ -7192,7 +7201,7 @@ impl App {
             );
             let entry = MeshCacheEntry {
                 vertex_offset,
-                vertex_count: vb_data.len() as u32,
+                vertex_count: vb_local.len() as u32,
                 index_offset,
                 index_count: mesh.indices.len() as u32,
                 vertex_bytes,
@@ -7211,6 +7220,9 @@ impl App {
                 self.mesh_cache_bytes += vertex_bytes + index_bytes;
             }
             mesh_upload_entry_time += entry_start.elapsed();
+
+            // Return vb_local buffer to the reusable field to preserve capacity
+            self.vb_data_tmp = vb_local;
 
             new_meshes_created += 1;
 
