@@ -2073,7 +2073,7 @@ impl App {
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format: config.format,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                         | wgpu::TextureUsages::TEXTURE_BINDING
                         | wgpu::TextureUsages::COPY_SRC,
@@ -2133,7 +2133,7 @@ impl App {
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format: config.format,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                         | wgpu::TextureUsages::TEXTURE_BINDING
                         | wgpu::TextureUsages::COPY_DST,
@@ -2162,7 +2162,7 @@ impl App {
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format: config.format,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                         | wgpu::TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
@@ -2190,7 +2190,7 @@ impl App {
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format: config.format,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                         | wgpu::TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
@@ -2210,7 +2210,7 @@ impl App {
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format: config.format,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                         | wgpu::TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
@@ -2247,7 +2247,7 @@ impl App {
                         mip_level_count: 1,
                         sample_count: 1,
                         dimension: wgpu::TextureDimension::D2,
-                        format: config.format,
+                        format: wgpu::TextureFormat::Rgba16Float,
                         usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                             | wgpu::TextureUsages::TEXTURE_BINDING,
                         view_formats: &[],
@@ -2264,7 +2264,7 @@ impl App {
                         mip_level_count: 1,
                         sample_count: 1,
                         dimension: wgpu::TextureDimension::D2,
-                        format: config.format,
+                        format: wgpu::TextureFormat::Rgba16Float,
                         usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                             | wgpu::TextureUsages::TEXTURE_BINDING,
                         view_formats: &[],
@@ -2291,7 +2291,7 @@ impl App {
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format: config.format,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                         | wgpu::TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
@@ -2308,7 +2308,7 @@ impl App {
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format: config.format,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                         | wgpu::TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
@@ -2348,7 +2348,7 @@ impl App {
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format: config.format,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                     view_formats: &[],
                 });
@@ -3867,7 +3867,7 @@ impl App {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -4013,7 +4013,7 @@ impl App {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -4457,13 +4457,14 @@ impl App {
                     } else {
                         let first_index = (entry.index_offset / 4) as u32; // u32 indices
                         let base_vertex = (entry.vertex_offset / vertex_stride as u64) as i32;
-                        self.multi_mesh_args_tmp.push(wgpu::util::DrawIndexedIndirectArgs {
-                            index_count: entry.index_count as u32,
-                            instance_count: 1,
-                            first_index,
-                            base_vertex,
-                            first_instance: 0,
-                        });
+                        self.multi_mesh_args_tmp
+                            .push(wgpu::util::DrawIndexedIndirectArgs {
+                                index_count: entry.index_count as u32,
+                                instance_count: 1,
+                                first_index,
+                                base_vertex,
+                                first_instance: 0,
+                            });
                         // Mark used so eviction won't yoink buffers used this frame
                         entry.last_used_frame = self.frame_index;
                     }
@@ -4487,13 +4488,14 @@ impl App {
                     } else {
                         let first_index = (entry.index_offset / 4) as u32;
                         let base_vertex = (entry.vertex_offset / vertex_stride as u64) as i32;
-                        self.multi_env_args_tmp.push(wgpu::util::DrawIndexedIndirectArgs {
-                            index_count: entry.index_count as u32,
-                            instance_count: 1,
-                            first_index,
-                            base_vertex,
-                            first_instance: 0,
-                        });
+                        self.multi_env_args_tmp
+                            .push(wgpu::util::DrawIndexedIndirectArgs {
+                                index_count: entry.index_count as u32,
+                                instance_count: 1,
+                                first_index,
+                                base_vertex,
+                                first_instance: 0,
+                            });
                         // Mark used so eviction won't yoink buffers used this frame
                         entry.last_used_frame = self.frame_index;
                     }
@@ -4513,13 +4515,18 @@ impl App {
             if !self.multi_mesh_args_tmp.is_empty() {
                 queue.write_buffer(buffer, 0, bytemuck::cast_slice(&self.multi_mesh_args_tmp));
                 // Count number of mesh indirect entries uploaded
-                self.gpu_buffer_items_frame = self.gpu_buffer_items_frame.saturating_add(self.multi_mesh_args_tmp.len());
+                self.gpu_buffer_items_frame = self
+                    .gpu_buffer_items_frame
+                    .saturating_add(self.multi_mesh_args_tmp.len());
             } else {
                 // zero-length doesn't matter, but clear first 4 bytes
                 let zero: [u8; 4] = [0; 4];
                 queue.write_buffer(buffer, 0, &zero);
             }
-            viewer_debug!("Populated mesh indirects: {} entries", self.multi_mesh_args_tmp.len());
+            viewer_debug!(
+                "Populated mesh indirects: {} entries",
+                self.multi_mesh_args_tmp.len()
+            );
         }
         if let Some(buffer) = &self.envelope_indirect_buffer {
             if self.multi_env_args_tmp.len() as usize > self.max_draw_capacity {
@@ -4533,17 +4540,25 @@ impl App {
             if !self.multi_env_args_tmp.is_empty() {
                 queue.write_buffer(buffer, 0, bytemuck::cast_slice(&self.multi_env_args_tmp));
                 // Count number of envelope indirect entries uploaded
-                self.gpu_buffer_items_frame = self.gpu_buffer_items_frame.saturating_add(self.multi_env_args_tmp.len());
+                self.gpu_buffer_items_frame = self
+                    .gpu_buffer_items_frame
+                    .saturating_add(self.multi_env_args_tmp.len());
             } else {
                 let zero: [u8; 4] = [0; 4];
                 queue.write_buffer(buffer, 0, &zero);
             }
-            viewer_debug!("Populated envelope indirects: {} entries", self.multi_env_args_tmp.len());
+            viewer_debug!(
+                "Populated envelope indirects: {} entries",
+                self.multi_env_args_tmp.len()
+            );
         }
 
         // Write counts into multi_draw_count_buffer; offsets: 0=mesh_count, 4=envelope_count
         if let Some(count_buf) = &self.multi_draw_count_buffer {
-            let counts = [self.multi_mesh_args_tmp.len() as u32, self.multi_env_args_tmp.len() as u32];
+            let counts = [
+                self.multi_mesh_args_tmp.len() as u32,
+                self.multi_env_args_tmp.len() as u32,
+            ];
             queue.write_buffer(count_buf, 0, bytemuck::cast_slice(&counts));
         }
     }
@@ -4738,7 +4753,7 @@ impl App {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -4792,7 +4807,7 @@ impl App {
                 module: &shader,
                 entry_point: Some("fs_mesh"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -5052,7 +5067,7 @@ impl App {
                 module: &dof_combine_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -5138,7 +5153,7 @@ impl App {
                 module: &kawase_down_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -5164,7 +5179,7 @@ impl App {
                 module: &kawase_up_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -5418,7 +5433,7 @@ impl App {
                     module: &bloom_extract_shader,
                     entry_point: Some("fs_main"),
                     targets: &[Some(wgpu::ColorTargetState {
-                        format: config.format,
+                        format: wgpu::TextureFormat::Rgba16Float,
                         blend: Some(wgpu::BlendState::REPLACE),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
@@ -5456,7 +5471,7 @@ impl App {
                 module: &bloom_blur_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -5494,7 +5509,7 @@ impl App {
                 module: &ssao_blur_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -6027,7 +6042,7 @@ impl App {
                 module: &dof_coc_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -6105,7 +6120,7 @@ impl App {
                 module: &ssilvb_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -6560,47 +6575,55 @@ impl App {
                             if cfg!(feature = "viewer-debug") {
                                 viewer_debug!("Validation warning on mesh cache entry (gpu prefill): index_buf_size={}, vertex_buf_size={} entry: index_offset={}, index_bytes={}, vertex_offset={}, vertex_bytes={}", index_buf_size, vertex_buf_size, mesh_entry.index_offset, mesh_entry.index_bytes, mesh_entry.vertex_offset, mesh_entry.vertex_bytes);
                             }
-                            self.mesh_indirect_args_tmp.push(wgpu::util::DrawIndexedIndirectArgs {
+                            self.mesh_indirect_args_tmp
+                                .push(wgpu::util::DrawIndexedIndirectArgs {
+                                    index_count: 0,
+                                    instance_count: 0,
+                                    first_index: 0,
+                                    base_vertex: 0,
+                                    first_instance: 0,
+                                });
+                        } else {
+                            let vertex_stride = std::mem::size_of::<MeshVertexRaw>() as u64;
+                            let first_index = (mesh_entry.index_offset / 4) as u32;
+                            let base_vertex = (mesh_entry.vertex_offset / vertex_stride) as i32;
+                            self.mesh_indirect_args_tmp
+                                .push(wgpu::util::DrawIndexedIndirectArgs {
+                                    index_count: mesh_entry.index_count,
+                                    instance_count: 0, // Shader will set to 1
+                                    first_index: first_index,
+                                    base_vertex: base_vertex,
+                                    first_instance: 0,
+                                });
+                        }
+                    } else {
+                        self.mesh_indirect_args_tmp
+                            .push(wgpu::util::DrawIndexedIndirectArgs {
                                 index_count: 0,
                                 instance_count: 0,
                                 first_index: 0,
                                 base_vertex: 0,
                                 first_instance: 0,
                             });
-                        } else {
-                            let vertex_stride = std::mem::size_of::<MeshVertexRaw>() as u64;
-                            let first_index = (mesh_entry.index_offset / 4) as u32;
-                            let base_vertex = (mesh_entry.vertex_offset / vertex_stride) as i32;
-                            self.mesh_indirect_args_tmp.push(wgpu::util::DrawIndexedIndirectArgs {
-                                index_count: mesh_entry.index_count,
-                                instance_count: 0, // Shader will set to 1
-                                first_index: first_index,
-                                base_vertex: base_vertex,
-                                first_instance: 0,
-                            });
-                        }
-                    } else {
-                        self.mesh_indirect_args_tmp.push(wgpu::util::DrawIndexedIndirectArgs {
+                    }
+                } else {
+                    self.mesh_indirect_args_tmp
+                        .push(wgpu::util::DrawIndexedIndirectArgs {
                             index_count: 0,
                             instance_count: 0,
                             first_index: 0,
                             base_vertex: 0,
                             first_instance: 0,
                         });
-                    }
-                } else {
-                    self.mesh_indirect_args_tmp.push(wgpu::util::DrawIndexedIndirectArgs {
-                        index_count: 0,
-                        instance_count: 0,
-                        first_index: 0,
-                        base_vertex: 0,
-                        first_instance: 0,
-                    });
                 }
             }
 
             if let Some(buffer) = self.mesh_indirect_buffer.as_ref() {
-                queue.write_buffer(buffer, 0, bytemuck::cast_slice(&self.mesh_indirect_args_tmp));
+                queue.write_buffer(
+                    buffer,
+                    0,
+                    bytemuck::cast_slice(&self.mesh_indirect_args_tmp),
+                );
                 // Count the number of indirect draw entries uploaded for meshes
                 self.gpu_buffer_items_frame = self
                     .gpu_buffer_items_frame
@@ -6636,47 +6659,57 @@ impl App {
                             if cfg!(feature = "viewer-debug") {
                                 viewer_debug!("Validation warning on envelope cache entry (gpu prefill): index_buf_size={}, vertex_buf_size={} entry: index_offset={}, index_bytes={}, vertex_offset={}, vertex_bytes={}", index_buf_size, vertex_buf_size, mesh_entry.index_offset, mesh_entry.index_bytes, mesh_entry.vertex_offset, mesh_entry.vertex_bytes);
                             }
-                            self.envelope_indirect_args_tmp.push(wgpu::util::DrawIndexedIndirectArgs {
+                            self.envelope_indirect_args_tmp.push(
+                                wgpu::util::DrawIndexedIndirectArgs {
+                                    index_count: 0,
+                                    instance_count: 0,
+                                    first_index: 0,
+                                    base_vertex: 0,
+                                    first_instance: 0,
+                                },
+                            );
+                        } else {
+                            let vertex_stride = std::mem::size_of::<MeshVertexRaw>() as u64;
+                            let first_index = (mesh_entry.index_offset / 4) as u32;
+                            let base_vertex = (mesh_entry.vertex_offset / vertex_stride) as i32;
+                            self.envelope_indirect_args_tmp.push(
+                                wgpu::util::DrawIndexedIndirectArgs {
+                                    index_count: mesh_entry.index_count,
+                                    instance_count: 0, // Shader will set to 1
+                                    first_index: first_index,
+                                    base_vertex: base_vertex,
+                                    first_instance: 0,
+                                },
+                            );
+                        }
+                    } else {
+                        self.envelope_indirect_args_tmp
+                            .push(wgpu::util::DrawIndexedIndirectArgs {
                                 index_count: 0,
                                 instance_count: 0,
                                 first_index: 0,
                                 base_vertex: 0,
                                 first_instance: 0,
                             });
-                        } else {
-                            let vertex_stride = std::mem::size_of::<MeshVertexRaw>() as u64;
-                            let first_index = (mesh_entry.index_offset / 4) as u32;
-                            let base_vertex = (mesh_entry.vertex_offset / vertex_stride) as i32;
-                            self.envelope_indirect_args_tmp.push(wgpu::util::DrawIndexedIndirectArgs {
-                                index_count: mesh_entry.index_count,
-                                instance_count: 0, // Shader will set to 1
-                                first_index: first_index,
-                                base_vertex: base_vertex,
-                                first_instance: 0,
-                            });
-                        }
-                    } else {
-                        self.envelope_indirect_args_tmp.push(wgpu::util::DrawIndexedIndirectArgs {
+                    }
+                } else {
+                    self.envelope_indirect_args_tmp
+                        .push(wgpu::util::DrawIndexedIndirectArgs {
                             index_count: 0,
                             instance_count: 0,
                             first_index: 0,
                             base_vertex: 0,
                             first_instance: 0,
                         });
-                    }
-                } else {
-                    self.envelope_indirect_args_tmp.push(wgpu::util::DrawIndexedIndirectArgs {
-                        index_count: 0,
-                        instance_count: 0,
-                        first_index: 0,
-                        base_vertex: 0,
-                        first_instance: 0,
-                    });
                 }
             }
 
             if let Some(buffer) = self.envelope_indirect_buffer.as_ref() {
-                queue.write_buffer(buffer, 0, bytemuck::cast_slice(&self.envelope_indirect_args_tmp));
+                queue.write_buffer(
+                    buffer,
+                    0,
+                    bytemuck::cast_slice(&self.envelope_indirect_args_tmp),
+                );
                 // Count the number of indirect draw entries uploaded for envelopes
                 self.gpu_buffer_items_frame = self
                     .gpu_buffer_items_frame
@@ -7096,8 +7129,8 @@ impl App {
                     self.chunk_emitters.remove(&key);
                 } else {
                     self.tmp_chunk_emitters.clear();
-                    self.tmp_chunk_emitters.extend(mesh.emitters.iter().map(|emitter| {
-                        ChunkEmitterWorld {
+                    self.tmp_chunk_emitters
+                        .extend(mesh.emitters.iter().map(|emitter| ChunkEmitterWorld {
                             position: [
                                 key.0 as f32 + emitter.position[0],
                                 key.1 as f32 + emitter.position[1],
@@ -7105,12 +7138,12 @@ impl App {
                             ],
                             color: emitter.color,
                             intensity: emitter.intensity,
-                        }
-                    }));
+                        }));
                     if self.tmp_chunk_emitters.is_empty() {
                         self.chunk_emitters.remove(&key);
                     } else {
-                        self.chunk_emitters.insert(key, self.tmp_chunk_emitters.clone());
+                        self.chunk_emitters
+                            .insert(key, self.tmp_chunk_emitters.clone());
                     }
                 }
             }
