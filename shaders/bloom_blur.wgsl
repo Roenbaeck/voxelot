@@ -33,22 +33,25 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 
 @fragment
 fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    let offsets = array<f32, 3>(0.0, 1.38461538, 3.23076923);
-    let weights = array<f32, 3>(0.227027, 0.3162162, 0.070270);
+    // 9-tap Gaussian blur for smoother gradients
+    // Offsets and weights calculated for sigma=2.0
+    let offsets = array<f32, 5>(0.0, 1.0, 2.0, 3.0, 4.0);
+    let weights = array<f32, 5>(
+        0.227027,   // Center
+        0.1945946,  // ±1
+        0.1216216,  // ±2
+        0.0540541,  // ±3
+        0.0162162   // ±4
+    );
 
     var color = textureSample(bloom_texture, post_sampler, uv).rgb * weights[0];
 
-    let offset1 = blur.direction * blur.texel_size * (offsets[1] * blur.radius);
-    color = color
-        + (textureSample(bloom_texture, post_sampler, uv + offset1).rgb
-            + textureSample(bloom_texture, post_sampler, uv - offset1).rgb)
-        * weights[1];
-
-    let offset2 = blur.direction * blur.texel_size * (offsets[2] * blur.radius);
-    color = color
-        + (textureSample(bloom_texture, post_sampler, uv + offset2).rgb
-            + textureSample(bloom_texture, post_sampler, uv - offset2).rgb)
-        * weights[2];
+    for (var i = 1; i < 5; i++) {
+        let offset = blur.direction * blur.texel_size * (offsets[i] * blur.radius);
+        color += textureSample(bloom_texture, post_sampler, uv + offset).rgb * weights[i];
+        color += textureSample(bloom_texture, post_sampler, uv - offset).rgb * weights[i];
+    }
 
     return vec4<f32>(color, 1.0);
 }
+
