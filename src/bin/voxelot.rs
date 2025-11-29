@@ -286,6 +286,9 @@ struct BloomSettings {
     saturation_boost: f32,
     exposure: f32,
     blur_radius: f32,
+    kawase_enabled: bool,
+    kawase_iterations: usize,
+    kawase_offset: f32,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -914,6 +917,9 @@ struct App {
     bloom_extract_bind_group: Option<wgpu::BindGroup>,
     bloom_blur_horizontal_bind_group: Option<wgpu::BindGroup>,
     bloom_blur_vertical_bind_group: Option<wgpu::BindGroup>,
+    // Bloom Kawase: optional per-iteration uniform buffers and bind groups
+    bloom_kawase_uniform_buffers: Vec<Option<wgpu::Buffer>>,
+    bloom_kawase_bind_groups: Vec<Option<wgpu::BindGroup>>,
     composite_bind_group: Option<wgpu::BindGroup>,
     ssao_ping_texture: Option<wgpu::Texture>,
     ssao_ping_view: Option<wgpu::TextureView>,
@@ -1205,8 +1211,7 @@ impl App {
 
         let available_workers = std::thread::available_parallelism()
             .map(|n| n.get().saturating_sub(2))
-            .unwrap_or(1)
-            .max(1);
+            .unwrap_or(1);
         let mesh_worker_count = cfg
             .performance
             .mesh_worker_count
@@ -1455,6 +1460,8 @@ impl App {
             bloom_extract_uniform_buffer: None,
             bloom_blur_horizontal_uniform_buffer: None,
             bloom_blur_vertical_uniform_buffer: None,
+            bloom_kawase_uniform_buffers: Vec::new(),
+            bloom_kawase_bind_groups: Vec::new(),
             ssao_blur_horizontal_uniform_buffer: None,
             ssao_blur_vertical_uniform_buffer: None,
             ssao_blur_horizontal_bind_group: None,
@@ -1521,6 +1528,9 @@ impl App {
                 saturation_boost: cfg.effects.bloom.saturation_boost,
                 exposure: cfg.effects.bloom.exposure,
                 blur_radius: cfg.effects.bloom.blur_radius,
+                kawase_enabled: cfg.effects.bloom.kawase_enabled,
+                kawase_iterations: cfg.effects.bloom.kawase_iterations,
+                kawase_offset: cfg.effects.bloom.kawase_offset,
             },
             bloom_enabled: cfg.effects.bloom.enabled,
             ssao_settings: SsaoSettings {
@@ -1646,6 +1656,9 @@ impl App {
             full_cfg.effects.bloom.saturation_boost = self.bloom_settings.saturation_boost;
             full_cfg.effects.bloom.exposure = self.bloom_settings.exposure;
             full_cfg.effects.bloom.blur_radius = self.bloom_settings.blur_radius;
+            full_cfg.effects.bloom.kawase_enabled = self.bloom_settings.kawase_enabled;
+            full_cfg.effects.bloom.kawase_iterations = self.bloom_settings.kawase_iterations;
+            full_cfg.effects.bloom.kawase_offset = self.bloom_settings.kawase_offset;
 
             // Shadow settings
             full_cfg.shadows.map_size = self.shadow_map_size;
@@ -2204,7 +2217,9 @@ impl App {
                     dimension: wgpu::TextureDimension::D2,
                     format: wgpu::TextureFormat::Rgba16Float,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                        | wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_SRC
+                        | wgpu::TextureUsages::COPY_DST,
                     view_formats: &[],
                 });
                 let uniform_bytes = std::mem::size_of::<Uniforms>() as u64;
@@ -2224,7 +2239,9 @@ impl App {
                     dimension: wgpu::TextureDimension::D2,
                     format: wgpu::TextureFormat::Rgba16Float,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                        | wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_SRC
+                        | wgpu::TextureUsages::COPY_DST,
                     view_formats: &[],
                 });
                 let bloom_pong_view_loc =
@@ -2966,6 +2983,22 @@ impl App {
             queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[data]));
         }
 
+        // Bloom Kawase UBO updates
+        if self.bloom_settings.kawase_enabled {
+            let bloom_w = (self.render_target_width / 2).max(1);
+            let bloom_h = (self.render_target_height / 2).max(1);
+            let texel_x = 1.0 / bloom_w as f32;
+            let texel_y = 1.0 / bloom_h as f32;
+            let iterations = self.bloom_settings.kawase_iterations.min(6).max(1);
+            for level in 0..iterations {
+                if let Some(buffer) = self.bloom_kawase_uniform_buffers.get(level).and_then(|b| b.as_ref()) {
+                    let offset = self.bloom_settings.kawase_offset * (level as f32 + 1.0) * self.bloom_settings.blur_radius;
+                    let data = [texel_x, texel_y, offset, 0.0_f32];
+                    queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[data]));
+                }
+            }
+        }
+
         if let Some(buffer) = self.ssao_blur_horizontal_uniform_buffer.as_ref() {
             let ssao_width = (self.render_target_width / 2).max(1);
             let ssao_height = (self.render_target_height / 2).max(1);
@@ -3144,6 +3177,51 @@ impl App {
                         },
                     ],
                 }));
+
+            // If bloom kawase is enabled, create per-iteration UBOs and bind groups for Kawase blur
+            if self.bloom_settings.kawase_enabled {
+                // Clear and allocate new arrays
+                self.bloom_kawase_uniform_buffers.clear();
+                self.bloom_kawase_bind_groups.clear();
+                let iterations = self.bloom_settings.kawase_iterations.min(6).max(1);
+                // bloom ping/pong extents
+                let bloom_w = (self.render_target_width / 2).max(1);
+                let bloom_h = (self.render_target_height / 2).max(1);
+                let texel_x = 1.0 / bloom_w as f32;
+                let texel_y = 1.0 / bloom_h as f32;
+                for level in 0..iterations {
+                    let offset = self.bloom_settings.kawase_offset * (level as f32 + 1.0) * self.bloom_settings.blur_radius;
+                    let ubo_data = [texel_x, texel_y, offset, 0.0_f32];
+                    let ubo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some(&format!("Bloom Kawase Uniform L{}", level)),
+                        contents: bytemuck::cast_slice(&ubo_data),
+                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    });
+                    let kawase_ubo_bytes = std::mem::size_of::<[f32; 4]>() as u64;
+                    App::replace_buffer_bytes_static(&mut self.uniform_buffer_bytes, kawase_ubo_bytes, &mut self.gpu_buffer_bytes);
+                    self.bloom_kawase_uniform_buffers.push(Some(ubo));
+
+                    // pick input view depending on iteration parity: even -> ping, odd -> pong
+                    let input_view = if level % 2 == 0 { bloom_ping_view } else { bloom_pong_view };
+                    let Some(kawa_layout) = self.kawase_bind_group_layout.as_ref() else { continue; };
+                    let Some(sampler) = self.post_sampler.as_ref() else { continue; };
+                    let ubo_ref = self.bloom_kawase_uniform_buffers[level].as_ref().unwrap();
+                    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(&format!("Bloom Kawase BG L{}", level)),
+                        layout: kawa_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: ubo_ref.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(input_view) },
+                            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
+                        ],
+                    });
+                    self.bloom_kawase_bind_groups.push(Some(bg));
+                }
+            } else {
+                // If disabled, keep arrays empty so we fall back to default horizontal/vertical blur.
+                self.bloom_kawase_uniform_buffers.clear();
+                self.bloom_kawase_bind_groups.clear();
+            }
 
             // SSAO blur vertical bind group (reads from SSAO Pong after horizontal)
             if self.ssao_settings.blur_enabled {
@@ -8336,6 +8414,7 @@ impl App {
             || self.bloom_extract_bind_group.is_none()
             || self.bloom_blur_horizontal_bind_group.is_none()
             || self.bloom_blur_vertical_bind_group.is_none()
+            || (self.bloom_settings.kawase_enabled && self.bloom_kawase_bind_groups.is_empty())
         {
             self.update_bloom_bind_groups();
         }
@@ -8682,54 +8761,142 @@ impl App {
                 extract_pass.draw(0..3, 0..1);
             }
 
-            if let (Some(bloom_blur_pipeline), Some(horizontal_bind_group), Some(bloom_pong_view)) = (
-                self.bloom_blur_pipeline.as_ref(),
-                self.bloom_blur_horizontal_bind_group.as_ref(),
-                self.bloom_pong_view.as_ref(),
-            ) {
-                let mut blur_pass_h = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("Bloom Blur Horizontal Pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: bloom_pong_view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                });
-                blur_pass_h.set_pipeline(bloom_blur_pipeline);
-                blur_pass_h.set_bind_group(0, horizontal_bind_group, &[]);
-                blur_pass_h.draw(0..3, 0..1);
-            }
+            if self.bloom_settings.kawase_enabled {
+                // Apply dual-Kawase style iterative passes on the half-resolution bloom buffers
+                if let (Some(kawase_down_pipeline), Some(kawase_layout), Some(sampler)) = (
+                    self.kawase_down_pipeline.as_ref(),
+                    self.kawase_bind_group_layout.as_ref(),
+                    self.post_sampler.as_ref(),
+                ) {
+                    // We will alternate ping/pong views as destinations
+                    let bloom_ping_view = self.bloom_ping_view.as_ref();
+                    let bloom_pong_view = self.bloom_pong_view.as_ref();
+                    if bloom_ping_view.is_none() || bloom_pong_view.is_none() {
+                        // Can't run Kawase without both ping/pong
+                    } else {
+                        let bloom_ping_view = bloom_ping_view.unwrap();
+                        let bloom_pong_view = bloom_pong_view.unwrap();
+                        let iterations = self.bloom_settings.kawase_iterations.min(6).max(1);
+                        for level in 0..iterations {
+                            // choose input and dest views depending on iteration parity
+                            let (src_view, dst_view) = if level % 2 == 0 {
+                                (bloom_ping_view, bloom_pong_view)
+                            } else {
+                                (bloom_pong_view, bloom_ping_view)
+                            };
+                            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some(&format!("Bloom Kawase Pass L{}", level)),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: dst_view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                    depth_slice: None,
+                                })],
+                                depth_stencil_attachment: None,
+                                timestamp_writes: None,
+                                occlusion_query_set: None,
+                            });
+                            pass.set_pipeline(kawase_down_pipeline);
+                            // Use per-iteration bind group if available, else create temporary one
+                            if let Some(bg) = self.bloom_kawase_bind_groups.get(level).and_then(|b| b.as_ref()) {
+                                // We need the bind group to reference the correct input texture, but the stored bind groups were created
+                                // to match parity (even -> ping, odd -> pong) — they should match our source view.
+                                pass.set_bind_group(0, bg, &[]);
+                            } else {
+                                // Create a temporary bind group on the fly if missing (fallback)
+                                if let Some(ubo) = self.bloom_kawase_uniform_buffers.get(level).and_then(|b| b.as_ref()) {
+                                    let bg_temp = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                        label: Some(&format!("Bloom Kawase Temp BG L{}", level)),
+                                        layout: kawase_layout,
+                                        entries: &[
+                                            wgpu::BindGroupEntry { binding: 0, resource: ubo.as_entire_binding() },
+                                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(src_view) },
+                                            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
+                                        ],
+                                    });
+                                    pass.set_bind_group(0, &bg_temp, &[]);
+                                }
+                            }
+                            pass.draw(0..3, 0..1);
+                        }
+                        // Ensure final result is in bloom_ping_view (composite expects ping view)
+                        if iterations % 2 == 1 {
+                            // Copy pong to ping to make final output in ping view
+                            encoder.copy_texture_to_texture(
+                                wgpu::TexelCopyTextureInfo {
+                                    texture: self.bloom_pong_texture.as_ref().unwrap(),
+                                    mip_level: 0,
+                                    origin: wgpu::Origin3d::ZERO,
+                                    aspect: wgpu::TextureAspect::All,
+                                },
+                                wgpu::TexelCopyTextureInfo {
+                                    texture: self.bloom_ping_texture.as_ref().unwrap(),
+                                    mip_level: 0,
+                                    origin: wgpu::Origin3d::ZERO,
+                                    aspect: wgpu::TextureAspect::All,
+                                },
+                                wgpu::Extent3d {
+                                    width: (self.render_target_width / 2).max(1),
+                                    height: (self.render_target_height / 2).max(1),
+                                    depth_or_array_layers: 1,
+                                },
+                            );
+                        }
+                    }
+                }
+            } else {
+                if let (Some(bloom_blur_pipeline), Some(horizontal_bind_group), Some(bloom_pong_view)) = (
+                    self.bloom_blur_pipeline.as_ref(),
+                    self.bloom_blur_horizontal_bind_group.as_ref(),
+                    self.bloom_pong_view.as_ref(),
+                ) {
+                    let mut blur_pass_h = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("Bloom Blur Horizontal Pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: bloom_pong_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    blur_pass_h.set_pipeline(bloom_blur_pipeline);
+                    blur_pass_h.set_bind_group(0, horizontal_bind_group, &[]);
+                    blur_pass_h.draw(0..3, 0..1);
+                }
 
-            if let (Some(bloom_blur_pipeline), Some(vertical_bind_group), Some(bloom_ping_view)) = (
-                self.bloom_blur_pipeline.as_ref(),
-                self.bloom_blur_vertical_bind_group.as_ref(),
-                self.bloom_ping_view.as_ref(),
-            ) {
-                let mut blur_pass_v = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("Bloom Blur Vertical Pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: bloom_ping_view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                });
-                blur_pass_v.set_pipeline(bloom_blur_pipeline);
-                blur_pass_v.set_bind_group(0, vertical_bind_group, &[]);
-                blur_pass_v.draw(0..3, 0..1);
+                if let (Some(bloom_blur_pipeline), Some(vertical_bind_group), Some(bloom_ping_view)) = (
+                    self.bloom_blur_pipeline.as_ref(),
+                    self.bloom_blur_vertical_bind_group.as_ref(),
+                    self.bloom_ping_view.as_ref(),
+                ) {
+                    let mut blur_pass_v = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("Bloom Blur Vertical Pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: bloom_ping_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    blur_pass_v.set_pipeline(bloom_blur_pipeline);
+                    blur_pass_v.set_bind_group(0, vertical_bind_group, &[]);
+                    blur_pass_v.draw(0..3, 0..1);
+                }
             }
         }
 
@@ -8938,6 +9105,27 @@ impl App {
                                 if r.changed() {
                                     need_recreate_offscreen = true;
                                 }
+                                // Bloom Kawase toggle and parameters
+                                ui.horizontal(|ui| {
+                                    if ui.checkbox(&mut self.bloom_settings.kawase_enabled, "Kawase Bloom").changed() {
+                                        // When toggled, force bind groups and UBOs to update next frame
+                                        self.bloom_kawase_bind_groups.clear();
+                                        self.bloom_kawase_uniform_buffers.clear();
+                                        println!("Bloom Kawase toggled: {}", self.bloom_settings.kawase_enabled);
+                                    }
+                                    if self.bloom_settings.kawase_enabled {
+                                        let mut iters = self.bloom_settings.kawase_iterations as i32;
+                                        if ui.add(egui::Slider::new(&mut iters, 1..=6).text("Kawase Iterations")).changed() {
+                                            self.bloom_settings.kawase_iterations = iters as usize;
+                                            self.bloom_kawase_bind_groups.clear();
+                                            self.bloom_kawase_uniform_buffers.clear();
+                                        }
+                                        let mut offset = self.bloom_settings.kawase_offset;
+                                        if ui.add(egui::Slider::new(&mut offset, 0.1..=4.0).text("Kawase Offset")).changed() {
+                                            self.bloom_settings.kawase_offset = offset;
+                                        }
+                                    }
+                                });
                                 ui.label(
                                     egui::RichText::new(format!(
                                         "Group: {:.2}ms",

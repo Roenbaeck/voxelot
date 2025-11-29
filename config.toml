@@ -21,7 +21,7 @@ window_height = 720
 
 [atmosphere]
 fog_density = 0.00044999996
-time_of_day = 0.4801001
+time_of_day = 0.77098554
 night_skybox_brightness = 0.02
 horizon_fade_up = 0.05
 horizon_fade_down = 0.25
@@ -53,6 +53,9 @@ bloom_strength = 1.6
 saturation_boost = 1.5
 exposure = 1.18
 blur_radius = 3.8
+kawase_enabled = true
+kawase_iterations = 4
+kawase_offset = 0.5
 
 [effects.ssao]
 enabled = true

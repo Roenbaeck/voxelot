@@ -154,6 +154,12 @@ pub struct BloomConfig {
     pub exposure: f32,
     #[serde(default = "default_bloom_blur_radius")]
     pub blur_radius: f32,
+    #[serde(default = "default_bloom_kawase_enabled")]
+    pub kawase_enabled: bool,
+    #[serde(default = "default_bloom_kawase_iterations")]
+    pub kawase_iterations: usize,
+    #[serde(default = "default_bloom_kawase_offset")]
+    pub kawase_offset: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -353,6 +359,18 @@ fn default_bloom_blur_radius() -> f32 {
     3.8
 }
 
+fn default_bloom_kawase_enabled() -> bool {
+    false
+}
+
+fn default_bloom_kawase_iterations() -> usize {
+    3
+}
+
+fn default_bloom_kawase_offset() -> f32 {
+    1.0
+}
+
 fn default_ssao_enabled() -> bool {
     false
 }
@@ -537,6 +555,9 @@ impl Default for BloomConfig {
             saturation_boost: default_bloom_saturation(),
             exposure: default_bloom_exposure(),
             blur_radius: default_bloom_blur_radius(),
+            kawase_enabled: default_bloom_kawase_enabled(),
+            kawase_iterations: default_bloom_kawase_iterations(),
+            kawase_offset: default_bloom_kawase_offset(),
         }
     }
 }
