@@ -1050,6 +1050,9 @@ struct App {
     hzb_params_buffer_bytes: u64,
     cube_vertex_buffer_bytes: u64,
     light_probe_buffer_bytes: u64,
+    emissive_texture: Option<wgpu::Texture>,
+    emissive_view: Option<wgpu::TextureView>,
+    emissive_texture_bytes: u64,
 }
 
 impl App {
@@ -1225,9 +1228,19 @@ impl App {
                 .name(format!("mesh-worker-{}", worker_index))
                 .spawn(move || {
                     while let Ok(job) = job_rx.recv() {
-                        let MeshJob { key, chunk, neighbors, envelope } = job;
+                        let MeshJob {
+                            key,
+                            chunk,
+                            neighbors,
+                            envelope,
+                        } = job;
                         // Generate chunk mesh using the optimized mesher
-                        let mesh = voxelot::generate_chunk_mesh_optimized(&chunk, &palette, Some(&neighbors), envelope);
+                        let mesh = voxelot::generate_chunk_mesh_optimized(
+                            &chunk,
+                            &palette,
+                            Some(&neighbors),
+                            envelope,
+                        );
                         if result_tx
                             .send(MeshResult {
                                 key,
@@ -1421,6 +1434,9 @@ impl App {
             light_probe_capacity: 0,
             lod_distance: cfg.rendering.chunk_lod_distance,
             water_level: cfg.world.water_level,
+            emissive_texture: None,
+            emissive_view: None,
+            emissive_texture_bytes: 0,
             dof_coc_pipeline: None,
             dof_bind_group_layout: None,
             dof_bind_group: None,
@@ -2055,6 +2071,9 @@ impl App {
             ssr_texture_view_loc,
             scene_copy_texture_loc,
             scene_copy_view_loc,
+            emissive_texture_loc,
+            emissive_view_loc,
+            emissive_bytes,
         ) =
             {
                 let (Some(device), Some(config)) = (self.device.as_ref(), self.config.as_ref())
@@ -2360,6 +2379,32 @@ impl App {
                 let scene_copy_view_loc =
                     scene_copy_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
 
+                // Emissive texture (G-Buffer attachment 1)
+                let emissive_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("Emissive Texture"),
+                    size: wgpu::Extent3d {
+                        width: target_width,
+                        height: target_height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                });
+                let emissive_view_loc =
+                    emissive_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
+                let emissive_bytes = App::compute_texture_bytes(
+                    wgpu::TextureFormat::Rgba16Float,
+                    target_width,
+                    target_height,
+                    1,
+                    1,
+                );
+
                 // Collect locals for assignment outside the scope
                 (
                     color_texture_loc,
@@ -2396,6 +2441,9 @@ impl App {
                     ssr_texture_view_loc,
                     scene_copy_texture_loc,
                     scene_copy_view_loc,
+                    emissive_texture_loc,
+                    emissive_view_loc,
+                    emissive_bytes,
                 )
             };
 
@@ -2411,6 +2459,13 @@ impl App {
         self.ssr_texture_view = Some(ssr_texture_view_loc);
         self.scene_copy_texture = Some(scene_copy_texture_loc);
         self.scene_copy_view = Some(scene_copy_view_loc);
+        self.emissive_texture = Some(emissive_texture_loc);
+        self.emissive_view = Some(emissive_view_loc);
+        App::replace_texture_bytes_static(
+            &mut self.emissive_texture_bytes,
+            emissive_bytes,
+            &mut self.gpu_texture_bytes,
+        );
         // Assign and track other created textures
         App::replace_texture_bytes_static(
             &mut self.depth_texture_bytes,
@@ -2958,8 +3013,14 @@ impl App {
             let texel_y = 1.0 / bloom_h as f32;
             let iterations = self.bloom_settings.kawase_iterations.min(6).max(1);
             for level in 0..iterations {
-                if let Some(buffer) = self.bloom_kawase_uniform_buffers.get(level).and_then(|b| b.as_ref()) {
-                    let offset = self.bloom_settings.kawase_offset * (level as f32 + 1.0) * self.bloom_settings.blur_radius;
+                if let Some(buffer) = self
+                    .bloom_kawase_uniform_buffers
+                    .get(level)
+                    .and_then(|b| b.as_ref())
+                {
+                    let offset = self.bloom_settings.kawase_offset
+                        * (level as f32 + 1.0)
+                        * self.bloom_settings.blur_radius;
                     let data = [texel_x, texel_y, offset, 0.0_f32];
                     queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[data]));
                 }
@@ -2987,7 +3048,8 @@ impl App {
 
         // SSILVB uniforms
         if let Some(buffer) = self.ssilvb_uniform_buffer.as_ref() {
-            let data = self.build_ssilvb_uniforms(self.render_target_width, self.render_target_height);
+            let data =
+                self.build_ssilvb_uniforms(self.render_target_width, self.render_target_height);
             queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[data]));
         }
     }
@@ -3101,6 +3163,12 @@ impl App {
                                 binding: 2,
                                 resource: wgpu::BindingResource::Sampler(psampler),
                             },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: wgpu::BindingResource::TextureView(
+                                    self.emissive_view.as_ref().unwrap(),
+                                ),
+                            },
                         ],
                     }));
             }
@@ -3119,7 +3187,9 @@ impl App {
                 let texel_x = 1.0 / bloom_w as f32;
                 let texel_y = 1.0 / bloom_h as f32;
                 for level in 0..iterations {
-                    let offset = self.bloom_settings.kawase_offset * (level as f32 + 1.0) * self.bloom_settings.blur_radius;
+                    let offset = self.bloom_settings.kawase_offset
+                        * (level as f32 + 1.0)
+                        * self.bloom_settings.blur_radius;
                     let ubo_data = [texel_x, texel_y, offset, 0.0_f32];
                     let ubo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some(&format!("Bloom Kawase Uniform L{}", level)),
@@ -3127,21 +3197,42 @@ impl App {
                         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                     });
                     let kawase_ubo_bytes = std::mem::size_of::<[f32; 4]>() as u64;
-                    App::replace_buffer_bytes_static(&mut self.uniform_buffer_bytes, kawase_ubo_bytes, &mut self.gpu_buffer_bytes);
+                    App::replace_buffer_bytes_static(
+                        &mut self.uniform_buffer_bytes,
+                        kawase_ubo_bytes,
+                        &mut self.gpu_buffer_bytes,
+                    );
                     self.bloom_kawase_uniform_buffers.push(Some(ubo));
 
                     // pick input view depending on iteration parity: even -> ping, odd -> pong
-                    let input_view = if level % 2 == 0 { bloom_ping_view } else { bloom_pong_view };
-                    let Some(kawa_layout) = self.kawase_bind_group_layout.as_ref() else { continue; };
-                    let Some(sampler) = self.post_sampler.as_ref() else { continue; };
+                    let input_view = if level % 2 == 0 {
+                        bloom_ping_view
+                    } else {
+                        bloom_pong_view
+                    };
+                    let Some(kawa_layout) = self.kawase_bind_group_layout.as_ref() else {
+                        continue;
+                    };
+                    let Some(sampler) = self.post_sampler.as_ref() else {
+                        continue;
+                    };
                     let ubo_ref = self.bloom_kawase_uniform_buffers[level].as_ref().unwrap();
                     let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some(&format!("Bloom Kawase BG L{}", level)),
                         layout: kawa_layout,
                         entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: ubo_ref.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(input_view) },
-                            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: ubo_ref.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(input_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::Sampler(sampler),
+                            },
                         ],
                     });
                     self.bloom_kawase_bind_groups.push(Some(bg));
@@ -3886,11 +3977,18 @@ impl App {
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba16Float,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                targets: &[
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                ],
                 compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState {
@@ -4734,13 +4832,13 @@ impl App {
             });
 
         // Create pipeline layouts
-            // Compute and cache logical render target dims using logical window size * render_scale
-            let logical_width = ((size.width as f32) / scale).round() as u32;
-            let logical_height = ((size.height as f32) / scale).round() as u32;
-            let render_target_width = ((logical_width as f32) * render_scale).round() as u32;
-            let render_target_height = ((logical_height as f32) * render_scale).round() as u32;
-            self.render_target_width = render_target_width.max(1);
-            self.render_target_height = render_target_height.max(1);
+        // Compute and cache logical render target dims using logical window size * render_scale
+        let logical_width = ((size.width as f32) / scale).round() as u32;
+        let logical_height = ((size.height as f32) / scale).round() as u32;
+        let render_target_width = ((logical_width as f32) * render_scale).round() as u32;
+        let render_target_height = ((logical_height as f32) * render_scale).round() as u32;
+        self.render_target_width = render_target_width.max(1);
+        self.render_target_height = render_target_height.max(1);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
             bind_group_layouts: &[&main_bind_group_layout],
@@ -4788,11 +4886,18 @@ impl App {
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba16Float,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                targets: &[
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                ],
                 compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState {
@@ -4842,11 +4947,18 @@ impl App {
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fs_mesh"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba16Float,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                targets: &[
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                ],
                 compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState {
@@ -5255,7 +5367,6 @@ impl App {
             source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/ssilvb.wgsl").into()),
         });
 
-
         let ssao_blur_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("SSAO Blur Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/ssao_blur.wgsl").into()),
@@ -5329,6 +5440,16 @@ impl App {
                         binding: 2,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
                         count: None,
                     },
                 ],
@@ -5490,7 +5611,6 @@ impl App {
                 cache: None,
             });
 
-
         let ssao_blur_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("SSAO Blur Pipeline"),
             layout: Some(&bloom_blur_pipeline_layout),
@@ -5555,8 +5675,10 @@ impl App {
             cache: None,
         });
 
-        let bloom_extract_uniforms =
-            self.build_bloom_extract_uniforms(self.render_target_width.max(1), self.render_target_height.max(1));
+        let bloom_extract_uniforms = self.build_bloom_extract_uniforms(
+            self.render_target_width.max(1),
+            self.render_target_height.max(1),
+        );
         let bloom_extract_uniform_buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Bloom Extract Uniform Buffer"),
@@ -6060,7 +6182,8 @@ impl App {
         // Don't create SSAO blur bind groups until ping/pong views exist; update later in update_bloom_bind_groups()
         self.composite_uniform_buffer = Some(composite_uniform_buffer);
         // SSILVB uniforms
-        let ssilvb_uniforms = self.build_ssilvb_uniforms(self.render_target_width, self.render_target_height);
+        let ssilvb_uniforms =
+            self.build_ssilvb_uniforms(self.render_target_width, self.render_target_height);
         let ssilvb_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("SSILVB Uniform Buffer"),
             contents: bytemuck::cast_slice(&[ssilvb_uniforms]),
@@ -8055,20 +8178,31 @@ impl App {
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Scene Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: offscreen_color_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.2,
-                            b: 0.3,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
+                color_attachments: &[
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: offscreen_color_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.1,
+                                g: 0.2,
+                                b: 0.3,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: self.emissive_view.as_ref().unwrap(),
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    }),
+                ],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: offscreen_depth_view,
                     depth_ops: Some(wgpu::Operations {
@@ -8671,22 +8805,47 @@ impl App {
                             });
                             pass.set_pipeline(kawase_down_pipeline);
                             // Use per-iteration bind group if available, else create temporary one
-                            if let Some(bg) = self.bloom_kawase_bind_groups.get(level).and_then(|b| b.as_ref()) {
+                            if let Some(bg) = self
+                                .bloom_kawase_bind_groups
+                                .get(level)
+                                .and_then(|b| b.as_ref())
+                            {
                                 // We need the bind group to reference the correct input texture, but the stored bind groups were created
                                 // to match parity (even -> ping, odd -> pong) — they should match our source view.
                                 pass.set_bind_group(0, bg, &[]);
                             } else {
                                 // Create a temporary bind group on the fly if missing (fallback)
-                                if let Some(ubo) = self.bloom_kawase_uniform_buffers.get(level).and_then(|b| b.as_ref()) {
-                                    let bg_temp = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                                        label: Some(&format!("Bloom Kawase Temp BG L{}", level)),
-                                        layout: kawase_layout,
-                                        entries: &[
-                                            wgpu::BindGroupEntry { binding: 0, resource: ubo.as_entire_binding() },
-                                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(src_view) },
-                                            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
-                                        ],
-                                    });
+                                if let Some(ubo) = self
+                                    .bloom_kawase_uniform_buffers
+                                    .get(level)
+                                    .and_then(|b| b.as_ref())
+                                {
+                                    let bg_temp =
+                                        device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                            label: Some(&format!(
+                                                "Bloom Kawase Temp BG L{}",
+                                                level
+                                            )),
+                                            layout: kawase_layout,
+                                            entries: &[
+                                                wgpu::BindGroupEntry {
+                                                    binding: 0,
+                                                    resource: ubo.as_entire_binding(),
+                                                },
+                                                wgpu::BindGroupEntry {
+                                                    binding: 1,
+                                                    resource: wgpu::BindingResource::TextureView(
+                                                        src_view,
+                                                    ),
+                                                },
+                                                wgpu::BindGroupEntry {
+                                                    binding: 2,
+                                                    resource: wgpu::BindingResource::Sampler(
+                                                        sampler,
+                                                    ),
+                                                },
+                                            ],
+                                        });
                                     pass.set_bind_group(0, &bg_temp, &[]);
                                 }
                             }
@@ -8921,7 +9080,10 @@ impl App {
                                         .size(10.0),
                                 );
                                 // Render scale slider (runtime performance tuning)
-                                let r = ui.add(egui::Slider::new(&mut new_render_scale_val, 0.25..=2.0).text("Render scale"));
+                                let r = ui.add(
+                                    egui::Slider::new(&mut new_render_scale_val, 0.25..=2.0)
+                                        .text("Render scale"),
+                                );
                                 if r.changed() {
                                     need_recreate_offscreen = true;
                                 }
@@ -8960,15 +9122,22 @@ impl App {
 
                 let full_output = egui_ctx.end_pass();
                 // If render_scale was changed in the GUI, apply it now to avoid borrow conflicts
-                if need_recreate_offscreen && (new_render_scale_val - self.user_config.performance.render_scale).abs() > 0.0001 {
+                if need_recreate_offscreen
+                    && (new_render_scale_val - self.user_config.performance.render_scale).abs()
+                        > 0.0001
+                {
                     self.user_config.performance.render_scale = new_render_scale_val;
                     if let Some(window) = self.window.as_ref() {
                         let size = window.inner_size();
                         let scale = window.scale_factor() as f32;
                         let logical_width = ((size.width as f32) / scale).round() as u32;
                         let logical_height = ((size.height as f32) / scale).round() as u32;
-                        self.render_target_width = ((logical_width as f32) * self.user_config.performance.render_scale).round() as u32;
-                        self.render_target_height = ((logical_height as f32) * self.user_config.performance.render_scale).round() as u32;
+                        self.render_target_width = ((logical_width as f32)
+                            * self.user_config.performance.render_scale)
+                            .round() as u32;
+                        self.render_target_height = ((logical_height as f32)
+                            * self.user_config.performance.render_scale)
+                            .round() as u32;
                         self.pending_recreate_offscreen = true;
                     }
                 }
@@ -9291,8 +9460,10 @@ impl ApplicationHandler for App {
                         let logical_width = ((new_size.width as f32) / scale).round() as u32;
                         let logical_height = ((new_size.height as f32) / scale).round() as u32;
                         let render_scale = self.user_config.performance.render_scale;
-                        self.render_target_width = ((logical_width as f32) * render_scale).round() as u32;
-                        self.render_target_height = ((logical_height as f32) * render_scale).round() as u32;
+                        self.render_target_width =
+                            ((logical_width as f32) * render_scale).round() as u32;
+                        self.render_target_height =
+                            ((logical_height as f32) * render_scale).round() as u32;
                     }
 
                     if let (Some(surface), Some(device), Some(config)) = (

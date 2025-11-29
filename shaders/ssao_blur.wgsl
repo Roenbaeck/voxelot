@@ -36,20 +36,19 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let offsets = array<f32, 3>(0.0, 1.38461538, 3.23076923);
     let weights = array<f32, 3>(0.227027, 0.3162162, 0.070270);
 
-    var v = textureSample(ssao_texture, post_sampler, uv).a * weights[0];
+    var v = textureSample(ssao_texture, post_sampler, uv) * weights[0];
 
     let offset1 = blur.direction * blur.texel_size * (offsets[1] * blur.radius);
     v = v
-        + (textureSample(ssao_texture, post_sampler, uv + offset1).a
-            + textureSample(ssao_texture, post_sampler, uv - offset1).a)
+        + (textureSample(ssao_texture, post_sampler, uv + offset1)
+            + textureSample(ssao_texture, post_sampler, uv - offset1))
         * weights[1];
 
     let offset2 = blur.direction * blur.texel_size * (offsets[2] * blur.radius);
     v = v
-        + (textureSample(ssao_texture, post_sampler, uv + offset2).a
-            + textureSample(ssao_texture, post_sampler, uv - offset2).a)
+        + (textureSample(ssao_texture, post_sampler, uv + offset2)
+            + textureSample(ssao_texture, post_sampler, uv - offset2))
         * weights[2];
 
-    // Write result into alpha channel to preserve existing composite usage.
-    return vec4<f32>(vec3<f32>(0.0), v);
+    return v;
 }

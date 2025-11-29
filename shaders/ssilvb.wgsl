@@ -11,6 +11,7 @@ struct SsaoUniforms {
 @group(0) @binding(0) var<uniform> ssao: SsaoUniforms;
 @group(0) @binding(1) var depth_tex: texture_depth_2d;
 @group(0) @binding(2) var post_sampler: sampler;
+@group(0) @binding(3) var emissive_tex: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -113,7 +114,7 @@ fn count_bits(value: u32) -> u32 {
 fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let depth = textureSample(depth_tex, post_sampler, uv);
     if (depth >= 1.0) {
-        return vec4<f32>(1.0, 1.0, 1.0, 1.0);
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
 
     let view_pos = reconstruct_position(uv, depth);
@@ -131,13 +132,13 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let radius = ssao.sample_radius;
     
     var visibility = 0.0;
+    var accumulated_light = vec3<f32>(0.0);
     
     for (var slice = 0u; slice < ssao.slice_count; slice = slice + 1u) {
         let phi = (PI / slice_count) * (f32(slice) + noise);
         let slice_dir = vec2<f32>(cos(phi), sin(phi));
         
         // Project normal onto slice plane
-        let slice_n = cross(vec3<f32>(slice_dir.x, slice_dir.y, 0.0), vec3<f32>(0.0, 0.0, 1.0)); // Simplified slice normal in screen space?
         // Actually, let's follow the reference logic more closely for the slice construction
         
         // Reference uses search in 2D screen space along the slice direction
@@ -183,7 +184,6 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
             
             // Logarithmic stepping
             let step_factor = pow(radius, 1.0 / sample_count);
-            var t = 1.0; // Start offset (pixels? or view space units?)
             // Reference uses view space radius but steps in screen space.
             // Let's map radius to screen space approximately.
             // Screen space radius ~= radius / view_z * projection_scale
@@ -206,6 +206,8 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
             
             current_step = pow(step_ratio, select(noise, 1.0 - noise, side == 1u));
             
+            var last_horizon_angle = n_angle;
+
             for (var s = 0u; s < ssao.sample_count; s = s + 1u) {
                 let sample_uv = uv + (ray_dir * current_step) / screen_size;
                 current_step *= step_ratio;
@@ -216,7 +218,8 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
                 let sample_pos = reconstruct_position(sample_uv, sample_depth);
                 
                 let delta = sample_pos - view_pos;
-                let dist = length(delta);
+                let dist_sq = dot(delta, delta);
+                let dist = sqrt(dist_sq);
                 let dist_vec = delta / dist;
                 
                 // Horizon angle
@@ -248,6 +251,28 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
                         occlusion_bits = occlusion_bits | mask;
                     }
                 }
+
+                // Indirect Lighting Accumulation
+                // If this sample is "above" the previous horizon, it contributes light
+                if (horizon_angle > last_horizon_angle) {
+                    let visible_angle = horizon_angle - last_horizon_angle;
+                    
+                    // Sample emissive texture
+                    let emissive_sample = textureSampleLevel(emissive_tex, post_sampler, sample_uv, 0);
+                    let emissive_color = emissive_sample.rgb;
+                    let emissive_strength = emissive_sample.a; // Assuming alpha contains strength or similar
+
+                    if (length(emissive_color) > 0.0) {
+                        // Inverse square falloff + solid angle approximation
+                        // visible_angle is the angular size of the visible segment
+                        // We also attenuate by distance to avoid over-contribution from far sources
+                        let attenuation = 1.0 / (1.0 + dist_sq * 0.1); 
+                        
+                        accumulated_light += emissive_color * visible_angle * attenuation * 2.0; // Boost factor
+                    }
+                    
+                    last_horizon_angle = horizon_angle;
+                }
             }
         }
         
@@ -256,9 +281,10 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     }
     
     visibility /= slice_count;
+    accumulated_light /= slice_count;
     
     // Apply strength/contrast
     visibility = pow(visibility, 2.0); // Ad-hoc contrast
     
-    return vec4<f32>(0.0, 0.0, 0.0, visibility);
+    return vec4<f32>(accumulated_light, visibility);
 }

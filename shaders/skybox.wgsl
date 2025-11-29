@@ -79,8 +79,13 @@ fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
     return out;
 }
 
+struct FragmentOutput {
+    @location(0) color: vec4<f32>,
+    @location(1) emissive: vec4<f32>,
+}
+
 @fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+fn fs_main(in: VertexOutput) -> FragmentOutput {
     let dir = normalize(in.rotated_dir);
     
     // Convert direction to equirectangular UV
@@ -105,5 +110,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let tint_strength = camera.skybox_tint_pad.w;
     let effect_strength = (1.0 - brightness) * tint_strength; // stronger at night
     let tinted = mix(desaturated, desaturated * tint, effect_strength);
-    return vec4<f32>(tinted * brightness, color.a);
+    
+    var out: FragmentOutput;
+    out.color = vec4<f32>(tinted * brightness, color.a);
+    out.emissive = vec4<f32>(0.0, 0.0, 0.0, 0.0); // Skybox is not emissive in the G-Buffer sense
+    return out;
 }

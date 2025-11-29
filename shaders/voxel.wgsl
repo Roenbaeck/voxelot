@@ -158,8 +158,13 @@ fn vs_main(
     return output;
 }
 
+struct FragmentOutput {
+    @location(0) color: vec4<f32>,
+    @location(1) emissive: vec4<f32>,
+}
+
 @fragment
-fn fs_main(input: VertexOutputInstanced) -> @location(0) vec4<f32> {
+fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     let sun_dir = normalize(uniforms.sun_direction_shadow_bias.xyz);
     let ndotl_raw = dot(input.normal, sun_dir);
     let sun_diffuse = max(ndotl_raw, 0.0);
@@ -232,8 +237,8 @@ fn fs_main(input: VertexOutputInstanced) -> @location(0) vec4<f32> {
     let fogged_color = mix(color, fog_color + inscatter, fog_factor);
     
     // Add emissive after fog so it stays bright
-    let emissive = input.emissive.rgb * emissive_strength;
-    let final_color = fogged_color + emissive;
+    let emissive_rgb = input.emissive.rgb * emissive_strength;
+    let final_color = fogged_color + emissive_rgb;
 
     // Distance-based alpha fade to hide pop-in at far distances
     // Start fading at 80% of LOD distance, fully transparent at 95%
@@ -279,7 +284,10 @@ fn fs_main(input: VertexOutputInstanced) -> @location(0) vec4<f32> {
     let alpha_fade_end = uniforms.lod_distance * 0.95;
     let alpha = 1.0 - smoothstep(alpha_fade_start, alpha_fade_end, distance);
 
-    return vec4<f32>(brightened, alpha);
+    var out: FragmentOutput;
+    out.color = vec4<f32>(brightened, alpha);
+    out.emissive = input.emissive; // Pass through emissive data (rgb + strength)
+    return out;
 }
 
 // Mesh pipeline entry points -------------------------------------------------
@@ -302,7 +310,7 @@ fn vs_mesh(
 }
 
 @fragment
-fn fs_mesh(input: VertexOutputMesh) -> @location(0) vec4<f32> {
+fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     let sun_dir = normalize(uniforms.sun_direction_shadow_bias.xyz);
     let sun_diffuse = max(dot(input.normal, sun_dir), 0.0);
     let base_shadow = compute_shadow(input.light_space_pos, input.normal, sun_dir);
@@ -367,8 +375,8 @@ fn fs_mesh(input: VertexOutputMesh) -> @location(0) vec4<f32> {
     let fogged_color = mix(color, fog_color + inscatter, fog_factor);
     
     // Add emissive after fog so it stays bright
-    let emissive = input.emissive.rgb * emissive_strength;
-    let final_color = fogged_color + emissive;
+    let emissive_rgb = input.emissive.rgb * emissive_strength;
+    let final_color = fogged_color + emissive_rgb;
     
     // Distance-based alpha fade to hide pop-in at far distances
     // Start fading at 80% of LOD distance, fully transparent at 95%
@@ -413,7 +421,10 @@ fn fs_mesh(input: VertexOutputMesh) -> @location(0) vec4<f32> {
     let alpha_fade_end = uniforms.lod_distance * 0.95;
     let alpha = 1.0 - smoothstep(alpha_fade_start, alpha_fade_end, distance);
     
-    return vec4<f32>(brightened, alpha);
+    var out: FragmentOutput;
+    out.color = vec4<f32>(brightened, alpha);
+    out.emissive = input.emissive;
+    return out;
 }
 
 fn compute_shadow(light_space_pos: vec4<f32>, normal: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
