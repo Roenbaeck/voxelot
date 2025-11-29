@@ -21,7 +21,7 @@ window_height = 720
 
 [atmosphere]
 fog_density = 0.00044999996
-time_of_day = 0.5179876
+time_of_day = 0.4801001
 night_skybox_brightness = 0.02
 horizon_fade_up = 0.05
 horizon_fade_down = 0.25
@@ -86,7 +86,7 @@ mesh_buffer_pool_entries = 256
 mega_vertex_buffer_mb = 512
 mega_index_buffer_mb = 256
 max_draw_capacity = 10000
-render_scale = 1.0
+render_scale = 1.42
 
 [debug]
 show_fps = true

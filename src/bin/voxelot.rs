@@ -718,6 +718,8 @@ struct App {
     device: Option<wgpu::Device>,
     queue: Option<wgpu::Queue>,
     config: Option<wgpu::SurfaceConfiguration>,
+    // Persisted user config containing unified TOML settings (render_scale, window size, etc.)
+    user_config: voxelot::Config,
     render_pipeline: Option<wgpu::RenderPipeline>,
     mesh_pipeline: Option<wgpu::RenderPipeline>,
     shadow_pipeline: Option<wgpu::RenderPipeline>,
@@ -758,6 +760,12 @@ struct App {
     jobs_per_sec_snapshot: usize,
     process_mem_mib: f64,
     mesh_cache_mib: f64,
+    // Internal render target size (logical * render_scale). These indicate the offscreen texture size
+    // we render into; they may differ from the swapchain physical size (`config.width`/`config.height`).
+    render_target_width: u32,
+    render_target_height: u32,
+    // If set, recreate offscreen targets at the next safe point (to avoid borrow conflicts)
+    pending_recreate_offscreen: bool,
     mesh_budget_mib: f64,
     envelope_cache_mib: f64,
     cull_ms: f64,
@@ -1216,20 +1224,9 @@ impl App {
                 .name(format!("mesh-worker-{}", worker_index))
                 .spawn(move || {
                     while let Ok(job) = job_rx.recv() {
-                        let MeshJob {
-                            key,
-                            chunk,
-                            neighbors,
-                            envelope,
-                        } = job;
-
-                        let mesh = voxelot::generate_chunk_mesh_optimized(
-                            &chunk,
-                            &palette,
-                            Some(&neighbors),
-                            envelope,
-                        );
-
+                        let MeshJob { key, chunk, neighbors, envelope } = job;
+                        // Generate chunk mesh using the optimized mesher
+                        let mesh = voxelot::generate_chunk_mesh_optimized(&chunk, &palette, Some(&neighbors), envelope);
                         if result_tx
                             .send(MeshResult {
                                 key,
@@ -1286,6 +1283,7 @@ impl App {
             device: None,
             queue: None,
             config: None,
+            user_config: cfg.clone(),
             render_pipeline: None,
             mesh_pipeline: None,
             shadow_pipeline: None,
@@ -1304,6 +1302,9 @@ impl App {
             gpu_input_capacity: 0,
             cpu_prepopulated_instances: Vec::with_capacity(4096),
             gpu_inputs: Vec::with_capacity(4096),
+            render_target_width: WINDOW_WIDTH,
+            render_target_height: WINDOW_HEIGHT,
+            pending_recreate_offscreen: false,
             mesh_indirect_buffer: None,
             envelope_indirect_buffer: None,
             fallback_indirect_buffer: None,
@@ -1659,6 +1660,7 @@ impl App {
             full_cfg.performance.fallback_detail_distance = self.fallback_detail_distance;
             full_cfg.performance.mesh_priority_sort_interval_frames =
                 self.pending_mesh_sort_interval_frames;
+            full_cfg.performance.render_scale = self.user_config.performance.render_scale;
 
             if let Err(e) = full_cfg.save(CONFIG_FILE) {
                 eprintln!("Failed to save unified config: {}", e);
@@ -2070,11 +2072,14 @@ impl App {
                 else {
                     return;
                 };
+                // Use internal render target dimensions (logical * render_scale) instead of swapchain physical size
+                let target_width = self.render_target_width.max(1);
+                let target_height = self.render_target_height.max(1);
                 let color_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("Offscreen Color Texture"),
                     size: wgpu::Extent3d {
-                        width: config.width,
-                        height: config.height,
+                        width: target_width,
+                        height: target_height,
                         depth_or_array_layers: 1,
                     },
                     mip_level_count: 1,
@@ -2097,13 +2102,13 @@ impl App {
                     color_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
                 // Track offscreen color texture bytes
                 let offscreen_color_bytes =
-                    App::compute_texture_bytes(config.format, config.width, config.height, 1, 1);
+                    App::compute_texture_bytes(config.format, target_width, target_height, 1, 1);
 
                 let depth_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("Offscreen Depth Texture"),
                     size: wgpu::Extent3d {
-                        width: config.width,
-                        height: config.height,
+                        width: target_width,
+                        height: target_height,
                         depth_or_array_layers: 1,
                     },
                     mip_level_count: 1,
@@ -2124,8 +2129,8 @@ impl App {
                     depth_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
                 let depth_bytes = App::compute_texture_bytes(
                     wgpu::TextureFormat::Depth32Float,
-                    config.width,
-                    config.height,
+                    target_width,
+                    target_height,
                     1,
                     1,
                 );
@@ -2133,8 +2138,8 @@ impl App {
                 let post_color_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("Post DoF Color Texture"),
                     size: wgpu::Extent3d {
-                        width: config.width,
-                        height: config.height,
+                        width: target_width,
+                        height: target_height,
                         depth_or_array_layers: 1,
                     },
                     mip_level_count: 1,
@@ -2154,11 +2159,11 @@ impl App {
                 let post_color_view_loc =
                     post_color_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
                 let post_color_bytes =
-                    App::compute_texture_bytes(config.format, config.width, config.height, 1, 1);
+                    App::compute_texture_bytes(config.format, target_width, target_height, 1, 1);
 
                 // Fused DoF blurred texture (half resolution) storing color + normalized CoC in alpha.
-                let fused_width = (config.width / 2).max(1);
-                let fused_height = (config.height / 2).max(1);
+                let fused_width = (target_width / 2).max(1);
+                let fused_height = (target_height / 2).max(1);
                 let dof_color_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("DoF Fused HalfRes Texture"),
                     size: wgpu::Extent3d {
@@ -2186,8 +2191,8 @@ impl App {
                     App::compute_texture_bytes(config.format, fused_width, fused_height, 1, 1);
 
                 let bloom_extent = wgpu::Extent3d {
-                    width: (config.width / 2).max(1),
-                    height: (config.height / 2).max(1),
+                    width: (target_width / 2).max(1),
+                    height: (target_height / 2).max(1),
                     depth_or_array_layers: 1,
                 };
 
@@ -2291,8 +2296,8 @@ impl App {
                 let ssao_ping_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("SSAO Ping Texture"),
                     size: wgpu::Extent3d {
-                        width: config.width,
-                        height: config.height,
+                        width: target_width,
+                        height: target_height,
                         depth_or_array_layers: 1,
                     },
                     mip_level_count: 1,
@@ -2308,8 +2313,8 @@ impl App {
                 let ssao_pong_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("SSAO Pong Texture"),
                     size: wgpu::Extent3d {
-                        width: config.width,
-                        height: config.height,
+                        width: target_width,
+                        height: target_height,
                         depth_or_array_layers: 1,
                     },
                     mip_level_count: 1,
@@ -2323,14 +2328,14 @@ impl App {
                 let ssao_pong_view_loc =
                     ssao_pong_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
                 let ssao_bytes =
-                    App::compute_texture_bytes(config.format, config.width, config.height, 1, 1);
+                    App::compute_texture_bytes(config.format, target_width, target_height, 1, 1);
 
                 // SSR texture (also used as scene color copy for water reflections)
                 let ssr_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("SSR Texture"),
                     size: wgpu::Extent3d {
-                        width: config.width,
-                        height: config.height,
+                        width: target_width,
+                        height: target_height,
                         depth_or_array_layers: 1,
                     },
                     mip_level_count: 1,
@@ -2348,8 +2353,8 @@ impl App {
                 let scene_copy_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("Scene Copy Texture"),
                     size: wgpu::Extent3d {
-                        width: config.width,
-                        height: config.height,
+                        width: target_width,
+                        height: target_height,
                         depth_or_array_layers: 1,
                     },
                     mip_level_count: 1,
@@ -2936,14 +2941,15 @@ impl App {
     }
 
     fn update_bloom_uniforms(&mut self) {
-        let (Some(queue), Some(config)) = (self.queue.as_ref(), self.config.as_ref()) else {
+        let Some(queue) = self.queue.as_ref() else {
             return;
         };
 
-        let width = config.width.max(1);
-        let height = config.height.max(1);
-        let bloom_width = (config.width / 2).max(1);
-        let bloom_height = (config.height / 2).max(1);
+        // Use internal render target dims for uniform calculations (not swapchain physical size)
+        let width = self.render_target_width.max(1);
+        let height = self.render_target_height.max(1);
+        let bloom_width = (self.render_target_width / 2).max(1);
+        let bloom_height = (self.render_target_height / 2).max(1);
 
         if let Some(buffer) = self.bloom_extract_uniform_buffer.as_ref() {
             let data = self.build_bloom_extract_uniforms(width, height);
@@ -2961,15 +2967,15 @@ impl App {
         }
 
         if let Some(buffer) = self.ssao_blur_horizontal_uniform_buffer.as_ref() {
-            let ssao_width = (config.width / 2).max(1);
-            let ssao_height = (config.height / 2).max(1);
+            let ssao_width = (self.render_target_width / 2).max(1);
+            let ssao_height = (self.render_target_height / 2).max(1);
             let data = self.build_ssao_blur_uniforms(ssao_width, ssao_height, [1.0, 0.0]);
             queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[data]));
         }
 
         if let Some(buffer) = self.ssao_blur_vertical_uniform_buffer.as_ref() {
-            let ssao_width = (config.width / 2).max(1);
-            let ssao_height = (config.height / 2).max(1);
+            let ssao_width = (self.render_target_width / 2).max(1);
+            let ssao_height = (self.render_target_height / 2).max(1);
             let data = self.build_ssao_blur_uniforms(ssao_width, ssao_height, [0.0, 1.0]);
             queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[data]));
         }
@@ -2981,7 +2987,7 @@ impl App {
 
         // SSILVB uniforms
         if let Some(buffer) = self.ssilvb_uniform_buffer.as_ref() {
-            let data = self.build_ssilvb_uniforms(config.width, config.height);
+            let data = self.build_ssilvb_uniforms(self.render_target_width, self.render_target_height);
             queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[data]));
         }
     }
@@ -3735,7 +3741,7 @@ impl App {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        config: &wgpu::SurfaceConfiguration,
+        _config: &wgpu::SurfaceConfiguration,
         main_bind_group_layout: &wgpu::BindGroupLayout,
     ) {
         // Load HDR image
@@ -3914,7 +3920,7 @@ impl App {
     fn create_water_pipeline(
         &mut self,
         device: &wgpu::Device,
-        config: &wgpu::SurfaceConfiguration,
+        _config: &wgpu::SurfaceConfiguration,
         main_bind_group_layout: &wgpu::BindGroupLayout,
     ) {
         // Create water uniforms buffer
@@ -4404,6 +4410,11 @@ impl App {
         compute_pass.dispatch_workgroups(dispatch_x, 1, 1);
         drop(compute_pass);
 
+        // If we requested a deferred offscreen target recreation, do it now (safe point)
+        if self.pending_recreate_offscreen {
+            self.pending_recreate_offscreen = false;
+            self.recreate_offscreen_targets();
+        }
         queue.submit(std::iter::once(encoder.finish()));
     }
 
@@ -4572,6 +4583,10 @@ impl App {
 
     async fn init_wgpu(&mut self, window: Arc<Window>) {
         let size = window.inner_size();
+        let scale = window.scale_factor() as f32;
+        // Compute logical window size (device-independent).
+        // Use performance.render_scale to compute rendered offscreen resolution
+        let render_scale = self.user_config.performance.render_scale;
 
         // Create instance
         let instance = wgpu::Instance::default();
@@ -4712,6 +4727,13 @@ impl App {
             });
 
         // Create pipeline layouts
+            // Compute and cache logical render target dims using logical window size * render_scale
+            let logical_width = ((size.width as f32) / scale).round() as u32;
+            let logical_height = ((size.height as f32) / scale).round() as u32;
+            let render_target_width = ((logical_width as f32) * render_scale).round() as u32;
+            let render_target_height = ((logical_height as f32) * render_scale).round() as u32;
+            self.render_target_width = render_target_width.max(1);
+            self.render_target_height = render_target_height.max(1);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
             bind_group_layouts: &[&main_bind_group_layout],
@@ -5568,7 +5590,7 @@ impl App {
         });
 
         let bloom_extract_uniforms =
-            self.build_bloom_extract_uniforms(config.width.max(1), config.height.max(1));
+            self.build_bloom_extract_uniforms(self.render_target_width.max(1), self.render_target_height.max(1));
         let bloom_extract_uniform_buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Bloom Extract Uniform Buffer"),
@@ -5576,8 +5598,8 @@ impl App {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
 
-        let bloom_width = (config.width / 2).max(1);
-        let bloom_height = (config.height / 2).max(1);
+        let bloom_width = (self.render_target_width / 2).max(1);
+        let bloom_height = (self.render_target_height / 2).max(1);
 
         let bloom_blur_horizontal_uniforms =
             self.build_bloom_blur_uniforms(bloom_width, bloom_height, [1.0, 0.0]);
@@ -5641,8 +5663,8 @@ impl App {
         });
 
         // SSAO blur uniforms (half-resolution like SSao textures)
-        let ssao_width = (config.width / 2).max(1);
-        let ssao_height = (config.height / 2).max(1);
+        let ssao_width = (self.render_target_width / 2).max(1);
+        let ssao_height = (self.render_target_height / 2).max(1);
         let ssao_blur_horizontal_uniforms =
             self.build_ssao_blur_uniforms(ssao_width, ssao_height, [1.0, 0.0]);
         let ssao_blur_horizontal_uniform_buffer =
@@ -6087,7 +6109,7 @@ impl App {
         // Don't create SSAO blur bind groups until ping/pong views exist; update later in update_bloom_bind_groups()
         self.composite_uniform_buffer = Some(composite_uniform_buffer);
         // SSILVB uniforms
-        let ssilvb_uniforms = self.build_ssilvb_uniforms(config.width, config.height);
+        let ssilvb_uniforms = self.build_ssilvb_uniforms(self.render_target_width, self.render_target_height);
         let ssilvb_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("SSILVB Uniform Buffer"),
             contents: bytemuck::cast_slice(&[ssilvb_uniforms]),
@@ -7377,7 +7399,8 @@ impl App {
                         if let Some(surface) = self.surface.as_ref() {
                             surface.configure(&device, &config);
                         }
-                        self.recreate_offscreen_targets();
+                        // Defer the heavy work to a safe point after rendering to avoid borrow conflicts
+                        self.pending_recreate_offscreen = true;
                     }
                     wgpu::SurfaceError::OutOfMemory => {
                         eprintln!("Out of memory!");
@@ -7398,7 +7421,7 @@ impl App {
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         // Create MVP matrix using glam (column-major, right-handed)
-        let aspect = config.width as f32 / config.height as f32;
+        let aspect = self.render_target_width as f32 / self.render_target_height as f32;
         let projection = Mat4::perspective_rh(
             self.camera_controller.camera.fov,
             aspect,
@@ -8249,7 +8272,7 @@ impl App {
 
         // Copy offscreen color to scene_copy_texture for water reflection sampling
         // Water pass writes to offscreen_color but needs to read scene color for reflections
-        if let (Some(offscreen_color), Some(scene_copy), Some(config)) = (
+        if let (Some(offscreen_color), Some(scene_copy), Some(_config)) = (
             self.offscreen_color_texture.as_ref(),
             self.scene_copy_texture.as_ref(),
             self.config.as_ref(),
@@ -8268,8 +8291,8 @@ impl App {
                     aspect: wgpu::TextureAspect::All,
                 },
                 wgpu::Extent3d {
-                    width: config.width,
-                    height: config.height,
+                    width: self.render_target_width,
+                    height: self.render_target_height,
                     depth_or_array_layers: 1,
                 },
             );
@@ -8744,6 +8767,8 @@ impl App {
                 let raw_input = egui_winit.take_egui_input(window);
                 egui_ctx.begin_pass(raw_input);
 
+                let mut need_recreate_offscreen = false;
+                let mut new_render_scale_val = self.user_config.performance.render_scale;
                 egui::Area::new(egui::Id::new("fps_counter"))
                     .fixed_pos(egui::pos2(10.0, 10.0))
                     .show(egui_ctx, |ui| {
@@ -8908,6 +8933,11 @@ impl App {
                                         .color(egui::Color32::WHITE)
                                         .size(10.0),
                                 );
+                                // Render scale slider (runtime performance tuning)
+                                let r = ui.add(egui::Slider::new(&mut new_render_scale_val, 0.25..=2.0).text("Render scale"));
+                                if r.changed() {
+                                    need_recreate_offscreen = true;
+                                }
                                 ui.label(
                                     egui::RichText::new(format!(
                                         "Group: {:.2}ms",
@@ -8941,6 +8971,19 @@ impl App {
                     });
 
                 let full_output = egui_ctx.end_pass();
+                // If render_scale was changed in the GUI, apply it now to avoid borrow conflicts
+                if need_recreate_offscreen && (new_render_scale_val - self.user_config.performance.render_scale).abs() > 0.0001 {
+                    self.user_config.performance.render_scale = new_render_scale_val;
+                    if let Some(window) = self.window.as_ref() {
+                        let size = window.inner_size();
+                        let scale = window.scale_factor() as f32;
+                        let logical_width = ((size.width as f32) / scale).round() as u32;
+                        let logical_height = ((size.height as f32) / scale).round() as u32;
+                        self.render_target_width = ((logical_width as f32) * self.user_config.performance.render_scale).round() as u32;
+                        self.render_target_height = ((logical_height as f32) * self.user_config.performance.render_scale).round() as u32;
+                        self.pending_recreate_offscreen = true;
+                    }
+                }
                 let paint_jobs =
                     egui_ctx.tessellate(full_output.shapes, egui_ctx.pixels_per_point());
                 let screen_descriptor = egui_wgpu::ScreenDescriptor {
@@ -9254,6 +9297,16 @@ impl ApplicationHandler for App {
                         config.height = new_size.height;
                     }
 
+                    // Update internal render target dims based on logical window size and configured render_scale
+                    if let Some(window) = self.window.as_ref() {
+                        let scale = window.scale_factor() as f32;
+                        let logical_width = ((new_size.width as f32) / scale).round() as u32;
+                        let logical_height = ((new_size.height as f32) / scale).round() as u32;
+                        let render_scale = self.user_config.performance.render_scale;
+                        self.render_target_width = ((logical_width as f32) * render_scale).round() as u32;
+                        self.render_target_height = ((logical_height as f32) * render_scale).round() as u32;
+                    }
+
                     if let (Some(surface), Some(device), Some(config)) = (
                         self.surface.as_ref(),
                         self.device.as_ref(),
@@ -9264,9 +9317,10 @@ impl ApplicationHandler for App {
 
                     self.recreate_offscreen_targets();
 
-                    if let Some(config) = self.config.as_ref() {
+                    // Use internal render target dims to set camera aspect ratio, not swapchain physical pixels
+                    if self.render_target_width > 0 && self.render_target_height > 0 {
                         self.camera_controller.camera.aspect =
-                            config.width as f32 / config.height as f32;
+                            self.render_target_width as f32 / self.render_target_height as f32;
                     }
 
                     let cam = &self.camera_controller.camera;
