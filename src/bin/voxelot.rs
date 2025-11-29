@@ -904,7 +904,6 @@ struct App {
     bloom_extract_pipeline: Option<wgpu::RenderPipeline>,
     // SSILVB (GTAO/SSAO with visibility bitmask)
     ssilvb_pipeline: Option<wgpu::RenderPipeline>,
-    bloom_blur_pipeline: Option<wgpu::RenderPipeline>,
     ssao_blur_pipeline: Option<wgpu::RenderPipeline>,
     composite_pipeline: Option<wgpu::RenderPipeline>,
     // SSILVB bind/group
@@ -915,8 +914,6 @@ struct App {
     bloom_blur_bind_group_layout: Option<wgpu::BindGroupLayout>,
     composite_bind_group_layout: Option<wgpu::BindGroupLayout>,
     bloom_extract_bind_group: Option<wgpu::BindGroup>,
-    bloom_blur_horizontal_bind_group: Option<wgpu::BindGroup>,
-    bloom_blur_vertical_bind_group: Option<wgpu::BindGroup>,
     // Bloom Kawase: optional per-iteration uniform buffers and bind groups
     bloom_kawase_uniform_buffers: Vec<Option<wgpu::Buffer>>,
     bloom_kawase_bind_groups: Vec<Option<wgpu::BindGroup>>,
@@ -927,8 +924,7 @@ struct App {
     ssao_pong_view: Option<wgpu::TextureView>,
     // ssao_readback_buffer: Option<wgpu::Buffer>, // removed: readback temporarily disabled
     bloom_extract_uniform_buffer: Option<wgpu::Buffer>,
-    bloom_blur_horizontal_uniform_buffer: Option<wgpu::Buffer>,
-    bloom_blur_vertical_uniform_buffer: Option<wgpu::Buffer>,
+    // Bloom is handled by Kawase now — old separable pipeline/UBOs removed.
     ssao_blur_horizontal_uniform_buffer: Option<wgpu::Buffer>,
     ssao_blur_vertical_uniform_buffer: Option<wgpu::Buffer>,
     ssao_blur_horizontal_bind_group: Option<wgpu::BindGroup>,
@@ -1447,19 +1443,15 @@ impl App {
             ssao_pong_view: None,
             // ssao_readback_buffer: None,
             bloom_extract_pipeline: None,
-            bloom_blur_pipeline: None,
             ssao_blur_pipeline: None,
             composite_pipeline: None,
             bloom_extract_bind_group_layout: None,
             bloom_blur_bind_group_layout: None,
             composite_bind_group_layout: None,
             bloom_extract_bind_group: None,
-            bloom_blur_horizontal_bind_group: None,
-            bloom_blur_vertical_bind_group: None,
             composite_bind_group: None,
             bloom_extract_uniform_buffer: None,
-            bloom_blur_horizontal_uniform_buffer: None,
-            bloom_blur_vertical_uniform_buffer: None,
+            // separable bloom pipeline fields removed (using Kawase)
             bloom_kawase_uniform_buffers: Vec::new(),
             bloom_kawase_bind_groups: Vec::new(),
             ssao_blur_horizontal_uniform_buffer: None,
@@ -6055,7 +6047,6 @@ impl App {
         self.post_sampler = Some(post_sampler);
         self.bloom_extract_pipeline = Some(bloom_extract_pipeline);
         // Old separable bloom blur pipeline removed; Kawase blur is used for bloom instead.
-        self.bloom_blur_pipeline = None;
         self.ssao_blur_pipeline = Some(ssao_blur_pipeline);
         self.composite_pipeline = Some(composite_pipeline);
         self.bloom_extract_bind_group_layout = Some(bloom_extract_bind_group_layout);
@@ -6063,9 +6054,7 @@ impl App {
         self.composite_bind_group_layout = Some(composite_bind_group_layout);
         self.bloom_extract_uniform_buffer = Some(bloom_extract_uniform_buffer);
         // Bloom separable horizontal UBO removed; using Kawase blur for bloom instead.
-        self.bloom_blur_horizontal_uniform_buffer = None;
         // Separable bloom vertical UBO removed; using Kawase for bloom instead.
-        self.bloom_blur_vertical_uniform_buffer = None;
         self.ssao_blur_horizontal_uniform_buffer = Some(ssao_blur_horizontal_uniform_buffer);
         self.ssao_blur_vertical_uniform_buffer = Some(ssao_blur_vertical_uniform_buffer);
         // Don't create SSAO blur bind groups until ping/pong views exist; update later in update_bloom_bind_groups()
@@ -6086,8 +6075,7 @@ impl App {
         );
         self.ssilvb_uniform_buffer = Some(ssilvb_uniform_buffer);
         self.bloom_extract_bind_group = None;
-        self.bloom_blur_horizontal_bind_group = None;
-        self.bloom_blur_vertical_bind_group = None;
+        // Old separable bloom fields removed; nothing to assign here.
         self.composite_bind_group = None;
 
         // SSILVB: SSAO pipeline creation
