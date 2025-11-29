@@ -1719,23 +1719,7 @@ impl App {
         }
     }
 
-    fn build_bloom_blur_uniforms(
-        &self,
-        target_width: u32,
-        target_height: u32,
-        direction: [f32; 2],
-    ) -> BloomBlurUniforms {
-        BloomBlurUniforms {
-            direction,
-            radius: self.bloom_settings.blur_radius,
-            _padding0: 0.0,
-            texel_size: [
-                1.0 / target_width.max(1) as f32,
-                1.0 / target_height.max(1) as f32,
-            ],
-            _padding1: [0.0; 2],
-        }
-    }
+    // Separable blur uniforms helper removed; using Kawase for bloom blur.
 
     fn build_ssao_blur_uniforms(
         &self,
@@ -1784,7 +1768,7 @@ impl App {
 
     fn build_composite_uniforms(&self) -> CompositeUniforms {
         CompositeUniforms {
-            bloom_strength: if self.bloom_enabled {
+            bloom_strength: if self.bloom_enabled && self.bloom_settings.kawase_enabled {
                 self.bloom_settings.bloom_strength
             } else {
                 0.0
@@ -2965,23 +2949,14 @@ impl App {
         // Use internal render target dims for uniform calculations (not swapchain physical size)
         let width = self.render_target_width.max(1);
         let height = self.render_target_height.max(1);
-        let bloom_width = (self.render_target_width / 2).max(1);
-        let bloom_height = (self.render_target_height / 2).max(1);
+        // Bloom ping/pong buffer sizes are computed on demand and used by Kawase UBOs
 
         if let Some(buffer) = self.bloom_extract_uniform_buffer.as_ref() {
             let data = self.build_bloom_extract_uniforms(width, height);
             queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[data]));
         }
 
-        if let Some(buffer) = self.bloom_blur_horizontal_uniform_buffer.as_ref() {
-            let data = self.build_bloom_blur_uniforms(bloom_width, bloom_height, [1.0, 0.0]);
-            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[data]));
-        }
-
-        if let Some(buffer) = self.bloom_blur_vertical_uniform_buffer.as_ref() {
-            let data = self.build_bloom_blur_uniforms(bloom_width, bloom_height, [0.0, 1.0]);
-            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[data]));
-        }
+        // Separable bloom blur UBOs removed (we use Kawase UBO writes below).
 
         // Bloom Kawase UBO updates
         if self.bloom_settings.kawase_enabled {
@@ -3056,11 +3031,9 @@ impl App {
             return;
         };
 
-        if let (Some(ubo), Some(sampler), Some(blur_horizontal_ubo), Some(blur_vertical_ubo)) = (
+        if let (Some(ubo), Some(sampler)) = (
             self.bloom_extract_uniform_buffer.as_ref(),
             self.post_sampler.as_ref(),
-            self.bloom_blur_horizontal_uniform_buffer.as_ref(),
-            self.bloom_blur_vertical_uniform_buffer.as_ref(),
         ) {
             self.bloom_extract_bind_group =
                 Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3082,25 +3055,7 @@ impl App {
                     ],
                 }));
 
-            self.bloom_blur_horizontal_bind_group =
-                Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("Bloom Blur Horizontal Bind Group"),
-                    layout: blur_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: blur_horizontal_ubo.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(bloom_ping_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::Sampler(sampler),
-                        },
-                    ],
-                }));
+            // Separable bloom blur horizontal/vertical bind groups removed; we use Kawase bind groups instead.
 
             // SSAO blur horizontal bind group (use bloom blur pipeline)
             if self.ssao_settings.blur_enabled {
@@ -3158,25 +3113,7 @@ impl App {
                     }));
             }
 
-            self.bloom_blur_vertical_bind_group =
-                Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("Bloom Blur Vertical Bind Group"),
-                    layout: blur_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: blur_vertical_ubo.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(bloom_pong_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::Sampler(sampler),
-                        },
-                    ],
-                }));
+            // Separable bloom bloom vertical bind group removed (using Kawase instead)
 
             // If bloom kawase is enabled, create per-iteration UBOs and bind groups for Kawase blur
             if self.bloom_settings.kawase_enabled {
@@ -5326,10 +5263,6 @@ impl App {
             source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/ssilvb.wgsl").into()),
         });
 
-        let bloom_blur_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Bloom Blur Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/bloom_blur.wgsl").into()),
-        });
 
         let ssao_blur_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("SSAO Blur Shader"),
@@ -5565,43 +5498,6 @@ impl App {
                 cache: None,
             });
 
-        let bloom_blur_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Bloom Blur Pipeline"),
-            layout: Some(&bloom_blur_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &bloom_blur_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &bloom_blur_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba16Float,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview: None,
-            cache: None,
-        });
 
         let ssao_blur_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("SSAO Blur Pipeline"),
@@ -5676,26 +5572,11 @@ impl App {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
 
-        let bloom_width = (self.render_target_width / 2).max(1);
-        let bloom_height = (self.render_target_height / 2).max(1);
+        // bloom half-resolution extents are allocated and used by Kawase UBOs
 
-        let bloom_blur_horizontal_uniforms =
-            self.build_bloom_blur_uniforms(bloom_width, bloom_height, [1.0, 0.0]);
-        let bloom_blur_horizontal_uniform_buffer =
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Bloom Blur Horizontal Uniform Buffer"),
-                contents: bytemuck::cast_slice(&[bloom_blur_horizontal_uniforms]),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
+        // Separable bloom UBOs removed — Kawase blur is used.
 
-        let bloom_blur_vertical_uniforms =
-            self.build_bloom_blur_uniforms(bloom_width, bloom_height, [0.0, 1.0]);
-        let bloom_blur_vertical_uniform_buffer =
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Bloom Blur Vertical Uniform Buffer"),
-                contents: bytemuck::cast_slice(&[bloom_blur_vertical_uniforms]),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
+        // (vertical UBO removed)
 
         let composite_uniforms = self.build_composite_uniforms();
         let composite_uniform_buffer =
@@ -6173,15 +6054,18 @@ impl App {
         self.dof_combine_bind_group_layout = Some(dof_combine_bind_group_layout);
         self.post_sampler = Some(post_sampler);
         self.bloom_extract_pipeline = Some(bloom_extract_pipeline);
-        self.bloom_blur_pipeline = Some(bloom_blur_pipeline);
+        // Old separable bloom blur pipeline removed; Kawase blur is used for bloom instead.
+        self.bloom_blur_pipeline = None;
         self.ssao_blur_pipeline = Some(ssao_blur_pipeline);
         self.composite_pipeline = Some(composite_pipeline);
         self.bloom_extract_bind_group_layout = Some(bloom_extract_bind_group_layout);
         self.bloom_blur_bind_group_layout = Some(bloom_blur_bind_group_layout);
         self.composite_bind_group_layout = Some(composite_bind_group_layout);
         self.bloom_extract_uniform_buffer = Some(bloom_extract_uniform_buffer);
-        self.bloom_blur_horizontal_uniform_buffer = Some(bloom_blur_horizontal_uniform_buffer);
-        self.bloom_blur_vertical_uniform_buffer = Some(bloom_blur_vertical_uniform_buffer);
+        // Bloom separable horizontal UBO removed; using Kawase blur for bloom instead.
+        self.bloom_blur_horizontal_uniform_buffer = None;
+        // Separable bloom vertical UBO removed; using Kawase for bloom instead.
+        self.bloom_blur_vertical_uniform_buffer = None;
         self.ssao_blur_horizontal_uniform_buffer = Some(ssao_blur_horizontal_uniform_buffer);
         self.ssao_blur_vertical_uniform_buffer = Some(ssao_blur_vertical_uniform_buffer);
         // Don't create SSAO blur bind groups until ping/pong views exist; update later in update_bloom_bind_groups()
@@ -8412,8 +8296,6 @@ impl App {
 
         if self.composite_bind_group.is_none()
             || self.bloom_extract_bind_group.is_none()
-            || self.bloom_blur_horizontal_bind_group.is_none()
-            || self.bloom_blur_vertical_bind_group.is_none()
             || (self.bloom_settings.kawase_enabled && self.bloom_kawase_bind_groups.is_empty())
         {
             self.update_bloom_bind_groups();
@@ -8646,7 +8528,7 @@ impl App {
                 }
             }
         }
-        if self.bloom_enabled {
+        if self.bloom_enabled && self.bloom_settings.kawase_enabled {
             if let (
                 Some(bloom_extract_pipeline),
                 Some(bloom_extract_bind_group),
@@ -8846,56 +8728,6 @@ impl App {
                             );
                         }
                     }
-                }
-            } else {
-                if let (Some(bloom_blur_pipeline), Some(horizontal_bind_group), Some(bloom_pong_view)) = (
-                    self.bloom_blur_pipeline.as_ref(),
-                    self.bloom_blur_horizontal_bind_group.as_ref(),
-                    self.bloom_pong_view.as_ref(),
-                ) {
-                    let mut blur_pass_h = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("Bloom Blur Horizontal Pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: bloom_pong_view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                                store: wgpu::StoreOp::Store,
-                            },
-                            depth_slice: None,
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                    });
-                    blur_pass_h.set_pipeline(bloom_blur_pipeline);
-                    blur_pass_h.set_bind_group(0, horizontal_bind_group, &[]);
-                    blur_pass_h.draw(0..3, 0..1);
-                }
-
-                if let (Some(bloom_blur_pipeline), Some(vertical_bind_group), Some(bloom_ping_view)) = (
-                    self.bloom_blur_pipeline.as_ref(),
-                    self.bloom_blur_vertical_bind_group.as_ref(),
-                    self.bloom_ping_view.as_ref(),
-                ) {
-                    let mut blur_pass_v = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("Bloom Blur Vertical Pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: bloom_ping_view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                                store: wgpu::StoreOp::Store,
-                            },
-                            depth_slice: None,
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                    });
-                    blur_pass_v.set_pipeline(bloom_blur_pipeline);
-                    blur_pass_v.set_bind_group(0, vertical_bind_group, &[]);
-                    blur_pass_v.draw(0..3, 0..1);
                 }
             }
         }
@@ -9105,27 +8937,7 @@ impl App {
                                 if r.changed() {
                                     need_recreate_offscreen = true;
                                 }
-                                // Bloom Kawase toggle and parameters
-                                ui.horizontal(|ui| {
-                                    if ui.checkbox(&mut self.bloom_settings.kawase_enabled, "Kawase Bloom").changed() {
-                                        // When toggled, force bind groups and UBOs to update next frame
-                                        self.bloom_kawase_bind_groups.clear();
-                                        self.bloom_kawase_uniform_buffers.clear();
-                                        println!("Bloom Kawase toggled: {}", self.bloom_settings.kawase_enabled);
-                                    }
-                                    if self.bloom_settings.kawase_enabled {
-                                        let mut iters = self.bloom_settings.kawase_iterations as i32;
-                                        if ui.add(egui::Slider::new(&mut iters, 1..=6).text("Kawase Iterations")).changed() {
-                                            self.bloom_settings.kawase_iterations = iters as usize;
-                                            self.bloom_kawase_bind_groups.clear();
-                                            self.bloom_kawase_uniform_buffers.clear();
-                                        }
-                                        let mut offset = self.bloom_settings.kawase_offset;
-                                        if ui.add(egui::Slider::new(&mut offset, 0.1..=4.0).text("Kawase Offset")).changed() {
-                                            self.bloom_settings.kawase_offset = offset;
-                                        }
-                                    }
-                                });
+                                // Bloom Kawase controls removed from runtime UI — use config or recompile to change defaults
                                 ui.label(
                                     egui::RichText::new(format!(
                                         "Group: {:.2}ms",

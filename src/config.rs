@@ -360,15 +360,15 @@ fn default_bloom_blur_radius() -> f32 {
 }
 
 fn default_bloom_kawase_enabled() -> bool {
-    false
+    true
 }
 
 fn default_bloom_kawase_iterations() -> usize {
-    3
+    4
 }
 
 fn default_bloom_kawase_offset() -> f32 {
-    1.0
+    0.5
 }
 
 fn default_ssao_enabled() -> bool {
