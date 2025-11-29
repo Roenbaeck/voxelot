@@ -194,8 +194,6 @@ pub struct PerformanceConfig {
     pub hzb_enabled: bool,
     #[serde(default = "default_fallback_detail_distance")]
     pub fallback_detail_distance: f32,
-    #[serde(default = "default_fallback_bbox_shrink")]
-    pub fallback_bbox_shrink: f32,
     #[serde(default = "default_mesh_priority_sort_interval_frames")]
     pub mesh_priority_sort_interval_frames: u64,
     #[serde(default = "default_mesh_buffer_pool_entries")]
@@ -372,7 +370,7 @@ fn default_bloom_kawase_offset() -> f32 {
 }
 
 fn default_ssao_enabled() -> bool {
-    false
+    true
 }
 fn default_ssao_sample_count() -> u32 {
     8
@@ -446,15 +444,11 @@ fn default_max_envelope_distance() -> f32 {
 }
 
 fn default_hzb_enabled() -> bool {
-    false
+    true
 }
 
 fn default_fallback_detail_distance() -> f32 {
     500.0
-}
-
-fn default_fallback_bbox_shrink() -> f32 {
-    1.0 // No shrinkage - prevents position mismatch between fallback voxels and meshes
 }
 
 fn default_mesh_priority_sort_interval_frames() -> u64 {
@@ -610,7 +604,6 @@ impl Default for PerformanceConfig {
             max_envelope_distance: default_max_envelope_distance(),
             hzb_enabled: default_hzb_enabled(),
             fallback_detail_distance: default_fallback_detail_distance(),
-            fallback_bbox_shrink: default_fallback_bbox_shrink(),
             mesh_priority_sort_interval_frames: default_mesh_priority_sort_interval_frames(),
             mesh_buffer_pool_entries: default_mesh_buffer_pool_entries(),
             mega_vertex_buffer_mb: default_mega_vertex_buffer_mb(),
