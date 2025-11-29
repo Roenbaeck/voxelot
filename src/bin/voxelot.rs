@@ -1764,7 +1764,7 @@ impl App {
         SsaoUniformsRaw {
             sample_count: self.ssao_settings.sample_count as u32,
             slice_count: self.ssao_settings.slice_count as u32,
-            sample_radius: self.ssao_settings.radius,
+            sample_radius: self.ssao_settings.radius * 2.5,
             hit_thickness: self.ssao_settings.thickness,
             screen_width: src_width as f32,
             screen_height: src_height as f32,

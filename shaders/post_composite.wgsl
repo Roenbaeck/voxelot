@@ -44,10 +44,14 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let base = textureSample(post_color, post_sampler, uv).rgb;
     let bloom = textureSample(bloom_texture, post_sampler, uv).rgb;
+    
+    // Sample SSILVB: RGB = accumulated emissive light, A = ambient occlusion
+    let ssilvb_sample = textureSample(ssao_texture, post_sampler, uv);
+    let indirect_light = ssilvb_sample.rgb;
+    let raw_ao = ssilvb_sample.a;
+    
     var ao: f32 = 1.0;
-    var raw_ao: f32 = 1.0;
     if (composite.ssao_enabled > 0.5) {
-        raw_ao = textureSample(ssao_texture, post_sampler, uv).a;
         // Blend between no occlusion (1.0) and raw AO by strength.
         ao = 1.0 - composite.ssao_strength * (1.0 - raw_ao);
     }
@@ -69,6 +73,7 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let saturated = vec3<f32>(luma, luma, luma) + balance * composite.saturation_boost;
 
     var color = saturated + bloom * composite.bloom_strength;
+    color = color + indirect_light; // Add screen-space emissive indirect lighting
     color = color * ao; // apply SSAO visibility (0..1) to darken color
     color = color * composite.exposure;
     color = max(color, vec3<f32>(0.0));

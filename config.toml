@@ -9,7 +9,7 @@ camera_position = [
 water_level = 2.0
 
 [rendering]
-lod_subdivide_distance = 1250.0
+lod_subdivide_distance = 1800.0
 lod_merge_distance = 750.0
 chunk_lod_distance = 1500.0
 fov_degrees = 70.0
@@ -21,7 +21,7 @@ window_height = 720
 
 [atmosphere]
 fog_density = 0.00044999996
-time_of_day = 0.007094149
+time_of_day = 0.5172135
 night_skybox_brightness = 0.02
 horizon_fade_up = 0.05
 horizon_fade_down = 0.25

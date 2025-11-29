@@ -195,7 +195,7 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
             let screen_radius = (radius * proj_scale) / -view_pos.z;
             
             // If screen radius is too small, skip
-            if (screen_radius < 2.0) { continue; }
+            // if (screen_radius < 2.0) { continue; } // Removed culling to allow distant lights
             
             let step_ratio = pow(screen_radius, 1.0 / sample_count);
             var current_step = 1.0; // Start at 1 pixel offset
@@ -208,7 +208,10 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
             
             var last_horizon_angle = n_angle;
 
-            for (var s = 0u; s < ssao.sample_count; s = s + 1u) {
+            // Hardcoded loop limit increase for better long-range sampling
+            for (var s = 0u; s < 64u; s = s + 1u) {
+                if (s >= ssao.sample_count) { break; } 
+
                 let sample_uv = uv + (ray_dir * current_step) / screen_size;
                 current_step *= step_ratio;
                 
@@ -266,9 +269,9 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
                         // Inverse square falloff + solid angle approximation
                         // visible_angle is the angular size of the visible segment
                         // We also attenuate by distance to avoid over-contribution from far sources
-                        let attenuation = 1.0 / (1.0 + dist_sq * 0.1); 
+                        let attenuation = 1.0 / (1.0 + dist_sq * 0.02); 
                         
-                        accumulated_light += emissive_color * visible_angle * attenuation * 2.0; // Boost factor
+                        accumulated_light += emissive_color * visible_angle * attenuation * 1.0; // No boost
                     }
                     
                     last_horizon_angle = horizon_angle;
@@ -283,8 +286,18 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     visibility /= slice_count;
     accumulated_light /= slice_count;
     
+    // Chromatic noise reduction:
+    // Use the center pixel's emissive color as a base to avoid dark "holes" in the lighting
+    // This makes noise appear as brightness variations within the same color instead of color vs black
+    let center_emissive = textureSampleLevel(emissive_tex, post_sampler, uv, 0).rgb;
+    
+    // If we have very little accumulated light, blend towards the center emissive color
+    // This makes sparse sampling look like "dimmer version of the right color" instead of "black"
+    let light_strength = min(length(accumulated_light), 1.0);
+    let final_light = mix(center_emissive * 0.3, accumulated_light, light_strength);
+    
     // Apply strength/contrast
     visibility = pow(visibility, 2.0); // Ad-hoc contrast
     
-    return vec4<f32>(accumulated_light, visibility);
+    return vec4<f32>(final_light, visibility);
 }
