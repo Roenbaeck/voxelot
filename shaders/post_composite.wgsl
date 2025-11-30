@@ -23,7 +23,6 @@ struct VertexOutput {
 @group(0) @binding(4) var ssao_texture: texture_2d<f32>;
 @group(0) @binding(5) var ssr_debug_texture: texture_2d<f32>;
 @group(0) @binding(3) var post_sampler: sampler;
-@group(0) @binding(6) var emissive_texture: texture_2d<f32>;
 
 @vertex
 fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
@@ -73,11 +72,8 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let balance = base - vec3<f32>(luma, luma, luma);
     let saturated = vec3<f32>(luma, luma, luma) + balance * composite.saturation_boost;
 
-    // Add direct emissive contribution (always at full strength - emissive surfaces always glow)
-    let direct_emissive = textureSample(emissive_texture, post_sampler, uv).rgb;
-
+    // Note: direct emissive is already included in 'base' (added in DoF CoC pass)
     var color = saturated + bloom * composite.bloom_strength;
-    color = color + direct_emissive; // Direct emission (no modulation)
     color = color + indirect_light * composite.indirect_light_scale; // Bounce light (modulated by darkness)
     color = color * ao; // apply SSAO visibility (0..1) to darken color
     color = color * composite.exposure;
