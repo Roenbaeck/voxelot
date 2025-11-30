@@ -226,23 +226,23 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
                 let dist = sqrt(dist_sq);
                 let dist_vec = delta / dist;
                 
-                // Horizon angle
+                // Horizon angle calculation:
+                // - For occlusion bitmask: use direction-relative signed angle (old method)
+                // - For indirect lighting: use monotonic elevation angle (new GTAO method)
                 let horizon_cos = dot(dist_vec, view_vec);
-                // Use monotonic elevation: 0 is Up, -PI/2 is Flat, -PI is Down
-                let horizon_angle = -fast_acos(horizon_cos);
                 
-                // Thickness heuristic (unused for lighting but kept for occlusion logic if needed)
+                // Direction-relative angle for occlusion (preserves left/right distinction)
+                let horizon_angle_rel = fast_acos(horizon_cos) * direction;
+                
+                // Monotonic elevation for indirect lighting (0=Up, -PI/2=Flat, -PI=Down)
+                let horizon_angle_mono = -fast_acos(horizon_cos);
+                
+                // Thickness heuristic for occlusion bitmask
                 let back_horizon_cos = dot(normalize(delta - view_vec * ssao.hit_thickness), view_vec);
                 let back_horizon_angle = fast_acos(back_horizon_cos) * direction;
                 
-                // Convert to [0, 1] relative to normal for occlusion bitmask (legacy logic, might be broken by this change but we care about lighting)
-                // For lighting, we just need horizon_angle > last_horizon_angle
-                
-                // ... occlusion logic ...
-
-                
-                // Convert to [0, 1] relative to normal
-                let h1 = clamp((horizon_angle + n_angle) / PI + 0.5, 0.0, 1.0);
+                // Occlusion bitmask using direction-relative angles
+                let h1 = clamp((horizon_angle_rel + n_angle) / PI + 0.5, 0.0, 1.0);
                 let h2 = clamp((back_horizon_angle + n_angle) / PI + 0.5, 0.0, 1.0);
                 
                 let min_h = min(h1, h2);
@@ -263,10 +263,10 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
                     }
                 }
 
-                // Indirect Lighting Accumulation
+                // Indirect Lighting Accumulation (using monotonic elevation)
                 // If this sample is "above" the previous horizon, it contributes light
-                if (horizon_angle > last_horizon_angle) {
-                    let visible_angle = horizon_angle - last_horizon_angle;
+                if (horizon_angle_mono > last_horizon_angle) {
+                    let visible_angle = horizon_angle_mono - last_horizon_angle;
                     
                     // Sample emissive texture
                     let emissive_sample = textureSampleLevel(emissive_tex, post_sampler, sample_uv, 0);
@@ -282,7 +282,7 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
                         accumulated_light += emissive_color * visible_angle * attenuation * 1.0; // No boost
                     }
                     
-                    last_horizon_angle = horizon_angle;
+                    last_horizon_angle = horizon_angle_mono;
                 }
             }
         }
