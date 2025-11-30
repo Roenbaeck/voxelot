@@ -7,7 +7,7 @@ struct CompositeUniforms {
     ssao_debug: f32,
     ssao_strength: f32,
     ssr_debug: f32,
-    _pad0: f32,
+    indirect_light_scale: f32, // Modulates emissive bounce light by ambient darkness (0=day, 1=night)
     _pad1: f32,
     _pad2: f32,
 };
@@ -73,12 +73,12 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let balance = base - vec3<f32>(luma, luma, luma);
     let saturated = vec3<f32>(luma, luma, luma) + balance * composite.saturation_boost;
 
-    // Add direct emissive contribution (so emissive surfaces glow from their own emission)
+    // Add direct emissive contribution (always at full strength - emissive surfaces always glow)
     let direct_emissive = textureSample(emissive_texture, post_sampler, uv).rgb;
 
     var color = saturated + bloom * composite.bloom_strength;
-    color = color + direct_emissive; // Add direct emission from this pixel
-    color = color + indirect_light; // Add screen-space emissive indirect lighting
+    color = color + direct_emissive; // Direct emission (no modulation)
+    color = color + indirect_light * composite.indirect_light_scale; // Bounce light (modulated by darkness)
     color = color * ao; // apply SSAO visibility (0..1) to darken color
     color = color * composite.exposure;
     color = max(color, vec3<f32>(0.0));

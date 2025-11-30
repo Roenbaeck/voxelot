@@ -272,7 +272,7 @@ struct CompositeUniforms {
     ssao_debug: f32,
     ssao_strength: f32,
     ssr_debug: f32,
-    _padding0: f32,
+    indirect_light_scale: f32, // Modulates emissive bounce light by ambient darkness (0=day, 1=night)
     _padding1: f32,
     _padding2: f32,
 }
@@ -1775,6 +1775,33 @@ impl App {
     }
 
     fn build_composite_uniforms(&self) -> CompositeUniforms {
+        // Calculate indirect light scale based on time of day
+        // Emissive bounce light should be most visible at night, minimal during day
+        let t = self.time_of_day;
+
+        // Simple smoothstep helper
+        let smoothstep = |edge0: f32, edge1: f32, x: f32| -> f32 {
+            let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        };
+
+        let indirect_light_scale = if t < 0.20 {
+            // Midnight to dawn: full visibility ramping down
+            1.0 - smoothstep(0.0, 0.20, t) * 0.5
+        } else if t < 0.25 {
+            // Dawn to sunrise: rapid fade
+            0.5 * (1.0 - smoothstep(0.20, 0.25, t))
+        } else if t < 0.75 {
+            // Daytime: minimal visibility
+            0.05
+        } else if t < 0.80 {
+            // Sunset to dusk: rapid increase
+            0.05 + 0.45 * smoothstep(0.75, 0.80, t)
+        } else {
+            // Dusk to midnight: ramp to full visibility
+            0.5 + 0.5 * smoothstep(0.80, 1.0, t)
+        };
+
         CompositeUniforms {
             bloom_strength: if self.bloom_enabled && self.bloom_settings.kawase_enabled {
                 self.bloom_settings.bloom_strength
@@ -1787,7 +1814,7 @@ impl App {
             ssao_debug: if self.ssao_debug { 1.0 } else { 0.0 },
             ssao_strength: self.ssao_settings.strength,
             ssr_debug: if self.ssr_debug { 1.0 } else { 0.0 },
-            _padding0: 0.0,
+            indirect_light_scale,
             _padding1: 0.0,
             _padding2: 0.0,
         }
