@@ -21,7 +21,7 @@ window_height = 720
 
 [atmosphere]
 fog_density = 0.00044999996
-time_of_day = 0.9994196
+time_of_day = 0.9686589
 night_skybox_brightness = 0.02
 horizon_fade_up = 0.05
 horizon_fade_down = 0.25
@@ -59,7 +59,7 @@ kawase_offset = 0.5
 
 [effects.ssao]
 enabled = true
-sample_count = 32
+sample_count = 16
 slice_count = 4
 radius = 100.0
 thickness = 8.0
