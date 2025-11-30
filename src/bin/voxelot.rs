@@ -3273,11 +3273,18 @@ impl App {
             }
         }
 
-        if let (Some(composite_ubo), Some(sampler), Some(ssao_ping_view), Some(ssr_view)) = (
+        if let (
+            Some(composite_ubo),
+            Some(sampler),
+            Some(ssao_ping_view),
+            Some(ssr_view),
+            Some(emissive_view),
+        ) = (
             self.composite_uniform_buffer.as_ref(),
             self.post_sampler.as_ref(),
             self.ssao_ping_view.as_ref(),
             self.ssr_texture_view.as_ref(),
+            self.emissive_view.as_ref(),
         ) {
             self.composite_bind_group =
                 Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3307,6 +3314,10 @@ impl App {
                         wgpu::BindGroupEntry {
                             binding: 3,
                             resource: wgpu::BindingResource::Sampler(sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: wgpu::BindingResource::TextureView(emissive_view),
                         },
                     ],
                 }));
@@ -5546,6 +5557,16 @@ impl App {
                         binding: 3,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
                         count: None,
                     },
                 ],
