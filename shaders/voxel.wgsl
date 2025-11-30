@@ -206,12 +206,9 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     
     let lighting = ambient + sun_contribution + moon_light + indirect_light;
     
-    // For emissive surfaces, reduce lighting influence to prevent over-brightening
-    // Emissive surfaces should show their base color + emission, not lit base color + emission
-    let emissive_strength = input.emissive.a;
-    let lighting_multiplier = mix(1.0, 0.3, emissive_strength);
+    let emissive_strength = input.emissive.a; // Still needed for emissive glow scaling
     let ao = input.ao; // AO passed separately from instance AO attribute
-    let color = input.color.rgb * (lighting * lighting_multiplier) * ao;
+    let color = input.color.rgb * lighting * ao;
 
     // Fog color modulated by ambient and sky brightness (darker at night)
     let base_fog_color = vec3<f32>(0.7, 0.8, 0.9);
@@ -272,7 +269,7 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
         // We assume Type 0 is used for envelopes as per design
         let env_color_base = get_voxel_color(0u);
         // Apply lighting to envelope color so it matches the scene
-        let env_lit = env_color_base * (lighting * lighting_multiplier);
+        let env_lit = env_color_base * lighting;
         let env_fogged = mix(env_lit, fog_color + inscatter, fog_factor);
         
         brightened = mix(brightened, env_fogged, env_fade_factor);
@@ -351,11 +348,8 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     
     let lighting = ambient + sun_contribution + moon_light + indirect_light;
     
-    // For emissive surfaces, reduce lighting influence to prevent over-brightening
-    // Emissive surfaces should show their base color + emission, not lit base color + emission
-    let emissive_strength = input.emissive.a;
-    let lighting_multiplier = mix(1.0, 0.3, emissive_strength);
-        let color = input.color.rgb * (lighting * lighting_multiplier) * input.color.a;
+    let emissive_strength = input.emissive.a; // Still needed for emissive glow scaling
+    let color = input.color.rgb * lighting * input.color.a;
     
     // Fog color modulated by ambient and sky brightness (darker at night)
     let base_fog_color = vec3<f32>(0.7, 0.8, 0.9);
@@ -409,7 +403,7 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
         // We assume Type 0 is used for envelopes as per design
         let env_color_base = get_voxel_color(0u);
         // Apply lighting to envelope color so it matches the scene
-        let env_lit = env_color_base * (lighting * lighting_multiplier);
+        let env_lit = env_color_base * lighting;
         let env_fogged = mix(env_lit, fog_color + inscatter, fog_factor);
         
         brightened = mix(brightened, env_fogged, env_fade_factor);
