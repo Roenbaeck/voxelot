@@ -6505,11 +6505,12 @@ impl App {
                             // We know it's a solid voxel because it's in the shell
                             if let Some(vtype) = chunk.get_type(x, y, z) {
                                 // DEBUG: Print first few shell voxels
+                                /*
                                 if voxels_written < 5 {
                                     eprintln!("DEBUG shell: voxel_type={}, pos=({},{},{}), chunk_key=({},{},{})", 
                                         vtype, x, y, z, key.0, key.1, key.2);
                                 }
-
+                                 */
                                 let (emissive_rgb, emissive_intensity) =
                                     self.palette.emissive(vtype as u32);
                                 self.cpu_prepopulated_instances.push(VoxelInstanceRaw {
