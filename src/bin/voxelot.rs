@@ -7258,6 +7258,27 @@ impl App {
         }
         mesh_result_collect_time += result_collect_start.elapsed();
 
+        // Prune pending mesh queue: remove chunks that are no longer visible
+        // This prevents wasting work on chunks that were queued but then culled
+        let prune_start = std::time::Instant::now();
+        let original_pending_count = self.pending_chunk_meshes.len();
+        self.pending_chunk_meshes.retain(|key| {
+            if leaf_chunks.contains(key) {
+                true
+            } else {
+                self.pending_chunk_set.remove(key);
+                false
+            }
+        });
+        let pruned_count = original_pending_count - self.pending_chunk_meshes.len();
+        if pruned_count > 0 && self.frame_count % 60 == 0 {
+            // Log occasionally if we're pruning a lot
+            if pruned_count > 100 {
+                eprintln!("Pruned {} stale chunks from pending mesh queue", pruned_count);
+            }
+        }
+        let _prune_time = prune_start.elapsed();
+
         let max_inflight = self.max_inflight_jobs();
         let schedule_start = std::time::Instant::now();
         while self.mesh_jobs_in_flight < max_inflight {
@@ -7311,6 +7332,12 @@ impl App {
                 break;
             };
             let job_create_start = std::time::Instant::now();
+
+            // Skip chunks that are no longer visible (they may have been queued before culling removed them)
+            if !leaf_chunks.contains(&key) {
+                self.pending_chunk_set.remove(&key);
+                continue;
+            }
 
             // Determine if we need an envelope or standard mesh
             let cam_pos = self.camera_controller.camera.position;
