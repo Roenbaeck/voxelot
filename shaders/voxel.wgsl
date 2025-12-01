@@ -172,7 +172,12 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     let shadow_strength = uniforms.camera_shadow_strength.w;
     let raw_visibility = mix(1.0, base_shadow, shadow_strength);
     let shadow_visibility = clamp(1.0 - (1.0 - raw_visibility) * uniforms.shadow_darkness.x, 0.0, 1.0);
-    let sun_contribution = sun_diffuse * uniforms.sun_color_pad.xyz * shadow_visibility;
+    let emissive_strength = input.emissive.a;
+    // Attenuate directional light on emissive surfaces to prevent over-brightness
+    // We keep ambient full to avoid "sharpness" artifacts in shadow.
+    let dir_light_attenuation = 1.0 - (emissive_strength * 1.0);
+
+    let sun_contribution = sun_diffuse * uniforms.sun_color_pad.xyz * shadow_visibility * dir_light_attenuation;
     var ambient = uniforms.ambient_color_pad.xyz;
     // If normal faces away from sun, reduce ambient for clear back-face darkening.
     // back_strength == 0 for faces facing sun, >0 for faces facing away
@@ -183,7 +188,7 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     // Moon light (no shadows yet) -------------------------------------------------
     let moon_dir = normalize(uniforms.moon_direction_intensity.xyz);
     let moon_diffuse = max(dot(input.normal, moon_dir), 0.0);
-    let moon_light = moon_diffuse * uniforms.moon_color_pad.xyz * uniforms.moon_direction_intensity.w;
+    let moon_light = moon_diffuse * uniforms.moon_color_pad.xyz * uniforms.moon_direction_intensity.w * dir_light_attenuation;
     
     // Sample light probes for indirect emissive lighting
     var indirect_light = vec3<f32>(0.0, 0.0, 0.0);
@@ -206,12 +211,9 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     
     let lighting = ambient + sun_contribution + moon_light + indirect_light;
     
-    // For emissive surfaces, reduce lighting influence to prevent over-brightening
-    // Emissive surfaces should show their base color + emission, not lit base color + emission
-    let emissive_strength = input.emissive.a;
-    let lighting_multiplier = mix(1.0, 0.3, emissive_strength);
+    // emissive_strength is already defined above
     let ao = input.ao; // AO passed separately from instance AO attribute
-    let color = input.color.rgb * (lighting * lighting_multiplier) * ao;
+    let color = input.color.rgb * lighting * ao;
 
     // Fog color modulated by ambient and sky brightness (darker at night)
     let base_fog_color = vec3<f32>(0.7, 0.8, 0.9);
@@ -272,7 +274,7 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
         // We assume Type 0 is used for envelopes as per design
         let env_color_base = get_voxel_color(0u);
         // Apply lighting to envelope color so it matches the scene
-        let env_lit = env_color_base * (lighting * lighting_multiplier);
+        let env_lit = env_color_base * lighting;
         let env_fogged = mix(env_lit, fog_color + inscatter, fog_factor);
         
         brightened = mix(brightened, env_fogged, env_fade_factor);
@@ -286,7 +288,10 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
 
     var out: FragmentOutput;
     out.color = vec4<f32>(brightened, alpha);
-    out.emissive = input.emissive; // Pass through emissive data (rgb + strength)
+    
+    // Scale emissive by strength and apply fades so it doesn't pop in/out
+    let final_emissive = input.emissive.rgb * input.emissive.a * (1.0 - env_fade_factor) * alpha;
+    out.emissive = vec4<f32>(final_emissive, input.emissive.a);
     return out;
 }
 
@@ -317,7 +322,11 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     let shadow_strength = uniforms.camera_shadow_strength.w;
     let raw_visibility = mix(1.0, base_shadow, shadow_strength);
     let shadow_visibility = clamp(1.0 - (1.0 - raw_visibility) * uniforms.shadow_darkness.x, 0.0, 1.0);
-    let sun_contribution = sun_diffuse * uniforms.sun_color_pad.xyz * shadow_visibility;
+    let emissive_strength = input.emissive.a;
+    // Attenuate directional light on emissive surfaces to prevent over-brightness
+    let dir_light_attenuation = 1.0 - (emissive_strength * 1.0);
+
+    let sun_contribution = sun_diffuse * uniforms.sun_color_pad.xyz * shadow_visibility * dir_light_attenuation;
     var ambient = uniforms.ambient_color_pad.xyz;
     // If normal faces away from sun, reduce ambient for back-face darkening
     let ndotl_raw = dot(input.normal, sun_dir);
@@ -328,7 +337,7 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     // Moon light (no shadows yet)
     let moon_dir = normalize(uniforms.moon_direction_intensity.xyz);
     let moon_diffuse = max(dot(input.normal, moon_dir), 0.0);
-    let moon_light = moon_diffuse * uniforms.moon_color_pad.xyz * uniforms.moon_direction_intensity.w;
+    let moon_light = moon_diffuse * uniforms.moon_color_pad.xyz * uniforms.moon_direction_intensity.w * dir_light_attenuation;
     
     // Sample light probes for indirect emissive lighting
     var indirect_light = vec3<f32>(0.0, 0.0, 0.0);
@@ -351,11 +360,8 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     
     let lighting = ambient + sun_contribution + moon_light + indirect_light;
     
-    // For emissive surfaces, reduce lighting influence to prevent over-brightening
-    // Emissive surfaces should show their base color + emission, not lit base color + emission
-    let emissive_strength = input.emissive.a;
-    let lighting_multiplier = mix(1.0, 0.3, emissive_strength);
-        let color = input.color.rgb * (lighting * lighting_multiplier) * input.color.a;
+    // emissive_strength is already defined above
+    let color = input.color.rgb * lighting * input.color.a;
     
     // Fog color modulated by ambient and sky brightness (darker at night)
     let base_fog_color = vec3<f32>(0.7, 0.8, 0.9);
@@ -409,7 +415,7 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
         // We assume Type 0 is used for envelopes as per design
         let env_color_base = get_voxel_color(0u);
         // Apply lighting to envelope color so it matches the scene
-        let env_lit = env_color_base * (lighting * lighting_multiplier);
+        let env_lit = env_color_base * lighting;
         let env_fogged = mix(env_lit, fog_color + inscatter, fog_factor);
         
         brightened = mix(brightened, env_fogged, env_fade_factor);
@@ -423,7 +429,10 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     
     var out: FragmentOutput;
     out.color = vec4<f32>(brightened, alpha);
-    out.emissive = input.emissive;
+    
+    // Scale emissive by strength and apply fades so it doesn't pop in/out
+    let final_emissive = input.emissive.rgb * input.emissive.a * (1.0 - env_fade_factor) * alpha;
+    out.emissive = vec4<f32>(final_emissive, input.emissive.a);
     return out;
 }
 

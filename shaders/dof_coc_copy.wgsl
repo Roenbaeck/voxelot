@@ -21,6 +21,9 @@ var depth_texture: texture_depth_2d;
 @group(0) @binding(3)
 var color_sampler: sampler;
 
+@group(0) @binding(4)
+var emissive_texture: texture_2d<f32>;
+
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
@@ -59,9 +62,14 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let focus_distance = dof_uniforms.focal_distance;
     let focal_range = dof_uniforms.focal_range;
     let distance_from_focus = linear_depth - focus_distance;
+    
+    // Sample base color and emissive
+    let base_color = textureSample(color_texture, color_sampler, base_uv).rgb;
+    let emissive_color = textureSample(emissive_texture, color_sampler, base_uv).rgb;
+    let final_color = base_color + emissive_color; // Add emissive before blur
+    
     if (abs(distance_from_focus) < focal_range) || (dof_uniforms.blur_strength <= 0.01) {
-        let base_color = textureSample(color_texture, color_sampler, base_uv).rgb;
-        return vec4<f32>(base_color, 0.0);
+        return vec4<f32>(final_color, 0.0);
     }
 
     // Compute pixel CoC magnitude (unsigned approx), store normalized alpha.
@@ -70,6 +78,5 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let coc_norm = blur_start / max(abs(linear_depth), 1e-3);
     let coc_pixels = clamp(coc_norm * sensor_scale * 0.02, -15.0, 15.0);
     let coc_abs = abs(coc_pixels);
-    let base_color = textureSample(color_texture, color_sampler, base_uv).rgb;
-    return vec4<f32>(base_color, coc_abs / 15.0);
+    return vec4<f32>(final_color, coc_abs / 15.0);
 }
