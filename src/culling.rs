@@ -1,6 +1,6 @@
 //! Culling and visibility determination for hierarchical chunks
 
-use crate::lib_hierarchical::{Chunk, Voxel, VoxelType, World, bbox_local_to_world};
+use crate::lib_hierarchical::{bbox_local_to_world, Chunk, Voxel, VoxelType, World};
 use rustc_hash::FxHashMap as HashMap;
 
 /// Runtime configuration for rendering and LOD
@@ -797,6 +797,48 @@ fn process_voxels<I>(
                 let distance = camera.distance_to(voxel_center);
 
                 if distance >= camera.config.lod_render_distance && sub_chunk.voxel_count > 0 {
+                    // --- Hierarchy Shell Culling ---
+                    // Check if this sub-chunk has any visible faces toward the camera
+                    if let Some(shell) = &sub_chunk.hierarchy_shell {
+                        // Compute demand mask based on camera direction
+                        let dx = voxel_center[0] - camera.position[0];
+                        let dy = voxel_center[1] - camera.position[1];
+                        let dz = voxel_center[2] - camera.position[2];
+
+                        let mut demand_mask = 0u8;
+                        // Show faces pointing toward camera
+                        if dx > 0.0 {
+                            demand_mask |= 1 << 0;
+                        }
+                        // Camera left of chunk, show +X face
+                        else {
+                            demand_mask |= 1 << 1;
+                        } // Camera right of chunk, show -X face
+                        if dy > 0.0 {
+                            demand_mask |= 1 << 2;
+                        }
+                        // Camera below chunk, show +Y face
+                        else {
+                            demand_mask |= 1 << 3;
+                        } // Camera above chunk, show -Y face
+                        if dz > 0.0 {
+                            demand_mask |= 1 << 4;
+                        }
+                        // Camera behind chunk, show +Z face
+                        else {
+                            demand_mask |= 1 << 5;
+                        } // Camera in front of chunk, show -Z face
+
+                        // Check if ANY shell voxel has a visible face toward camera
+                        let has_visible_faces =
+                            shell.iter().any(|sv| (sv.visible_faces & demand_mask) != 0);
+
+                        if !has_visible_faces {
+                            // Fully obscured - skip this sub-chunk entirely!
+                            return;
+                        }
+                    }
+
                     let (pos, size) = if let Some(bbox) = sub_chunk.bounding_box {
                         // Convert local bbox (0..15) to world coordinates + size in world units.
                         bbox_local_to_world([world_x, world_y, world_z], scale, bbox)
@@ -989,7 +1031,7 @@ pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> Vec<Voxel
                         if distance >= camera.config.lod_render_distance {
                             if chunk.voxel_count > 0 {
                                 let (pos, size) = if let Some(bbox) = chunk.bounding_box {
-                                        bbox_local_to_world([world_x, world_y, world_z], scale, bbox)
+                                    bbox_local_to_world([world_x, world_y, world_z], scale, bbox)
                                 } else {
                                     (
                                         [world_x, world_y, world_z],
@@ -1132,7 +1174,7 @@ fn mul_scalar(v: &[f32; 3], s: f32) -> [f32; 3] {
 // bbox_local_to_world is provided by `lib_hierarchical` for consistent conversions.
 
 #[cfg(test)]
-    mod tests_culling {
+mod tests_culling {
     use crate::lib_hierarchical::bbox_local_to_world;
     #[test]
     fn test_bbox_local_to_world() {

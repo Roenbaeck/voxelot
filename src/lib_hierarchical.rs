@@ -137,6 +137,11 @@ pub struct Chunk {
 
     /// Ratio of solid voxels to total slots (0.0..=1.0)
     pub solid_ratio: f32,
+
+    /// Shell of surface sub-chunks for this hierarchy level (None for leaf chunks)
+    /// Each entry represents a sub-chunk with at least one exposed face
+    /// Enables fast occlusion culling at any hierarchy level
+    pub hierarchy_shell: Option<Vec<ShellVoxel>>,
 }
 
 impl Chunk {
@@ -155,6 +160,7 @@ impl Chunk {
             emissive_voxels: 0,
             solid_ratio: 0.0,
             bounding_box: None,
+            hierarchy_shell: None,
         }
     }
 
@@ -561,7 +567,82 @@ impl Chunk {
         }
     }
 
-    /// Generate a shell of surface voxels for this chunk
+    /// Check if this chunk is a leaf chunk (contains only solid voxels, no sub-chunks)
+    pub fn is_leaf_chunk(&self) -> bool {
+        self.voxels.iter().all(|v| matches!(v, Voxel::Solid(_)))
+    }
+
+    /// Check if a position is occupied (contains a solid voxel or non-empty sub-chunk)
+    fn is_occupied_at(&self, x: u8, y: u8, z: u8) -> bool {
+        match self.get(x, y, z) {
+            Some(Voxel::Solid(_)) => true,
+            Some(Voxel::Chunk(c)) => c.voxel_count > 0,
+            None => false,
+        }
+    }
+
+    /// Generate a hierarchical shell for non-leaf chunks
+    /// Returns a list of sub-chunks that have at least one face exposed
+    pub fn generate_hierarchy_shell(&mut self) {
+        if self.is_leaf_chunk() || self.is_empty() {
+            self.hierarchy_shell = None;
+            return;
+        }
+
+        let mut shell = Vec::with_capacity(256);
+
+        for ((x, y, z), voxel) in self.iter() {
+            // Only consider occupied sub-chunks
+            let is_occupied = match voxel {
+                Voxel::Solid(_) => true,
+                Voxel::Chunk(c) => c.voxel_count > 0,
+            };
+
+            if !is_occupied {
+                continue;
+            }
+
+            let mut mask = 0u8;
+
+            // Check 6 neighbor sub-chunks
+            // +X (Right)
+            if x == 15 || !self.is_occupied_at(x + 1, y, z) {
+                mask |= 1 << 0;
+            }
+            // -X (Left)
+            if x == 0 || !self.is_occupied_at(x - 1, y, z) {
+                mask |= 1 << 1;
+            }
+            // +Y (Top)
+            if y == 15 || !self.is_occupied_at(x, y + 1, z) {
+                mask |= 1 << 2;
+            }
+            // -Y (Bottom)
+            if y == 0 || !self.is_occupied_at(x, y - 1, z) {
+                mask |= 1 << 3;
+            }
+            // +Z (Front)
+            if z == 15 || !self.is_occupied_at(x, y, z + 1) {
+                mask |= 1 << 4;
+            }
+            // -Z (Back)
+            if z == 0 || !self.is_occupied_at(x, y, z - 1) {
+                mask |= 1 << 5;
+            }
+
+            if mask != 0 {
+                let packed = (x as u16) | ((y as u16) << 4) | ((z as u16) << 8);
+                shell.push(ShellVoxel {
+                    packed_pos: packed,
+                    visible_faces: mask,
+                });
+            }
+        }
+
+        self.hierarchy_shell = Some(shell);
+    }
+
+    /// Generate a shell of surface voxels for this chunk (leaf level only)
     /// Returns a list of voxels that have at least one face exposed to air (or chunk boundary)
     pub fn generate_shell(&self) -> Vec<ShellVoxel> {
         let mut shell = Vec::with_capacity(512); // Heuristic start size
@@ -979,6 +1060,29 @@ impl World {
 
         // Then update this chunk's metadata
         chunk.update_lod_metadata(palette);
+    }
+
+    /// Generate hierarchical shells for all non-leaf chunks
+    /// Call after update_all_lod_metadata() to enable efficient occlusion culling
+    pub fn generate_all_hierarchy_shells(&mut self) {
+        let root_mut = Arc::make_mut(&mut self.root);
+        Self::generate_hierarchy_shells_recursive(root_mut);
+    }
+
+    /// Recursive helper to generate hierarchy shells bottom-up
+    fn generate_hierarchy_shells_recursive(chunk: &mut Chunk) {
+        use rayon::prelude::*;
+
+        // First, recursively generate shells for all sub-chunks
+        chunk.voxels.par_iter_mut().for_each(|voxel| {
+            if let Voxel::Chunk(sub_chunk_arc) = voxel {
+                let sub_chunk = Arc::make_mut(sub_chunk_arc);
+                Self::generate_hierarchy_shells_recursive(sub_chunk);
+            }
+        });
+
+        // Then generate shell for this chunk
+        chunk.generate_hierarchy_shell();
     }
 }
 

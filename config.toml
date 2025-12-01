@@ -1,12 +1,12 @@
 [world]
-file = "test_world_smoothed5.oct"
+file = "worlds/world_3.oct"
 palette = "worlds/palette.txt"
 camera_position = [
     320.0,
     100.0,
     320.0,
 ]
-water_level = 11.0
+water_level = 500.0
 
 [rendering]
 lod_subdivide_distance = 2000.0
@@ -21,7 +21,7 @@ window_height = 720
 
 [atmosphere]
 fog_density = 0.00019999995
-time_of_day = 0.13459969
+time_of_day = 0.5491209
 night_skybox_brightness = 0.02
 horizon_fade_up = 0.05
 horizon_fade_down = 0.25

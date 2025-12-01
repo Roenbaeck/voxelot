@@ -1114,7 +1114,7 @@ impl App {
         // Load configuration once for all initialization
         let cfg = voxelot::Config::load_or_default(CONFIG_FILE);
 
-        let initial_camera;
+        let mut initial_camera;
         let mut world;
 
         if cfg!(feature = "test-block-world") {
@@ -1199,6 +1199,37 @@ impl App {
             );
         }
 
+        // Failsafe: Ensure camera is not inside terrain
+        let mut cam_pos = initial_camera;
+        let start_y = cam_pos[1];
+        let mut corrected = false;
+        // Check up to 200 voxels up
+        for _ in 0..200 {
+            let wp = WorldPos::new(
+                cam_pos[0].floor() as i64,
+                cam_pos[1].floor() as i64,
+                cam_pos[2].floor() as i64,
+            );
+            if let Some(voxel) = world.get(wp) {
+                // If solid (non-zero), move up
+                if voxel != 0 {
+                    cam_pos[1] += 1.0;
+                    corrected = true;
+                } else {
+                    break;
+                }
+            } else {
+                break; // Out of bounds or empty
+            }
+        }
+        if corrected {
+            println!(
+                "Camera was inside terrain at y={:.1}, moved to y={:.1}",
+                start_y, cam_pos[1]
+            );
+            initial_camera = cam_pos;
+        }
+
         println!("World created with voxels");
 
         println!("Loading palette from {}...", cfg.world.palette);
@@ -1272,6 +1303,15 @@ impl App {
         println!(
             "LOD metadata updated (took {:.3}s)",
             lod_elapsed.as_secs_f32()
+        );
+
+        println!("Generating hierarchy shells...");
+        let shell_start = Instant::now();
+        world.generate_all_hierarchy_shells();
+        let shell_elapsed = shell_start.elapsed();
+        println!(
+            "Hierarchy shells generated (took {:.3}s)",
+            shell_elapsed.as_secs_f32()
         );
 
         println!("\n=== Controls ===");
@@ -3539,7 +3579,14 @@ impl App {
             return;
         }
 
-        let needed_capacity = required.next_power_of_two();
+        let max_capacity = 6_000_000; // Cap at ~480MB to stay under 512MB limit
+        let needed_capacity = required.next_power_of_two().min(max_capacity);
+        if required > max_capacity {
+            eprintln!(
+                "Warning: GPU input buffer required {} exceeds max {}, capping.",
+                required, max_capacity
+            );
+        }
         if self.gpu_input_capacity < needed_capacity || self.gpu_input_buffer.is_none() {
             if let Some(old_buffer) = self.gpu_input_buffer.take() {
                 old_buffer.destroy();
@@ -6457,6 +6504,12 @@ impl App {
 
                             // We know it's a solid voxel because it's in the shell
                             if let Some(vtype) = chunk.get_type(x, y, z) {
+                                // DEBUG: Print first few shell voxels
+                                if voxels_written < 5 {
+                                    eprintln!("DEBUG shell: voxel_type={}, pos=({},{},{}), chunk_key=({},{},{})", 
+                                        vtype, x, y, z, key.0, key.1, key.2);
+                                }
+
                                 let (emissive_rgb, emissive_intensity) =
                                     self.palette.emissive(vtype as u32);
                                 self.cpu_prepopulated_instances.push(VoxelInstanceRaw {
@@ -6508,6 +6561,9 @@ impl App {
                         } else {
                             self.palette.emissive(v.voxel_type as u32)
                         };
+                        if self.gpu_inputs.len() >= 6_000_000 {
+                            continue;
+                        }
                         self.gpu_inputs.push(GpuInstanceInput {
                             position: [
                                 v.position[0] as f32,
@@ -6642,6 +6698,10 @@ impl App {
                 flags |= 4;
             }
 
+            if self.gpu_inputs.len() >= 6_000_000 {
+                // Buffer full, stop adding instances to prevent crash
+                continue;
+            }
             self.gpu_inputs.push(GpuInstanceInput {
                 position: [
                     v.position[0] as f32,
@@ -6671,11 +6731,17 @@ impl App {
         if gpu_candidate_count > 0 {
             self.ensure_gpu_input_buffer(&device, gpu_candidate_count);
             if let Some(buffer) = self.gpu_input_buffer.as_ref() {
-                queue.write_buffer(buffer, 0, bytemuck::cast_slice(&self.gpu_inputs));
+                let max_items =
+                    (buffer.size() / std::mem::size_of::<GpuInstanceInput>() as u64) as usize;
+                let items_to_write = gpu_candidate_count.min(max_items);
+                queue.write_buffer(
+                    buffer,
+                    0,
+                    bytemuck::cast_slice(&self.gpu_inputs[0..items_to_write]),
+                );
                 // Count the number of instance entries uploaded to the GPU input buffer
-                self.gpu_buffer_items_frame = self
-                    .gpu_buffer_items_frame
-                    .saturating_add(gpu_candidate_count);
+                self.gpu_buffer_items_frame =
+                    self.gpu_buffer_items_frame.saturating_add(items_to_write);
             }
 
             // Upload Mesh Indirect Args
@@ -7027,6 +7093,24 @@ impl App {
             let envelope_dist_sq = self.envelope_distance * self.envelope_distance;
             let max_envelope_dist_sq = self.max_envelope_distance * self.max_envelope_distance;
             let use_envelope = dist_sq > envelope_dist_sq;
+
+            // Frustum check for meshing: don't mesh what we can't see
+            let chunk_min = [key.0 as f32, key.1 as f32, key.2 as f32];
+            let chunk_max = [
+                key.0 as f32 + 16.0,
+                key.1 as f32 + 16.0,
+                key.2 as f32 + 16.0,
+            ];
+            // Allow a small radius around camera to always mesh (e.g. 32 units) to prevent pop-in when turning fast
+            let always_mesh_dist_sq = 32.0 * 32.0;
+            if dist_sq > always_mesh_dist_sq
+                && !self
+                    .camera_controller
+                    .camera
+                    .frustum_cull_aabb(chunk_min, chunk_max)
+            {
+                continue;
+            }
 
             if use_envelope && dist_sq > max_envelope_dist_sq {
                 continue;
