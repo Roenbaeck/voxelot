@@ -16,4 +16,6 @@ I am testing world/world_1.oct after the recent changes to generate biomes. The 
 
 I don't understand why this is happening, but it is a bug. Can you check why the meshing is picking up the wrong color?
 
-If remove the entries 8 to 46, just keeping the original 0 to 7 in palette.txt the bug is gone. If I add back all 46 entries, the bug comes back.
+If remove the entries 8 to 46, just keeping the original 0 to 7 in palette.txt the bug is gone. If I add back all 46 entries, the bug comes back. 
+
+Note that since individual voxels render with a different color than the meshed variant of the same geometry, there is a bug here somewhere. 
