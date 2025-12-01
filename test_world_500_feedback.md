@@ -12,7 +12,7 @@ Note: Lakes and hills should not be separate biomes on top of the general terrai
 5. The camera_position puts the camera inside the world. Would it be possible to have a failsafe that moves the camera up above the world if it detects on startup that the camera is inside something?
 
 --------
-I am testing world/world_1.oct after the recent changes to generate biomes. The palette.txt was extended with more colors, but palette index 0-7 remain unchanged. I would have expected world_3 to render as before, but I can see that unmeshed chunks (fallback to individual voxels) render correctly with respect to the palette, but that when these get replaced by meshed geometry, some meshes turn green. See screenshot showing both the unmeshed and meshed chunks next to each other and differing in color in some places. 
+I am testing world/world_1.oct after the recent changes to generate biomes. The palette.txt was extended with more colors, but palette index 0-7 remain unchanged. I would have expected world_3 to render as before, but I can see that unmeshed chunks (fallback to individual voxels) render correctly with respect to the palette, but that when these get replaced by meshed geometry, some meshes turn green, and it's not the green color from the legacy palette (0 to 7). See screenshot showing both the unmeshed and meshed chunks next to each other and differing in color in some places. 
 
 I don't understand why this is happening, but it is a bug. Can you check why the meshing is picking up the wrong color?
 
