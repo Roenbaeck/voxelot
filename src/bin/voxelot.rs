@@ -845,6 +845,8 @@ struct App {
     last_pending_mesh_sort_frame: u64,
     mesh_cache_budget_bytes: u64,
     fallback_detail_distance: f32,
+    /// Maximum number of GPU instances (configurable, used for buffer sizing and safeguards)
+    max_gpu_instances: usize,
 
     // Reusable buffers for internal processing to avoid per-frame allocations
     pending_chunk_sort_buf: Vec<(i64, i64, i64)>,
@@ -1200,35 +1202,68 @@ impl App {
             );
         }
 
-        // Failsafe: Ensure camera is not inside terrain
+        // Failsafe: Ensure camera spawns above terrain
         let mut cam_pos = initial_camera;
         let start_y = cam_pos[1];
-        let mut corrected = false;
-        // Check up to 200 voxels up
-        for _ in 0..200 {
-            let wp = WorldPos::new(
-                cam_pos[0].floor() as i64,
-                cam_pos[1].floor() as i64,
-                cam_pos[2].floor() as i64,
-            );
+        
+        // Strategy: Search from top of world down to find the highest solid voxel at camera X,Z
+        // Then place camera 10 units above that point
+        let world_height = world.world_size() as i64;
+        let cam_x = cam_pos[0].floor() as i64;
+        let cam_z = cam_pos[2].floor() as i64;
+        
+        let mut highest_solid_y: Option<i64> = None;
+        
+        // Search from near the top of the world downward
+        for y in (0..world_height).rev() {
+            let wp = WorldPos::new(cam_x, y, cam_z);
             if let Some(voxel) = world.get(wp) {
-                // If solid (non-zero), move up
                 if voxel != 0 {
-                    cam_pos[1] += 1.0;
-                    corrected = true;
+                    highest_solid_y = Some(y);
+                    break;
+                }
+            }
+        }
+        
+        // Place camera above the highest solid voxel found, or use a reasonable default
+        if let Some(solid_y) = highest_solid_y {
+            let safe_y = (solid_y + 10) as f32;
+            if cam_pos[1] <= solid_y as f32 {
+                println!(
+                    "Camera was at y={:.1} (inside/below terrain at y={}), moved to y={:.1}",
+                    start_y, solid_y, safe_y
+                );
+                cam_pos[1] = safe_y;
+                initial_camera = cam_pos;
+            }
+        } else {
+            // No solid found at this X,Z - camera position is likely fine
+            // But do a quick check to make sure we're not inside something
+            let mut corrected = false;
+            for _ in 0..50 {
+                let wp = WorldPos::new(
+                    cam_pos[0].floor() as i64,
+                    cam_pos[1].floor() as i64,
+                    cam_pos[2].floor() as i64,
+                );
+                if let Some(voxel) = world.get(wp) {
+                    if voxel != 0 {
+                        cam_pos[1] += 1.0;
+                        corrected = true;
+                    } else {
+                        break;
+                    }
                 } else {
                     break;
                 }
-            } else {
-                break; // Out of bounds or empty
             }
-        }
-        if corrected {
-            println!(
-                "Camera was inside terrain at y={:.1}, moved to y={:.1}",
-                start_y, cam_pos[1]
-            );
-            initial_camera = cam_pos;
+            if corrected {
+                println!(
+                    "Camera was inside terrain at y={:.1}, moved to y={:.1}",
+                    start_y, cam_pos[1]
+                );
+                initial_camera = cam_pos;
+            }
         }
 
         println!("World created with voxels");
@@ -1447,6 +1482,7 @@ impl App {
             last_pending_mesh_sort_frame: 0,
             mesh_cache_budget_bytes: cfg.performance.mesh_cache_budget_mb as u64 * 1024 * 1024,
             fallback_detail_distance: cfg.performance.fallback_detail_distance,
+            max_gpu_instances: cfg.performance.max_gpu_instances,
             pending_chunk_sort_buf: Vec::with_capacity(4096),
             tmp_chunk_emitters: Vec::with_capacity(64),
             vb_data_tmp: Vec::with_capacity(8192),
@@ -3587,7 +3623,7 @@ impl App {
             return;
         }
 
-        let max_capacity = 6_000_000; // Cap at ~480MB to stay under 512MB limit
+        let max_capacity = self.max_gpu_instances;
         let needed_capacity = required.next_power_of_two().min(max_capacity);
         if required > max_capacity {
             eprintln!(
@@ -6539,13 +6575,10 @@ impl App {
 
                             // We know it's a solid voxel because it's in the shell
                             if let Some(vtype) = chunk.get_type(x, y, z) {
-                                // DEBUG: Print first few shell voxels
-                                /*
-                                if voxels_written < 5 {
-                                    eprintln!("DEBUG shell: voxel_type={}, pos=({},{},{}), chunk_key=({},{},{})", 
-                                        vtype, x, y, z, key.0, key.1, key.2);
+                                // Check buffer capacity before adding
+                                if self.cpu_prepopulated_instances.len() >= self.max_gpu_instances {
+                                    break; // Buffer full
                                 }
-                                 */
                                 let (emissive_rgb, emissive_intensity) =
                                     self.palette.emissive(vtype as u32);
                                 self.cpu_prepopulated_instances.push(VoxelInstanceRaw {
@@ -6597,7 +6630,7 @@ impl App {
                         } else {
                             self.palette.emissive(v.voxel_type as u32)
                         };
-                        if self.gpu_inputs.len() >= 6_000_000 {
+                        if self.gpu_inputs.len() >= self.max_gpu_instances {
                             continue;
                         }
                         self.gpu_inputs.push(GpuInstanceInput {
@@ -6685,22 +6718,25 @@ impl App {
                         [0.0, 0.0, 0.0, 0.0]
                     };
 
-                    self.cpu_prepopulated_instances.push(VoxelInstanceRaw {
-                        position: pos,
-                        voxel_type: v.voxel_type as u32,
-                        scale: scale,
-                        ao_factor: 1.0,
-                        custom_color: custom_color_f32,
-                        emissive: [
-                            emissive_rgb[0],
-                            emissive_rgb[1],
-                            emissive_rgb[2],
-                            emissive_intensity,
-                        ],
-                    });
+                    // Check buffer capacity before adding
+                    if self.cpu_prepopulated_instances.len() < self.max_gpu_instances {
+                        self.cpu_prepopulated_instances.push(VoxelInstanceRaw {
+                            position: pos,
+                            voxel_type: v.voxel_type as u32,
+                            scale: scale,
+                            ao_factor: 1.0,
+                            custom_color: custom_color_f32,
+                            emissive: [
+                                emissive_rgb[0],
+                                emissive_rgb[1],
+                                emissive_rgb[2],
+                                emissive_intensity,
+                            ],
+                        });
 
-                    _voxel_expansion_count += 1;
-                    cpu_prepop = true;
+                        _voxel_expansion_count += 1;
+                        cpu_prepop = true;
+                    }
                 }
             }
 
@@ -6734,7 +6770,7 @@ impl App {
                 flags |= 4;
             }
 
-            if self.gpu_inputs.len() >= 6_000_000 {
+            if self.gpu_inputs.len() >= self.max_gpu_instances {
                 // Buffer full, stop adding instances to prevent crash
                 continue;
             }
@@ -6978,24 +7014,37 @@ impl App {
             if cpu_prepopulated_count > 0 {
                 // Ensure fallback instance buffer has room for prepopulated + new appended instances
                 self.ensure_gpu_input_buffer(&device, gpu_candidate_count + cpu_prepopulated_count);
-                if let Some(buffer) = self.fallback_instance_buffer.as_ref() {
-                    queue.write_buffer(
-                        buffer,
-                        0,
-                        bytemuck::cast_slice(&self.cpu_prepopulated_instances),
+                
+                // Clamp to actual buffer capacity to prevent overflow
+                let write_count = cpu_prepopulated_count.min(self.fallback_instance_capacity);
+                if write_count < cpu_prepopulated_count {
+                    eprintln!(
+                        "Warning: CPU prepopulated instances {} exceeds fallback buffer capacity {}, truncating.",
+                        cpu_prepopulated_count, self.fallback_instance_capacity
                     );
-                    // Count the CPU-prepopulated instances written into the fallback instance buffer
-                    self.gpu_buffer_items_frame = self
-                        .gpu_buffer_items_frame
-                        .saturating_add(cpu_prepopulated_count);
+                }
+                
+                if write_count > 0 {
+                    if let Some(buffer) = self.fallback_instance_buffer.as_ref() {
+                        queue.write_buffer(
+                            buffer,
+                            0,
+                            bytemuck::cast_slice(&self.cpu_prepopulated_instances[..write_count]),
+                        );
+                        // Count the CPU-prepopulated instances written into the fallback instance buffer
+                        self.gpu_buffer_items_frame = self
+                            .gpu_buffer_items_frame
+                            .saturating_add(write_count);
+                    }
                 }
             }
 
-            // Reset Fallback Indirect Args (seed instance_count with CPU prepopulated count)
+            // Reset Fallback Indirect Args (seed instance_count with CPU prepopulated count, clamped to what was written)
+            let actual_prepop_count = cpu_prepopulated_count.min(self.fallback_instance_capacity);
             if let Some(buffer) = self.fallback_indirect_buffer.as_ref() {
                 let reset_args = wgpu::util::DrawIndirectArgs {
                     vertex_count: 36,
-                    instance_count: cpu_prepopulated_count as u32,
+                    instance_count: actual_prepop_count as u32,
                     first_vertex: 0,
                     first_instance: 0,
                 };

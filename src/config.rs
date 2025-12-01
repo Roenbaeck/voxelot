@@ -206,6 +206,9 @@ pub struct PerformanceConfig {
     pub max_draw_capacity: usize,
     #[serde(default = "default_render_scale")]
     pub render_scale: f32,
+    /// Maximum number of GPU instances (chunks + fallback voxels). Limits memory usage.
+    #[serde(default = "default_max_gpu_instances")]
+    pub max_gpu_instances: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -475,6 +478,10 @@ fn default_render_scale() -> f32 {
     1.0
 }
 
+fn default_max_gpu_instances() -> usize {
+    6_000_000 // ~384MB for VoxelInstanceRaw (64 bytes each)
+}
+
 fn default_true() -> bool {
     true
 }
@@ -610,6 +617,7 @@ impl Default for PerformanceConfig {
             mega_index_buffer_mb: default_mega_index_buffer_mb(),
             max_draw_capacity: default_max_draw_capacity(),
             render_scale: default_render_scale(),
+            max_gpu_instances: default_max_gpu_instances(),
         }
     }
 }

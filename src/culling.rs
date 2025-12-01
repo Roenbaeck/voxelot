@@ -835,7 +835,7 @@ fn process_voxels<I>(
 
                         if !has_visible_faces {
                             // Fully obscured - skip this sub-chunk entirely!
-                            return;
+                            continue;
                         }
                     }
 
