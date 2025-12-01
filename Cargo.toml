@@ -17,6 +17,7 @@ glam = "0.30"
 serde_json = "1"
 rand = "0.8"
 clap = { version = "4.5", features = ["derive"] }
+noise = "0.8"
 
 # wgpu-based viewer (desktop)
 wgpu = "27.0.1"

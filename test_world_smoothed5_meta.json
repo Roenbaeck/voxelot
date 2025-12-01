@@ -1,0 +1,413 @@
+{
+  "world": {
+    "center_lon": -74.006,
+    "center_lat": 40.7128,
+    "zoom": 15,
+    "seed": 12345,
+    "radius": 2,
+    "voxel_resolution": 64,
+    "meters_per_voxel": 1.25,
+    "max_height_voxels": 128,
+    "bounds": {
+      "min_x": 0,
+      "max_x": 319,
+      "min_y": 0,
+      "max_y": 156,
+      "min_z": 0,
+      "max_z": 319
+    },
+    "camera_position": [
+      159,
+      206,
+      159
+    ]
+  },
+  "tiles": [
+    {
+      "z": 15,
+      "x": 9645,
+      "y": 12318,
+      "voxel_count": 67061,
+      "stats": {
+        "district": "nature",
+        "building_count": 0,
+        "park_count": 0,
+        "water_features": 0,
+        "road_segments": 0,
+        "voxel_count": 67061,
+        "biome": "Lake"
+      }
+    },
+    {
+      "z": 15,
+      "x": 9646,
+      "y": 12318,
+      "voxel_count": 210483,
+      "stats": {
+        "district": "downtown",
+        "building_count": 56,
+        "park_count": 0,
+        "water_features": 0,
+        "road_segments": 10,
+        "average_height_m": 56.43392857142856,
+        "voxel_count": 210483,
+        "biome": "City"
+      }
+    },
+    {
+      "z": 15,
+      "x": 9647,
+      "y": 12318,
+      "voxel_count": 140007,
+      "stats": {
+        "district": "residential",
+        "building_count": 40,
+        "park_count": 1,
+        "water_features": 0,
+        "road_segments": 10,
+        "average_height_m": 11.314999999999994,
+        "voxel_count": 140007,
+        "biome": "City"
+      }
+    },
+    {
+      "z": 15,
+      "x": 9648,
+      "y": 12318,
+      "voxel_count": 25578,
+      "stats": {
+        "district": "nature",
+        "building_count": 0,
+        "park_count": 0,
+        "water_features": 0,
+        "road_segments": 0,
+        "voxel_count": 25578,
+        "biome": "Hill"
+      }
+    },
+    {
+      "z": 15,
+      "x": 9649,
+      "y": 12318,
+      "voxel_count": 132123,
+      "stats": {
+        "district": "mixed_use",
+        "building_count": 44,
+        "park_count": 1,
+        "water_features": 1,
+        "road_segments": 10,
+        "average_height_m": 24.165909090909096,
+        "voxel_count": 132123,
+        "biome": "City"
+      }
+    },
+    {
+      "z": 15,
+      "x": 9645,
+      "y": 12319,
+      "voxel_count": 109981,
+      "stats": {
+        "district": "residential",
+        "building_count": 38,
+        "park_count": 1,
+        "water_features": 1,
+        "road_segments": 10,
+        "average_height_m": 11.91052631578947,
+        "voxel_count": 109981,
+        "biome": "City"
+      }
+    },
+    {
+      "z": 15,
+      "x": 9646,
+      "y": 12319,
+      "voxel_count": 54119,
+      "stats": {
+        "district": "nature",
+        "building_count": 0,
+        "park_count": 0,
+        "water_features": 0,
+        "road_segments": 0,
+        "voxel_count": 54119,
+        "biome": "Lake"
+      }
+    },
+    {
+      "z": 15,
+      "x": 9647,
+      "y": 12319,
+      "voxel_count": 68672,
+      "stats": {
+        "district": "nature",
+        "building_count": 0,
+        "park_count": 0,
+        "water_features": 0,
+        "road_segments": 0,
+        "voxel_count": 68672,
+        "biome": "Lake"
+      }
+    },
+    {
+      "z": 15,
+      "x": 9648,
+      "y": 12319,
+      "voxel_count": 49367,
+      "stats": {
+        "district": "nature",
+        "building_count": 0,
+        "park_count": 0,
+        "water_features": 0,
+        "road_segments": 0,
+        "voxel_count": 49367,
+        "biome": "Lake"
+      }
+    },
+    {
+      "z": 15,
+      "x": 9649,
+      "y": 12319,
+      "voxel_count": 32493,
+      "stats": {
+        "district": "nature",
+        "building_count": 0,
+        "park_count": 0,
+        "water_features": 0,
+        "road_segments": 0,
+        "voxel_count": 32493,
+        "biome": "Hill"
+      }
+    },
+    {
+      "z": 15,
+      "x": 9645,
+      "y": 12320,
+      "voxel_count": 105769,
+      "stats": {
+        "district": "residential",
+        "building_count": 31,
+        "park_count": 2,
+        "water_features": 1,
+        "road_segments": 10,
+        "average_height_m": 12.700000000000001,
+        "voxel_count": 105769,
+        "biome": "City"
+      }
+    },
+    {
+      "z": 15,
+      "x": 9646,
+      "y": 12320,
+      "voxel_count": 47475,
+      "stats": {
+        "district": "nature",
+        "building_count": 0,
+        "park_count": 0,
+        "water_features": 0,
+        "road_segments": 0,
+        "voxel_count": 47475,
+        "biome": "Lake"
+      }
+    },
+    {
+      "z": 15,
+      "x": 9647,
+      "y": 12320,
+      "voxel_count": 70394,
+      "stats": {
+        "district": "nature",
+        "building_count": 0,
+        "park_count": 0,
+        "water_features": 0,
+        "road_segments": 0,
+        "voxel_count": 70394,
+        "biome": "Hill"
+      }
+    },
+    {
+      "z": 15,
+      "x": 9648,
+      "y": 12320,
+      "voxel_count": 237057,
+      "stats": {
+        "district": "downtown",
+        "building_count": 58,
+        "park_count": 0,
+        "water_features": 0,
+        "road_segments": 10,
+        "average_height_m": 65.79827586206896,
+        "voxel_count": 237057,
+        "biome": "City"
+      }
+    },
+    {
+      "z": 15,
+      "x": 9649,
+      "y": 12320,
+      "voxel_count": 201416,
+      "stats": {
+        "district": "downtown",
+        "building_count": 62,
+        "park_count": 0,
+        "water_features": 1,
+        "road_segments": 10,
+        "average_height_m": 55.69516129032257,
+        "voxel_count": 201416,
+        "biome": "City"
+      }
+    },
+    {
+      "z": 15,
+      "x": 9645,
+      "y": 12321,
+      "voxel_count": 54376,
+      "stats": {
+        "district": "nature",
+        "building_count": 0,
+        "park_count": 0,
+        "water_features": 0,
+        "road_segments": 0,
+        "voxel_count": 54376,
+        "biome": "Lake"
+      }
+    },
+    {
+      "z": 15,
+      "x": 9646,
+      "y": 12321,
+      "voxel_count": 173561,
+      "stats": {
+        "district": "mixed_use",
+        "building_count": 43,
+        "park_count": 1,
+        "water_features": 0,
+        "road_segments": 10,
+        "average_height_m": 29.63023255813953,
+        "voxel_count": 173561,
+        "biome": "City"
+      }
+    },
+    {
+      "z": 15,
+      "x": 9647,
+      "y": 12321,
+      "voxel_count": 245710,
+      "stats": {
+        "district": "downtown",
+        "building_count": 64,
+        "park_count": 0,
+        "water_features": 0,
+        "road_segments": 10,
+        "average_height_m": 54.10468749999999,
+        "voxel_count": 245710,
+        "biome": "City"
+      }
+    },
+    {
+      "z": 15,
+      "x": 9648,
+      "y": 12321,
+      "voxel_count": 65553,
+      "stats": {
+        "district": "nature",
+        "building_count": 0,
+        "park_count": 0,
+        "water_features": 0,
+        "road_segments": 0,
+        "voxel_count": 65553,
+        "biome": "Lake"
+      }
+    },
+    {
+      "z": 15,
+      "x": 9649,
+      "y": 12321,
+      "voxel_count": 77818,
+      "stats": {
+        "district": "nature",
+        "building_count": 0,
+        "park_count": 0,
+        "water_features": 0,
+        "road_segments": 0,
+        "voxel_count": 77818,
+        "biome": "Hill"
+      }
+    },
+    {
+      "z": 15,
+      "x": 9645,
+      "y": 12322,
+      "voxel_count": 107779,
+      "stats": {
+        "district": "residential",
+        "building_count": 36,
+        "park_count": 1,
+        "water_features": 1,
+        "road_segments": 10,
+        "average_height_m": 11.969444444444441,
+        "voxel_count": 107779,
+        "biome": "City"
+      }
+    },
+    {
+      "z": 15,
+      "x": 9646,
+      "y": 12322,
+      "voxel_count": 48147,
+      "stats": {
+        "district": "nature",
+        "building_count": 0,
+        "park_count": 0,
+        "water_features": 0,
+        "road_segments": 0,
+        "voxel_count": 48147,
+        "biome": "Hill"
+      }
+    },
+    {
+      "z": 15,
+      "x": 9647,
+      "y": 12322,
+      "voxel_count": 29664,
+      "stats": {
+        "district": "nature",
+        "building_count": 0,
+        "park_count": 0,
+        "water_features": 0,
+        "road_segments": 0,
+        "voxel_count": 29664,
+        "biome": "Hill"
+      }
+    },
+    {
+      "z": 15,
+      "x": 9648,
+      "y": 12322,
+      "voxel_count": 14832,
+      "stats": {
+        "district": "nature",
+        "building_count": 0,
+        "park_count": 0,
+        "water_features": 0,
+        "road_segments": 0,
+        "voxel_count": 14832,
+        "biome": "Hill"
+      }
+    },
+    {
+      "z": 15,
+      "x": 9649,
+      "y": 12322,
+      "voxel_count": 135776,
+      "stats": {
+        "district": "mixed_use",
+        "building_count": 48,
+        "park_count": 0,
+        "water_features": 0,
+        "road_segments": 10,
+        "average_height_m": 28.093750000000004,
+        "voxel_count": 135776,
+        "biome": "City"
+      }
+    }
+  ]
+}
