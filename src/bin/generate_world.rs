@@ -121,7 +121,6 @@ struct TileStats {
 enum Biome {
     City,
     Hill,
-    Lake,
 }
 
 // Material Indices (matching palette.txt)
@@ -180,34 +179,56 @@ impl TileFetcher {
             self.seed,
         ]));
 
-        // Determine Biome
-        // Simple noise-based biome selection
-        // Determine Biome based on global height at tile center
+        // Determine Biome based on terrain height across the tile
         let ((min_lon, max_lon), (north_lat, south_lat)) = tile.lon_lat_bounds();
-        let center_lon = (min_lon + max_lon) * 0.5;
-        let center_lat = (north_lat + south_lat) * 0.5;
-        let (cx_m, cy_m) = lon_lat_to_mercator_meters(center_lon, center_lat);
-
+        
         // Use a temporary Perlin for biome selection (must match sample_tile_heights seed)
         let perlin = Perlin::new(self.seed as u32);
-        let center_h = get_global_height(&perlin, cx_m, cy_m);
+        
+        // Sample heights at multiple points across the tile to get min/avg height
+        let sample_grid = 4;
+        let mut min_h = f64::INFINITY;
+        let mut sum_h = 0.0;
+        for si in 0..sample_grid {
+            for sj in 0..sample_grid {
+                let frac_x = (si as f64 + 0.5) / sample_grid as f64;
+                let frac_y = (sj as f64 + 0.5) / sample_grid as f64;
+                let sample_lon = min_lon + (max_lon - min_lon) * frac_x;
+                let sample_lat = south_lat + (north_lat - south_lat) * frac_y;
+                let (sx_m, sy_m) = lon_lat_to_mercator_meters(sample_lon, sample_lat);
+                let h = get_global_height(&perlin, sx_m, sy_m);
+                min_h = min_h.min(h);
+                sum_h += h;
+            }
+        }
+        let avg_h = sum_h / (sample_grid * sample_grid) as f64;
 
         // Water level is passed via Args usually, but here we need to know it.
-        // We'll assume the standard 500.0 or pass it in TileFetcher if needed.
-        // Let's assume 500.0 for now as per the plan.
         let water_level = 500.0;
 
         // Use random noise for biome selection (City vs Hill for above-water areas)
         let biome_noise = rng.gen::<f64>();
 
-        let biome = if center_h < water_level {
-            // Even if it's a lake/ocean, we treat it as "Hill" (Nature) so it generates terrain + water
+        // Only allow City biome if the tile's minimum height is well above water level
+        // This prevents cities from being placed on terrain that would be partially underwater
+        // Require min_h to be at least 50m above water (was 10m) to ensure no artificial ground raising
+        let biome = if min_h < water_level + 50.0 {
+            // Tile has areas too close to water level - use Hill for natural terrain
             Biome::Hill
-        } else if biome_noise < 0.5 {
+        } else if avg_h < water_level + 80.0 {
+            // Tile is low-lying - prefer Hill biome for more natural look
+            Biome::Hill
+        } else if biome_noise < 0.4 {
+            // Random selection for higher terrain
             Biome::Hill
         } else {
             Biome::City
         };
+
+        eprintln!(
+            "Tile ({},{},{}): min_h={:.1}, avg_h={:.1}, water={:.1}, biome={:?}",
+            tile.x, tile.y, tile.z, min_h, avg_h, water_level, biome
+        );
 
         // If Lake or Hill, we might skip city generation logic or adapt it.
         // For now, we'll keep the city generation but maybe clear it if it's a pure nature biome,
@@ -944,6 +965,8 @@ struct TileSpace {
     max_y_m: f64,
     seed: u64,
     water_level_m: f64,
+    /// Global minimum Y voxel level - voxels below this are not generated
+    base_y_vox: i64,
 }
 
 impl TileSpace {
@@ -977,6 +1000,7 @@ impl TileSpace {
             max_y_m,
             seed,
             water_level_m,
+            base_y_vox: 0, // Will be set later after global min is computed
         }
     }
 
@@ -1091,7 +1115,6 @@ fn voxelize_tile(
     match data.biome {
         Biome::City => voxelize_city(tile, data, space, max_height_voxels),
         Biome::Hill => voxelize_hill(tile, data, space, max_height_voxels),
-        Biome::Lake => voxelize_lake(tile, data, space, max_height_voxels),
     }
 }
 
@@ -1105,7 +1128,7 @@ fn voxelize_hill(
 ) -> TileVoxelResult {
     // Refactored hill generation using multi-octave FBM, slope-based materials, and clustered vegetation.
     let mut voxels = Vec::new();
-    // Use precomputed tile heights if provided, otherwise compute locally
+    // Use precomputed tile heights if provided (already smoothed by generate_area), otherwise compute locally
     let size = space.voxel_resolution as usize;
     let mut heights_m: Vec<f64> = if let Some(ref pre) = data.heights_m {
         pre.clone()
@@ -1114,27 +1137,8 @@ fn voxelize_hill(
     };
     let perlin = Perlin::new(space.seed as u32);
 
-    // Smooth edges near tile border to make transitions more plausible: simple kernel
-    for xi in 0..size {
-        for zi in 0..size {
-            let mut sum = 0.0;
-            let mut cnt = 0;
-            for dx in -1..=1 {
-                for dz in -1..=1 {
-                    let nx = xi as isize + dx as isize;
-                    let nz = zi as isize + dz as isize;
-                    if nx >= 0 && nx < size as isize && nz >= 0 && nz < size as isize {
-                        sum += heights_m[nx as usize + nz as usize * size];
-                        cnt += 1;
-                    }
-                }
-            }
-            if cnt > 0 {
-                heights_m[xi + zi * size] =
-                    (sum / cnt as f64) * 0.95 + heights_m[xi + zi * size] * 0.05;
-            }
-        }
-    }
+    // Note: Heights are already smoothed across tile boundaries in generate_area,
+    // so we skip the per-tile smoothing that was previously here.
 
     // Compute river mask and apply small carving before voxelization
     let river_mask = compute_river_mask(space, &perlin, &heights_m, 1.0 / 3000.0, -0.35);
@@ -1170,7 +1174,8 @@ fn voxelize_hill(
             let slope_z = (neighbor_z - center).abs();
             let slope = (slope_x + slope_z) * 0.5 / space.meters_per_voxel;
 
-            for y in 0..h_vox {
+            // Start from base_y_vox instead of 0 to avoid generating deep underground voxels
+            for y in space.base_y_vox..h_vox {
                 let mat = if slope > 3.0 {
                     // steep cliff - expose stone
                     if y < h_vox - 1 {
@@ -1374,196 +1379,6 @@ fn voxelize_hill(
     }
 }
 
-fn voxelize_lake(
-    tile: TileId,
-    data: TileData,
-    space: &TileSpace,
-    max_height_voxels: u32,
-) -> TileVoxelResult {
-    // Improved lake generation using a smooth heightmap + dynamic water fill, shoreline, and vegetation.
-    let mut voxels = Vec::new();
-    let perlin = Perlin::new(space.seed as u32);
-    let size = space.voxel_resolution as usize;
-    let heights_m: Vec<f64> = if let Some(ref pre) = data.heights_m {
-        pre.clone()
-    } else {
-        sample_tile_heights(&perlin, space)
-    };
-    let mut min_h = f64::INFINITY;
-    let mut max_h = f64::NEG_INFINITY;
-    for xi in 0..size {
-        for zi in 0..size {
-            let elev = heights_m[xi + zi * size];
-            min_h = min_h.min(elev);
-            max_h = max_h.max(elev);
-        }
-    }
-
-    // Global water level from world config
-    let water_level_m = space.water_level_m;
-    let mut rng = StdRng::seed_from_u64(space.seed.wrapping_add(stable_mix(&[
-        tile.x as u64,
-        tile.y as u64,
-        tile.z as u64,
-    ])));
-    let water_level_vox = (water_level_m / space.meters_per_voxel).ceil() as i64;
-
-    // Identify lake mask within tile: cells below water_level_m expanded to make shorelines
-    let mut lake_mask = vec![false; size * size];
-    for xi in 0..size {
-        for zi in 0..size {
-            let elev = heights_m[xi + zi * size];
-            if elev <= water_level_m + 1.5 {
-                lake_mask[xi + zi * size] = true;
-            }
-        }
-    }
-
-    // Rivers based on global low frequency noise
-    let river_mask = compute_river_mask(space, &perlin, &heights_m, 1.0 / 3000.0, -0.35);
-    for i in 0..lake_mask.len() {
-        if river_mask[i] {
-            lake_mask[i] = true;
-        }
-    }
-
-    // Fill ground and water
-    for xi in 0..size {
-        for zi in 0..size {
-            let idx = xi + zi * size;
-            let h_m = heights_m[idx];
-            let h_vox = (h_m / space.meters_per_voxel).floor() as i64;
-            let h_vox = h_vox.clamp(0, max_height_voxels as i64);
-
-            // Ground layering: stone beneath, sand near shoreline, otherwise dirt/grass
-            for y in 0..=h_vox {
-                let mat = if y < h_vox - 2 { MAT_STONE } else { MAT_DIRT };
-                voxels.push(VoxelRecord {
-                    x: xi as i64,
-                    y,
-                    z: zi as i64,
-                    material_index: mat,
-                });
-            }
-
-            if lake_mask[idx] {
-                // Shallow gradient for shore
-                let water_top = water_level_vox.clamp(0, max_height_voxels as i64);
-                let water_depth = water_top - h_vox;
-                if water_depth > 0 {
-                    // Shallow near edges
-                    for y in (h_vox + 1)..=water_top {
-                        let mat = if water_depth >= 6 {
-                            MAT_WATER_DEEP
-                        } else {
-                            MAT_WATER_SHALLOW
-                        };
-                        voxels.push(VoxelRecord {
-                            x: xi as i64,
-                            y,
-                            z: zi as i64,
-                            material_index: mat,
-                        });
-                    }
-                }
-                // Add shoreline sand layer just above water
-                if h_vox + 1 < max_height_voxels as i64 {
-                    voxels.push(VoxelRecord {
-                        x: xi as i64,
-                        y: h_vox + 1,
-                        z: zi as i64,
-                        material_index: MAT_SAND,
-                    });
-                }
-                // Wet vegetation around lakes (place only in the shoreline band)
-                let water_top = water_level_vox.clamp(0, max_height_voxels as i64);
-                if h_vox >= water_top - 2 && h_vox <= water_top && rng.gen_bool(0.02) {
-                    voxels.push(VoxelRecord {
-                        x: xi as i64,
-                        y: h_vox + 1,
-                        z: zi as i64,
-                        material_index: MAT_TRUNK_LIGHT,
-                    });
-                    voxels.push(VoxelRecord {
-                        x: xi as i64,
-                        y: h_vox + 2,
-                        z: zi as i64,
-                        material_index: MAT_LEAVES_MED,
-                    });
-                }
-                // Occasional shoreline boulder
-                if rng.gen_bool(0.015) {
-                    let bx = (xi as i64 + rng.gen_range(-1..=1)).clamp(0, size as i64 - 1);
-                    let bz = (zi as i64 + rng.gen_range(-1..=1)).clamp(0, size as i64 - 1);
-                    let by = h_vox;
-                    voxels.push(VoxelRecord {
-                        x: bx,
-                        y: by,
-                        z: bz,
-                        material_index: MAT_STONE,
-                    });
-                }
-            } else {
-                // Not water - maybe place some trees if gentle slope
-                let neighbor_x = if xi + 1 < size {
-                    heights_m[(xi + 1) + zi * size]
-                } else {
-                    heights_m[idx]
-                };
-                let neighbor_z = if zi + 1 < size {
-                    heights_m[xi + (zi + 1) * size]
-                } else {
-                    heights_m[idx]
-                };
-                let slope = ((neighbor_x - heights_m[idx]).abs()
-                    + (neighbor_z - heights_m[idx]).abs())
-                    * 0.5
-                    / space.meters_per_voxel;
-                if slope < 1.1 && rng.gen_bool(0.03) {
-                    let trunk_h = rng.gen_range(3..6);
-                    for ty in 0..trunk_h {
-                        voxels.push(VoxelRecord {
-                            x: xi as i64,
-                            y: h_vox + ty,
-                            z: zi as i64,
-                            material_index: MAT_TRUNK_DARK,
-                        });
-                    }
-                    for cx in -2..=2 {
-                        for cz in -2..=2 {
-                            for cy_offset in 0..=3 {
-                                let cy = h_vox + trunk_h - 2 + cy_offset;
-                                if cy >= h_vox && cy < max_height_voxels as i64 {
-                                    let dist = (cx as i32).abs()
-                                        + (cz as i32).abs()
-                                        + (cy_offset as i32).abs();
-                                    if dist <= 3 {
-                                        voxels.push(VoxelRecord {
-                                            x: (xi as i64 + cx).clamp(0, size as i64 - 1),
-                                            y: cy,
-                                            z: (zi as i64 + cz).clamp(0, size as i64 - 1),
-                                            material_index: MAT_LEAVES_MED,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let mut stats = data.stats.clone();
-    stats.voxel_count = voxels.len();
-    TileVoxelResult {
-        tile,
-        voxels,
-        stats,
-        voxel_resolution: space.voxel_resolution,
-    }
-}
-
 fn voxelize_city(
     tile: TileId,
     data: TileData,
@@ -1578,20 +1393,15 @@ fn voxelize_city(
         sample_tile_heights(&perlin, space)
     };
 
-    // Build per-cell base ground that is the maximum of terrain & minimal water-safe base
-    let water_level_vox = (space.water_level_m / space.meters_per_voxel).ceil() as i64;
+    // Build per-cell base ground from terrain heights
+    // Cities should only be placed on high ground, so no artificial raising is needed
     let mut base_ground_vox =
         vec![0i64; (space.voxel_resolution * space.voxel_resolution) as usize];
     let size = space.voxel_resolution as usize;
     for xi in 0..size {
         for zi in 0..size {
             let elev_m = heights_m[xi + zi * size];
-            let mut ground_vox = (elev_m / space.meters_per_voxel).ceil() as i64;
-            // Ensure the city ground is at least water level + margin
-            let min_ground = water_level_vox + 3;
-            if ground_vox < min_ground {
-                ground_vox = min_ground;
-            }
+            let ground_vox = (elev_m / space.meters_per_voxel).ceil() as i64;
             base_ground_vox[xi + zi * size] = ground_vox;
         }
     }
@@ -1636,10 +1446,11 @@ fn voxelize_city(
     }
 
     // Fill the ground using the adjusted per-cell base heights
+    // Start from base_y_vox to avoid generating deep underground voxels
     for xi in 0..size {
         for zi in 0..size {
             let ground_vox = base_ground_vox[xi + zi * size];
-            for y in 0..=ground_vox {
+            for y in space.base_y_vox..=ground_vox {
                 let mat = if y < ground_vox - 2 {
                     MAT_STONE
                 } else {
@@ -1948,6 +1759,7 @@ fn voxelize_city(
 }
 
 fn generate_area(args: &Args) -> Vec<TileVoxelResult> {
+    eprintln!("=== GENERATE_AREA v2 - WITH BIOME FIX ===");
     let center_tile = lon_lat_to_tile(args.center_lon, args.center_lat, args.zoom);
     let fetcher = TileFetcher::new(args.seed);
     let mut results = Vec::new();
@@ -2266,6 +2078,32 @@ fn generate_area(args: &Args) -> Vec<TileVoxelResult> {
         if let Some(data) = tile_map.get_mut(tile_id) {
             data.base_ground_vox = Some(base.clone());
         }
+    }
+
+    // Compute global minimum height across all tiles to avoid generating deep underground voxels
+    let mut global_min_height_m = f64::INFINITY;
+    for (_, data) in tile_map.iter() {
+        if let Some(heights) = data.heights_m.as_ref() {
+            for &h in heights.iter() {
+                if h < global_min_height_m {
+                    global_min_height_m = h;
+                }
+            }
+        }
+    }
+    // Convert to voxel level with some margin below the lowest valley
+    // Use a margin of 10 voxels below the lowest point for visual consistency
+    let global_base_y_vox = ((global_min_height_m / args.meters_per_voxel).floor() as i64 - 10).max(0);
+    eprintln!(
+        "Global terrain: min height = {:.1}m, base_y_vox = {} (saving ~{} voxels per column)",
+        global_min_height_m,
+        global_base_y_vox,
+        global_base_y_vox
+    );
+
+    // Update all TileSpaces with the global base Y
+    for (_, space) in tile_spaces.iter_mut() {
+        space.base_y_vox = global_base_y_vox;
     }
 
     // Voxelize each tile using the smoothed heights
