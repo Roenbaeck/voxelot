@@ -283,7 +283,10 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
 
     var out: FragmentOutput;
     out.color = vec4<f32>(brightened, alpha);
-    out.emissive = input.emissive; // Pass through emissive data (rgb + strength)
+    
+    // Scale emissive by strength and apply fades so it doesn't pop in/out
+    let final_emissive = input.emissive.rgb * input.emissive.a * (1.0 - env_fade_factor) * alpha;
+    out.emissive = vec4<f32>(final_emissive, input.emissive.a);
     return out;
 }
 
@@ -417,7 +420,10 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     
     var out: FragmentOutput;
     out.color = vec4<f32>(brightened, alpha);
-    out.emissive = input.emissive;
+    
+    // Scale emissive by strength and apply fades so it doesn't pop in/out
+    let final_emissive = input.emissive.rgb * input.emissive.a * (1.0 - env_fade_factor) * alpha;
+    out.emissive = vec4<f32>(final_emissive, input.emissive.a);
     return out;
 }
 
