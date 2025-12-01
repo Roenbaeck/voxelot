@@ -728,6 +728,7 @@ struct App {
     shadow_pipeline: Option<wgpu::RenderPipeline>,
     shadow_mesh_pipeline: Option<wgpu::RenderPipeline>,
     uniform_buffer: Option<wgpu::Buffer>,
+    palette_buffer: Option<wgpu::Buffer>,
     bind_group: Option<wgpu::BindGroup>,
     shadow_bind_group: Option<wgpu::BindGroup>,
     main_bind_group_layout: Option<wgpu::BindGroupLayout>,
@@ -1343,6 +1344,7 @@ impl App {
             shadow_pipeline: None,
             shadow_mesh_pipeline: None,
             uniform_buffer: None,
+            palette_buffer: None,
             bind_group: None,
             shadow_bind_group: None,
             main_bind_group_layout: None,
@@ -2942,6 +2944,7 @@ impl App {
             Some(shadow_view),
             Some(shadow_sampler),
             Some(light_probe_buffer),
+            Some(palette_buffer),
         ) = (
             self.device.as_ref(),
             self.main_bind_group_layout.as_ref(),
@@ -2949,6 +2952,7 @@ impl App {
             self.shadow_view.as_ref(),
             self.shadow_sampler.as_ref(),
             self.light_probe_buffer.as_ref(),
+            self.palette_buffer.as_ref(),
         )
         else {
             return;
@@ -2973,6 +2977,10 @@ impl App {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: light_probe_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: palette_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -4908,6 +4916,17 @@ impl App {
                         },
                         count: None,
                     },
+                    // Palette buffer for voxel colors
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -5825,6 +5844,21 @@ impl App {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
+        // Create palette buffer for voxel colors (max 256 entries)
+        let palette_data = self.palette.colors();
+        // Pad to 256 entries (each entry is 4 floats = 16 bytes)
+        let mut palette_padded = vec![[1.0f32, 1.0, 1.0, 1.0]; 256];
+        for (i, color) in palette_data.iter().enumerate() {
+            if i < 256 {
+                palette_padded[i] = *color;
+            }
+        }
+        let palette_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Palette Buffer"),
+            contents: bytemuck::cast_slice(&palette_padded),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
         // SSAO blur uniforms (half-resolution like SSao textures)
         let ssao_width = (self.render_target_width / 2).max(1);
         let ssao_height = (self.render_target_height / 2).max(1);
@@ -6344,6 +6378,7 @@ impl App {
         self.shadow_pipeline = Some(shadow_pipeline);
         self.shadow_mesh_pipeline = Some(shadow_mesh_pipeline);
         self.uniform_buffer = Some(uniform_buffer);
+        self.palette_buffer = Some(palette_buffer);
 
         self.light_probe_buffer = Some(light_probe_buffer);
         self.light_probe_capacity = light_probe_capacity;
