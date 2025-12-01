@@ -172,7 +172,12 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     let shadow_strength = uniforms.camera_shadow_strength.w;
     let raw_visibility = mix(1.0, base_shadow, shadow_strength);
     let shadow_visibility = clamp(1.0 - (1.0 - raw_visibility) * uniforms.shadow_darkness.x, 0.0, 1.0);
-    let sun_contribution = sun_diffuse * uniforms.sun_color_pad.xyz * shadow_visibility;
+    let emissive_strength = input.emissive.a;
+    // Attenuate directional light on emissive surfaces to prevent over-brightness
+    // We keep ambient full to avoid "sharpness" artifacts in shadow.
+    let dir_light_attenuation = 1.0 - (emissive_strength * 1.0);
+
+    let sun_contribution = sun_diffuse * uniforms.sun_color_pad.xyz * shadow_visibility * dir_light_attenuation;
     var ambient = uniforms.ambient_color_pad.xyz;
     // If normal faces away from sun, reduce ambient for clear back-face darkening.
     // back_strength == 0 for faces facing sun, >0 for faces facing away
@@ -183,7 +188,7 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     // Moon light (no shadows yet) -------------------------------------------------
     let moon_dir = normalize(uniforms.moon_direction_intensity.xyz);
     let moon_diffuse = max(dot(input.normal, moon_dir), 0.0);
-    let moon_light = moon_diffuse * uniforms.moon_color_pad.xyz * uniforms.moon_direction_intensity.w;
+    let moon_light = moon_diffuse * uniforms.moon_color_pad.xyz * uniforms.moon_direction_intensity.w * dir_light_attenuation;
     
     // Sample light probes for indirect emissive lighting
     var indirect_light = vec3<f32>(0.0, 0.0, 0.0);
@@ -206,7 +211,7 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     
     let lighting = ambient + sun_contribution + moon_light + indirect_light;
     
-    let emissive_strength = input.emissive.a; // Still needed for emissive glow scaling
+    // emissive_strength is already defined above
     let ao = input.ao; // AO passed separately from instance AO attribute
     let color = input.color.rgb * lighting * ao;
 
@@ -317,7 +322,11 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     let shadow_strength = uniforms.camera_shadow_strength.w;
     let raw_visibility = mix(1.0, base_shadow, shadow_strength);
     let shadow_visibility = clamp(1.0 - (1.0 - raw_visibility) * uniforms.shadow_darkness.x, 0.0, 1.0);
-    let sun_contribution = sun_diffuse * uniforms.sun_color_pad.xyz * shadow_visibility;
+    let emissive_strength = input.emissive.a;
+    // Attenuate directional light on emissive surfaces to prevent over-brightness
+    let dir_light_attenuation = 1.0 - (emissive_strength * 1.0);
+
+    let sun_contribution = sun_diffuse * uniforms.sun_color_pad.xyz * shadow_visibility * dir_light_attenuation;
     var ambient = uniforms.ambient_color_pad.xyz;
     // If normal faces away from sun, reduce ambient for back-face darkening
     let ndotl_raw = dot(input.normal, sun_dir);
@@ -328,7 +337,7 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     // Moon light (no shadows yet)
     let moon_dir = normalize(uniforms.moon_direction_intensity.xyz);
     let moon_diffuse = max(dot(input.normal, moon_dir), 0.0);
-    let moon_light = moon_diffuse * uniforms.moon_color_pad.xyz * uniforms.moon_direction_intensity.w;
+    let moon_light = moon_diffuse * uniforms.moon_color_pad.xyz * uniforms.moon_direction_intensity.w * dir_light_attenuation;
     
     // Sample light probes for indirect emissive lighting
     var indirect_light = vec3<f32>(0.0, 0.0, 0.0);
@@ -351,7 +360,7 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     
     let lighting = ambient + sun_contribution + moon_light + indirect_light;
     
-    let emissive_strength = input.emissive.a; // Still needed for emissive glow scaling
+    // emissive_strength is already defined above
     let color = input.color.rgb * lighting * input.color.a;
     
     // Fog color modulated by ambient and sky brightness (darker at night)
