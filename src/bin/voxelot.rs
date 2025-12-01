@@ -26,7 +26,7 @@ use std::collections::VecDeque;
 use sysinfo::{Pid, ProcessExt, System, SystemExt};
 use voxelot::SlabAllocator;
 use voxelot::{
-    bbox_local_to_world, cull_visible_voxels_parallel, Camera, Chunk, ChunkMesh, Palette,
+    bbox_local_to_world, cull_visible_voxels_parallel, Camera, Chunk, ChunkMesh, CullStats, Palette,
     RenderConfig, VoxelInstance, World, WorldPos,
 };
 
@@ -1016,6 +1016,9 @@ struct App {
     egui_renderer: Option<egui_wgpu::Renderer>,
     last_fps: u32,
 
+    // Culling statistics
+    cull_stats: CullStats,
+
     // Skybox
     skybox_texture: Option<wgpu::Texture>,
     skybox_texture_bytes: u64,
@@ -1431,6 +1434,7 @@ impl App {
             egui_winit: None,
             egui_renderer: None,
             last_fps: 0,
+            cull_stats: CullStats::default(),
             mesh_chunk_arc_cache: FxHashMap::default(),
             // empty_mesh buffers removed; placeholders use offsets into mega buffers
             stat_empty_meshes: 0,
@@ -6493,7 +6497,8 @@ impl App {
 
         // Gather candidate voxels for GPU culling using CPU hierarchy traversal
         let cull_start = Instant::now();
-        let visible = cull_visible_voxels_parallel(&self.world, &self.camera_controller.camera);
+        let (visible, cull_stats) = cull_visible_voxels_parallel(&self.world, &self.camera_controller.camera);
+        self.cull_stats = cull_stats;
         let cull_time = cull_start.elapsed();
 
         let mut _voxel_expansion_count = 0;
@@ -9514,6 +9519,16 @@ impl App {
                 , mesh_emitters_proc_time.as_secs_f64() * 1000.0
                 , processed_meshes
                     , frame_mesh_upload_limit
+            );
+            // Print culling statistics grouped by reason
+            println!(
+                "  Cull Stats: examined={}, visible={}, frustum={}, marginal={}, shell={}, empty={}",
+                self.cull_stats.chunks_examined,
+                self.cull_stats.chunks_visible,
+                self.cull_stats.frustum_aabb_culled,
+                self.cull_stats.marginal_bitmap_culled,
+                self.cull_stats.hierarchy_shell_culled,
+                self.cull_stats.empty_chunk_culled,
             );
 
             // Update UI overlay stats

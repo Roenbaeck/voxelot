@@ -13,7 +13,7 @@ pub use buffer_allocator::{AllocationError, SlabAllocator};
 pub use config::Config;
 pub use culling::{
     cull_visible_voxels, cull_visible_voxels_parallel, cull_visible_voxels_with_occlusion,
-    get_visible_chunks, Camera, ChunkRenderInfo, RenderConfig, VisibilityCache, VoxelInstance,
+    get_visible_chunks, Camera, ChunkRenderInfo, CullStats, RenderConfig, VisibilityCache, VoxelInstance,
 };
 pub use lib_hierarchical::bbox_local_to_world;
 pub use lib_hierarchical::{Chunk, ShellVoxel, Voxel, VoxelType, World, WorldPos};

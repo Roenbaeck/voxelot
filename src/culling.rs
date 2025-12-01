@@ -98,7 +98,7 @@ impl VisibilityCache {
         }
 
         // Recalculate visible voxels using parallel culling
-        let instances = cull_visible_voxels_parallel(world, camera);
+        let (instances, _stats) = cull_visible_voxels_parallel(world, camera);
 
         // Update cache - organize by chunk
         self.cache.clear();
@@ -579,6 +579,34 @@ impl ChunkRenderInfo {
     }
 }
 
+/// Statistics for culling operations, grouped by reason
+#[derive(Default, Debug, Clone)]
+pub struct CullStats {
+    /// Chunks culled because frustum AABB had no intersection
+    pub frustum_aabb_culled: usize,
+    /// Chunks culled because marginal bitmap showed no voxels in range
+    pub marginal_bitmap_culled: usize,
+    /// Chunks culled because hierarchy shell showed no visible faces
+    pub hierarchy_shell_culled: usize,
+    /// Chunks culled because voxel_count was 0
+    pub empty_chunk_culled: usize,
+    /// Chunks that passed all culling and were added to result
+    pub chunks_visible: usize,
+    /// Total chunks examined (all levels)
+    pub chunks_examined: usize,
+}
+
+impl CullStats {
+    pub fn merge(&mut self, other: &CullStats) {
+        self.frustum_aabb_culled += other.frustum_aabb_culled;
+        self.marginal_bitmap_culled += other.marginal_bitmap_culled;
+        self.hierarchy_shell_culled += other.hierarchy_shell_culled;
+        self.empty_chunk_culled += other.empty_chunk_culled;
+        self.chunks_visible += other.chunks_visible;
+        self.chunks_examined += other.chunks_examined;
+    }
+}
+
 /// Recursively collect visible voxels from a chunk, handling hierarchical subdivision
 fn collect_voxels_recursive(
     chunk: &Chunk,
@@ -586,6 +614,7 @@ fn collect_voxels_recursive(
     scale: i64,
     camera: &Camera,
     result: &mut Vec<VoxelInstance>,
+    stats: &mut CullStats,
 ) {
     // 1. Compute Intersection AABB between Frustum AABB and Chunk AABB
     let chunk_min = [
@@ -677,6 +706,7 @@ fn collect_voxels_recursive(
             scale,
             camera,
             result,
+            stats,
         );
     } else {
         // Masked iteration using precomputed masks
@@ -724,6 +754,7 @@ fn collect_voxels_recursive(
             scale,
             camera,
             result,
+            stats,
         );
     }
 }
@@ -735,6 +766,7 @@ fn process_voxels<I>(
     scale: i64,
     camera: &Camera,
     result: &mut Vec<VoxelInstance>,
+    stats: &mut CullStats,
 ) where
     I: Iterator<Item = u32>,
 {
@@ -788,6 +820,7 @@ fn process_voxels<I>(
                 }
             }
             Voxel::Chunk(sub_chunk) => {
+                stats.chunks_examined += 1;
                 let voxel_center = [
                     world_x as f32 + (scale as f32 / 2.0),
                     world_y as f32 + (scale as f32 / 2.0),
@@ -835,6 +868,7 @@ fn process_voxels<I>(
 
                         if !has_visible_faces {
                             // Fully obscured - skip this sub-chunk entirely!
+                            stats.hierarchy_shell_culled += 1;
                             continue;
                         }
                     }
@@ -856,7 +890,43 @@ fn process_voxels<I>(
                         scale: size,
                         is_leaf_chunk: false,
                     });
+                    stats.chunks_visible += 1;
                 } else {
+                    // --- Hierarchy Shell Culling for subdivision ---
+                    // Even when subdividing, check if this sub-chunk has any visible faces
+                    // This prevents expanding into fully occluded regions (e.g., underwater)
+                    if let Some(shell) = &sub_chunk.hierarchy_shell {
+                        let dx = voxel_center[0] - camera.position[0];
+                        let dy = voxel_center[1] - camera.position[1];
+                        let dz = voxel_center[2] - camera.position[2];
+
+                        let mut demand_mask = 0u8;
+                        if dx > 0.0 {
+                            demand_mask |= 1 << 0;
+                        } else {
+                            demand_mask |= 1 << 1;
+                        }
+                        if dy > 0.0 {
+                            demand_mask |= 1 << 2;
+                        } else {
+                            demand_mask |= 1 << 3;
+                        }
+                        if dz > 0.0 {
+                            demand_mask |= 1 << 4;
+                        } else {
+                            demand_mask |= 1 << 5;
+                        }
+
+                        let has_visible_faces =
+                            shell.iter().any(|sv| (sv.visible_faces & demand_mask) != 0);
+
+                        if !has_visible_faces {
+                            // Fully obscured - skip subdividing this sub-chunk
+                            stats.hierarchy_shell_culled += 1;
+                            continue;
+                        }
+                    }
+
                     let next_scale = scale / 16;
                     if next_scale > 1 {
                         collect_voxels_recursive(
@@ -865,6 +935,7 @@ fn process_voxels<I>(
                             next_scale,
                             camera,
                             result,
+                            stats,
                         );
                     } else if sub_chunk.voxel_count > 0 {
                         // Final check before adding leaf chunk
@@ -884,7 +955,12 @@ fn process_voxels<I>(
                                 scale: [scale as f32, scale as f32, scale as f32],
                                 is_leaf_chunk: true,
                             });
+                            stats.chunks_visible += 1;
+                        } else {
+                            stats.frustum_aabb_culled += 1;
                         }
+                    } else {
+                        stats.empty_chunk_culled += 1;
                     }
                 }
             }
@@ -912,12 +988,14 @@ pub fn cull_visible_voxels(world: &World, camera: &Camera) -> Vec<VoxelInstance>
     // The scale factor depends on hierarchy depth
     let scale = 16i64.pow(world.hierarchy_depth() as u32 - 1);
 
+    let mut stats = CullStats::default();
     collect_voxels_recursive(
         world.root(),
         [0, 0, 0], // World starts at origin
         scale,     // Scale of root voxels
         camera,
         &mut instances,
+        &mut stats,
     );
 
     instances
@@ -941,13 +1019,15 @@ pub fn cull_visible_voxels_with_occlusion(world: &World, camera: &Camera) -> Vec
     // Recursively collect voxels with occlusion
     let scale = 16i64.pow(world.hierarchy_depth() as u32 - 1);
 
-    collect_voxels_recursive(world.root(), [0, 0, 0], scale, camera, &mut instances);
+    let mut stats = CullStats::default();
+    collect_voxels_recursive(world.root(), [0, 0, 0], scale, camera, &mut instances, &mut stats);
 
     instances
 }
 
 /// Parallel culling - for hierarchical world, parallelize at top level of root chunk
-pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> Vec<VoxelInstance> {
+/// Returns visible voxel instances and culling statistics
+pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> (Vec<VoxelInstance>, CullStats) {
     use rayon::prelude::*;
 
     // For hierarchical world, we can parallelize by processing top-level cells
@@ -957,7 +1037,7 @@ pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> Vec<Voxel
 
     // Frustum cull the entire world first
     if !camera.frustum_cull_aabb(min, max) {
-        return Vec::new();
+        return (Vec::new(), CullStats::default());
     }
 
     // Collect top-level positions that have voxels
@@ -966,8 +1046,8 @@ pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> Vec<Voxel
 
     let top_level_cells: Vec<_> = root.positions().map(|(x, y, z)| (x, y, z)).collect();
 
-    // Process each top-level cell in parallel
-    let visible_voxels: Vec<Vec<VoxelInstance>> = top_level_cells
+    // Process each top-level cell in parallel, collecting both instances and stats
+    let results: Vec<(Vec<VoxelInstance>, CullStats)> = top_level_cells
         .par_iter()
         .filter_map(|&(x, y, z)| {
             // Get the voxel at this position
@@ -986,8 +1066,12 @@ pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> Vec<Voxel
                 (world_z + scale) as f32,
             ];
 
+            let mut cell_stats = CullStats::default();
+            cell_stats.chunks_examined += 1;
+
             if !camera.frustum_cull_aabb(cell_min, cell_max) {
-                return None;
+                cell_stats.frustum_aabb_culled += 1;
+                return Some((Vec::new(), cell_stats));
             }
 
             let mut cell_instances = Vec::new();
@@ -1008,6 +1092,7 @@ pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> Vec<Voxel
                         scale: [scale as f32, scale as f32, scale as f32],
                         is_leaf_chunk: false,
                     });
+                    cell_stats.chunks_visible += 1;
                 }
                 Voxel::Chunk(chunk) => {
                     // Recursively collect from sub-chunk until bottom chunk level.
@@ -1019,6 +1104,7 @@ pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> Vec<Voxel
                             next_scale,
                             camera,
                             &mut cell_instances,
+                            &mut cell_stats,
                         );
                     } else {
                         // Bottom-level chunk: near = individual voxels, far = averaged block
@@ -1047,6 +1133,9 @@ pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> Vec<Voxel
                                     scale: size,
                                     is_leaf_chunk: false,
                                 });
+                                cell_stats.chunks_visible += 1;
+                            } else {
+                                cell_stats.empty_chunk_culled += 1;
                             }
                         } else {
                             if chunk.voxel_count > 0 {
@@ -1058,18 +1147,28 @@ pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> Vec<Voxel
                                     scale: [scale as f32, scale as f32, scale as f32],
                                     is_leaf_chunk: true,
                                 });
+                                cell_stats.chunks_visible += 1;
+                            } else {
+                                cell_stats.empty_chunk_culled += 1;
                             }
                         }
                     }
                 }
             }
 
-            Some(cell_instances)
+            Some((cell_instances, cell_stats))
         })
         .collect();
 
-    // Flatten results
-    visible_voxels.into_iter().flatten().collect()
+    // Merge all results
+    let mut all_instances = Vec::new();
+    let mut total_stats = CullStats::default();
+    for (instances, stats) in results {
+        all_instances.extend(instances);
+        total_stats.merge(&stats);
+    }
+
+    (all_instances, total_stats)
 }
 
 /// Get visible top-level cells as chunk render info
