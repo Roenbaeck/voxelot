@@ -9522,13 +9522,14 @@ impl App {
             );
             // Print culling statistics grouped by reason
             println!(
-                "  Cull Stats: examined={}, visible={}, frustum={}, marginal={}, shell={}, empty={}",
+                "  Cull Stats: examined={}, visible={}, frustum={}, marginal={}, shell={}, empty={}, no_shell={}",
                 self.cull_stats.chunks_examined,
                 self.cull_stats.chunks_visible,
                 self.cull_stats.frustum_aabb_culled,
                 self.cull_stats.marginal_bitmap_culled,
                 self.cull_stats.hierarchy_shell_culled,
                 self.cull_stats.empty_chunk_culled,
+                self.cull_stats.no_shell_available,
             );
 
             // Update UI overlay stats
@@ -9566,20 +9567,6 @@ impl App {
             self.ready_mesh_count = ready_count;
             self.jobs_in_flight = jobs_in_flight;
             self.jobs_per_sec_snapshot = jobs_per_sec;
-            // Print Kawase timing ones per second to avoid spamming
-            if self.kawase_acc_frames > 0 {
-                let avg_write =
-                    self.kawase_write_acc.as_secs_f64() * 1000.0 / self.kawase_acc_frames as f64;
-                let avg_pass =
-                    self.kawase_pass_acc.as_secs_f64() * 1000.0 / self.kawase_acc_frames as f64;
-                println!(
-                    "Kawase write avg: {:.3}ms, pass avg: {:.3}ms (over {} frames)",
-                    avg_write, avg_pass, self.kawase_acc_frames
-                );
-                self.kawase_write_acc = std::time::Duration::from_secs(0);
-                self.kawase_pass_acc = std::time::Duration::from_secs(0);
-                self.kawase_acc_frames = 0;
-            }
             self.frame_count = 0;
             self.last_fps_print = now;
         }

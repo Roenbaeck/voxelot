@@ -594,6 +594,8 @@ pub struct CullStats {
     pub chunks_visible: usize,
     /// Total chunks examined (all levels)
     pub chunks_examined: usize,
+    /// Chunks that had no hierarchy shell (couldn't be shell-culled)
+    pub no_shell_available: usize,
 }
 
 impl CullStats {
@@ -604,6 +606,7 @@ impl CullStats {
         self.empty_chunk_culled += other.empty_chunk_culled;
         self.chunks_visible += other.chunks_visible;
         self.chunks_examined += other.chunks_examined;
+        self.no_shell_available += other.no_shell_available;
     }
 }
 
@@ -779,6 +782,12 @@ fn process_voxels<I>(
     // Chunk.voxels is indexed by RANK, not position.
     // So we need: chunk.voxels[chunk.presence.rank(index) - 1]
 
+    // Pre-compute the shell lookup: map packed_pos -> visible_faces
+    // The parent chunk's shell tells us which children have exposed faces
+    let shell_map: Option<rustc_hash::FxHashMap<u16, u8>> = chunk.hierarchy_shell.as_ref().map(|shell| {
+        shell.iter().map(|sv| (sv.packed_pos, sv.visible_faces)).collect()
+    });
+
     for index in indices {
         let z = index >> 8;
         let y = (index >> 4) & 0xF;
@@ -829,50 +838,42 @@ fn process_voxels<I>(
 
                 let distance = camera.distance_to(voxel_center);
 
-                if distance >= camera.config.lod_render_distance && sub_chunk.voxel_count > 0 {
-                    // --- Hierarchy Shell Culling ---
-                    // Check if this sub-chunk has any visible faces toward the camera
-                    if let Some(shell) = &sub_chunk.hierarchy_shell {
+                // --- Hierarchy Shell Culling ---
+                // Use the PARENT chunk's shell to check if this child has visible faces.
+                // The visibility mask now correctly propagates from leaf voxels up through
+                // the hierarchy, so we can use direction-based culling.
+                let packed_pos = (x as u16) | ((y as u16) << 4) | ((z as u16) << 8);
+                
+                if let Some(ref shell) = shell_map {
+                    if let Some(&visible_faces) = shell.get(&packed_pos) {
                         // Compute demand mask based on camera direction
+                        // We need to see faces pointing TOWARD the camera
                         let dx = voxel_center[0] - camera.position[0];
                         let dy = voxel_center[1] - camera.position[1];
                         let dz = voxel_center[2] - camera.position[2];
 
                         let mut demand_mask = 0u8;
-                        // Show faces pointing toward camera
-                        if dx > 0.0 {
-                            demand_mask |= 1 << 0;
-                        }
-                        // Camera left of chunk, show +X face
-                        else {
-                            demand_mask |= 1 << 1;
-                        } // Camera right of chunk, show -X face
-                        if dy > 0.0 {
-                            demand_mask |= 1 << 2;
-                        }
-                        // Camera below chunk, show +Y face
-                        else {
-                            demand_mask |= 1 << 3;
-                        } // Camera above chunk, show -Y face
-                        if dz > 0.0 {
-                            demand_mask |= 1 << 4;
-                        }
-                        // Camera behind chunk, show +Z face
-                        else {
-                            demand_mask |= 1 << 5;
-                        } // Camera in front of chunk, show -Z face
+                        // Chunk to right of camera (dx > 0) -> we see its left face (-X, bit 1)
+                        // Chunk to left of camera (dx < 0) -> we see its right face (+X, bit 0)
+                        if dx > 0.0 { demand_mask |= 1 << 1; } else { demand_mask |= 1 << 0; }
+                        if dy > 0.0 { demand_mask |= 1 << 3; } else { demand_mask |= 1 << 2; }
+                        if dz > 0.0 { demand_mask |= 1 << 5; } else { demand_mask |= 1 << 4; }
 
-                        // Check if ANY shell voxel has a visible face toward camera
-                        let has_visible_faces =
-                            shell.iter().any(|sv| (sv.visible_faces & demand_mask) != 0);
-
-                        if !has_visible_faces {
-                            // Fully obscured - skip this sub-chunk entirely!
+                        // Check if ANY demanded face is visible
+                        if (visible_faces & demand_mask) == 0 {
                             stats.hierarchy_shell_culled += 1;
                             continue;
                         }
+                    } else {
+                        // Not in shell = fully interior, no exposed faces
+                        stats.hierarchy_shell_culled += 1;
+                        continue;
                     }
+                } else {
+                    stats.no_shell_available += 1;
+                }
 
+                if distance >= camera.config.lod_render_distance && sub_chunk.voxel_count > 0 {
                     let (pos, size) = if let Some(bbox) = sub_chunk.bounding_box {
                         // Convert local bbox (0..15) to world coordinates + size in world units.
                         bbox_local_to_world([world_x, world_y, world_z], scale, bbox)
@@ -892,41 +893,7 @@ fn process_voxels<I>(
                     });
                     stats.chunks_visible += 1;
                 } else {
-                    // --- Hierarchy Shell Culling for subdivision ---
-                    // Even when subdividing, check if this sub-chunk has any visible faces
-                    // This prevents expanding into fully occluded regions (e.g., underwater)
-                    if let Some(shell) = &sub_chunk.hierarchy_shell {
-                        let dx = voxel_center[0] - camera.position[0];
-                        let dy = voxel_center[1] - camera.position[1];
-                        let dz = voxel_center[2] - camera.position[2];
-
-                        let mut demand_mask = 0u8;
-                        if dx > 0.0 {
-                            demand_mask |= 1 << 0;
-                        } else {
-                            demand_mask |= 1 << 1;
-                        }
-                        if dy > 0.0 {
-                            demand_mask |= 1 << 2;
-                        } else {
-                            demand_mask |= 1 << 3;
-                        }
-                        if dz > 0.0 {
-                            demand_mask |= 1 << 4;
-                        } else {
-                            demand_mask |= 1 << 5;
-                        }
-
-                        let has_visible_faces =
-                            shell.iter().any(|sv| (sv.visible_faces & demand_mask) != 0);
-
-                        if !has_visible_faces {
-                            // Fully obscured - skip subdividing this sub-chunk
-                            stats.hierarchy_shell_culled += 1;
-                            continue;
-                        }
-                    }
-
+                    // Shell culling already done above, proceed with subdivision
                     let next_scale = scale / 16;
                     if next_scale > 1 {
                         collect_voxels_recursive(
