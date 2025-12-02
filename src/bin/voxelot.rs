@@ -6507,22 +6507,22 @@ impl App {
 
         // Gather candidate voxels for GPU culling using CPU hierarchy traversal
         let cull_start = Instant::now();
-        let (visible, cull_stats) = cull_visible_voxels_parallel(&self.world, &self.camera_controller.camera);
+        let (all_visible, cull_stats) = cull_visible_voxels_parallel(&self.world, &self.camera_controller.camera);
         self.cull_stats = cull_stats;
         let cull_time = cull_start.elapsed();
         
         // CPU cull: filter out chunks that are completely below water visibility threshold
-        // Any chunk whose max z-value is below (water_level - water_visibility) is invisible
-        // NOTE: This optimization is disabled for now - the shader handles the fade effect
-        // TODO: Re-enable once we verify the shader underwater fade works correctly
-        // let min_visible_z = self.water_level - self.water_visibility;
-        // let visible: Vec<_> = all_visible
-        //     .into_iter()
-        //     .filter(|v| {
-        //         let max_z = v.position[2] as f32 + v.scale[2];
-        //         max_z >= min_visible_z
-        //     })
-        //     .collect();
+        // Any chunk whose max y-value is below (water_level - water_visibility) is invisible
+        // Y is the up axis in this engine
+        let min_visible_y = self.water_level - self.water_visibility;
+        let visible: Vec<_> = all_visible
+            .into_iter()
+            .filter(|v| {
+                // The position is the min corner; scale[1] is the Y dimension size
+                let max_y = v.position[1] as f32 + v.scale[1];
+                max_y >= min_visible_y
+            })
+            .collect();
 
         let mut _voxel_expansion_count = 0;
         // Reuse persistent allocation across frames to avoid heap churn
