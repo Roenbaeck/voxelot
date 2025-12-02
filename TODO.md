@@ -14,10 +14,13 @@
 - ✅ Distant objects look like they again get brighter closer to the horizon at early night and early morning. It’s making them look unnaturally lit up. 
 - ✅ Reflections from SSR are only visible if the camera is close to a reflective surface.
 - ✅ Implement a cache of shells that can be quickly masked depending on camera position, for simple culling and fewer iterations.
- - ✅ The shader dof_blur.wgsl was removed (deprecated placeholder).
+- ✅ The shader dof_blur.wgsl was removed (deprecated placeholder).
+- ✅ Why is the fullscreen render so much slower than the windowed render? It drops from 120FPS to 20FPS when I go fullscreen.
 
+- 🛑 The underwater geometry looks a little bit sharp. See the encircled area in the screenshot for an example. What do you suggest? Can we make it even more water-like?
 - 🛑 Reflections should be stronger at night than in the day, since nothing is drowning out the light.
-- 🛑 Why is the fullscreen render so much slower than the windowed render? It drops from 120FPS to 20FPS when I go fullscreen.
 - 🛑 Sliders instead of buttons to change settings.
 - 🛑 Can all of our code be compiled as wasm?
+- 🛑 Print how many chunks are culled by the depth culler.
+- 🛑 It would be very neat if there could be a shoreline somewhere.
 
