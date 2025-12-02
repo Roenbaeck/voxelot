@@ -164,11 +164,12 @@ const MAT_NEON_BLUE: usize = 46;
 #[derive(Clone, Debug)]
 struct TileFetcher {
     seed: u64,
+    water_level: f64,
 }
 
 impl TileFetcher {
-    fn new(seed: u64) -> Self {
-        Self { seed }
+    fn new(seed: u64, water_level: f64) -> Self {
+        Self { seed, water_level }
     }
 
     fn fetch(&self, tile: TileId) -> TileData {
@@ -203,8 +204,8 @@ impl TileFetcher {
         }
         let avg_h = sum_h / (sample_grid * sample_grid) as f64;
 
-        // Water level is passed via Args usually, but here we need to know it.
-        let water_level = 500.0;
+        // Use water level from the fetcher (passed from Args)
+        let water_level = self.water_level;
 
         // Use random noise for biome selection (City vs Hill for above-water areas)
         let biome_noise = rng.gen::<f64>();
@@ -611,7 +612,7 @@ fn smooth_tiles_pass(smoothed_map: &mut HashMap<TileId, Vec<f64>>, size: usize) 
                         let neighbor = TileId {
                             z: tile_id.z,
                             x: tile_id.x,
-                            y: tile_id.y - 1,
+                            y: tile_id.y + 1,  // South neighbor (tile.y increases southward)
                         };
                         if let Some(nei) = smoothed_map.get(&neighbor) {
                             sum += nei[xi + (size - 1) * size];
@@ -622,7 +623,7 @@ fn smooth_tiles_pass(smoothed_map: &mut HashMap<TileId, Vec<f64>>, size: usize) 
                         let neighbor = TileId {
                             z: tile_id.z,
                             x: tile_id.x,
-                            y: tile_id.y + 1,
+                            y: tile_id.y - 1,  // North neighbor (tile.y decreases northward)
                         };
                         if let Some(nei) = smoothed_map.get(&neighbor) {
                             sum += nei[xi + 0 * size];
@@ -686,16 +687,17 @@ fn blend_tile_edges(smoothed_map: &mut HashMap<TileId, Vec<f64>>, size: usize, b
                     }
                 }
             }
-            // top/bottom blend similar
-            let top_neighbor = TileId {
+            // north/south blend (tile.y increases southward in slippy tile convention)
+            // South neighbor (tile.y + 1) blends with our south edge (zi = 0)
+            let south_neighbor = TileId {
                 z: tile_id.z,
                 x: tile_id.x,
-                y: tile_id.y - 1,
+                y: tile_id.y + 1,
             };
-            if let Some(nei) = smoothed_map.get(&top_neighbor) {
+            if let Some(nei) = smoothed_map.get(&south_neighbor) {
                 for w in 0..blend_width {
-                    let z = w;
-                    let z_nei = size - 1 - w;
+                    let z = w;  // Our south edge (low z)
+                    let z_nei = size - 1 - w;  // Their north edge (high z)
                     let t = (w + 1) as f64 / (blend_width + 1) as f64;
                     for xi in 0..size {
                         let idx = xi + z * size;
@@ -706,15 +708,16 @@ fn blend_tile_edges(smoothed_map: &mut HashMap<TileId, Vec<f64>>, size: usize, b
                     }
                 }
             }
-            let bottom_neighbor = TileId {
+            // North neighbor (tile.y - 1) blends with our north edge (zi = size-1)
+            let north_neighbor = TileId {
                 z: tile_id.z,
                 x: tile_id.x,
-                y: tile_id.y + 1,
+                y: tile_id.y - 1,
             };
-            if let Some(nei) = smoothed_map.get(&bottom_neighbor) {
+            if let Some(nei) = smoothed_map.get(&north_neighbor) {
                 for w in 0..blend_width {
-                    let z = size - 1 - w;
-                    let z_nei = w;
+                    let z = size - 1 - w;  // Our north edge (high z)
+                    let z_nei = w;  // Their south edge (low z)
                     let t = (w + 1) as f64 / (blend_width + 1) as f64;
                     for xi in 0..size {
                         let idx = xi + z * size;
@@ -769,7 +772,7 @@ fn smooth_base_pass(smoothed_map: &mut HashMap<TileId, Vec<i64>>, size: usize) {
                         let neighbor = TileId {
                             z: tile_id.z,
                             x: tile_id.x,
-                            y: tile_id.y - 1,
+                            y: tile_id.y + 1,  // South neighbor
                         };
                         if let Some(nei) = smoothed_map.get(&neighbor) {
                             sum += nei[xi + (size - 1) * size] as f64;
@@ -780,7 +783,7 @@ fn smooth_base_pass(smoothed_map: &mut HashMap<TileId, Vec<i64>>, size: usize) {
                         let neighbor = TileId {
                             z: tile_id.z,
                             x: tile_id.x,
-                            y: tile_id.y + 1,
+                            y: tile_id.y - 1,  // North neighbor
                         };
                         if let Some(nei) = smoothed_map.get(&neighbor) {
                             sum += nei[xi + 0 * size] as f64;
@@ -840,10 +843,11 @@ fn blend_base_edges(smoothed_map: &mut HashMap<TileId, Vec<i64>>, size: usize, b
                     }
                 }
             }
+            // Slippy tiles: tile.y increases southward, so z==0 is south edge
             let top_neighbor = TileId {
                 z: tile_id.z,
                 x: tile_id.x,
-                y: tile_id.y - 1,
+                y: tile_id.y + 1,  // South neighbor (z==0 edge)
             };
             if let Some(nei) = smoothed_map.get(&top_neighbor) {
                 for w in 0..blend_width {
@@ -862,7 +866,7 @@ fn blend_base_edges(smoothed_map: &mut HashMap<TileId, Vec<i64>>, size: usize, b
             let bottom_neighbor = TileId {
                 z: tile_id.z,
                 x: tile_id.x,
-                y: tile_id.y + 1,
+                y: tile_id.y - 1,  // North neighbor (z==size-1 edge)
             };
             if let Some(nei) = smoothed_map.get(&bottom_neighbor) {
                 for w in 0..blend_width {
@@ -1011,7 +1015,10 @@ impl TileSpace {
         let mut vz = (rel_y * self.voxel_resolution as f64).floor() as i32;
         vx = vx.clamp(0, self.voxel_resolution as i32 - 1);
         vz = vz.clamp(0, self.voxel_resolution as i32 - 1);
-        (vx, vz)
+        // Flip Z coordinate so that adjacent tiles have matching edges:
+        // zi=0 (south) → high voxel z, zi=size-1 (north) → low voxel z
+        let vz_flipped = (self.voxel_resolution as i32 - 1) - vz;
+        (vx, vz_flipped)
     }
 }
 
@@ -1152,8 +1159,13 @@ fn voxelize_hill(
     }
 
     // Convert to voxels, set layers based on slope and height
+    // voxel_z is flipped: zi=0 (south in sampling) → high voxel.z, zi=size-1 (north) → low voxel.z
+    // This ensures that when tiles are stacked (tile.y increases southward), adjacent tile edges match:
+    // - Our tile's zi=0 (south) → voxel.z=size-1 → world Z = tile_offset + size-1
+    // - South neighbor's zi=size-1 (north) → voxel.z=0 → world Z = tile_offset + size + 0
     for xi in 0..size {
         for zi in 0..size {
+            let voxel_z = (size - 1 - zi) as i64;  // Flip Z coordinate
             let h_m = heights_m[xi + zi * size];
             let h_vox = (h_m / space.meters_per_voxel).ceil() as i64;
             let h_vox = h_vox.clamp(1, max_height_voxels as i64);
@@ -1202,65 +1214,28 @@ fn voxelize_hill(
                 voxels.push(VoxelRecord {
                     x: xi as i64,
                     y,
-                    z: zi as i64,
+                    z: voxel_z,
                     material_index: mat,
                 });
             }
-            // Water filling for natural terrain
+            // Water is rendered by the viewer as a translucent plane - do NOT generate water voxels!
+            // Just mark shoreline/underwater terrain with sand
             let water_level_vox = (space.water_level_m / space.meters_per_voxel).ceil() as i64;
-            if h_vox < water_level_vox {
-                let water_to = water_level_vox.min(max_height_voxels as i64);
-                // Fill water
-                for y in (h_vox + 1)..=water_to {
-                    let mat = if (water_to - y) > 5 {
-                        MAT_WATER_DEEP
-                    } else {
-                        MAT_WATER_SHALLOW
-                    };
-                    voxels.push(VoxelRecord {
-                        x: xi as i64,
-                        y,
-                        z: zi as i64,
-                        material_index: mat,
-                    });
-                }
-                // Sand at the bottom of water (shoreline/riverbed)
-                if h_vox >= 0 && h_vox < max_height_voxels as i64 {
-                    // Replace top dirt with sand if underwater or near water
-                    if let Some(last) = voxels.last_mut() {
-                        if last.x == xi as i64 && last.z == zi as i64 && last.y == h_vox {
-                            last.material_index = MAT_SAND;
-                        }
-                    }
-                }
-            } else if h_vox == water_level_vox {
-                // Shoreline just above water
+            if h_vox <= water_level_vox + 2 {
+                // Near or below water - use sand for beaches and seabed
                 if let Some(last) = voxels.last_mut() {
-                    if last.x == xi as i64 && last.z == zi as i64 && last.y == h_vox {
+                    if last.x == xi as i64 && last.z == voxel_z && last.y == h_vox {
                         last.material_index = MAT_SAND;
                     }
                 }
             }
 
             if river_mask[xi + zi * size] {
-                // River carving logic (already applied to heights, but ensure water is placed)
-                // If river carved below terrain, it should be filled by the global water logic above
-                // IF the river is at global water level.
-                // But river carving subtracts 2.0m.
-                // If this drops it below water_level, the loop above fills it.
-                // If it's an upland river (above sea level), we need to fill it here.
-                let river_water_level =
-                    (heights_m[xi + zi * size] / space.meters_per_voxel).ceil() as i64 + 1;
-                // Only fill if it's NOT already filled by global water
-                if h_vox >= water_level_vox {
-                    let water_to = river_water_level.min(max_height_voxels as i64);
-                    for y in (h_vox + 1)..=water_to {
-                        voxels.push(VoxelRecord {
-                            x: xi as i64,
-                            y,
-                            z: zi as i64,
-                            material_index: MAT_WATER_SHALLOW,
-                        });
+                // River areas - just mark with sand, don't add water voxels
+                // (water is rendered by the viewer)
+                if let Some(last) = voxels.last_mut() {
+                    if last.x == xi as i64 && last.z == voxel_z && last.y == h_vox {
+                        last.material_index = MAT_SAND;
                     }
                 }
             }
@@ -1277,6 +1252,7 @@ fn voxelize_hill(
     let veg_density = 0.02 + (rng.gen::<f64>() * 0.04);
     for xi in 0..size {
         for zi in 0..size {
+            let voxel_z = (size - 1 - zi) as i64;  // Flip Z coordinate
             if rng.gen_bool(veg_density) {
                 let h_m = heights_m[xi + zi * size];
                 // Skip vegetation if cell is below (or very close to) global water level
@@ -1308,7 +1284,7 @@ fn voxelize_hill(
                             voxels.push(VoxelRecord {
                                 x: xi as i64,
                                 y: h_vox + ty,
-                                z: zi as i64,
+                                z: voxel_z,
                                 material_index: MAT_TRUNK_DARK,
                             });
                         }
@@ -1333,7 +1309,7 @@ fn voxelize_hill(
                                             voxels.push(VoxelRecord {
                                                 x: (xi as i64 + cx).clamp(0, size as i64 - 1),
                                                 y: cy,
-                                                z: (zi as i64 + cz).clamp(0, size as i64 - 1),
+                                                z: (voxel_z - cz).clamp(0, size as i64 - 1),
                                                 material_index: leaf_choice,
                                             });
                                         }
@@ -1342,14 +1318,14 @@ fn voxelize_hill(
                                             let bx = (xi as i64 + rng.gen_range(-1..=1))
                                                 .clamp(0, size as i64 - 1)
                                                 as i64;
-                                            let bz = (zi as i64 + rng.gen_range(-1..=1))
+                                            let bz = (voxel_z - rng.gen_range(-1..=1))
                                                 .clamp(0, size as i64 - 1)
                                                 as i64;
                                             let by = h_vox - 1;
                                             for rx in -1..=0 {
                                                 for rz in -1..=0 {
                                                     let xrx = (bx + rx).clamp(0, size as i64 - 1);
-                                                    let zrz = (bz + rz).clamp(0, size as i64 - 1);
+                                                    let zrz = (bz - rz).clamp(0, size as i64 - 1);
                                                     voxels.push(VoxelRecord {
                                                         x: xrx,
                                                         y: by,
@@ -1449,6 +1425,7 @@ fn voxelize_city(
     // Start from base_y_vox to avoid generating deep underground voxels
     for xi in 0..size {
         for zi in 0..size {
+            let voxel_z = (size - 1 - zi) as i64;  // Flip Z coordinate
             let ground_vox = base_ground_vox[xi + zi * size];
             for y in space.base_y_vox..=ground_vox {
                 let mat = if y < ground_vox - 2 {
@@ -1459,7 +1436,7 @@ fn voxelize_city(
                 voxels.push(VoxelRecord {
                     x: xi as i64,
                     y,
-                    z: zi as i64,
+                    z: voxel_z,
                     material_index: mat,
                 });
             }
@@ -1485,22 +1462,12 @@ fn voxelize_city(
     };
 
     // Apply polygons now that terrain fill is created
-    voxels.extend(apply_polygons_per_cell(&data.water, MAT_WATER_DEEP, 0));
-    if max_height_voxels > 1 {
-        voxels.extend(apply_polygons_per_cell(&data.water, MAT_WATER_DEEP, 1));
-    }
+    // NOTE: Do NOT add water voxels - water is rendered by the viewer as a translucent plane
     voxels.extend(apply_polygons_per_cell(&data.roads, MAT_ASPHALT, 0));
     if max_height_voxels > 2 {
         voxels.extend(apply_polygons_per_cell(&data.roads, MAT_ASPHALT, 1));
     }
     voxels.extend(apply_polygons_per_cell(&data.parks, MAT_GRASS_DARK, 0));
-    if max_height_voxels > 1 {
-        voxels.extend(apply_polygons_per_cell(&data.water, MAT_WATER_DEEP, 1));
-    }
-    voxels.extend(apply_polygons_per_cell(&data.roads, MAT_ASPHALT, 0));
-    if max_height_voxels > 2 {
-        voxels.extend(apply_polygons_per_cell(&data.roads, MAT_ASPHALT, 1));
-    }
     // parks will be applied later
 
     let mut park_cells = HashSet::new();
@@ -1759,9 +1726,10 @@ fn voxelize_city(
 }
 
 fn generate_area(args: &Args) -> Vec<TileVoxelResult> {
-    eprintln!("=== GENERATE_AREA v2 - WITH BIOME FIX ===");
+    eprintln!("=== GENERATE_AREA v3 - DEBUG HEIGHTS ===");
     let center_tile = lon_lat_to_tile(args.center_lon, args.center_lat, args.zoom);
-    let fetcher = TileFetcher::new(args.seed);
+    eprintln!("Center tile: ({}, {}, {})", center_tile.x, center_tile.y, center_tile.z);
+    let fetcher = TileFetcher::new(args.seed, args.water_level);
     let mut results = Vec::new();
     let perlin = Perlin::new(args.seed as u32);
     // Collect tile metadata and precompute heights
@@ -1885,16 +1853,12 @@ fn generate_area(args: &Args) -> Vec<TileVoxelResult> {
     for (tile_id, heights) in smoothed_map.iter() {
         if let Some(data) = tile_map.get_mut(tile_id) {
             data.heights_m = Some(heights.clone());
-            // compute base ground vox per cell
+            // compute base ground vox per cell - use natural terrain height
             let mut base_vox = vec![0i64; size * size];
-            let water_level_vox = (args.water_level / args.meters_per_voxel).ceil() as i64;
             for xi in 0..size {
                 for zi in 0..size {
                     let elev_m = heights[xi + zi * size];
-                    let mut g = (elev_m / args.meters_per_voxel).ceil() as i64;
-                    if g < water_level_vox + 3 {
-                        g = water_level_vox + 3;
-                    }
+                    let g = (elev_m / args.meters_per_voxel).ceil() as i64;
                     base_vox[xi + zi * size] = g;
                 }
             }

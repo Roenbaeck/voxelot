@@ -3852,11 +3852,11 @@ impl App {
                 }
                 self.envelope_mesh_cache_bytes =
                     self.envelope_mesh_cache_bytes.saturating_sub(entry_bytes);
-                freed_bytes += entry_bytes;
-                evicted += 1;
+                // freed_bytes += entry_bytes;
+                // evicted += 1;
             }
         }
-
+        /* 
         if evicted > 0 {
             println!(
                 "Evicted {} envelope meshes, freed {:.1} MB (current usage {:.1} MB)",
@@ -3865,6 +3865,7 @@ impl App {
                 self.envelope_mesh_cache_bytes as f64 / 1024.0 / 1024.0
             );
         }
+        */
     }
 
     fn max_inflight_jobs(&self) -> usize {
