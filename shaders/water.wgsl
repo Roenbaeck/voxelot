@@ -345,15 +345,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Depth-based visibility: deeper underwater = more obscured
     // depth_diff is how far below water level (in world units/voxels)
     // Use water_visibility from config to control falloff
-    let depth_visibility_falloff = camera.water_visibility;
+    let depth_visibility_falloff = max(camera.water_visibility, 1.0); // Prevent div by zero
     let depth_factor = clamp(depth_diff / depth_visibility_falloff, 0.0, 1.0);
     
     // Increase opacity with depth (objects deeper are harder to see through water)
-    alpha = mix(alpha, 1.0, depth_factor * 0.85);
+    // Stronger effect: go from base alpha to fully opaque
+    alpha = mix(alpha, 1.0, depth_factor);
     
-    // Also tint deeper water more blue/dark
-    let deep_water_tint = vec3<f32>(0.1, 0.2, 0.35) * brightness;
-    final_rgb = mix(final_rgb, deep_water_tint, depth_factor * 0.7);
+    // Also tint deeper water more blue/dark - stronger effect
+    let deep_water_tint = vec3<f32>(0.05, 0.15, 0.25) * brightness;
+    final_rgb = mix(final_rgb, deep_water_tint, depth_factor * 0.9);
     
     return vec4<f32>(final_rgb, alpha * shore_fade);
 }

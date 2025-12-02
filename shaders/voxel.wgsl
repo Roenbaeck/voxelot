@@ -231,10 +231,9 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     let fade_end = uniforms.lod_distance * 0.95;
     let fade_factor = smoothstep(fade_start, fade_end, distance);
     
-    // Use world position hash for stable, deterministic alpha testing
-    // Higher frequency (50.0) creates finer noise that blurs better
-    let hash_pos = floor(relative_pos * 50.0);
-    let hash_val = fract(sin(dot(hash_pos, vec3<f32>(12.9898, 78.233, 45.164))) * 43758.5453);
+    // Use improved noise for stable, deterministic alpha testing with less moiré
+    let noise_pos = relative_pos * 7.3 + vec3<f32>(input.world_pos.x * 0.1, input.world_pos.y * 0.1, input.world_pos.z * 0.1);
+    let hash_val = fract(sin(dot(floor(noise_pos), vec3<f32>(127.1, 311.7, 74.7))) * 43758.5453);
     
     if fade_factor > hash_val {
         discard;
@@ -285,9 +284,12 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
             discard;
         }
         
-        // Alpha fade: geometry becomes more transparent with depth
-        // Fully transparent at 80% of water_visibility
-        underwater_alpha = 1.0 - smoothstep(0.0, water_vis * 0.8, underwater_depth);
+        // Alpha fade using Beer-Lambert exponential decay (how light behaves in water)
+        // exp(-k*d) where k controls absorption rate, d is depth
+        // At depth = water_vis, we want alpha to be near 0
+        // exp(-3) ≈ 0.05, so k = 3/water_vis gives ~5% visibility at max depth
+        let absorption_coefficient = 3.0 / water_vis;
+        underwater_alpha = exp(-absorption_coefficient * underwater_depth);
         
         // Also tint remaining pixels toward a darker blue-green for underwater atmosphere
         let water_tint = vec3<f32>(0.1, 0.3, 0.4);
@@ -404,12 +406,11 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     let fade_end = uniforms.lod_distance * 0.95;
     let fade_factor = smoothstep(fade_start, fade_end, distance);
     
-    // Use world position hash for stable, deterministic alpha testing
-    // Higher frequency (50.0) creates finer noise that blurs better
-    let hash_pos = floor(input.world_pos * 50.0);
-    let hash_val = fract(sin(dot(hash_pos, vec3<f32>(12.9898, 78.233, 45.164))) * 43758.5453);
+    // Use improved noise function - lower frequency reduces moiré patterns
+    let hash_pos2 = floor(input.world_pos * 7.3);  // Lower frequency
+    let hash_val2 = fract(sin(dot(hash_pos2, vec3<f32>(17.0, 59.4, 113.0))) * 1e4);
     
-    if fade_factor > hash_val {
+    if fade_factor > hash_val2 {
         discard;
     }
     
@@ -456,9 +457,9 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
             discard;
         }
         
-        // Alpha fade: geometry becomes more transparent with depth
-        // Fully transparent at 80% of water_visibility
-        underwater_alpha_mesh = 1.0 - smoothstep(0.0, water_vis_mesh * 0.8, underwater_depth_mesh);
+        // Alpha fade using Beer-Lambert exponential decay (how light behaves in water)
+        let absorption_coefficient_mesh = 3.0 / water_vis_mesh;
+        underwater_alpha_mesh = exp(-absorption_coefficient_mesh * underwater_depth_mesh);
         
         // Also tint remaining pixels toward a darker blue-green for underwater atmosphere
         let water_tint_mesh = vec3<f32>(0.1, 0.3, 0.4);
