@@ -304,11 +304,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // Mix based on reflection strength (Fresnel)
-    let final_rgb = mix(base_color, combined_reflection, reflection_strength);
+    var final_rgb = mix(base_color, combined_reflection, reflection_strength);
     
     // Alpha
     // More opaque at grazing angles, more transparent looking down
-    let alpha = mix(water.water_color.a, 1.0, fresnel * 0.5);
+    var alpha = mix(water.water_color.a, 1.0, fresnel * 0.5);
     
     // Soft shore fade
     // Reconstruct scene world position to get actual distance
@@ -338,6 +338,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if (scene_depth_raw >= 0.9999) {
         shore_fade = 1.0;
     }
+    
+    // Depth-based visibility: deeper underwater = more obscured
+    // depth_diff is how far below water level (in world units/voxels)
+    // At 50 units deep, visibility should be very low
+    let depth_visibility_falloff = 50.0; // Units at which visibility is near zero
+    let depth_factor = clamp(depth_diff / depth_visibility_falloff, 0.0, 1.0);
+    
+    // Increase opacity with depth (objects deeper are harder to see through water)
+    alpha = mix(alpha, 1.0, depth_factor * 0.85);
+    
+    // Also tint deeper water more blue/dark
+    let deep_water_tint = vec3<f32>(0.1, 0.2, 0.35) * brightness;
+    final_rgb = mix(final_rgb, deep_water_tint, depth_factor * 0.7);
     
     return vec4<f32>(final_rgb, alpha * shore_fade);
 }

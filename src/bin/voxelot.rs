@@ -2131,11 +2131,11 @@ impl App {
                 println!("SSR DEBUG overlay: {}", self.ssr_debug);
             }
             KeyCode::KeyY => {
-                self.water_level = (self.water_level - 0.5).max(0.0);
+                self.water_level = (self.water_level - 5.0).max(0.0);
                 println!("Water level: {:.1}", self.water_level);
             }
             KeyCode::KeyM => {
-                self.water_level = (self.water_level + 0.5).min(100.0);
+                self.water_level = (self.water_level + 5.0).min(1000.0);
                 println!("Water level: {:.1}", self.water_level);
             }
             _ => {}

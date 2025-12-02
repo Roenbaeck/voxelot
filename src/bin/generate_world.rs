@@ -889,11 +889,11 @@ fn blend_base_edges(smoothed_map: &mut HashMap<TileId, Vec<i64>>, size: usize, b
 
 fn get_global_height(perlin: &Perlin, x: f64, y: f64) -> f64 {
     // Large scale terrain for mountains/lakes
-    // Base 500m
-    let base = 500.0;
+    // Base is above water level (500m) so more terrain is above water
+    let base = 580.0;
 
     // Very large scale features (continents/ranges)
-    let large = fbm(perlin, x * 0.0002, y * 0.0002, 4, 2.0, 0.5) * 400.0;
+    let large = fbm(perlin, x * 0.0002, y * 0.0002, 4, 2.0, 0.5) * 350.0;
 
     // Medium scale features (hills/valleys)
     let mid = fbm(perlin, x * 0.001, y * 0.001, 4, 2.0, 0.5) * 100.0;
@@ -1371,6 +1371,7 @@ fn voxelize_city(
 
     // Build per-cell base ground from terrain heights
     // Cities should only be placed on high ground, so no artificial raising is needed
+    // NOTE: Index using flipped z to match polygon_cells which returns flipped coordinates
     let mut base_ground_vox =
         vec![0i64; (space.voxel_resolution * space.voxel_resolution) as usize];
     let size = space.voxel_resolution as usize;
@@ -1378,7 +1379,9 @@ fn voxelize_city(
         for zi in 0..size {
             let elev_m = heights_m[xi + zi * size];
             let ground_vox = (elev_m / space.meters_per_voxel).ceil() as i64;
-            base_ground_vox[xi + zi * size] = ground_vox;
+            // Store using flipped z coordinate to match polygon_cells coordinate system
+            let flipped_z = size - 1 - zi;
+            base_ground_vox[xi + flipped_z * size] = ground_vox;
         }
     }
 
@@ -1426,7 +1429,8 @@ fn voxelize_city(
     for xi in 0..size {
         for zi in 0..size {
             let voxel_z = (size - 1 - zi) as i64;  // Flip Z coordinate
-            let ground_vox = base_ground_vox[xi + zi * size];
+            // base_ground_vox uses flipped z indexing to match polygon_cells
+            let ground_vox = base_ground_vox[xi + voxel_z as usize * size];
             for y in space.base_y_vox..=ground_vox {
                 let mat = if y < ground_vox - 2 {
                     MAT_STONE
