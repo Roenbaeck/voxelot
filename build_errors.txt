@@ -1,0 +1,65 @@
+warning: method `is_occupied_at` is never used
+   --> src/lib_hierarchical.rs:576:8
+    |
+147 | impl Chunk {
+    | ---------- method in this implementation
+...
+576 |     fn is_occupied_at(&self, x: u8, y: u8, z: u8) -> bool {
+    |        ^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `voxelot` (lib) generated 1 warning
+    Checking voxelot v0.1.0 (/Users/lars/Documents/GitHub/voxelot)
+error[E0425]: cannot find value `large_deltas` in this scope
+    --> src/bin/generate_world.rs:2329:25
+     |
+2329 |                         large_deltas.push((
+     |                         ^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find value `large_deltas` in this scope
+    --> src/bin/generate_world.rs:2352:25
+     |
+2352 |                         large_deltas.push((
+     |                         ^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find value `large_deltas` in this scope
+    --> src/bin/generate_world.rs:2372:5
+     |
+2372 |     large_deltas.sort_by(|a, b| (b.3 - b.4).abs().cmp(&(a.3 - a.4).abs()));
+     |     ^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find value `large_deltas` in this scope
+    --> src/bin/generate_world.rs:2374:32
+     |
+2374 |     for (a, b, idx, va, vb) in large_deltas.iter().take(10) {
+     |                                ^^^^^^^^^^^^ not found in this scope
+
+warning: unnecessary parentheses around assigned value
+   --> src/bin/generate_world.rs:936:37
+    |
+936 |                     let idx_nei_x = (size - 1 - w);
+    |                                     ^            ^
+    |
+    = note: `#[warn(unused_parens)]` (part of `#[warn(unused)]`) on by default
+help: remove these parentheses
+    |
+936 -                     let idx_nei_x = (size - 1 - w);
+936 +                     let idx_nei_x = size - 1 - w ;
+    |
+
+warning: unnecessary parentheses around assigned value
+   --> src/bin/generate_world.rs:957:37
+    |
+957 |                     let idx_nei_z = (size - 1 - w);
+    |                                     ^            ^
+    |
+help: remove these parentheses
+    |
+957 -                     let idx_nei_z = (size - 1 - w);
+957 +                     let idx_nei_z = size - 1 - w ;
+    |
+
+For more information about this error, try `rustc --explain E0425`.
+warning: `voxelot` (bin "generate_world") generated 2 warnings
+error: could not compile `voxelot` (bin "generate_world") due to 4 previous errors; 2 warnings emitted
