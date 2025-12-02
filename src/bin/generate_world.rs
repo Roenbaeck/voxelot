@@ -31,6 +31,25 @@ struct Args {
     #[arg(long, default_value_t = 2)]
     radius: u32,
 
+    /// Blend width in voxels across tiles
+    #[arg(long, default_value_t = 6)]
+    tile_blend_width: u32,
+    /// Building pad radius in voxels for raised foundations
+    #[arg(long, default_value_t = 3)]
+    building_pad_radius: i32,
+    /// Disable building pads (no raised foundations)
+    #[arg(long, default_value_t = false)]
+    no_building_pad: bool,
+    /// Generate near-flat tile heights (useful for debugging seams)
+    #[arg(long, default_value_t = false)]
+    flat: bool,
+    /// Number of tiles in X direction (overrides radius if > 0)
+    #[arg(long, default_value_t = 0)]
+    tile_width: u32,
+    /// Number of tiles in Y direction (overrides radius if > 0)
+    #[arg(long, default_value_t = 0)]
+    tile_height: u32,
+
     #[arg(long = "voxels-per-tile", default_value_t = 128)]
     voxel_resolution: u32,
 
@@ -45,6 +64,10 @@ struct Args {
 
     #[arg(long, default_value_t = 500.0)]
     water_level: f64,
+
+    /// Sample heights across the whole world grid instead of per-tile sampling
+    #[arg(long, default_value_t = false)]
+    sample_global: bool,
 
     #[arg(long = "output-name", default_value = "world_1")]
     output_name: String,
@@ -182,10 +205,10 @@ impl TileFetcher {
 
         // Determine Biome based on terrain height across the tile
         let ((min_lon, max_lon), (north_lat, south_lat)) = tile.lon_lat_bounds();
-        
+
         // Use a temporary Perlin for biome selection (must match sample_tile_heights seed)
         let perlin = Perlin::new(self.seed as u32);
-        
+
         // Sample heights at multiple points across the tile to get min/avg height
         let sample_grid = 4;
         let mut min_h = f64::INFINITY;
@@ -612,7 +635,7 @@ fn smooth_tiles_pass(smoothed_map: &mut HashMap<TileId, Vec<f64>>, size: usize) 
                         let neighbor = TileId {
                             z: tile_id.z,
                             x: tile_id.x,
-                            y: tile_id.y + 1,  // South neighbor (tile.y increases southward)
+                            y: tile_id.y + 1, // South neighbor (tile.y increases southward)
                         };
                         if let Some(nei) = smoothed_map.get(&neighbor) {
                             sum += nei[xi + (size - 1) * size];
@@ -623,7 +646,7 @@ fn smooth_tiles_pass(smoothed_map: &mut HashMap<TileId, Vec<f64>>, size: usize) 
                         let neighbor = TileId {
                             z: tile_id.z,
                             x: tile_id.x,
-                            y: tile_id.y - 1,  // North neighbor (tile.y decreases northward)
+                            y: tile_id.y - 1, // North neighbor (tile.y decreases northward)
                         };
                         if let Some(nei) = smoothed_map.get(&neighbor) {
                             sum += nei[xi + 0 * size];
@@ -696,8 +719,8 @@ fn blend_tile_edges(smoothed_map: &mut HashMap<TileId, Vec<f64>>, size: usize, b
             };
             if let Some(nei) = smoothed_map.get(&south_neighbor) {
                 for w in 0..blend_width {
-                    let z = w;  // Our south edge (low z)
-                    let z_nei = size - 1 - w;  // Their north edge (high z)
+                    let z = w; // Our south edge (low z)
+                    let z_nei = size - 1 - w; // Their north edge (high z)
                     let t = (w + 1) as f64 / (blend_width + 1) as f64;
                     for xi in 0..size {
                         let idx = xi + z * size;
@@ -716,8 +739,8 @@ fn blend_tile_edges(smoothed_map: &mut HashMap<TileId, Vec<f64>>, size: usize, b
             };
             if let Some(nei) = smoothed_map.get(&north_neighbor) {
                 for w in 0..blend_width {
-                    let z = size - 1 - w;  // Our north edge (high z)
-                    let z_nei = w;  // Their south edge (low z)
+                    let z = size - 1 - w; // Our north edge (high z)
+                    let z_nei = w; // Their south edge (low z)
                     let t = (w + 1) as f64 / (blend_width + 1) as f64;
                     for xi in 0..size {
                         let idx = xi + z * size;
@@ -772,7 +795,7 @@ fn smooth_base_pass(smoothed_map: &mut HashMap<TileId, Vec<i64>>, size: usize) {
                         let neighbor = TileId {
                             z: tile_id.z,
                             x: tile_id.x,
-                            y: tile_id.y + 1,  // South neighbor
+                            y: tile_id.y + 1, // South neighbor
                         };
                         if let Some(nei) = smoothed_map.get(&neighbor) {
                             sum += nei[xi + (size - 1) * size] as f64;
@@ -783,7 +806,7 @@ fn smooth_base_pass(smoothed_map: &mut HashMap<TileId, Vec<i64>>, size: usize) {
                         let neighbor = TileId {
                             z: tile_id.z,
                             x: tile_id.x,
-                            y: tile_id.y - 1,  // North neighbor
+                            y: tile_id.y - 1, // North neighbor
                         };
                         if let Some(nei) = smoothed_map.get(&neighbor) {
                             sum += nei[xi + 0 * size] as f64;
@@ -847,7 +870,7 @@ fn blend_base_edges(smoothed_map: &mut HashMap<TileId, Vec<i64>>, size: usize, b
             let top_neighbor = TileId {
                 z: tile_id.z,
                 x: tile_id.x,
-                y: tile_id.y + 1,  // South neighbor (z==0 edge)
+                y: tile_id.y + 1, // South neighbor (z==0 edge)
             };
             if let Some(nei) = smoothed_map.get(&top_neighbor) {
                 for w in 0..blend_width {
@@ -866,7 +889,7 @@ fn blend_base_edges(smoothed_map: &mut HashMap<TileId, Vec<i64>>, size: usize, b
             let bottom_neighbor = TileId {
                 z: tile_id.z,
                 x: tile_id.x,
-                y: tile_id.y - 1,  // North neighbor (z==size-1 edge)
+                y: tile_id.y - 1, // North neighbor (z==size-1 edge)
             };
             if let Some(nei) = smoothed_map.get(&bottom_neighbor) {
                 for w in 0..blend_width {
@@ -885,6 +908,184 @@ fn blend_base_edges(smoothed_map: &mut HashMap<TileId, Vec<i64>>, size: usize, b
             smoothed_map.insert(tile_id, new_b);
         }
     }
+}
+
+// Enforce identical values across shared tile edges by averaging the integer values
+// This avoids 1-voxel seams due to rounding inconsistencies.
+// Enforce identical values across shared tile edges by averaging integer values
+// across an adjustable width in case pad updates or smoothing cause larger transitions.
+// This avoids narrow 1-voxel seams by equalizing a wider band along edges.
+fn equalize_tile_edges(
+    smoothed_map: &mut HashMap<TileId, Vec<i64>>,
+    size: usize,
+    width: usize,
+) -> usize {
+    let keys: Vec<TileId> = smoothed_map.keys().copied().collect();
+    let mut updates: Vec<(TileId, usize, i64)> = Vec::new();
+    for tile_id in keys.iter() {
+        if let Some(base) = smoothed_map.get(tile_id) {
+            // Left neighbor: our x=0..width-1 matches neighbor x=size-1 - (0..width-1)
+            let left_neighbor = TileId {
+                z: tile_id.z,
+                x: tile_id.x - 1,
+                y: tile_id.y,
+            };
+            if let Some(nei) = smoothed_map.get(&left_neighbor) {
+                for w in 0..width {
+                    let idx_x = w;
+                    let idx_nei_x = size - 1 - w;
+                    for zi in 0..size {
+                        let idx = idx_x + zi * size;
+                        let idx_nei = idx_nei_x + zi * size;
+                        let a = base[idx];
+                        let b = nei[idx_nei];
+                        let avg = ((a + b) as f64 / 2.0).round() as i64;
+                        updates.push((*tile_id, idx, avg));
+                        updates.push((left_neighbor, idx_nei, avg));
+                    }
+                }
+            }
+            // Top neighbor (south): our z=0 matches neighbor z=size-1
+            let top_neighbor = TileId {
+                z: tile_id.z,
+                x: tile_id.x,
+                y: tile_id.y + 1,
+            };
+            if let Some(nei) = smoothed_map.get(&top_neighbor) {
+                for w in 0..width {
+                    let idx_z = w;
+                    let idx_nei_z = size - 1 - w;
+                    for xi in 0..size {
+                        let idx = xi + idx_z * size;
+                        let idx_nei = xi + idx_nei_z * size;
+                        let a = base[idx];
+                        let b = nei[idx_nei];
+                        let avg = ((a + b) as f64 / 2.0).round() as i64;
+                        updates.push((*tile_id, idx, avg));
+                        updates.push((top_neighbor, idx_nei, avg));
+                    }
+                }
+            }
+        }
+    }
+    let mut applied = 0usize;
+    // apply updates
+    for (tile, idx, val) in updates.iter() {
+        if let Some(v) = smoothed_map.get_mut(tile) {
+            if *idx < v.len() {
+                if v[*idx] != *val {
+                    v[*idx] = *val;
+                    applied += 1;
+                }
+            }
+        }
+    }
+    applied
+}
+
+// Clamp small per-edge deltas (e.g., 1-voxel) down to exact equality by averaging only
+// where the gap is small. This prevents one-voxel ridges due to rounding noise.
+fn clamp_small_edge_deltas(smoothed_map: &mut HashMap<TileId, Vec<i64>>, size: usize) -> usize {
+    let keys: Vec<TileId> = smoothed_map.keys().copied().collect();
+    let mut updates: Vec<(TileId, usize, i64)> = Vec::new();
+    for tile_id in keys.iter() {
+        if let Some(base) = smoothed_map.get(tile_id) {
+            // left neighbor (our x==0 vs neighbor x==size-1)
+            let left_neighbor = TileId {
+                z: tile_id.z,
+                x: tile_id.x - 1,
+                y: tile_id.y,
+            };
+            if let Some(nei) = smoothed_map.get(&left_neighbor) {
+                for zi in 0..size {
+                    let idx = 0 + zi * size;
+                    let idx_nei = (size - 1) + zi * size;
+                    let a = base[idx];
+                    let b = nei[idx_nei];
+                    let delta = (a - b).abs();
+                    if delta <= 1 {
+                        let avg = ((a + b) as f64 / 2.0).round() as i64;
+                        updates.push((*tile_id, idx, avg));
+                        updates.push((left_neighbor, idx_nei, avg));
+                    }
+                }
+            }
+            // north neighbor (tile.y -1) (our z==size-1 vs neighbor z==0)
+            let north_neighbor = TileId {
+                z: tile_id.z,
+                x: tile_id.x,
+                y: tile_id.y - 1,
+            };
+            if let Some(nei) = smoothed_map.get(&north_neighbor) {
+                for xi in 0..size {
+                    let idx = xi + (size - 1) * size;
+                    let idx_nei = xi + 0 * size;
+                    let a = base[idx];
+                    let b = nei[idx_nei];
+                    let delta = (a - b).abs();
+                    if delta <= 1 {
+                        let avg = ((a + b) as f64 / 2.0).round() as i64;
+                        updates.push((*tile_id, idx, avg));
+                        updates.push((north_neighbor, idx_nei, avg));
+                    }
+                }
+            }
+
+            // south neighbor (our z==0 vs neighbor z==size-1)
+            let south_neighbor = TileId {
+                z: tile_id.z,
+                x: tile_id.x,
+                y: tile_id.y + 1,
+            };
+            if let Some(nei) = smoothed_map.get(&south_neighbor) {
+                for xi in 0..size {
+                    let idx = xi + 0 * size;
+                    let idx_nei = xi + (size - 1) * size;
+                    let a = base[idx];
+                    let b = nei[idx_nei];
+                    let delta = (a - b).abs();
+                    if delta <= 1 {
+                        let avg = ((a + b) as f64 / 2.0).round() as i64;
+                        updates.push((*tile_id, idx, avg));
+                        updates.push((south_neighbor, idx_nei, avg));
+                    }
+                }
+            }
+
+            // right neighbor (our x==size-1 vs neighbor x==0)
+            let right_neighbor = TileId {
+                z: tile_id.z,
+                x: tile_id.x + 1,
+                y: tile_id.y,
+            };
+            if let Some(nei) = smoothed_map.get(&right_neighbor) {
+                for zi in 0..size {
+                    let idx = (size - 1) + zi * size;
+                    let idx_nei = 0 + zi * size;
+                    let a = base[idx];
+                    let b = nei[idx_nei];
+                    let delta = (a - b).abs();
+                    if delta <= 1 {
+                        let avg = ((a + b) as f64 / 2.0).round() as i64;
+                        updates.push((*tile_id, idx, avg));
+                        updates.push((right_neighbor, idx_nei, avg));
+                    }
+                }
+            }
+        }
+    }
+    let mut applied = 0usize;
+    for (tile, idx, val) in updates.iter() {
+        if let Some(v) = smoothed_map.get_mut(tile) {
+            if *idx < v.len() {
+                if v[*idx] != *val {
+                    v[*idx] = *val;
+                    applied += 1;
+                }
+            }
+        }
+    }
+    applied
 }
 
 fn get_global_height(perlin: &Perlin, x: f64, y: f64) -> f64 {
@@ -909,8 +1110,11 @@ fn sample_tile_heights(perlin: &Perlin, space: &TileSpace) -> Vec<f64> {
     let mut heights = vec![0.0f64; size * size];
     for xi in 0..size {
         for zi in 0..size {
-            let wx = space.min_x_m + (xi as f64 / size as f64) * (space.max_x_m - space.min_x_m);
-            let wz = space.min_y_m + (zi as f64 / size as f64) * (space.max_y_m - space.min_y_m);
+            // Sample at cell centers (xi + 0.5) / size -> consistent with mercator->voxel mapping
+            let wx =
+                space.min_x_m + ((xi as f64 + 0.5) / size as f64) * (space.max_x_m - space.min_x_m);
+            let wz =
+                space.min_y_m + ((zi as f64 + 0.5) / size as f64) * (space.max_y_m - space.min_y_m);
             heights[xi + zi * size] = get_global_height(perlin, wx, wz).max(1.0);
         }
     }
@@ -929,8 +1133,11 @@ fn compute_river_mask(
     let max_river_elevation = space.water_level_m + 40.0;
     for xi in 0..size {
         for zi in 0..size {
-            let wx = space.min_x_m + (xi as f64 / size as f64) * (space.max_x_m - space.min_x_m);
-            let wz = space.min_y_m + (zi as f64 / size as f64) * (space.max_y_m - space.min_y_m);
+            // Sample at cell centers to be consistent with polygon cell mapping
+            let wx =
+                space.min_x_m + ((xi as f64 + 0.5) / size as f64) * (space.max_x_m - space.min_x_m);
+            let wz =
+                space.min_y_m + ((zi as f64 + 0.5) / size as f64) * (space.max_y_m - space.min_y_m);
             let v = fbm(perlin, wx * river_scale, wz * river_scale, 3, 2.0, 0.5);
             // Rivers follow low values in this global low-frequency noise
             let elev = heights_m[xi + zi * size];
@@ -1118,9 +1325,18 @@ fn voxelize_tile(
     data: TileData,
     space: &TileSpace,
     max_height_voxels: u32,
+    pad_radius: i32,
+    no_building_pad: bool,
 ) -> TileVoxelResult {
     match data.biome {
-        Biome::City => voxelize_city(tile, data, space, max_height_voxels),
+        Biome::City => voxelize_city(
+            tile,
+            data,
+            space,
+            max_height_voxels,
+            pad_radius,
+            no_building_pad,
+        ),
         Biome::Hill => voxelize_hill(tile, data, space, max_height_voxels),
     }
 }
@@ -1165,9 +1381,9 @@ fn voxelize_hill(
     // - South neighbor's zi=size-1 (north) → voxel.z=0 → world Z = tile_offset + size + 0
     for xi in 0..size {
         for zi in 0..size {
-            let voxel_z = (size - 1 - zi) as i64;  // Flip Z coordinate
+            let voxel_z = (size - 1 - zi) as i64; // Flip Z coordinate
             let h_m = heights_m[xi + zi * size];
-            let h_vox = (h_m / space.meters_per_voxel).ceil() as i64;
+            let h_vox = (h_m / space.meters_per_voxel).round() as i64;
             let h_vox = h_vox.clamp(1, max_height_voxels as i64);
 
             // approximate slope: sample neighbors
@@ -1220,7 +1436,8 @@ fn voxelize_hill(
             }
             // Water is rendered by the viewer as a translucent plane - do NOT generate water voxels!
             // Just mark shoreline/underwater terrain with sand
-            let water_level_vox = (space.water_level_m / space.meters_per_voxel).ceil() as i64;
+            // Use round() to match other voxel conversions and reduce differences
+            let water_level_vox = (space.water_level_m / space.meters_per_voxel).round() as i64;
             if h_vox <= water_level_vox + 2 {
                 // Near or below water - use sand for beaches and seabed
                 if let Some(last) = voxels.last_mut() {
@@ -1252,14 +1469,14 @@ fn voxelize_hill(
     let veg_density = 0.02 + (rng.gen::<f64>() * 0.04);
     for xi in 0..size {
         for zi in 0..size {
-            let voxel_z = (size - 1 - zi) as i64;  // Flip Z coordinate
+            let voxel_z = (size - 1 - zi) as i64; // Flip Z coordinate
             if rng.gen_bool(veg_density) {
                 let h_m = heights_m[xi + zi * size];
                 // Skip vegetation if cell is below (or very close to) global water level
                 if h_m <= space.water_level_m + 0.5 {
                     continue;
                 }
-                let h_vox = (h_m / space.meters_per_voxel).ceil() as i64;
+                let h_vox = (h_m / space.meters_per_voxel).round() as i64;
                 // Only place vegetation on gentle slopes and not too high
                 let center = heights_m[xi + zi * size];
                 let neighbor_x = if xi + 1 < size {
@@ -1360,6 +1577,8 @@ fn voxelize_city(
     data: TileData,
     space: &TileSpace,
     max_height_voxels: u32,
+    pad_radius: i32,
+    no_building_pad: bool,
 ) -> TileVoxelResult {
     let mut voxels = Vec::new();
     let perlin = Perlin::new(space.seed as u32);
@@ -1371,21 +1590,29 @@ fn voxelize_city(
 
     // Build per-cell base ground from terrain heights
     // Cities should only be placed on high ground, so no artificial raising is needed
-    // NOTE: Index using flipped z to match polygon_cells which returns flipped coordinates
-    let mut base_ground_vox =
-        vec![0i64; (space.voxel_resolution * space.voxel_resolution) as usize];
+    // NOTE: If a precomputed `base_ground_vox` exists in `data`, prefer that so
+    // tile rounding is consistent. Otherwise compute it using round().
     let size = space.voxel_resolution as usize;
-    for xi in 0..size {
-        for zi in 0..size {
-            let elev_m = heights_m[xi + zi * size];
-            let ground_vox = (elev_m / space.meters_per_voxel).ceil() as i64;
-            // Store using flipped z coordinate to match polygon_cells coordinate system
-            let flipped_z = size - 1 - zi;
-            base_ground_vox[xi + flipped_z * size] = ground_vox;
+    let mut base_ground_vox: Vec<i64> = if let Some(ref precomputed) = data.base_ground_vox {
+        precomputed.clone()
+    } else {
+        let mut base_ground_vox = vec![0i64; size * size];
+        for xi in 0..size {
+            for zi in 0..size {
+                let elev_m = heights_m[xi + zi * size];
+                // Use round() to match other conversions and to reduce 1-voxel seams
+                let ground_vox = (elev_m / space.meters_per_voxel).round() as i64;
+                // Store using flipped z coordinate to match polygon_cells coordinate system
+                let flipped_z = size - 1 - zi;
+                base_ground_vox[xi + flipped_z * size] = ground_vox;
+            }
         }
-    }
+        base_ground_vox
+    };
 
     // Building pad pass: expand raised base around building footprints to create smooth pads
+    // Allow pad disabled via no_building_pad flag
+    let pad_radius_effective = if no_building_pad { 0 } else { pad_radius };
     for entry in data.buildings.iter() {
         let cells_list = polygon_cells(space, &[entry.footprint.clone()]);
         if cells_list.is_empty() {
@@ -1404,7 +1631,7 @@ fn voxelize_city(
             }
         }
         // Expand neighboring ground to create a small pad (2 cells) around footprint for smoother transition
-        let pad_radius = 2;
+        let pad_radius = pad_radius_effective;
         for &(x, z) in cells {
             for dx in -(pad_radius as i32)..=(pad_radius as i32) {
                 for dz in -(pad_radius as i32)..=(pad_radius as i32) {
@@ -1428,8 +1655,8 @@ fn voxelize_city(
     // Start from base_y_vox to avoid generating deep underground voxels
     for xi in 0..size {
         for zi in 0..size {
-            let voxel_z = (size - 1 - zi) as i64;  // Flip Z coordinate
-            // base_ground_vox uses flipped z indexing to match polygon_cells
+            let voxel_z = (size - 1 - zi) as i64; // Flip Z coordinate
+                                                  // base_ground_vox uses flipped z indexing to match polygon_cells
             let ground_vox = base_ground_vox[xi + voxel_z as usize * size];
             for y in space.base_y_vox..=ground_vox {
                 let mat = if y < ground_vox - 2 {
@@ -1612,7 +1839,7 @@ fn voxelize_city(
             continue;
         }
         let height_m = infer_height_meters(&entry.tags);
-        let height_vox = (height_m / space.meters_per_voxel).ceil() as i64;
+        let height_vox = (height_m / space.meters_per_voxel).round() as i64;
         let height_vox = height_vox.clamp(3, max_height_voxels as i64);
         let roof_y = height_vox.min(max_roof_y);
 
@@ -1732,7 +1959,10 @@ fn voxelize_city(
 fn generate_area(args: &Args) -> Vec<TileVoxelResult> {
     eprintln!("=== GENERATE_AREA v3 - DEBUG HEIGHTS ===");
     let center_tile = lon_lat_to_tile(args.center_lon, args.center_lat, args.zoom);
-    eprintln!("Center tile: ({}, {}, {})", center_tile.x, center_tile.y, center_tile.z);
+    eprintln!(
+        "Center tile: ({}, {}, {})",
+        center_tile.x, center_tile.y, center_tile.z
+    );
     let fetcher = TileFetcher::new(args.seed, args.water_level);
     let mut results = Vec::new();
     let perlin = Perlin::new(args.seed as u32);
@@ -1740,12 +1970,26 @@ fn generate_area(args: &Args) -> Vec<TileVoxelResult> {
     let mut tile_map: HashMap<TileId, TileData> = HashMap::new();
     let mut tile_spaces: HashMap<TileId, TileSpace> = HashMap::new();
     let mut tiles: Vec<TileId> = Vec::new();
-    for dy in -(args.radius as i32)..=(args.radius as i32) {
-        for dx in -(args.radius as i32)..=(args.radius as i32) {
+    // Determine tile grid size (tile_count = 2*radius + 1 by default). Allow explicit overrides
+    let tile_w = if args.tile_width > 0 {
+        args.tile_width as i32
+    } else {
+        (args.radius as i32) * 2 + 1
+    };
+    let tile_h = if args.tile_height > 0 {
+        args.tile_height as i32
+    } else {
+        (args.radius as i32) * 2 + 1
+    };
+    let start_x = center_tile.x - (tile_w / 2);
+    let start_y = center_tile.y - (tile_h / 2);
+    let size = args.voxel_resolution as usize;
+    for ty in 0..tile_h {
+        for tx in 0..tile_w {
             let tile = TileId {
                 z: center_tile.z,
-                x: center_tile.x + dx,
-                y: center_tile.y + dy,
+                x: start_x + tx,
+                y: start_y + ty,
             };
             let mut data = fetcher.fetch(tile);
             let space = TileSpace::new(
@@ -1760,6 +2004,65 @@ fn generate_area(args: &Args) -> Vec<TileVoxelResult> {
             tile_map.insert(tile, data);
             tile_spaces.insert(tile, space);
             tiles.push(tile);
+        }
+    }
+
+    // If sampling globally, create a big grid covering full world extents and fill
+    // per-tile heights from it. This ensures consistent sampling across tile boundaries.
+    if args.sample_global {
+        eprintln!("Sampling heights globally across tile grid...");
+        // Determine world bounds in meters from tile_spaces
+        let mut global_min_x = f64::INFINITY;
+        let mut global_max_x = f64::NEG_INFINITY;
+        let mut global_min_y = f64::INFINITY;
+        let mut global_max_y = f64::NEG_INFINITY;
+        for (_tid, space) in tile_spaces.iter() {
+            if space.min_x_m < global_min_x {
+                global_min_x = space.min_x_m;
+            }
+            if space.max_x_m > global_max_x {
+                global_max_x = space.max_x_m;
+            }
+            if space.min_y_m < global_min_y {
+                global_min_y = space.min_y_m;
+            }
+            if space.max_y_m > global_max_y {
+                global_max_y = space.max_y_m;
+            }
+        }
+        let grid_w = tile_w as usize * size;
+        let grid_h = tile_h as usize * size;
+        let mut global_heights = vec![0.0f64; grid_w * grid_h];
+        for gz in 0..grid_h {
+            for gx in 0..grid_w {
+                let wx = global_min_x
+                    + ((gx as f64 + 0.5) / grid_w as f64) * (global_max_x - global_min_x);
+                let wz = global_min_y
+                    + ((gz as f64 + 0.5) / grid_h as f64) * (global_max_y - global_min_y);
+                global_heights[gx + gz * grid_w] = get_global_height(&perlin, wx, wz).max(1.0);
+            }
+        }
+        // Copy slices from global_heights into each tile's `heights_m`
+        for ty in 0..tile_h {
+            for tx in 0..tile_w {
+                let tile = TileId {
+                    z: center_tile.z,
+                    x: start_x + tx,
+                    y: start_y + ty,
+                };
+                let gx0 = (tx as usize) * size;
+                let gz0 = (ty as usize) * size;
+                if let Some(data) = tile_map.get_mut(&tile) {
+                    let mut h = vec![0.0f64; size * size];
+                    for zi in 0..size {
+                        for xi in 0..size {
+                            let gidx = (gx0 + xi) + (gz0 + zi) * grid_w;
+                            h[xi + zi * size] = global_heights[gidx];
+                        }
+                    }
+                    data.heights_m = Some(h);
+                }
+            }
         }
     }
 
@@ -1779,80 +2082,14 @@ fn generate_area(args: &Args) -> Vec<TileVoxelResult> {
         smooth_tiles_pass(&mut smoothed_map, size);
     }
     // Blend tile edges to produce ramps across tile boundaries
-    let blend_width = 6usize;
+    let blend_width = args.tile_blend_width as usize;
     blend_tile_edges(&mut smoothed_map, size, blend_width);
     // Additional smoothing passes to settle blend
     for _ in 0..1 {
         smooth_tiles_pass(&mut smoothed_map, size);
     }
     // Previously this loop performed a single pass; we've replaced it with helper calls
-    for tile_id in tiles.iter() {
-        let mut new_h = smoothed_map.get(tile_id).unwrap().clone();
-        if new_h.len() != size * size {
-            continue;
-        }
-        for xi in 0..size {
-            for zi in 0..size {
-                let idx = xi + zi * size;
-                let mut sum = new_h[idx];
-                let mut count = 1.0;
-                // Left edge neighbor
-                if xi == 0 {
-                    let neighbor = TileId {
-                        z: tile_id.z,
-                        x: tile_id.x - 1,
-                        y: tile_id.y,
-                    };
-                    if let Some(nei_h) = smoothed_map.get(&neighbor) {
-                        let idx_nei = (size - 1) + zi * size;
-                        sum += nei_h[idx_nei];
-                        count += 1.0;
-                    }
-                }
-                // Right edge neighbor
-                if xi == size - 1 {
-                    let neighbor = TileId {
-                        z: tile_id.z,
-                        x: tile_id.x + 1,
-                        y: tile_id.y,
-                    };
-                    if let Some(nei_h) = smoothed_map.get(&neighbor) {
-                        let idx_nei = 0 + zi * size;
-                        sum += nei_h[idx_nei];
-                        count += 1.0;
-                    }
-                }
-                // Top edge neighbor
-                if zi == 0 {
-                    let neighbor = TileId {
-                        z: tile_id.z,
-                        x: tile_id.x,
-                        y: tile_id.y - 1,
-                    };
-                    if let Some(nei_h) = smoothed_map.get(&neighbor) {
-                        let idx_nei = xi + (size - 1) * size;
-                        sum += nei_h[idx_nei];
-                        count += 1.0;
-                    }
-                }
-                // Bottom edge neighbor
-                if zi == size - 1 {
-                    let neighbor = TileId {
-                        z: tile_id.z,
-                        x: tile_id.x,
-                        y: tile_id.y + 1,
-                    };
-                    if let Some(nei_h) = smoothed_map.get(&neighbor) {
-                        let idx_nei = xi + 0 * size;
-                        sum += nei_h[idx_nei];
-                        count += 1.0;
-                    }
-                }
-                new_h[idx] = sum / count;
-            }
-        }
-        smoothed_map.insert(*tile_id, new_h);
-    }
+
     // Write smoothed heights back to tile data and compute base_ground_vox
     for (tile_id, heights) in smoothed_map.iter() {
         if let Some(data) = tile_map.get_mut(tile_id) {
@@ -1862,7 +2099,8 @@ fn generate_area(args: &Args) -> Vec<TileVoxelResult> {
             for xi in 0..size {
                 for zi in 0..size {
                     let elev_m = heights[xi + zi * size];
-                    let g = (elev_m / args.meters_per_voxel).ceil() as i64;
+                    // Use rounding instead of ceil to reduce 1-voxel seams between tiles
+                    let g = (elev_m / args.meters_per_voxel).round() as i64;
                     base_vox[xi + zi * size] = g;
                 }
             }
@@ -1877,15 +2115,15 @@ fn generate_area(args: &Args) -> Vec<TileVoxelResult> {
     for tile_id in tiles.iter() {
         if let Some(h) = smoothed_map.get(tile_id) {
             for xi in 0..size {
-                // compare top edge to neighbor
-                let idx_top = xi + 0 * size;
+                // compare top edge (North, z=size-1) to neighbor (y-1, South edge z=0)
+                let idx_top = xi + (size - 1) * size;
                 let top_neighbor = TileId {
                     z: tile_id.z,
                     x: tile_id.x,
                     y: tile_id.y - 1,
                 };
                 if let Some(nei) = smoothed_map.get(&top_neighbor) {
-                    let nei_idx = xi + (size - 1) * size;
+                    let nei_idx = xi + 0 * size;
                     let delta = (h[idx_top] - nei[nei_idx]).abs();
                     max_border_delta = max_border_delta.max(delta);
                     total_border_delta += delta;
@@ -1915,6 +2153,8 @@ fn generate_area(args: &Args) -> Vec<TileVoxelResult> {
             total_border_delta / border_count as f64
         );
     }
+
+    // Base border diffs diagnostic will be computed after pad smoothing & equalization
 
     // Building pad pass across tiles: expand elevated bases around building footprints
     // Increase pad radius for smoother, more gradual ramps across neighbors
@@ -2038,14 +2278,183 @@ fn generate_area(args: &Args) -> Vec<TileVoxelResult> {
     for _ in 0..6 {
         smooth_base_pass(&mut base_map, size);
     }
-    blend_base_edges(&mut base_map, size, 12);
+    blend_base_edges(&mut base_map, size, args.tile_blend_width as usize * 2);
+    // Force identical integer values across shared edges to eliminate 1-voxel seams
+    // Use an equalization width proportional to the configured tile blend width
+    let equal_width = (args.tile_blend_width as usize).max(1);
+    // Iteratively equalize and clamp until stable (or hit max iterations)
+    let mut iter = 0usize;
+    loop {
+        let mut changed = 0usize;
+        changed += equalize_tile_edges(&mut base_map, size, equal_width);
+        changed += clamp_small_edge_deltas(&mut base_map, size);
+        changed += equalize_tile_edges(&mut base_map, size, equal_width);
+        iter += 1;
+        if changed == 0 || iter > 8 {
+            break;
+        }
+    }
     for _ in 0..3 {
         smooth_base_pass(&mut base_map, size);
     }
+    // Re-apply equalization after final smoothing to ensure exact edge equality
+    equalize_tile_edges(&mut base_map, size, (args.tile_blend_width as usize).max(1));
     for (tile_id, base) in base_map.iter() {
         if let Some(data) = tile_map.get_mut(tile_id) {
             data.base_ground_vox = Some(base.clone());
         }
+    }
+
+    // Diagnostic: base integer border deltas after equalization
+    let mut large_deltas: Vec<(TileId, TileId, usize, i64, i64)> = Vec::new();
+    let mut max_base_delta = 0i64;
+    let mut total_base_delta = 0i64;
+    let mut base_count = 0usize;
+    for tile_id in tiles.iter() {
+        if let Some(base) = base_map.get(tile_id) {
+            for xi in 0..size {
+                // top edge (North, z=size-1) vs neighbor (y-1, South edge z=0)
+                let idx_top = xi + (size - 1) * size;
+                let top_neighbor = TileId {
+                    z: tile_id.z,
+                    x: tile_id.x,
+                    y: tile_id.y - 1,
+                };
+                if let Some(nei) = base_map.get(&top_neighbor) {
+                    let nei_idx = xi + 0 * size;
+                    let delta = (base[idx_top] - nei[nei_idx]).abs();
+                    max_base_delta = max_base_delta.max(delta);
+                    total_base_delta += delta as i64;
+                    base_count += 1;
+                    if delta > 0 {
+                        large_deltas.push((
+                            *tile_id,
+                            top_neighbor,
+                            nei_idx,
+                            base[idx_top],
+                            nei[nei_idx],
+                        ));
+                    }
+                }
+                // left edge
+                let idx_left = 0 + xi * size;
+                let left_neighbor = TileId {
+                    z: tile_id.z,
+                    x: tile_id.x - 1,
+                    y: tile_id.y,
+                };
+                if let Some(nei) = base_map.get(&left_neighbor) {
+                    let nei_idx = (size - 1) + xi * size;
+                    let delta = (base[idx_left] - nei[nei_idx]).abs();
+                    max_base_delta = max_base_delta.max(delta);
+                    total_base_delta += delta as i64;
+                    base_count += 1;
+                    if delta > 0 {
+                        large_deltas.push((
+                            *tile_id,
+                            left_neighbor,
+                            nei_idx,
+                            base[idx_left],
+                            nei[nei_idx],
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if base_count > 0 {
+        println!(
+            "Base border diffs after equalization: max = {}, avg = {:.3}",
+            max_base_delta,
+            total_base_delta as f64 / base_count as f64
+        );
+    }
+    // Print some of the largest border deltas for debugging
+    large_deltas.sort_by(|a, b| (b.3 - b.4).abs().cmp(&(a.3 - a.4).abs()));
+    println!("Largest base border deltas (tileA, tileB, idx, baseA, baseB):");
+    for (a, b, idx, va, vb) in large_deltas.iter().take(10) {
+        println!("  {:?} - {:?} idx={} baseA={} baseB={}", a, b, idx, va, vb);
+    }
+    // More thorough listing of 1-voxel diffs by checking each adjacent tile pair explicitly
+    let mut one_diffs: Vec<(TileId, TileId, usize, usize, i64, i64)> = Vec::new();
+    for tile_id in tiles.iter() {
+        if let Some(base) = base_map.get(tile_id) {
+            // left neighbor (our x==0 vs neighbor x==size-1)
+            let left_neighbor = TileId {
+                z: tile_id.z,
+                x: tile_id.x - 1,
+                y: tile_id.y,
+            };
+            if let Some(nei) = base_map.get(&left_neighbor) {
+                for zi in 0..size {
+                    let idx_a = 0 + zi * size;
+                    let idx_b = (size - 1) + zi * size;
+                    let a = base[idx_a];
+                    let b = nei[idx_b];
+                    if (a - b).abs() == 1 {
+                        one_diffs.push((*tile_id, left_neighbor, idx_a, idx_b, a, b));
+                    }
+                }
+            }
+            // right neighbor (our x==size-1 vs neighbor x==0)
+            let right_neighbor = TileId {
+                z: tile_id.z,
+                x: tile_id.x + 1,
+                y: tile_id.y,
+            };
+            if let Some(nei) = base_map.get(&right_neighbor) {
+                for zi in 0..size {
+                    let idx_a = (size - 1) + zi * size;
+                    let idx_b = 0 + zi * size;
+                    let a = base[idx_a];
+                    let b = nei[idx_b];
+                    if (a - b).abs() == 1 {
+                        one_diffs.push((*tile_id, right_neighbor, idx_a, idx_b, a, b));
+                    }
+                }
+            }
+            // north neighbor (our z==size-1 vs neighbor z==0)
+            let north_neighbor = TileId {
+                z: tile_id.z,
+                x: tile_id.x,
+                y: tile_id.y - 1,
+            };
+            if let Some(nei) = base_map.get(&north_neighbor) {
+                for xi in 0..size {
+                    let idx_a = xi + (size - 1) * size;
+                    let idx_b = xi + 0 * size;
+                    let a = base[idx_a];
+                    let b = nei[idx_b];
+                    if (a - b).abs() == 1 {
+                        one_diffs.push((*tile_id, north_neighbor, idx_a, idx_b, a, b));
+                    }
+                }
+            }
+            // south neighbor (our z==0 vs neighbor z==size-1)
+            let south_neighbor = TileId {
+                z: tile_id.z,
+                x: tile_id.x,
+                y: tile_id.y + 1,
+            };
+            if let Some(nei) = base_map.get(&south_neighbor) {
+                for xi in 0..size {
+                    let idx_a = xi + 0 * size;
+                    let idx_b = xi + (size - 1) * size;
+                    let a = base[idx_a];
+                    let b = nei[idx_b];
+                    if (a - b).abs() == 1 {
+                        one_diffs.push((*tile_id, south_neighbor, idx_a, idx_b, a, b));
+                    }
+                }
+            }
+        }
+    }
+    println!("Count of 1-voxel border diffs: {}", one_diffs.len());
+    for (a, b, idx_a, idx_b, va, vb) in one_diffs.iter().take(50) {
+        println!(
+            "  {:?} - {:?} idx_a={} idx_b={} baseA={} baseB={}",
+            a, b, idx_a, idx_b, va, vb
+        );
     }
 
     // Compute global minimum height across all tiles to avoid generating deep underground voxels
@@ -2061,12 +2470,11 @@ fn generate_area(args: &Args) -> Vec<TileVoxelResult> {
     }
     // Convert to voxel level with some margin below the lowest valley
     // Use a margin of 10 voxels below the lowest point for visual consistency
-    let global_base_y_vox = ((global_min_height_m / args.meters_per_voxel).floor() as i64 - 10).max(0);
+    let global_base_y_vox =
+        ((global_min_height_m / args.meters_per_voxel).floor() as i64 - 10).max(0);
     eprintln!(
         "Global terrain: min height = {:.1}m, base_y_vox = {} (saving ~{} voxels per column)",
-        global_min_height_m,
-        global_base_y_vox,
-        global_base_y_vox
+        global_min_height_m, global_base_y_vox, global_base_y_vox
     );
 
     // Update all TileSpaces with the global base Y
@@ -2074,17 +2482,31 @@ fn generate_area(args: &Args) -> Vec<TileVoxelResult> {
         space.base_y_vox = global_base_y_vox;
     }
 
-    // Voxelize each tile using the smoothed heights
-    for dy in -(args.radius as i32)..=(args.radius as i32) {
-        for dx in -(args.radius as i32)..=(args.radius as i32) {
+    // Voxelize each tile using the smoothed heights. Use the previously computed tile grid
+    // (start_x/start_y and tile_w/tile_h) rather than args.radius so we operate on the
+    // same set of tiles that were fetched and smoothed above.
+    for ty in 0..tile_h {
+        for tx in 0..tile_w {
             let tile = TileId {
                 z: center_tile.z,
-                x: center_tile.x + dx,
-                y: center_tile.y + dy,
+                x: start_x + tx,
+                y: start_y + ty,
             };
             let data = tile_map.remove(&tile).unwrap();
             let space = tile_spaces.remove(&tile).unwrap();
-            let result = voxelize_tile(tile, data, &space, args.max_height_voxels);
+            let pad_radius = if args.no_building_pad {
+                0
+            } else {
+                args.building_pad_radius
+            };
+            let result = voxelize_tile(
+                tile,
+                data,
+                &space,
+                args.max_height_voxels,
+                pad_radius,
+                args.no_building_pad,
+            );
             results.push(result);
         }
     }
