@@ -16,6 +16,9 @@ struct CameraUniforms {
     lod_distance: f32,
     envelope_distance: f32,
     envelope_fade_range: f32,
+    water_level: f32,
+    water_visibility: f32,
+    _water_pad: vec2<f32>,
     inverse_view: mat4x4<f32>,
     inverse_proj: mat4x4<f32>,
 };
@@ -304,11 +307,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // Mix based on reflection strength (Fresnel)
-    let final_rgb = mix(base_color, combined_reflection, reflection_strength);
+    var final_rgb = mix(base_color, combined_reflection, reflection_strength);
     
     // Alpha
     // More opaque at grazing angles, more transparent looking down
-    let alpha = mix(water.water_color.a, 1.0, fresnel * 0.5);
+    var alpha = mix(water.water_color.a, 1.0, fresnel * 0.5);
     
     // Soft shore fade
     // Reconstruct scene world position to get actual distance
@@ -338,6 +341,29 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if (scene_depth_raw >= 0.9999) {
         shore_fade = 1.0;
     }
+    
+    // Depth-based visibility: deeper underwater = more obscured
+    // depth_diff is how far below water level (in world units/voxels)
+    // Use water_visibility from config to control falloff - use exponential for more natural look
+    let depth_visibility_falloff = max(camera.water_visibility, 1.0); // Prevent div by zero
+    
+    // Exponential falloff for more realistic underwater visibility
+    // At depth = water_visibility, transmittance ≈ 5%
+    let absorption_coeff = 3.0 / depth_visibility_falloff;
+    let depth_factor = 1.0 - exp(-absorption_coeff * max(depth_diff, 0.0));
+    
+    // Increase opacity with depth (objects deeper are harder to see through water)
+    // Strong effect: even shallow water gets some opacity increase
+    alpha = mix(alpha, 1.0, depth_factor);
+    
+    // Tint water based on depth - ALWAYS apply some tint even at shore
+    // Base tint that's visible even at shallow depths
+    let shallow_tint = vec3<f32>(0.2, 0.35, 0.4) * brightness;
+    let deep_water_tint = vec3<f32>(0.02, 0.08, 0.15) * brightness;
+    let water_tint = mix(shallow_tint, deep_water_tint, depth_factor);
+    
+    // Blend tint into final color - stronger effect
+    final_rgb = mix(final_rgb, water_tint, 0.3 + depth_factor * 0.6);
     
     return vec4<f32>(final_rgb, alpha * shore_fade);
 }

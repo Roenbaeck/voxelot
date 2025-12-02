@@ -137,6 +137,11 @@ pub struct Chunk {
 
     /// Ratio of solid voxels to total slots (0.0..=1.0)
     pub solid_ratio: f32,
+
+    /// Shell of surface sub-chunks for this hierarchy level (None for leaf chunks)
+    /// Each entry represents a sub-chunk with at least one exposed face
+    /// Enables fast occlusion culling at any hierarchy level
+    pub hierarchy_shell: Option<Vec<ShellVoxel>>,
 }
 
 impl Chunk {
@@ -155,6 +160,7 @@ impl Chunk {
             emissive_voxels: 0,
             solid_ratio: 0.0,
             bounding_box: None,
+            hierarchy_shell: None,
         }
     }
 
@@ -561,7 +567,265 @@ impl Chunk {
         }
     }
 
-    /// Generate a shell of surface voxels for this chunk
+    /// Check if this chunk is a leaf chunk (contains only solid voxels, no sub-chunks)
+    pub fn is_leaf_chunk(&self) -> bool {
+        self.voxels.iter().all(|v| matches!(v, Voxel::Solid(_)))
+    }
+
+    /// Check if a position is occupied (contains a solid voxel or non-empty sub-chunk)
+    fn is_occupied_at(&self, x: u8, y: u8, z: u8) -> bool {
+        match self.get(x, y, z) {
+            Some(Voxel::Solid(_)) => true,
+            Some(Voxel::Chunk(c)) => c.voxel_count > 0,
+            None => false,
+        }
+    }
+
+    /// Generate a hierarchical shell for non-leaf chunks
+    /// Returns a list of sub-chunks that have at least one face exposed
+    pub fn generate_hierarchy_shell(&mut self) {
+        if self.is_leaf_chunk() || self.is_empty() {
+            self.hierarchy_shell = None;
+            return;
+        }
+
+        let mut shell = Vec::with_capacity(256);
+
+        for ((x, y, z), voxel) in self.iter() {
+            // Get the child chunk (skip solids - they're always fully visible)
+            let child = match voxel {
+                Voxel::Solid(_) => {
+                    // Solid voxels: check if neighbors exist
+                    let mut mask = 0u8;
+                    if x == 15 || self.get(x + 1, y, z).is_none() { mask |= 1 << 0; }
+                    if x == 0  || self.get(x - 1, y, z).is_none() { mask |= 1 << 1; }
+                    if y == 15 || self.get(x, y + 1, z).is_none() { mask |= 1 << 2; }
+                    if y == 0  || self.get(x, y - 1, z).is_none() { mask |= 1 << 3; }
+                    if z == 15 || self.get(x, y, z + 1).is_none() { mask |= 1 << 4; }
+                    if z == 0  || self.get(x, y, z - 1).is_none() { mask |= 1 << 5; }
+                    if mask != 0 {
+                        let packed = (x as u16) | ((y as u16) << 4) | ((z as u16) << 8);
+                        shell.push(ShellVoxel { packed_pos: packed, visible_faces: mask });
+                    }
+                    continue;
+                }
+                Voxel::Chunk(c) => {
+                    if c.voxel_count == 0 {
+                        continue;
+                    }
+                    c
+                }
+            };
+
+            // Get neighbor chunks for overlap checking
+            let get_neighbor = |dx: i8, dy: i8, dz: i8| -> Option<&Arc<Chunk>> {
+                let (nx, ny, nz) = (x as i8 + dx, y as i8 + dy, z as i8 + dz);
+                if nx < 0 || nx > 15 || ny < 0 || ny > 15 || nz < 0 || nz > 15 {
+                    return None;
+                }
+                match self.get(nx as u8, ny as u8, nz as u8) {
+                    Some(Voxel::Chunk(c)) if c.voxel_count > 0 => Some(c),
+                    _ => None,
+                }
+            };
+
+            let neighbor_px = get_neighbor(1, 0, 0);
+            let neighbor_nx = get_neighbor(-1, 0, 0);
+            let neighbor_py = get_neighbor(0, 1, 0);
+            let neighbor_ny = get_neighbor(0, -1, 0);
+            let neighbor_pz = get_neighbor(0, 0, 1);
+            let neighbor_nz = get_neighbor(0, 0, -1);
+
+            // Compute visibility mask with neighbor overlap
+            let mask = child.compute_visibility_mask_with_neighbors(
+                neighbor_px, neighbor_nx,
+                neighbor_py, neighbor_ny,
+                neighbor_pz, neighbor_nz,
+            );
+
+            if mask != 0 {
+                let packed = (x as u16) | ((y as u16) << 4) | ((z as u16) << 8);
+                shell.push(ShellVoxel {
+                    packed_pos: packed,
+                    visible_faces: mask,
+                });
+            }
+        }
+
+        self.hierarchy_shell = Some(shell);
+    }
+
+    /// Compute visibility mask with neighbor overlap.
+    /// For boundary voxels, checks if the neighbor chunk has a voxel blocking that face.
+    pub fn compute_visibility_mask_with_neighbors(
+        &self,
+        neighbor_px: Option<&Arc<Chunk>>, // +X neighbor
+        neighbor_nx: Option<&Arc<Chunk>>, // -X neighbor
+        neighbor_py: Option<&Arc<Chunk>>, // +Y neighbor
+        neighbor_ny: Option<&Arc<Chunk>>, // -Y neighbor
+        neighbor_pz: Option<&Arc<Chunk>>, // +Z neighbor
+        neighbor_nz: Option<&Arc<Chunk>>, // -Z neighbor
+    ) -> u8 {
+        if self.is_empty() {
+            return 0;
+        }
+
+        let mut mask = 0u8;
+
+        // Helper: check if neighbor blocks a face at given local position
+        // For +X face at (15, y, z), check neighbor_px at (0, y, z)
+        let is_blocked_by_neighbor = |neighbor: Option<&Arc<Chunk>>, lx: u8, ly: u8, lz: u8| -> bool {
+            match neighbor {
+                Some(n) => n.contains(lx, ly, lz),
+                None => false, // No neighbor = exposed to air
+            }
+        };
+
+        // For leaf chunks, scan voxels
+        if self.is_leaf_chunk() {
+            for ((x, y, z), voxel) in self.iter() {
+                if !matches!(voxel, Voxel::Solid(_)) {
+                    continue;
+                }
+
+                // +X: voxel has +X exposed if no neighbor at x+1
+                if (mask & (1 << 0)) == 0 {
+                    let has_internal_neighbor = x < 15 && self.contains(x + 1, y, z);
+                    let blocked_by_external = x == 15 && is_blocked_by_neighbor(neighbor_px, 0, y, z);
+                    if !has_internal_neighbor && !blocked_by_external {
+                        mask |= 1 << 0;
+                    }
+                }
+                // -X
+                if (mask & (1 << 1)) == 0 {
+                    let has_internal_neighbor = x > 0 && self.contains(x - 1, y, z);
+                    let blocked_by_external = x == 0 && is_blocked_by_neighbor(neighbor_nx, 15, y, z);
+                    if !has_internal_neighbor && !blocked_by_external {
+                        mask |= 1 << 1;
+                    }
+                }
+                // +Y
+                if (mask & (1 << 2)) == 0 {
+                    let has_internal_neighbor = y < 15 && self.contains(x, y + 1, z);
+                    let blocked_by_external = y == 15 && is_blocked_by_neighbor(neighbor_py, x, 0, z);
+                    if !has_internal_neighbor && !blocked_by_external {
+                        mask |= 1 << 2;
+                    }
+                }
+                // -Y
+                if (mask & (1 << 3)) == 0 {
+                    let has_internal_neighbor = y > 0 && self.contains(x, y - 1, z);
+                    let blocked_by_external = y == 0 && is_blocked_by_neighbor(neighbor_ny, x, 15, z);
+                    if !has_internal_neighbor && !blocked_by_external {
+                        mask |= 1 << 3;
+                    }
+                }
+                // +Z
+                if (mask & (1 << 4)) == 0 {
+                    let has_internal_neighbor = z < 15 && self.contains(x, y, z + 1);
+                    let blocked_by_external = z == 15 && is_blocked_by_neighbor(neighbor_pz, x, y, 0);
+                    if !has_internal_neighbor && !blocked_by_external {
+                        mask |= 1 << 4;
+                    }
+                }
+                // -Z
+                if (mask & (1 << 5)) == 0 {
+                    let has_internal_neighbor = z > 0 && self.contains(x, y, z - 1);
+                    let blocked_by_external = z == 0 && is_blocked_by_neighbor(neighbor_nz, x, y, 15);
+                    if !has_internal_neighbor && !blocked_by_external {
+                        mask |= 1 << 5;
+                    }
+                }
+
+                if mask == 0b111111 {
+                    break;
+                }
+            }
+        } else {
+            // For non-leaf chunks, use the hierarchy shell
+            if let Some(ref shell) = self.hierarchy_shell {
+                for sv in shell.iter() {
+                    mask |= sv.visible_faces;
+                    if mask == 0b111111 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        mask
+    }
+
+    /// Compute a visibility mask for this chunk using a greedy algorithm.
+    /// For each of the 6 directions, we only need to find ONE voxel with that face exposed.
+    /// This is much faster than computing the full shell for large chunks.
+    /// 
+    /// Returns a bitmask where each bit indicates if that face direction has any visible geometry:
+    /// bit 0: +X, bit 1: -X, bit 2: +Y, bit 3: -Y, bit 4: +Z, bit 5: -Z
+    pub fn compute_visibility_mask(&self) -> u8 {
+        if self.is_empty() {
+            return 0;
+        }
+
+        let mut mask = 0u8;
+        
+        if self.is_leaf_chunk() {
+            // For leaf chunks, scan face voxels until we find one exposed
+            // We iterate through the presence bitmap which is sparse
+            
+            for ((x, y, z), voxel) in self.iter() {
+                if !matches!(voxel, Voxel::Solid(_)) {
+                    continue;
+                }
+                
+                // Check each direction we haven't found yet
+                // +X: voxel at x=15 or with no +X neighbor
+                if (mask & (1 << 0)) == 0 && (x == 15 || !self.contains(x + 1, y, z)) {
+                    mask |= 1 << 0;
+                }
+                // -X: voxel at x=0 or with no -X neighbor  
+                if (mask & (1 << 1)) == 0 && (x == 0 || !self.contains(x - 1, y, z)) {
+                    mask |= 1 << 1;
+                }
+                // +Y: voxel at y=15 or with no +Y neighbor
+                if (mask & (1 << 2)) == 0 && (y == 15 || !self.contains(x, y + 1, z)) {
+                    mask |= 1 << 2;
+                }
+                // -Y: voxel at y=0 or with no -Y neighbor
+                if (mask & (1 << 3)) == 0 && (y == 0 || !self.contains(x, y - 1, z)) {
+                    mask |= 1 << 3;
+                }
+                // +Z: voxel at z=15 or with no +Z neighbor
+                if (mask & (1 << 4)) == 0 && (z == 15 || !self.contains(x, y, z + 1)) {
+                    mask |= 1 << 4;
+                }
+                // -Z: voxel at z=0 or with no -Z neighbor
+                if (mask & (1 << 5)) == 0 && (z == 0 || !self.contains(x, y, z - 1)) {
+                    mask |= 1 << 5;
+                }
+                
+                // Early exit if all 6 faces found
+                if mask == 0b111111 {
+                    break;
+                }
+            }
+        } else {
+            // For non-leaf chunks, aggregate from children's visibility masks
+            // A face is visible if ANY child on that face has it visible
+            if let Some(ref shell) = self.hierarchy_shell {
+                for sv in shell.iter() {
+                    mask |= sv.visible_faces;
+                    if mask == 0b111111 {
+                        break;
+                    }
+                }
+            }
+        }
+        
+        mask
+    }
+
+    /// Generate a shell of surface voxels for this chunk (leaf level only)
     /// Returns a list of voxels that have at least one face exposed to air (or chunk boundary)
     pub fn generate_shell(&self) -> Vec<ShellVoxel> {
         let mut shell = Vec::with_capacity(512); // Heuristic start size
@@ -979,6 +1243,57 @@ impl World {
 
         // Then update this chunk's metadata
         chunk.update_lod_metadata(palette);
+    }
+
+    /// Generate hierarchical shells for all non-leaf chunks
+    /// Call after update_all_lod_metadata() to enable efficient occlusion culling
+    pub fn generate_all_hierarchy_shells(&mut self) {
+        let root_mut = Arc::make_mut(&mut self.root);
+        let stats = Self::generate_hierarchy_shells_recursive(root_mut, 0);
+        println!("Shell generation stats: {:?}", stats);
+    }
+
+    /// Recursive helper to generate hierarchy shells bottom-up
+    /// Returns (total_shells, total_entries, masks_by_depth)
+    fn generate_hierarchy_shells_recursive(chunk: &mut Chunk, depth: usize) -> (usize, usize, Vec<u32>) {
+        use rayon::prelude::*;
+
+        // First, recursively generate shells for all sub-chunks
+        let child_stats: Vec<_> = chunk.voxels.par_iter_mut().filter_map(|voxel| {
+            if let Voxel::Chunk(sub_chunk_arc) = voxel {
+                let sub_chunk = Arc::make_mut(sub_chunk_arc);
+                Some(Self::generate_hierarchy_shells_recursive(sub_chunk, depth + 1))
+            } else {
+                None
+            }
+        }).collect();
+
+        // Aggregate child stats
+        let mut total_shells = 0usize;
+        let mut total_entries = 0usize;
+        let mut mask_counts = vec![0u32; 64]; // Count of each possible mask value
+        for (s, e, m) in child_stats {
+            total_shells += s;
+            total_entries += e;
+            for (i, &c) in m.iter().enumerate() {
+                if i < mask_counts.len() {
+                    mask_counts[i] += c;
+                }
+            }
+        }
+
+        // Then generate shell for this chunk
+        chunk.generate_hierarchy_shell();
+        
+        if let Some(ref shell) = chunk.hierarchy_shell {
+            total_shells += 1;
+            total_entries += shell.len();
+            for sv in shell.iter() {
+                mask_counts[sv.visible_faces as usize] += 1;
+            }
+        }
+
+        (total_shells, total_entries, mask_counts)
     }
 }
 

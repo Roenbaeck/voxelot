@@ -9,6 +9,7 @@ use rand::seq::SliceRandom;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::Serialize;
 
+use noise::{NoiseFn, Perlin};
 use voxelot::{octree_format::save_world_file, Palette, World, WorldPos};
 
 const EARTH_RADIUS_METERS: f64 = 6_378_137.0;
@@ -22,13 +23,11 @@ const EARTH_RADIUS_METERS: f64 = 6_378_137.0;
 struct Args {
     #[arg(long, default_value = "-74.006")]
     center_lon: f64,
-
     #[arg(long, default_value = "40.7128")]
     center_lat: f64,
 
     #[arg(long, default_value_t = 15)]
     zoom: u32,
-
     #[arg(long, default_value_t = 2)]
     radius: u32,
 
@@ -38,11 +37,14 @@ struct Args {
     #[arg(long = "meters-per-voxel", default_value = "1.25")]
     meters_per_voxel: f64,
 
-    #[arg(long = "max-height-voxels", default_value_t = 192)]
+    #[arg(long = "max-height-voxels", default_value_t = 1024)]
     max_height_voxels: u32,
 
     #[arg(long, default_value_t = 1337)]
     seed: u64,
+
+    #[arg(long, default_value_t = 500.0)]
+    water_level: f64,
 
     #[arg(long = "output-name", default_value = "world_1")]
     output_name: String,
@@ -86,7 +88,12 @@ struct TileData {
     parks: Vec<Polygon>,
     water: Vec<Polygon>,
     buildings: Vec<BuildingEntry>,
+    biome: Biome,
     stats: TileStats,
+    // Optional, precomputed height field for the tile (meters)
+    heights_m: Option<Vec<f64>>,
+    // Optional per-cell base ground heights (voxel Y levels), used to ensure pad continuity.
+    base_ground_vox: Option<Vec<i64>>,
 }
 
 type Polygon = Vec<[f64; 2]>;
@@ -107,16 +114,62 @@ struct TileStats {
     #[serde(skip_serializing_if = "Option::is_none")]
     average_height_m: Option<f64>,
     voxel_count: usize,
+    biome: String,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Biome {
+    City,
+    Hill,
+}
+
+// Material Indices (matching palette.txt)
+const MAT_GRASS_DARK: usize = 8;
+const MAT_GRASS_LIGHT: usize = 9;
+const MAT_DIRT: usize = 10;
+const MAT_STONE: usize = 11;
+const MAT_SAND: usize = 12;
+const MAT_SNOW: usize = 13;
+const MAT_WATER_DEEP: usize = 14;
+const MAT_WATER_SHALLOW: usize = 15;
+
+const MAT_ASPHALT: usize = 16;
+const MAT_CONCRETE: usize = 17;
+const MAT_PAVEMENT: usize = 18;
+const MAT_COBBLE: usize = 19;
+
+const MAT_BRICK_RED: usize = 20;
+const MAT_PLASTER: usize = 21;
+const MAT_GLASS: usize = 22;
+const MAT_STEEL: usize = 23;
+const MAT_ROOF_TERRACOTTA: usize = 24;
+const MAT_ROOF_SLATE: usize = 25;
+const MAT_MARBLE: usize = 26;
+
+const MAT_TRUNK_DARK: usize = 32;
+const MAT_TRUNK_LIGHT: usize = 33;
+const MAT_LEAVES_DARK: usize = 34;
+const MAT_LEAVES_MED: usize = 35;
+const MAT_LEAVES_LIGHT: usize = 36;
+const MAT_LEAVES_AUTUMN: usize = 37;
+
+const MAT_LIGHT_WARM: usize = 40;
+const MAT_LIGHT_COOL: usize = 41;
+const MAT_WINDOW_WARM: usize = 42;
+const MAT_WINDOW_COOL: usize = 43;
+const MAT_NEON_RED: usize = 44;
+const MAT_NEON_GREEN: usize = 45;
+const MAT_NEON_BLUE: usize = 46;
 
 #[derive(Clone, Debug)]
 struct TileFetcher {
     seed: u64,
+    water_level: f64,
 }
 
 impl TileFetcher {
-    fn new(seed: u64) -> Self {
-        Self { seed }
+    fn new(seed: u64, water_level: f64) -> Self {
+        Self { seed, water_level }
     }
 
     fn fetch(&self, tile: TileId) -> TileData {
@@ -126,6 +179,84 @@ impl TileFetcher {
             tile.z as u64,
             self.seed,
         ]));
+
+        // Determine Biome based on terrain height across the tile
+        let ((min_lon, max_lon), (north_lat, south_lat)) = tile.lon_lat_bounds();
+        
+        // Use a temporary Perlin for biome selection (must match sample_tile_heights seed)
+        let perlin = Perlin::new(self.seed as u32);
+        
+        // Sample heights at multiple points across the tile to get min/avg height
+        let sample_grid = 4;
+        let mut min_h = f64::INFINITY;
+        let mut sum_h = 0.0;
+        for si in 0..sample_grid {
+            for sj in 0..sample_grid {
+                let frac_x = (si as f64 + 0.5) / sample_grid as f64;
+                let frac_y = (sj as f64 + 0.5) / sample_grid as f64;
+                let sample_lon = min_lon + (max_lon - min_lon) * frac_x;
+                let sample_lat = south_lat + (north_lat - south_lat) * frac_y;
+                let (sx_m, sy_m) = lon_lat_to_mercator_meters(sample_lon, sample_lat);
+                let h = get_global_height(&perlin, sx_m, sy_m);
+                min_h = min_h.min(h);
+                sum_h += h;
+            }
+        }
+        let avg_h = sum_h / (sample_grid * sample_grid) as f64;
+
+        // Use water level from the fetcher (passed from Args)
+        let water_level = self.water_level;
+
+        // Use random noise for biome selection (City vs Hill for above-water areas)
+        let biome_noise = rng.gen::<f64>();
+
+        // Only allow City biome if the tile's minimum height is well above water level
+        // This prevents cities from being placed on terrain that would be partially underwater
+        // Require min_h to be at least 50m above water (was 10m) to ensure no artificial ground raising
+        let biome = if min_h < water_level + 50.0 {
+            // Tile has areas too close to water level - use Hill for natural terrain
+            Biome::Hill
+        } else if avg_h < water_level + 80.0 {
+            // Tile is low-lying - prefer Hill biome for more natural look
+            Biome::Hill
+        } else if biome_noise < 0.4 {
+            // Random selection for higher terrain
+            Biome::Hill
+        } else {
+            Biome::City
+        };
+
+        eprintln!(
+            "Tile ({},{},{}): min_h={:.1}, avg_h={:.1}, water={:.1}, biome={:?}",
+            tile.x, tile.y, tile.z, min_h, avg_h, water_level, biome
+        );
+
+        // If Lake or Hill, we might skip city generation logic or adapt it.
+        // For now, we'll keep the city generation but maybe clear it if it's a pure nature biome,
+        // or we can mix them. Let's make Lake and Hill distinct for now.
+
+        if biome != Biome::City {
+            return TileData {
+                roads: Vec::new(),
+                parks: Vec::new(),
+                water: Vec::new(),
+                buildings: Vec::new(),
+                biome,
+                stats: TileStats {
+                    district: "nature".to_string(),
+                    building_count: 0,
+                    park_count: 0,
+                    water_features: 0,
+                    road_segments: 0,
+                    average_height_m: None,
+                    voxel_count: 0,
+                    biome: format!("{:?}", biome),
+                },
+                heights_m: None,
+                base_ground_vox: None,
+            };
+        }
+
         let ((min_lon, max_lon), (north_lat, south_lat)) = tile.lon_lat_bounds();
         let lon_span = max_lon - min_lon;
         let lat_span = north_lat - south_lat;
@@ -383,7 +514,11 @@ impl TileFetcher {
                 road_segments,
                 average_height_m,
                 voxel_count: 0,
+                biome: format!("{:?}", biome),
             },
+            heights_m: None,
+            base_ground_vox: None,
+            biome,
         }
     }
 }
@@ -419,6 +554,412 @@ fn stable_mix(values: &[u64]) -> u64 {
     hash
 }
 
+fn fbm(perlin: &Perlin, x: f64, y: f64, octaves: usize, lacunarity: f64, gain: f64) -> f64 {
+    let mut amplitude = 1.0;
+    let mut frequency = 1.0;
+    let mut total = 0.0;
+    let mut max = 0.0;
+    for _ in 0..octaves {
+        total += perlin.get([x * frequency, y * frequency]) * amplitude;
+        max += amplitude;
+        amplitude *= gain;
+        frequency *= lacunarity;
+    }
+    if max.abs() < 1e-12 {
+        0.0
+    } else {
+        total / max
+    }
+}
+
+fn smooth_tiles_pass(smoothed_map: &mut HashMap<TileId, Vec<f64>>, size: usize) {
+    let keys: Vec<TileId> = smoothed_map.keys().copied().collect();
+    for tile_id in keys {
+        if let Some(base) = smoothed_map.get(&tile_id) {
+            if base.len() != size * size {
+                continue;
+            }
+            let mut new_h = base.clone();
+            for xi in 0..size {
+                for zi in 0..size {
+                    let idx = xi + zi * size;
+                    let mut sum = base[idx];
+                    let mut count = 1.0;
+                    // neighbor tiles for edge smoothing
+                    if xi == 0 {
+                        let neighbor = TileId {
+                            z: tile_id.z,
+                            x: tile_id.x - 1,
+                            y: tile_id.y,
+                        };
+                        if let Some(nei) = smoothed_map.get(&neighbor) {
+                            sum += nei[(size - 1) + zi * size];
+                            count += 1.0;
+                        }
+                    }
+                    if xi == size - 1 {
+                        let neighbor = TileId {
+                            z: tile_id.z,
+                            x: tile_id.x + 1,
+                            y: tile_id.y,
+                        };
+                        if let Some(nei) = smoothed_map.get(&neighbor) {
+                            sum += nei[0 + zi * size];
+                            count += 1.0;
+                        }
+                    }
+                    if zi == 0 {
+                        let neighbor = TileId {
+                            z: tile_id.z,
+                            x: tile_id.x,
+                            y: tile_id.y + 1,  // South neighbor (tile.y increases southward)
+                        };
+                        if let Some(nei) = smoothed_map.get(&neighbor) {
+                            sum += nei[xi + (size - 1) * size];
+                            count += 1.0;
+                        }
+                    }
+                    if zi == size - 1 {
+                        let neighbor = TileId {
+                            z: tile_id.z,
+                            x: tile_id.x,
+                            y: tile_id.y - 1,  // North neighbor (tile.y decreases northward)
+                        };
+                        if let Some(nei) = smoothed_map.get(&neighbor) {
+                            sum += nei[xi + 0 * size];
+                            count += 1.0;
+                        }
+                    }
+                    new_h[idx] = sum / count;
+                }
+            }
+            smoothed_map.insert(tile_id, new_h);
+        }
+    }
+}
+
+// Blend across tile edges to create gradual ramps over a width
+fn blend_tile_edges(smoothed_map: &mut HashMap<TileId, Vec<f64>>, size: usize, blend_width: usize) {
+    let keys: Vec<TileId> = smoothed_map.keys().copied().collect();
+    for tile_id in keys {
+        if let Some(base) = smoothed_map.get(&tile_id) {
+            if base.len() != size * size {
+                continue;
+            }
+            let mut new_h = base.clone();
+            // blend each side with neighbor
+            // left side x=0 blends with neighbor's x=size-1
+            let left_neighbor = TileId {
+                z: tile_id.z,
+                x: tile_id.x - 1,
+                y: tile_id.y,
+            };
+            if let Some(nei) = smoothed_map.get(&left_neighbor) {
+                for w in 0..blend_width {
+                    let left_x = w;
+                    let right_x = size - 1 - w;
+                    let t = (w + 1) as f64 / (blend_width + 1) as f64; // 0..1
+                    for zi in 0..size {
+                        let idx = left_x + zi * size;
+                        let idx_nei = right_x + zi * size;
+                        let a = base[idx];
+                        let b = nei[idx_nei];
+                        new_h[idx] = a * (1.0 - t) + b * t;
+                    }
+                }
+            }
+            // right side x=size-1 blends with neighbor's x=0
+            let right_neighbor = TileId {
+                z: tile_id.z,
+                x: tile_id.x + 1,
+                y: tile_id.y,
+            };
+            if let Some(nei) = smoothed_map.get(&right_neighbor) {
+                for w in 0..blend_width {
+                    let x = size - 1 - w;
+                    let t = (w + 1) as f64 / (blend_width + 1) as f64;
+                    for zi in 0..size {
+                        let idx = x + zi * size;
+                        let idx_nei = w + zi * size;
+                        let a = base[idx];
+                        let b = nei[idx_nei];
+                        new_h[idx] = a * (1.0 - t) + b * t;
+                    }
+                }
+            }
+            // north/south blend (tile.y increases southward in slippy tile convention)
+            // South neighbor (tile.y + 1) blends with our south edge (zi = 0)
+            let south_neighbor = TileId {
+                z: tile_id.z,
+                x: tile_id.x,
+                y: tile_id.y + 1,
+            };
+            if let Some(nei) = smoothed_map.get(&south_neighbor) {
+                for w in 0..blend_width {
+                    let z = w;  // Our south edge (low z)
+                    let z_nei = size - 1 - w;  // Their north edge (high z)
+                    let t = (w + 1) as f64 / (blend_width + 1) as f64;
+                    for xi in 0..size {
+                        let idx = xi + z * size;
+                        let idx_nei = xi + z_nei * size;
+                        let a = base[idx];
+                        let b = nei[idx_nei];
+                        new_h[idx] = a * (1.0 - t) + b * t;
+                    }
+                }
+            }
+            // North neighbor (tile.y - 1) blends with our north edge (zi = size-1)
+            let north_neighbor = TileId {
+                z: tile_id.z,
+                x: tile_id.x,
+                y: tile_id.y - 1,
+            };
+            if let Some(nei) = smoothed_map.get(&north_neighbor) {
+                for w in 0..blend_width {
+                    let z = size - 1 - w;  // Our north edge (high z)
+                    let z_nei = w;  // Their south edge (low z)
+                    let t = (w + 1) as f64 / (blend_width + 1) as f64;
+                    for xi in 0..size {
+                        let idx = xi + z * size;
+                        let idx_nei = xi + z_nei * size;
+                        let a = base[idx];
+                        let b = nei[idx_nei];
+                        new_h[idx] = a * (1.0 - t) + b * t;
+                    }
+                }
+            }
+            smoothed_map.insert(tile_id, new_h);
+        }
+    }
+}
+
+fn smooth_base_pass(smoothed_map: &mut HashMap<TileId, Vec<i64>>, size: usize) {
+    let keys: Vec<TileId> = smoothed_map.keys().copied().collect();
+    for tile_id in keys {
+        if let Some(base) = smoothed_map.get(&tile_id) {
+            if base.len() != size * size {
+                continue;
+            }
+            let mut new_b = base.clone();
+            for xi in 0..size {
+                for zi in 0..size {
+                    let idx = xi + zi * size;
+                    let mut sum = base[idx] as f64;
+                    let mut count = 1.0;
+                    if xi == 0 {
+                        let neighbor = TileId {
+                            z: tile_id.z,
+                            x: tile_id.x - 1,
+                            y: tile_id.y,
+                        };
+                        if let Some(nei) = smoothed_map.get(&neighbor) {
+                            sum += nei[(size - 1) + zi * size] as f64;
+                            count += 1.0;
+                        }
+                    }
+                    if xi == size - 1 {
+                        let neighbor = TileId {
+                            z: tile_id.z,
+                            x: tile_id.x + 1,
+                            y: tile_id.y,
+                        };
+                        if let Some(nei) = smoothed_map.get(&neighbor) {
+                            sum += nei[0 + zi * size] as f64;
+                            count += 1.0;
+                        }
+                    }
+                    if zi == 0 {
+                        let neighbor = TileId {
+                            z: tile_id.z,
+                            x: tile_id.x,
+                            y: tile_id.y + 1,  // South neighbor
+                        };
+                        if let Some(nei) = smoothed_map.get(&neighbor) {
+                            sum += nei[xi + (size - 1) * size] as f64;
+                            count += 1.0;
+                        }
+                    }
+                    if zi == size - 1 {
+                        let neighbor = TileId {
+                            z: tile_id.z,
+                            x: tile_id.x,
+                            y: tile_id.y - 1,  // North neighbor
+                        };
+                        if let Some(nei) = smoothed_map.get(&neighbor) {
+                            sum += nei[xi + 0 * size] as f64;
+                            count += 1.0;
+                        }
+                    }
+                    new_b[idx] = (sum / count).round() as i64;
+                }
+            }
+            smoothed_map.insert(tile_id, new_b);
+        }
+    }
+}
+
+fn blend_base_edges(smoothed_map: &mut HashMap<TileId, Vec<i64>>, size: usize, blend_width: usize) {
+    let keys: Vec<TileId> = smoothed_map.keys().copied().collect();
+    for tile_id in keys {
+        if let Some(base) = smoothed_map.get(&tile_id) {
+            if base.len() != size * size {
+                continue;
+            }
+            let mut new_b = base.clone();
+            let left_neighbor = TileId {
+                z: tile_id.z,
+                x: tile_id.x - 1,
+                y: tile_id.y,
+            };
+            if let Some(nei) = smoothed_map.get(&left_neighbor) {
+                for w in 0..blend_width {
+                    let left_x = w;
+                    let right_x = size - 1 - w;
+                    let t = (w + 1) as f64 / (blend_width + 1) as f64;
+                    for zi in 0..size {
+                        let idx = left_x + zi * size;
+                        let idx_nei = right_x + zi * size;
+                        let a = base[idx] as f64;
+                        let b = nei[idx_nei] as f64;
+                        new_b[idx] = (a * (1.0 - t) + b * t).round() as i64;
+                    }
+                }
+            }
+            let right_neighbor = TileId {
+                z: tile_id.z,
+                x: tile_id.x + 1,
+                y: tile_id.y,
+            };
+            if let Some(nei) = smoothed_map.get(&right_neighbor) {
+                for w in 0..blend_width {
+                    let x = size - 1 - w;
+                    let t = (w + 1) as f64 / (blend_width + 1) as f64;
+                    for zi in 0..size {
+                        let idx = x + zi * size;
+                        let idx_nei = w + zi * size;
+                        let a = base[idx] as f64;
+                        let b = nei[idx_nei] as f64;
+                        new_b[idx] = (a * (1.0 - t) + b * t).round() as i64;
+                    }
+                }
+            }
+            // Slippy tiles: tile.y increases southward, so z==0 is south edge
+            let top_neighbor = TileId {
+                z: tile_id.z,
+                x: tile_id.x,
+                y: tile_id.y + 1,  // South neighbor (z==0 edge)
+            };
+            if let Some(nei) = smoothed_map.get(&top_neighbor) {
+                for w in 0..blend_width {
+                    let z = w;
+                    let z_nei = size - 1 - w;
+                    let t = (w + 1) as f64 / (blend_width + 1) as f64;
+                    for xi in 0..size {
+                        let idx = xi + z * size;
+                        let idx_nei = xi + z_nei * size;
+                        let a = base[idx] as f64;
+                        let b = nei[idx_nei] as f64;
+                        new_b[idx] = (a * (1.0 - t) + b * t).round() as i64;
+                    }
+                }
+            }
+            let bottom_neighbor = TileId {
+                z: tile_id.z,
+                x: tile_id.x,
+                y: tile_id.y - 1,  // North neighbor (z==size-1 edge)
+            };
+            if let Some(nei) = smoothed_map.get(&bottom_neighbor) {
+                for w in 0..blend_width {
+                    let z = size - 1 - w;
+                    let z_nei = w;
+                    let t = (w + 1) as f64 / (blend_width + 1) as f64;
+                    for xi in 0..size {
+                        let idx = xi + z * size;
+                        let idx_nei = xi + z_nei * size;
+                        let a = base[idx] as f64;
+                        let b = nei[idx_nei] as f64;
+                        new_b[idx] = (a * (1.0 - t) + b * t).round() as i64;
+                    }
+                }
+            }
+            smoothed_map.insert(tile_id, new_b);
+        }
+    }
+}
+
+fn get_global_height(perlin: &Perlin, x: f64, y: f64) -> f64 {
+    // Large scale terrain for mountains/lakes
+    // Base is above water level (500m) so more terrain is above water
+    let base = 580.0;
+
+    // Very large scale features (continents/ranges)
+    let large = fbm(perlin, x * 0.0002, y * 0.0002, 4, 2.0, 0.5) * 350.0;
+
+    // Medium scale features (hills/valleys)
+    let mid = fbm(perlin, x * 0.001, y * 0.001, 4, 2.0, 0.5) * 100.0;
+
+    // Detail
+    let detail = fbm(perlin, x * 0.005, y * 0.005, 3, 2.0, 0.5) * 20.0;
+
+    base + large + mid + detail
+}
+
+fn sample_tile_heights(perlin: &Perlin, space: &TileSpace) -> Vec<f64> {
+    let size = space.voxel_resolution as usize;
+    let mut heights = vec![0.0f64; size * size];
+    for xi in 0..size {
+        for zi in 0..size {
+            let wx = space.min_x_m + (xi as f64 / size as f64) * (space.max_x_m - space.min_x_m);
+            let wz = space.min_y_m + (zi as f64 / size as f64) * (space.max_y_m - space.min_y_m);
+            heights[xi + zi * size] = get_global_height(perlin, wx, wz).max(1.0);
+        }
+    }
+    heights
+}
+
+fn compute_river_mask(
+    space: &TileSpace,
+    perlin: &Perlin,
+    heights_m: &[f64],
+    river_scale: f64,
+    threshold: f64,
+) -> Vec<bool> {
+    let size = space.voxel_resolution as usize;
+    let mut mask = vec![false; size * size];
+    let max_river_elevation = space.water_level_m + 40.0;
+    for xi in 0..size {
+        for zi in 0..size {
+            let wx = space.min_x_m + (xi as f64 / size as f64) * (space.max_x_m - space.min_x_m);
+            let wz = space.min_y_m + (zi as f64 / size as f64) * (space.max_y_m - space.min_y_m);
+            let v = fbm(perlin, wx * river_scale, wz * river_scale, 3, 2.0, 0.5);
+            // Rivers follow low values in this global low-frequency noise
+            let elev = heights_m[xi + zi * size];
+            if v < threshold && elev <= max_river_elevation {
+                mask[xi + zi * size] = true;
+            }
+        }
+    }
+    // Dilate to give rivers some width
+    let mut out = mask.clone();
+    let radius = 1;
+    for xi in 0..size {
+        for zi in 0..size {
+            if mask[xi + zi * size] {
+                for dx in -(radius as isize)..=(radius as isize) {
+                    for dz in -(radius as isize)..=(radius as isize) {
+                        let nx = xi as isize + dx;
+                        let nz = zi as isize + dz;
+                        if nx >= 0 && nx < size as isize && nz >= 0 && nz < size as isize {
+                            out[nx as usize + nz as usize * size] = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 struct TileSpace {
     voxel_resolution: u32,
     meters_per_voxel: f64,
@@ -426,10 +967,20 @@ struct TileSpace {
     max_x_m: f64,
     min_y_m: f64,
     max_y_m: f64,
+    seed: u64,
+    water_level_m: f64,
+    /// Global minimum Y voxel level - voxels below this are not generated
+    base_y_vox: i64,
 }
 
 impl TileSpace {
-    fn new(tile: TileId, voxel_resolution: u32, meters_per_voxel: f64) -> Self {
+    fn new(
+        tile: TileId,
+        voxel_resolution: u32,
+        meters_per_voxel: f64,
+        seed: u64,
+        water_level_m: f64,
+    ) -> Self {
         let ((min_lon, max_lon), (north_lat, south_lat)) = tile.lon_lat_bounds();
         let (min_x_m, min_y_m) = lon_lat_to_mercator_meters(min_lon, south_lat);
         let (max_x_m, _) = lon_lat_to_mercator_meters(max_lon, south_lat);
@@ -451,6 +1002,9 @@ impl TileSpace {
             max_x_m,
             min_y_m,
             max_y_m,
+            seed,
+            water_level_m,
+            base_y_vox: 0, // Will be set later after global min is computed
         }
     }
 
@@ -461,7 +1015,10 @@ impl TileSpace {
         let mut vz = (rel_y * self.voxel_resolution as f64).floor() as i32;
         vx = vx.clamp(0, self.voxel_resolution as i32 - 1);
         vz = vz.clamp(0, self.voxel_resolution as i32 - 1);
-        (vx, vz)
+        // Flip Z coordinate so that adjacent tiles have matching edges:
+        // zi=0 (south) → high voxel z, zi=size-1 (north) → low voxel z
+        let vz_flipped = (self.voxel_resolution as i32 - 1) - vz;
+        (vx, vz_flipped)
     }
 }
 
@@ -562,61 +1119,360 @@ fn voxelize_tile(
     space: &TileSpace,
     max_height_voxels: u32,
 ) -> TileVoxelResult {
-    let mut voxels = Vec::new();
-    let materials = vec![
-        "ground",
-        "road",
-        "park",
-        "water",
-        "wall",
-        "wallbrick",
-        "glazing",
-        "roof",
-        "roof_dark",
-        "trunk",
-        "canopy",
-    ];
-    let material_index: HashMap<&str, usize> = materials
-        .iter()
-        .enumerate()
-        .map(|(i, &name)| (name, i))
-        .collect();
+    match data.biome {
+        Biome::City => voxelize_city(tile, data, space, max_height_voxels),
+        Biome::Hill => voxelize_hill(tile, data, space, max_height_voxels),
+    }
+}
 
-    for x in 0..space.voxel_resolution as i32 {
-        for z in 0..space.voxel_resolution as i32 {
-            voxels.push(VoxelRecord {
-                x: x as i64,
-                y: 0,
-                z: z as i64,
-                material_index: *material_index.get("ground").unwrap_or(&0),
-            });
+// deprecated: previously used simple sin/cos fallback; refactored to a FBM-perlin approach
+
+fn voxelize_hill(
+    tile: TileId,
+    data: TileData,
+    space: &TileSpace,
+    max_height_voxels: u32,
+) -> TileVoxelResult {
+    // Refactored hill generation using multi-octave FBM, slope-based materials, and clustered vegetation.
+    let mut voxels = Vec::new();
+    // Use precomputed tile heights if provided (already smoothed by generate_area), otherwise compute locally
+    let size = space.voxel_resolution as usize;
+    let mut heights_m: Vec<f64> = if let Some(ref pre) = data.heights_m {
+        pre.clone()
+    } else {
+        sample_tile_heights(&Perlin::new(space.seed as u32), space)
+    };
+    let perlin = Perlin::new(space.seed as u32);
+
+    // Note: Heights are already smoothed across tile boundaries in generate_area,
+    // so we skip the per-tile smoothing that was previously here.
+
+    // Compute river mask and apply small carving before voxelization
+    let river_mask = compute_river_mask(space, &perlin, &heights_m, 1.0 / 3000.0, -0.35);
+    for xi in 0..size {
+        for zi in 0..size {
+            let idx = xi + zi * size;
+            if river_mask[idx] {
+                heights_m[idx] = (heights_m[idx] - 2.0).max(0.5);
+            }
         }
     }
 
-    let apply_polygons = |polys: &[Polygon], voxel_type: &str, height: i64| {
+    // Convert to voxels, set layers based on slope and height
+    // voxel_z is flipped: zi=0 (south in sampling) → high voxel.z, zi=size-1 (north) → low voxel.z
+    // This ensures that when tiles are stacked (tile.y increases southward), adjacent tile edges match:
+    // - Our tile's zi=0 (south) → voxel.z=size-1 → world Z = tile_offset + size-1
+    // - South neighbor's zi=size-1 (north) → voxel.z=0 → world Z = tile_offset + size + 0
+    for xi in 0..size {
+        for zi in 0..size {
+            let voxel_z = (size - 1 - zi) as i64;  // Flip Z coordinate
+            let h_m = heights_m[xi + zi * size];
+            let h_vox = (h_m / space.meters_per_voxel).ceil() as i64;
+            let h_vox = h_vox.clamp(1, max_height_voxels as i64);
+
+            // approximate slope: sample neighbors
+            let center = heights_m[xi + zi * size];
+            let neighbor_x = if xi + 1 < size {
+                heights_m[(xi + 1) + zi * size]
+            } else {
+                center
+            };
+            let neighbor_z = if zi + 1 < size {
+                heights_m[xi + (zi + 1) * size]
+            } else {
+                center
+            };
+            let slope_x = (neighbor_x - center).abs();
+            let slope_z = (neighbor_z - center).abs();
+            let slope = (slope_x + slope_z) * 0.5 / space.meters_per_voxel;
+
+            // Start from base_y_vox instead of 0 to avoid generating deep underground voxels
+            for y in space.base_y_vox..h_vox {
+                let mat = if slope > 3.0 {
+                    // steep cliff - expose stone
+                    if y < h_vox - 1 {
+                        MAT_STONE
+                    } else {
+                        MAT_STONE
+                    }
+                } else if y < h_vox - 4 {
+                    MAT_STONE
+                } else if y < h_vox - 1 {
+                    MAT_DIRT
+                } else {
+                    // topmost
+                    if h_m > 140.0 {
+                        MAT_SNOW
+                    } else {
+                        if (xi + zi) % 3 == 0 {
+                            MAT_GRASS_LIGHT
+                        } else {
+                            MAT_GRASS_DARK
+                        }
+                    }
+                };
+                voxels.push(VoxelRecord {
+                    x: xi as i64,
+                    y,
+                    z: voxel_z,
+                    material_index: mat,
+                });
+            }
+            // Water is rendered by the viewer as a translucent plane - do NOT generate water voxels!
+            // Just mark shoreline/underwater terrain with sand
+            let water_level_vox = (space.water_level_m / space.meters_per_voxel).ceil() as i64;
+            if h_vox <= water_level_vox + 2 {
+                // Near or below water - use sand for beaches and seabed
+                if let Some(last) = voxels.last_mut() {
+                    if last.x == xi as i64 && last.z == voxel_z && last.y == h_vox {
+                        last.material_index = MAT_SAND;
+                    }
+                }
+            }
+
+            if river_mask[xi + zi * size] {
+                // River areas - just mark with sand, don't add water voxels
+                // (water is rendered by the viewer)
+                if let Some(last) = voxels.last_mut() {
+                    if last.x == xi as i64 && last.z == voxel_z && last.y == h_vox {
+                        last.material_index = MAT_SAND;
+                    }
+                }
+            }
+        }
+    }
+
+    // Vegetation clusters: we pick seeds based on noise and place small clusters where slope is gentle
+    let mut rng = StdRng::seed_from_u64(stable_mix(&[
+        tile.x as u64,
+        tile.y as u64,
+        tile.z as u64,
+        0xDEADBEEF,
+    ]));
+    let veg_density = 0.02 + (rng.gen::<f64>() * 0.04);
+    for xi in 0..size {
+        for zi in 0..size {
+            let voxel_z = (size - 1 - zi) as i64;  // Flip Z coordinate
+            if rng.gen_bool(veg_density) {
+                let h_m = heights_m[xi + zi * size];
+                // Skip vegetation if cell is below (or very close to) global water level
+                if h_m <= space.water_level_m + 0.5 {
+                    continue;
+                }
+                let h_vox = (h_m / space.meters_per_voxel).ceil() as i64;
+                // Only place vegetation on gentle slopes and not too high
+                let center = heights_m[xi + zi * size];
+                let neighbor_x = if xi + 1 < size {
+                    heights_m[(xi + 1) + zi * size]
+                } else {
+                    center
+                };
+                let neighbor_z = if zi + 1 < size {
+                    heights_m[xi + (zi + 1) * size]
+                } else {
+                    center
+                };
+                let slope_x = (neighbor_x - center).abs();
+                let slope_z = (neighbor_z - center).abs();
+                let slope = (slope_x + slope_z) * 0.5 / space.meters_per_voxel;
+                if slope < 1.1 && h_vox + 6 < max_height_voxels as i64 {
+                    // Tree probability decreases with altitude
+                    let p = 0.5 - (h_m / 500.0);
+                    if rng.gen_bool(p.max(0.05)) {
+                        let trunk_h = rng.gen_range(3..6);
+                        for ty in 0..trunk_h {
+                            voxels.push(VoxelRecord {
+                                x: xi as i64,
+                                y: h_vox + ty,
+                                z: voxel_z,
+                                material_index: MAT_TRUNK_DARK,
+                            });
+                        }
+                        let canopy_base = h_vox + trunk_h - 1;
+                        for cx in -2..=2 {
+                            for cz in -2..=2 {
+                                for cy_offset in 0..=3 {
+                                    let cy = canopy_base + cy_offset;
+                                    if cy >= h_vox && cy < max_height_voxels as i64 {
+                                        let dist = (cx as i32).abs()
+                                            + (cz as i32).abs()
+                                            + (cy_offset as i32).abs();
+                                        if dist <= 3 {
+                                            // Some trees are evergreen, some are autumnal or with lighter canopy
+                                            let leaf_choice = if rng.gen_bool(0.12) {
+                                                MAT_LEAVES_AUTUMN
+                                            } else if rng.gen_bool(0.25) {
+                                                MAT_LEAVES_LIGHT
+                                            } else {
+                                                MAT_LEAVES_DARK
+                                            };
+                                            voxels.push(VoxelRecord {
+                                                x: (xi as i64 + cx).clamp(0, size as i64 - 1),
+                                                y: cy,
+                                                z: (voxel_z - cz).clamp(0, size as i64 - 1),
+                                                material_index: leaf_choice,
+                                            });
+                                        }
+                                        // Occasionally place a small rock boulder near trees
+                                        if rng.gen_bool(0.02) {
+                                            let bx = (xi as i64 + rng.gen_range(-1..=1))
+                                                .clamp(0, size as i64 - 1)
+                                                as i64;
+                                            let bz = (voxel_z - rng.gen_range(-1..=1))
+                                                .clamp(0, size as i64 - 1)
+                                                as i64;
+                                            let by = h_vox - 1;
+                                            for rx in -1..=0 {
+                                                for rz in -1..=0 {
+                                                    let xrx = (bx + rx).clamp(0, size as i64 - 1);
+                                                    let zrz = (bz - rz).clamp(0, size as i64 - 1);
+                                                    voxels.push(VoxelRecord {
+                                                        x: xrx,
+                                                        y: by,
+                                                        z: zrz,
+                                                        material_index: MAT_STONE,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut stats = data.stats.clone();
+    stats.voxel_count = voxels.len();
+    TileVoxelResult {
+        tile,
+        voxels,
+        stats,
+        voxel_resolution: space.voxel_resolution,
+    }
+}
+
+fn voxelize_city(
+    tile: TileId,
+    data: TileData,
+    space: &TileSpace,
+    max_height_voxels: u32,
+) -> TileVoxelResult {
+    let mut voxels = Vec::new();
+    let perlin = Perlin::new(space.seed as u32);
+    let heights_m: Vec<f64> = if let Some(ref pre) = data.heights_m {
+        pre.clone()
+    } else {
+        sample_tile_heights(&perlin, space)
+    };
+
+    // Build per-cell base ground from terrain heights
+    // Cities should only be placed on high ground, so no artificial raising is needed
+    // NOTE: Index using flipped z to match polygon_cells which returns flipped coordinates
+    let mut base_ground_vox =
+        vec![0i64; (space.voxel_resolution * space.voxel_resolution) as usize];
+    let size = space.voxel_resolution as usize;
+    for xi in 0..size {
+        for zi in 0..size {
+            let elev_m = heights_m[xi + zi * size];
+            let ground_vox = (elev_m / space.meters_per_voxel).ceil() as i64;
+            // Store using flipped z coordinate to match polygon_cells coordinate system
+            let flipped_z = size - 1 - zi;
+            base_ground_vox[xi + flipped_z * size] = ground_vox;
+        }
+    }
+
+    // Building pad pass: expand raised base around building footprints to create smooth pads
+    for entry in data.buildings.iter() {
+        let cells_list = polygon_cells(space, &[entry.footprint.clone()]);
+        if cells_list.is_empty() {
+            continue;
+        }
+        let cells = &cells_list[0];
+        if cells.is_empty() {
+            continue;
+        }
+        // Compute building foundation base as the maximum base_ground across footprint
+        let mut b_base = 0i64;
+        for &(x, z) in cells {
+            let idx_b = x as usize + z as usize * size;
+            if base_ground_vox[idx_b] > b_base {
+                b_base = base_ground_vox[idx_b];
+            }
+        }
+        // Expand neighboring ground to create a small pad (2 cells) around footprint for smoother transition
+        let pad_radius = 2;
+        for &(x, z) in cells {
+            for dx in -(pad_radius as i32)..=(pad_radius as i32) {
+                for dz in -(pad_radius as i32)..=(pad_radius as i32) {
+                    let nx = x + dx;
+                    let nz = z + dz;
+                    if nx >= 0 && nz >= 0 && (nx as usize) < size && (nz as usize) < size {
+                        let idxn = nx as usize + nz as usize * size;
+                        // Raise base_ground_vox but preserve reasonable slope (decrease with dist)
+                        let dist = dx.abs().max(dz.abs()) as i64;
+                        let raise_to = (b_base - dist).max(base_ground_vox[idxn]);
+                        if raise_to > base_ground_vox[idxn] {
+                            base_ground_vox[idxn] = raise_to;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fill the ground using the adjusted per-cell base heights
+    // Start from base_y_vox to avoid generating deep underground voxels
+    for xi in 0..size {
+        for zi in 0..size {
+            let voxel_z = (size - 1 - zi) as i64;  // Flip Z coordinate
+            // base_ground_vox uses flipped z indexing to match polygon_cells
+            let ground_vox = base_ground_vox[xi + voxel_z as usize * size];
+            for y in space.base_y_vox..=ground_vox {
+                let mat = if y < ground_vox - 2 {
+                    MAT_STONE
+                } else {
+                    MAT_DIRT
+                };
+                voxels.push(VoxelRecord {
+                    x: xi as i64,
+                    y,
+                    z: voxel_z,
+                    material_index: mat,
+                });
+            }
+        }
+    }
+
+    // Per-cell polygon placement that respects per-cell base ground
+    let apply_polygons_per_cell = |polys: &[Polygon], voxel_type: usize, height_offset: i64| {
         let mut overrides = Vec::new();
         for cells in polygon_cells(space, polys) {
             for (x, z) in cells {
+                let idx = x as usize + z as usize * size;
+                let base_y = base_ground_vox[idx];
                 overrides.push(VoxelRecord {
                     x: x as i64,
-                    y: height,
+                    y: base_y + height_offset,
                     z: z as i64,
-                    material_index: *material_index.get(voxel_type).unwrap_or(&0),
+                    material_index: voxel_type,
                 });
             }
         }
         overrides
     };
 
-    voxels.extend(apply_polygons(&data.water, "water", 0));
-    if max_height_voxels > 1 {
-        voxels.extend(apply_polygons(&data.water, "water", 1));
-    }
-    voxels.extend(apply_polygons(&data.roads, "road", 0));
+    // Apply polygons now that terrain fill is created
+    // NOTE: Do NOT add water voxels - water is rendered by the viewer as a translucent plane
+    voxels.extend(apply_polygons_per_cell(&data.roads, MAT_ASPHALT, 0));
     if max_height_voxels > 2 {
-        voxels.extend(apply_polygons(&data.roads, "road", 1));
+        voxels.extend(apply_polygons_per_cell(&data.roads, MAT_ASPHALT, 1));
     }
-    voxels.extend(apply_polygons(&data.parks, "park", 0));
+    voxels.extend(apply_polygons_per_cell(&data.parks, MAT_GRASS_DARK, 0));
+    // parks will be applied later
 
     let mut park_cells = HashSet::new();
     for cells in polygon_cells(space, &data.parks) {
@@ -634,23 +1490,111 @@ fn voxelize_tile(
         ]));
         let canopy_limit = (max_height_voxels as i32 - 1).min(4);
         if canopy_limit >= 2 {
+            // Add park path network based on grid and perlin
+            let _path_rng = StdRng::seed_from_u64(
+                space
+                    .seed
+                    .wrapping_add(stable_mix(&[tile.x as u64, tile.y as u64])),
+            );
             for &(x, z) in park_cells.iter() {
-                if tree_rng.gen_bool(0.06) {
-                    voxels.push(VoxelRecord {
-                        x: x as i64,
-                        y: 1,
-                        z: z as i64,
-                        material_index: *material_index.get("trunk").unwrap(),
-                    });
-                    for h in 2..=canopy_limit {
+                if tree_rng.gen_bool(0.08) {
+                    // only place trees if the cell is not below the water level
+                    let idx = x as usize + z as usize * size;
+                    if heights_m[idx] > space.water_level_m + 0.5 {
+                        let base_y = base_ground_vox[idx];
                         voxels.push(VoxelRecord {
                             x: x as i64,
-                            y: h as i64,
+                            y: base_y,
                             z: z as i64,
-                            material_index: *material_index.get("canopy").unwrap(),
+                            material_index: MAT_TRUNK_LIGHT,
+                        });
+                        let leaf_choice = if tree_rng.gen_bool(0.25) {
+                            MAT_LEAVES_AUTUMN
+                        } else {
+                            MAT_LEAVES_MED
+                        };
+                        for h in 1..=canopy_limit {
+                            voxels.push(VoxelRecord {
+                                x: x as i64,
+                                y: (base_y + h as i64),
+                                z: z as i64,
+                                material_index: leaf_choice,
+                            });
+                        }
+                    }
+                    // Small shrub cluster near tree
+                    if tree_rng.gen_bool(0.15) {
+                        let idx_sh1 = (x + 1) as usize + z as usize * size;
+                        let idx_sh2 = (x - 1) as usize + z as usize * size;
+                        let base_sh1 = base_ground_vox[idx_sh1];
+                        let base_sh2 = base_ground_vox[idx_sh2];
+                        voxels.push(VoxelRecord {
+                            x: x as i64 + 1,
+                            y: base_sh1,
+                            z: z as i64,
+                            material_index: MAT_LEAVES_LIGHT,
+                        });
+                        voxels.push(VoxelRecord {
+                            x: x as i64 - 1,
+                            y: base_sh2,
+                            z: z as i64,
+                            material_index: MAT_LEAVES_LIGHT,
+                        });
+                    }
+                    // Occasional statue/bench
+                    if tree_rng.gen_bool(0.01) {
+                        let idxb = (x + 1) as usize + (z + 1) as usize * size;
+                        let base_b = base_ground_vox[idxb];
+                        voxels.push(VoxelRecord {
+                            x: x as i64 + 1,
+                            y: base_b,
+                            z: z as i64 + 1,
+                            material_index: MAT_MARBLE,
                         });
                     }
                 }
+            }
+        }
+        // Construct simple paths across the park cells
+        let path_threshold = 8;
+        for &(x, z) in park_cells.iter() {
+            if (x + z) % path_threshold == 0 || (x - z) % (path_threshold + 2) == 0 {
+                // place pavement at base level
+                let idxp = x as usize + z as usize * size;
+                let y = base_ground_vox[idxp] + 1;
+                voxels.push(VoxelRecord {
+                    x: x as i64,
+                    y,
+                    z: z as i64,
+                    material_index: MAT_PAVEMENT,
+                });
+            }
+        }
+        // Random outhouse placements (small 2x2 structures)
+        for &(x, z) in park_cells.iter() {
+            if tree_rng.gen_bool(0.015) {
+                let ox = x as i64;
+                let oz = z as i64;
+                let idxo = x as usize + z as usize * size;
+                let oy = base_ground_vox[idxo] + 1;
+                for dx in 0..2 {
+                    for dz in 0..2 {
+                        let idxf = (x + dx as i32) as usize + (z + dz as i32) as usize * size;
+                        let oyf = base_ground_vox[idxf] + 1;
+                        voxels.push(VoxelRecord {
+                            x: ox + dx,
+                            y: oyf,
+                            z: oz + dz,
+                            material_index: MAT_PLASTER,
+                        });
+                    }
+                }
+                voxels.push(VoxelRecord {
+                    x: ox,
+                    y: oy + 2,
+                    z: oz,
+                    material_index: MAT_ROOF_TERRACOTTA,
+                });
             }
         }
     }
@@ -677,16 +1621,16 @@ fn voxelize_tile(
             .get("facade")
             .map(|s| s.as_str())
             .unwrap_or("concrete");
-        let wall_name = match facade {
-            "brick" => "wallbrick",
-            "glass" => "glazing",
-            "plaster" => "wall",
-            "concrete" => "wall",
-            "steel" => "glazing",
-            _ => "wall",
+
+        let wall_idx = match facade {
+            "brick" => MAT_BRICK_RED,
+            "glass" => MAT_GLASS,
+            "plaster" => MAT_PLASTER,
+            "concrete" => MAT_CONCRETE,
+            "steel" => MAT_STEEL,
+            _ => MAT_CONCRETE,
         };
-        let wall_idx = *material_index.get(wall_name).unwrap_or(&4);
-        let glass_idx = *material_index.get("glazing").unwrap();
+        let glass_idx = MAT_GLASS;
 
         let roof_style = entry
             .tags
@@ -694,35 +1638,62 @@ fn voxelize_tile(
             .map(|s| s.as_str())
             .unwrap_or("terracotta");
         let roof_idx = if matches!(roof_style, "dark" | "flat") {
-            *material_index.get("roof_dark").unwrap()
+            MAT_ROOF_SLATE
         } else {
-            *material_index.get("roof").unwrap()
+            MAT_ROOF_TERRACOTTA
         };
 
         let band_seed = base_seed ^ ((b_idx as u64) * 0x45D9F3B);
         let mut facade_rng = StdRng::seed_from_u64(band_seed & 0xFFFFFFFFFFFF);
         let window_period = facade_rng.gen_range(3..=5);
 
+        // Compute building foundation base as the maximum base_ground across footprint
+        let mut b_base = 0i64;
+        for &(x, z) in cells {
+            let idx_b = x as usize + z as usize * size;
+            if base_ground_vox[idx_b] > b_base {
+                b_base = base_ground_vox[idx_b];
+            }
+        }
+        // Fill foundation under the building footprint
+        for &(x, z) in cells {
+            let idx_b = x as usize + z as usize * size;
+            let ground_vox = base_ground_vox[idx_b];
+            for gy in ground_vox..=b_base {
+                let mat = if gy < b_base - 1 { MAT_STONE } else { MAT_DIRT };
+                voxels.push(VoxelRecord {
+                    x: x as i64,
+                    y: gy,
+                    z: z as i64,
+                    material_index: mat,
+                });
+            }
+        }
         for &(x, z) in cells {
             for y in 1..roof_y {
                 let mut material_idx = wall_idx;
-                if wall_name == "glazing" {
+                if facade == "glass" {
                     if y % 6 != 0 && y % 6 != 1 {
                         material_idx = glass_idx;
                     }
                 } else if y > 2 && y % window_period == 0 {
-                    material_idx = glass_idx;
+                    // Window logic
+                    if facade_rng.gen_bool(0.1) {
+                        material_idx = MAT_WINDOW_WARM;
+                    } else {
+                        material_idx = glass_idx;
+                    }
                 }
                 voxels.push(VoxelRecord {
                     x: x as i64,
-                    y,
+                    y: b_base + y,
                     z: z as i64,
                     material_index: material_idx,
                 });
             }
             voxels.push(VoxelRecord {
                 x: x as i64,
-                y: roof_y,
+                y: b_base + roof_y,
                 z: z as i64,
                 material_index: roof_idx,
             });
@@ -739,7 +1710,7 @@ fn voxelize_tile(
             for extra in 1..=3 {
                 voxels.push(VoxelRecord {
                     x: center.0 as i64,
-                    y: roof_y + extra,
+                    y: b_base + roof_y + extra,
                     z: center.1 as i64,
                     material_index: roof_idx,
                 });
@@ -759,10 +1730,16 @@ fn voxelize_tile(
 }
 
 fn generate_area(args: &Args) -> Vec<TileVoxelResult> {
+    eprintln!("=== GENERATE_AREA v3 - DEBUG HEIGHTS ===");
     let center_tile = lon_lat_to_tile(args.center_lon, args.center_lat, args.zoom);
-    let fetcher = TileFetcher::new(args.seed);
+    eprintln!("Center tile: ({}, {}, {})", center_tile.x, center_tile.y, center_tile.z);
+    let fetcher = TileFetcher::new(args.seed, args.water_level);
     let mut results = Vec::new();
-
+    let perlin = Perlin::new(args.seed as u32);
+    // Collect tile metadata and precompute heights
+    let mut tile_map: HashMap<TileId, TileData> = HashMap::new();
+    let mut tile_spaces: HashMap<TileId, TileSpace> = HashMap::new();
+    let mut tiles: Vec<TileId> = Vec::new();
     for dy in -(args.radius as i32)..=(args.radius as i32) {
         for dx in -(args.radius as i32)..=(args.radius as i32) {
             let tile = TileId {
@@ -770,8 +1747,343 @@ fn generate_area(args: &Args) -> Vec<TileVoxelResult> {
                 x: center_tile.x + dx,
                 y: center_tile.y + dy,
             };
-            let data = fetcher.fetch(tile);
-            let space = TileSpace::new(tile, args.voxel_resolution, args.meters_per_voxel);
+            let mut data = fetcher.fetch(tile);
+            let space = TileSpace::new(
+                tile,
+                args.voxel_resolution,
+                args.meters_per_voxel,
+                args.seed,
+                args.water_level,
+            );
+            let heights = sample_tile_heights(&perlin, &space);
+            data.heights_m = Some(heights);
+            tile_map.insert(tile, data);
+            tile_spaces.insert(tile, space);
+            tiles.push(tile);
+        }
+    }
+
+    // Smooth across tile boundaries by averaging edge cells with neighbor's edge cells
+    let size = args.voxel_resolution as usize;
+    let mut smoothed_map: HashMap<TileId, Vec<f64>> = HashMap::new();
+    // Gather pad updates without mutating the tile_map during iteration
+    let mut pad_updates: Vec<(TileId, usize, i64)> = Vec::new();
+    for (tile_id, data) in tile_map.iter() {
+        if let Some(h) = data.heights_m.as_ref() {
+            smoothed_map.insert(*tile_id, h.clone());
+        }
+    }
+    // Multiple smoothing passes
+    let smoothing_passes = 3usize;
+    for _ in 0..smoothing_passes {
+        smooth_tiles_pass(&mut smoothed_map, size);
+    }
+    // Blend tile edges to produce ramps across tile boundaries
+    let blend_width = 6usize;
+    blend_tile_edges(&mut smoothed_map, size, blend_width);
+    // Additional smoothing passes to settle blend
+    for _ in 0..1 {
+        smooth_tiles_pass(&mut smoothed_map, size);
+    }
+    // Previously this loop performed a single pass; we've replaced it with helper calls
+    for tile_id in tiles.iter() {
+        let mut new_h = smoothed_map.get(tile_id).unwrap().clone();
+        if new_h.len() != size * size {
+            continue;
+        }
+        for xi in 0..size {
+            for zi in 0..size {
+                let idx = xi + zi * size;
+                let mut sum = new_h[idx];
+                let mut count = 1.0;
+                // Left edge neighbor
+                if xi == 0 {
+                    let neighbor = TileId {
+                        z: tile_id.z,
+                        x: tile_id.x - 1,
+                        y: tile_id.y,
+                    };
+                    if let Some(nei_h) = smoothed_map.get(&neighbor) {
+                        let idx_nei = (size - 1) + zi * size;
+                        sum += nei_h[idx_nei];
+                        count += 1.0;
+                    }
+                }
+                // Right edge neighbor
+                if xi == size - 1 {
+                    let neighbor = TileId {
+                        z: tile_id.z,
+                        x: tile_id.x + 1,
+                        y: tile_id.y,
+                    };
+                    if let Some(nei_h) = smoothed_map.get(&neighbor) {
+                        let idx_nei = 0 + zi * size;
+                        sum += nei_h[idx_nei];
+                        count += 1.0;
+                    }
+                }
+                // Top edge neighbor
+                if zi == 0 {
+                    let neighbor = TileId {
+                        z: tile_id.z,
+                        x: tile_id.x,
+                        y: tile_id.y - 1,
+                    };
+                    if let Some(nei_h) = smoothed_map.get(&neighbor) {
+                        let idx_nei = xi + (size - 1) * size;
+                        sum += nei_h[idx_nei];
+                        count += 1.0;
+                    }
+                }
+                // Bottom edge neighbor
+                if zi == size - 1 {
+                    let neighbor = TileId {
+                        z: tile_id.z,
+                        x: tile_id.x,
+                        y: tile_id.y + 1,
+                    };
+                    if let Some(nei_h) = smoothed_map.get(&neighbor) {
+                        let idx_nei = xi + 0 * size;
+                        sum += nei_h[idx_nei];
+                        count += 1.0;
+                    }
+                }
+                new_h[idx] = sum / count;
+            }
+        }
+        smoothed_map.insert(*tile_id, new_h);
+    }
+    // Write smoothed heights back to tile data and compute base_ground_vox
+    for (tile_id, heights) in smoothed_map.iter() {
+        if let Some(data) = tile_map.get_mut(tile_id) {
+            data.heights_m = Some(heights.clone());
+            // compute base ground vox per cell - use natural terrain height
+            let mut base_vox = vec![0i64; size * size];
+            for xi in 0..size {
+                for zi in 0..size {
+                    let elev_m = heights[xi + zi * size];
+                    let g = (elev_m / args.meters_per_voxel).ceil() as i64;
+                    base_vox[xi + zi * size] = g;
+                }
+            }
+            data.base_ground_vox = Some(base_vox);
+        }
+    }
+
+    // Diagnostic: compute border differences to quantify smoothing
+    let mut max_border_delta = 0.0f64;
+    let mut total_border_delta = 0.0f64;
+    let mut border_count = 0usize;
+    for tile_id in tiles.iter() {
+        if let Some(h) = smoothed_map.get(tile_id) {
+            for xi in 0..size {
+                // compare top edge to neighbor
+                let idx_top = xi + 0 * size;
+                let top_neighbor = TileId {
+                    z: tile_id.z,
+                    x: tile_id.x,
+                    y: tile_id.y - 1,
+                };
+                if let Some(nei) = smoothed_map.get(&top_neighbor) {
+                    let nei_idx = xi + (size - 1) * size;
+                    let delta = (h[idx_top] - nei[nei_idx]).abs();
+                    max_border_delta = max_border_delta.max(delta);
+                    total_border_delta += delta;
+                    border_count += 1;
+                }
+                // compare left edge
+                let idx_left = 0 + xi * size;
+                let left_neighbor = TileId {
+                    z: tile_id.z,
+                    x: tile_id.x - 1,
+                    y: tile_id.y,
+                };
+                if let Some(nei) = smoothed_map.get(&left_neighbor) {
+                    let nei_idx = (size - 1) + xi * size;
+                    let delta = (h[idx_left] - nei[nei_idx]).abs();
+                    max_border_delta = max_border_delta.max(delta);
+                    total_border_delta += delta;
+                    border_count += 1;
+                }
+            }
+        }
+    }
+    if border_count > 0 {
+        println!(
+            "Height border diffs after smoothing: max = {:.3}m, avg = {:.3}m",
+            max_border_delta,
+            total_border_delta / border_count as f64
+        );
+    }
+
+    // Building pad pass across tiles: expand elevated bases around building footprints
+    // Increase pad radius for smoother, more gradual ramps across neighbors
+    let pad_radius = 3i32;
+    for (tile_id, data) in tile_map.iter() {
+        if let Some(cells) = Some(&data.buildings) {
+            for entry in cells.iter() {
+                let footprint_cells = polygon_cells(
+                    tile_spaces.get(tile_id).unwrap(),
+                    &[entry.footprint.clone()],
+                );
+                if footprint_cells.is_empty() {
+                    continue;
+                }
+                let cells = &footprint_cells[0];
+                // compute max base for building footprint
+                let mut b_base = 0i64;
+                for &(x, z) in cells.iter() {
+                    let idx = x as usize + z as usize * size;
+                    if let Some(bv) = data.base_ground_vox.as_ref() {
+                        if bv[idx] > b_base {
+                            b_base = bv[idx];
+                        }
+                    }
+                }
+                // expand pad across neighborhood across tiles
+                for &(bx, bz) in cells.iter() {
+                    for dx in -(pad_radius)..=(pad_radius) {
+                        for dz in -(pad_radius)..=(pad_radius) {
+                            let nx = bx + dx;
+                            let nz = bz + dz;
+                            // if outside current tile bounds, compute neighbor tile and cell
+                            if nx < 0 || nx >= size as i32 || nz < 0 || nz >= size as i32 {
+                                let mut tx = tile_id.x as i32;
+                                let mut ty = tile_id.y as i32;
+                                let mut cx = nx;
+                                let mut cz = nz;
+                                while cx < 0 {
+                                    cx += size as i32;
+                                    tx -= 1;
+                                }
+                                while cx >= size as i32 {
+                                    cx -= size as i32;
+                                    tx += 1;
+                                }
+                                while cz < 0 {
+                                    cz += size as i32;
+                                    ty -= 1;
+                                }
+                                while cz >= size as i32 {
+                                    cz -= size as i32;
+                                    ty += 1;
+                                }
+                                let neighbor_tile = TileId {
+                                    z: tile_id.z,
+                                    x: tx,
+                                    y: ty,
+                                };
+                                let idxn = cx as usize + cz as usize * size;
+                                let dist = dx.abs().max(dz.abs()) as i64;
+                                // slope-aware taper: blend neighbor existing base to building base
+                                let neighbor_base = tile_map
+                                    .get(&neighbor_tile)
+                                    .and_then(|d| d.base_ground_vox.as_ref())
+                                    .map(|bv| bv[idxn])
+                                    .unwrap_or(0i64);
+                                let distf = dist as f64;
+                                let pad_span = (pad_radius + 1) as f64;
+                                let w = (distf / pad_span).clamp(0.0, 1.0);
+                                // ease curve for smoother ramp (quadratic)
+                                let t = 1.0 - w * w;
+                                let raise_to_f =
+                                    (neighbor_base as f64) * (1.0 - t) + (b_base as f64) * t;
+                                let raise_to = raise_to_f.round() as i64;
+                                pad_updates.push((neighbor_tile, idxn, raise_to));
+                            } else {
+                                let idx = nx as usize + nz as usize * size;
+                                let dist = dx.abs().max(dz.abs()) as i64;
+                                let neighbor_base = data
+                                    .base_ground_vox
+                                    .as_ref()
+                                    .map(|bv| bv[idx])
+                                    .unwrap_or(0i64);
+                                let distf = dist as f64;
+                                let pad_span = (pad_radius + 1) as f64;
+                                let w = (distf / pad_span).clamp(0.0, 1.0);
+                                let t = 1.0 - w * w;
+                                let raise_to_f =
+                                    (neighbor_base as f64) * (1.0 - t) + (b_base as f64) * t;
+                                let raise_to = raise_to_f.round() as i64;
+                                pad_updates.push((*tile_id, idx, raise_to));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Apply pad updates we collected
+    for (tile_id, idx, raise_to) in pad_updates.iter() {
+        if let Some(nei_data) = tile_map.get_mut(tile_id) {
+            if let Some(nei_bv) = nei_data.base_ground_vox.as_mut() {
+                if *idx < nei_bv.len() {
+                    if *raise_to > nei_bv[*idx] {
+                        nei_bv[*idx] = *raise_to;
+                    }
+                }
+            }
+        }
+    }
+
+    // Base smoothing after pad updates: smooth base elevations to remove step artifacts
+    let mut base_map: HashMap<TileId, Vec<i64>> = HashMap::new();
+    for (tile_id, data) in tile_map.iter() {
+        if let Some(bv) = data.base_ground_vox.as_ref() {
+            base_map.insert(*tile_id, bv.clone());
+        }
+    }
+    // More aggressive smoothing to reduce pad-induced plateaus
+    for _ in 0..6 {
+        smooth_base_pass(&mut base_map, size);
+    }
+    blend_base_edges(&mut base_map, size, 12);
+    for _ in 0..3 {
+        smooth_base_pass(&mut base_map, size);
+    }
+    for (tile_id, base) in base_map.iter() {
+        if let Some(data) = tile_map.get_mut(tile_id) {
+            data.base_ground_vox = Some(base.clone());
+        }
+    }
+
+    // Compute global minimum height across all tiles to avoid generating deep underground voxels
+    let mut global_min_height_m = f64::INFINITY;
+    for (_, data) in tile_map.iter() {
+        if let Some(heights) = data.heights_m.as_ref() {
+            for &h in heights.iter() {
+                if h < global_min_height_m {
+                    global_min_height_m = h;
+                }
+            }
+        }
+    }
+    // Convert to voxel level with some margin below the lowest valley
+    // Use a margin of 10 voxels below the lowest point for visual consistency
+    let global_base_y_vox = ((global_min_height_m / args.meters_per_voxel).floor() as i64 - 10).max(0);
+    eprintln!(
+        "Global terrain: min height = {:.1}m, base_y_vox = {} (saving ~{} voxels per column)",
+        global_min_height_m,
+        global_base_y_vox,
+        global_base_y_vox
+    );
+
+    // Update all TileSpaces with the global base Y
+    for (_, space) in tile_spaces.iter_mut() {
+        space.base_y_vox = global_base_y_vox;
+    }
+
+    // Voxelize each tile using the smoothed heights
+    for dy in -(args.radius as i32)..=(args.radius as i32) {
+        for dx in -(args.radius as i32)..=(args.radius as i32) {
+            let tile = TileId {
+                z: center_tile.z,
+                x: center_tile.x + dx,
+                y: center_tile.y + dy,
+            };
+            let data = tile_map.remove(&tile).unwrap();
+            let space = tile_spaces.remove(&tile).unwrap();
             let result = voxelize_tile(tile, data, &space, args.max_height_voxels);
             results.push(result);
         }

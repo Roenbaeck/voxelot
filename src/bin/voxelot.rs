@@ -26,8 +26,8 @@ use std::collections::VecDeque;
 use sysinfo::{Pid, ProcessExt, System, SystemExt};
 use voxelot::SlabAllocator;
 use voxelot::{
-    bbox_local_to_world, cull_visible_voxels_parallel, Camera, Chunk, ChunkMesh, Palette,
-    RenderConfig, VoxelInstance, World, WorldPos,
+    bbox_local_to_world, cull_visible_voxels_parallel, Camera, Chunk, ChunkMesh, CullStats,
+    Palette, RenderConfig, VoxelInstance, World, WorldPos,
 };
 
 macro_rules! viewer_debug {
@@ -216,6 +216,9 @@ struct Uniforms {
     lod_distance: f32, // LOD render distance for fade calculation
     envelope_distance: f32,
     envelope_fade_range: f32,
+    water_level: f32,
+    water_visibility: f32,
+    _water_pad: [f32; 2], // Padding for alignment
     inverse_view: [[f32; 4]; 4],
     inverse_proj: [[f32; 4]; 4],
 }
@@ -728,6 +731,7 @@ struct App {
     shadow_pipeline: Option<wgpu::RenderPipeline>,
     shadow_mesh_pipeline: Option<wgpu::RenderPipeline>,
     uniform_buffer: Option<wgpu::Buffer>,
+    palette_buffer: Option<wgpu::Buffer>,
     bind_group: Option<wgpu::BindGroup>,
     shadow_bind_group: Option<wgpu::BindGroup>,
     main_bind_group_layout: Option<wgpu::BindGroupLayout>,
@@ -844,6 +848,8 @@ struct App {
     last_pending_mesh_sort_frame: u64,
     mesh_cache_budget_bytes: u64,
     fallback_detail_distance: f32,
+    /// Maximum number of GPU instances (configurable, used for buffer sizing and safeguards)
+    max_gpu_instances: usize,
 
     // Reusable buffers for internal processing to avoid per-frame allocations
     pending_chunk_sort_buf: Vec<(i64, i64, i64)>,
@@ -881,6 +887,7 @@ struct App {
 
     // Water state
     water_level: f32,
+    water_visibility: f32,
 
     // Post-processing state
     dof_coc_pipeline: Option<wgpu::RenderPipeline>,
@@ -1013,6 +1020,9 @@ struct App {
     egui_renderer: Option<egui_wgpu::Renderer>,
     last_fps: u32,
 
+    // Culling statistics
+    cull_stats: CullStats,
+
     // Skybox
     skybox_texture: Option<wgpu::Texture>,
     skybox_texture_bytes: u64,
@@ -1114,7 +1124,7 @@ impl App {
         // Load configuration once for all initialization
         let cfg = voxelot::Config::load_or_default(CONFIG_FILE);
 
-        let initial_camera;
+        let mut initial_camera;
         let mut world;
 
         if cfg!(feature = "test-block-world") {
@@ -1199,6 +1209,70 @@ impl App {
             );
         }
 
+        // Failsafe: Ensure camera spawns above terrain
+        let mut cam_pos = initial_camera;
+        let start_y = cam_pos[1];
+
+        // Strategy: Search from top of world down to find the highest solid voxel at camera X,Z
+        // Then place camera 10 units above that point
+        let world_height = world.world_size() as i64;
+        let cam_x = cam_pos[0].floor() as i64;
+        let cam_z = cam_pos[2].floor() as i64;
+
+        let mut highest_solid_y: Option<i64> = None;
+
+        // Search from near the top of the world downward
+        for y in (0..world_height).rev() {
+            let wp = WorldPos::new(cam_x, y, cam_z);
+            if let Some(voxel) = world.get(wp) {
+                if voxel != 0 {
+                    highest_solid_y = Some(y);
+                    break;
+                }
+            }
+        }
+
+        // Place camera above the highest solid voxel found, or use a reasonable default
+        if let Some(solid_y) = highest_solid_y {
+            let safe_y = (solid_y + 10) as f32;
+            if cam_pos[1] <= solid_y as f32 {
+                println!(
+                    "Camera was at y={:.1} (inside/below terrain at y={}), moved to y={:.1}",
+                    start_y, solid_y, safe_y
+                );
+                cam_pos[1] = safe_y;
+                initial_camera = cam_pos;
+            }
+        } else {
+            // No solid found at this X,Z - camera position is likely fine
+            // But do a quick check to make sure we're not inside something
+            let mut corrected = false;
+            for _ in 0..50 {
+                let wp = WorldPos::new(
+                    cam_pos[0].floor() as i64,
+                    cam_pos[1].floor() as i64,
+                    cam_pos[2].floor() as i64,
+                );
+                if let Some(voxel) = world.get(wp) {
+                    if voxel != 0 {
+                        cam_pos[1] += 1.0;
+                        corrected = true;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            if corrected {
+                println!(
+                    "Camera was inside terrain at y={:.1}, moved to y={:.1}",
+                    start_y, cam_pos[1]
+                );
+                initial_camera = cam_pos;
+            }
+        }
+
         println!("World created with voxels");
 
         println!("Loading palette from {}...", cfg.world.palette);
@@ -1274,6 +1348,15 @@ impl App {
             lod_elapsed.as_secs_f32()
         );
 
+        println!("Generating hierarchy shells...");
+        let shell_start = Instant::now();
+        world.generate_all_hierarchy_shells();
+        let shell_elapsed = shell_start.elapsed();
+        println!(
+            "Hierarchy shells generated (took {:.3}s)",
+            shell_elapsed.as_secs_f32()
+        );
+
         println!("\n=== Controls ===");
         println!("Movement: WASD + Q/E (down/up)");
         println!("Look: Right Mouse + drag");
@@ -1303,6 +1386,7 @@ impl App {
             shadow_pipeline: None,
             shadow_mesh_pipeline: None,
             uniform_buffer: None,
+            palette_buffer: None,
             bind_group: None,
             shadow_bind_group: None,
             main_bind_group_layout: None,
@@ -1354,6 +1438,7 @@ impl App {
             egui_winit: None,
             egui_renderer: None,
             last_fps: 0,
+            cull_stats: CullStats::default(),
             mesh_chunk_arc_cache: FxHashMap::default(),
             // empty_mesh buffers removed; placeholders use offsets into mega buffers
             stat_empty_meshes: 0,
@@ -1405,6 +1490,7 @@ impl App {
             last_pending_mesh_sort_frame: 0,
             mesh_cache_budget_bytes: cfg.performance.mesh_cache_budget_mb as u64 * 1024 * 1024,
             fallback_detail_distance: cfg.performance.fallback_detail_distance,
+            max_gpu_instances: cfg.performance.max_gpu_instances,
             pending_chunk_sort_buf: Vec::with_capacity(4096),
             tmp_chunk_emitters: Vec::with_capacity(64),
             vb_data_tmp: Vec::with_capacity(8192),
@@ -1434,6 +1520,7 @@ impl App {
             light_probe_capacity: 0,
             lod_distance: cfg.rendering.chunk_lod_distance,
             water_level: cfg.world.water_level,
+            water_visibility: cfg.world.water_visibility,
             emissive_texture: None,
             emissive_view: None,
             emissive_texture_bytes: 0,
@@ -1644,6 +1731,7 @@ impl App {
 
             // World settings
             full_cfg.world.water_level = self.water_level;
+            full_cfg.world.water_visibility = self.water_visibility;
 
             // DoF settings
             full_cfg.effects.depth_of_field.enabled = self.dof_enabled;
@@ -2049,11 +2137,11 @@ impl App {
                 println!("SSR DEBUG overlay: {}", self.ssr_debug);
             }
             KeyCode::KeyY => {
-                self.water_level = (self.water_level - 0.5).max(0.0);
+                self.water_level = (self.water_level - 5.0).max(0.0);
                 println!("Water level: {:.1}", self.water_level);
             }
             KeyCode::KeyM => {
-                self.water_level = (self.water_level + 0.5).min(100.0);
+                self.water_level = (self.water_level + 5.0).min(1000.0);
                 println!("Water level: {:.1}", self.water_level);
             }
             _ => {}
@@ -2902,6 +2990,7 @@ impl App {
             Some(shadow_view),
             Some(shadow_sampler),
             Some(light_probe_buffer),
+            Some(palette_buffer),
         ) = (
             self.device.as_ref(),
             self.main_bind_group_layout.as_ref(),
@@ -2909,6 +2998,7 @@ impl App {
             self.shadow_view.as_ref(),
             self.shadow_sampler.as_ref(),
             self.light_probe_buffer.as_ref(),
+            self.palette_buffer.as_ref(),
         )
         else {
             return;
@@ -2933,6 +3023,10 @@ impl App {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: light_probe_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: palette_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -3539,7 +3633,14 @@ impl App {
             return;
         }
 
-        let needed_capacity = required.next_power_of_two();
+        let max_capacity = self.max_gpu_instances;
+        let needed_capacity = required.next_power_of_two().min(max_capacity);
+        if required > max_capacity {
+            eprintln!(
+                "Warning: GPU input buffer required {} exceeds max {}, capping.",
+                required, max_capacity
+            );
+        }
         if self.gpu_input_capacity < needed_capacity || self.gpu_input_buffer.is_none() {
             if let Some(old_buffer) = self.gpu_input_buffer.take() {
                 old_buffer.destroy();
@@ -3757,11 +3858,11 @@ impl App {
                 }
                 self.envelope_mesh_cache_bytes =
                     self.envelope_mesh_cache_bytes.saturating_sub(entry_bytes);
-                freed_bytes += entry_bytes;
-                evicted += 1;
+                // freed_bytes += entry_bytes;
+                // evicted += 1;
             }
         }
-
+        /*
         if evicted > 0 {
             println!(
                 "Evicted {} envelope meshes, freed {:.1} MB (current usage {:.1} MB)",
@@ -3770,6 +3871,7 @@ impl App {
                 self.envelope_mesh_cache_bytes as f64 / 1024.0 / 1024.0
             );
         }
+        */
     }
 
     fn max_inflight_jobs(&self) -> usize {
@@ -4861,6 +4963,17 @@ impl App {
                         },
                         count: None,
                     },
+                    // Palette buffer for voxel colors
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -5768,6 +5881,9 @@ impl App {
             lod_distance: 800.0,
             envelope_distance: 256.0,
             envelope_fade_range: 32.0,
+            water_level: self.water_level,
+            water_visibility: self.water_visibility,
+            _water_pad: [0.0; 2],
             inverse_view: [[0.0; 4]; 4],
             inverse_proj: [[0.0; 4]; 4],
         };
@@ -5776,6 +5892,21 @@ impl App {
             label: Some("Uniform Buffer"),
             contents: bytemuck::cast_slice(&[uniforms]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Create palette buffer for voxel colors (max 256 entries)
+        let palette_data = self.palette.colors();
+        // Pad to 256 entries (each entry is 4 floats = 16 bytes)
+        let mut palette_padded = vec![[1.0f32, 1.0, 1.0, 1.0]; 256];
+        for (i, color) in palette_data.iter().enumerate() {
+            if i < 256 {
+                palette_padded[i] = *color;
+            }
+        }
+        let palette_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Palette Buffer"),
+            contents: bytemuck::cast_slice(&palette_padded),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
         // SSAO blur uniforms (half-resolution like SSao textures)
@@ -6297,6 +6428,7 @@ impl App {
         self.shadow_pipeline = Some(shadow_pipeline);
         self.shadow_mesh_pipeline = Some(shadow_mesh_pipeline);
         self.uniform_buffer = Some(uniform_buffer);
+        self.palette_buffer = Some(palette_buffer);
 
         self.light_probe_buffer = Some(light_probe_buffer);
         self.light_probe_capacity = light_probe_capacity;
@@ -6335,6 +6467,61 @@ impl App {
         self.recreate_shadow_map();
 
         self.recreate_offscreen_targets();
+
+        // Initial CPU cull and seeding of pending meshing queue to avoid enqueueing
+        // everything before the first render pass. This primes the mesh worker queue
+        // with only visible chunks and gives accurate cull_stats / visible counts.
+        {
+            let (all_visible, stats) = cull_visible_voxels_parallel(&self.world, &self.camera_controller.camera);
+            self.cull_stats = stats;
+
+            // Depth cull like in render loop: hide geometry fully below water
+            let min_visible_y = self.water_level - self.water_visibility;
+            let visible: Vec<_> = all_visible
+                .into_iter()
+                .filter(|v| {
+                    let max_y = v.position[1] as f32 + v.scale[1];
+                    max_y >= min_visible_y
+                })
+                .collect();
+
+            // Seed the pending meshing queue with visible leaf chunks
+            if self.mesh_worker_count > 0 {
+                let mut seen = FxHashSet::default();
+                for v in visible.iter() {
+                    if !v.is_leaf_chunk {
+                        continue;
+                    }
+                    let key = (v.position[0], v.position[1], v.position[2]);
+                    if seen.contains(&key) { continue; }
+                    seen.insert(key);
+
+                    // Skip if we already have meshes; queue only missing ones
+                    let has_standard = self.mesh_cache.contains_key(&key);
+                    let has_envelope = self.envelope_mesh_cache.contains_key(&key);
+                    if has_standard || has_envelope { continue; }
+
+                    // LOD distance prioritization
+                    let cam_pos = self.camera_controller.camera.position;
+                    let chunk_center = [key.0 as f32 + 8.0, key.1 as f32 + 8.0, key.2 as f32 + 8.0];
+                    let dx = chunk_center[0] - cam_pos[0];
+                    let dy = chunk_center[1] - cam_pos[1];
+                    let dz = chunk_center[2] - cam_pos[2];
+                    let dist_sq = dx * dx + dy * dy + dz * dz;
+                    let lod_sq = self.lod_distance * self.lod_distance;
+                    if dist_sq <= lod_sq {
+                        self.pending_chunk_meshes.push_front(key);
+                    } else {
+                        self.pending_chunk_meshes.push_back(key);
+                    }
+                    self.pending_chunk_set.insert(key);
+                }
+            }
+
+            // For now, avoid calling run_gpu_culling here because it requires a mutable self borrow
+            // while we already hold immutable borrows. Optionally, we could schedule an initial
+            // GPU cull on the first frame instead.
+        }
 
         viewer_debug!("DEBUG: mesh_pipeline created successfully");
         println!("wgpu initialized");
@@ -6375,8 +6562,25 @@ impl App {
 
         // Gather candidate voxels for GPU culling using CPU hierarchy traversal
         let cull_start = Instant::now();
-        let visible = cull_visible_voxels_parallel(&self.world, &self.camera_controller.camera);
+        let (all_visible, cull_stats) =
+            cull_visible_voxels_parallel(&self.world, &self.camera_controller.camera);
+        self.cull_stats = cull_stats;
         let cull_time = cull_start.elapsed();
+
+        // CPU cull: filter out chunks that are completely below water visibility threshold
+        // Any chunk whose max y-value is below (water_level - water_visibility) is invisible
+        // Y is the up axis in this engine
+        let min_visible_y = self.water_level - self.water_visibility;
+        let pre_depth_cull_count = all_visible.len();
+        let visible: Vec<_> = all_visible
+            .into_iter()
+            .filter(|v| {
+                // The position is the min corner; scale[1] is the Y dimension size
+                let max_y = v.position[1] as f32 + v.scale[1];
+                max_y >= min_visible_y
+            })
+            .collect();
+        let depth_culled_count = pre_depth_cull_count - visible.len();
 
         let mut _voxel_expansion_count = 0;
         // Reuse persistent allocation across frames to avoid heap churn
@@ -6457,6 +6661,10 @@ impl App {
 
                             // We know it's a solid voxel because it's in the shell
                             if let Some(vtype) = chunk.get_type(x, y, z) {
+                                // Check buffer capacity before adding
+                                if self.cpu_prepopulated_instances.len() >= self.max_gpu_instances {
+                                    break; // Buffer full
+                                }
                                 let (emissive_rgb, emissive_intensity) =
                                     self.palette.emissive(vtype as u32);
                                 self.cpu_prepopulated_instances.push(VoxelInstanceRaw {
@@ -6508,6 +6716,9 @@ impl App {
                         } else {
                             self.palette.emissive(v.voxel_type as u32)
                         };
+                        if self.gpu_inputs.len() >= self.max_gpu_instances {
+                            continue;
+                        }
                         self.gpu_inputs.push(GpuInstanceInput {
                             position: [
                                 v.position[0] as f32,
@@ -6593,22 +6804,25 @@ impl App {
                         [0.0, 0.0, 0.0, 0.0]
                     };
 
-                    self.cpu_prepopulated_instances.push(VoxelInstanceRaw {
-                        position: pos,
-                        voxel_type: v.voxel_type as u32,
-                        scale: scale,
-                        ao_factor: 1.0,
-                        custom_color: custom_color_f32,
-                        emissive: [
-                            emissive_rgb[0],
-                            emissive_rgb[1],
-                            emissive_rgb[2],
-                            emissive_intensity,
-                        ],
-                    });
+                    // Check buffer capacity before adding
+                    if self.cpu_prepopulated_instances.len() < self.max_gpu_instances {
+                        self.cpu_prepopulated_instances.push(VoxelInstanceRaw {
+                            position: pos,
+                            voxel_type: v.voxel_type as u32,
+                            scale: scale,
+                            ao_factor: 1.0,
+                            custom_color: custom_color_f32,
+                            emissive: [
+                                emissive_rgb[0],
+                                emissive_rgb[1],
+                                emissive_rgb[2],
+                                emissive_intensity,
+                            ],
+                        });
 
-                    _voxel_expansion_count += 1;
-                    cpu_prepop = true;
+                        _voxel_expansion_count += 1;
+                        cpu_prepop = true;
+                    }
                 }
             }
 
@@ -6642,6 +6856,10 @@ impl App {
                 flags |= 4;
             }
 
+            if self.gpu_inputs.len() >= self.max_gpu_instances {
+                // Buffer full, stop adding instances to prevent crash
+                continue;
+            }
             self.gpu_inputs.push(GpuInstanceInput {
                 position: [
                     v.position[0] as f32,
@@ -6671,11 +6889,17 @@ impl App {
         if gpu_candidate_count > 0 {
             self.ensure_gpu_input_buffer(&device, gpu_candidate_count);
             if let Some(buffer) = self.gpu_input_buffer.as_ref() {
-                queue.write_buffer(buffer, 0, bytemuck::cast_slice(&self.gpu_inputs));
+                let max_items =
+                    (buffer.size() / std::mem::size_of::<GpuInstanceInput>() as u64) as usize;
+                let items_to_write = gpu_candidate_count.min(max_items);
+                queue.write_buffer(
+                    buffer,
+                    0,
+                    bytemuck::cast_slice(&self.gpu_inputs[0..items_to_write]),
+                );
                 // Count the number of instance entries uploaded to the GPU input buffer
-                self.gpu_buffer_items_frame = self
-                    .gpu_buffer_items_frame
-                    .saturating_add(gpu_candidate_count);
+                self.gpu_buffer_items_frame =
+                    self.gpu_buffer_items_frame.saturating_add(items_to_write);
             }
 
             // Upload Mesh Indirect Args
@@ -6876,24 +7100,36 @@ impl App {
             if cpu_prepopulated_count > 0 {
                 // Ensure fallback instance buffer has room for prepopulated + new appended instances
                 self.ensure_gpu_input_buffer(&device, gpu_candidate_count + cpu_prepopulated_count);
-                if let Some(buffer) = self.fallback_instance_buffer.as_ref() {
-                    queue.write_buffer(
-                        buffer,
-                        0,
-                        bytemuck::cast_slice(&self.cpu_prepopulated_instances),
+
+                // Clamp to actual buffer capacity to prevent overflow
+                let write_count = cpu_prepopulated_count.min(self.fallback_instance_capacity);
+                if write_count < cpu_prepopulated_count {
+                    eprintln!(
+                        "Warning: CPU prepopulated instances {} exceeds fallback buffer capacity {}, truncating.",
+                        cpu_prepopulated_count, self.fallback_instance_capacity
                     );
-                    // Count the CPU-prepopulated instances written into the fallback instance buffer
-                    self.gpu_buffer_items_frame = self
-                        .gpu_buffer_items_frame
-                        .saturating_add(cpu_prepopulated_count);
+                }
+
+                if write_count > 0 {
+                    if let Some(buffer) = self.fallback_instance_buffer.as_ref() {
+                        queue.write_buffer(
+                            buffer,
+                            0,
+                            bytemuck::cast_slice(&self.cpu_prepopulated_instances[..write_count]),
+                        );
+                        // Count the CPU-prepopulated instances written into the fallback instance buffer
+                        self.gpu_buffer_items_frame =
+                            self.gpu_buffer_items_frame.saturating_add(write_count);
+                    }
                 }
             }
 
-            // Reset Fallback Indirect Args (seed instance_count with CPU prepopulated count)
+            // Reset Fallback Indirect Args (seed instance_count with CPU prepopulated count, clamped to what was written)
+            let actual_prepop_count = cpu_prepopulated_count.min(self.fallback_instance_capacity);
             if let Some(buffer) = self.fallback_indirect_buffer.as_ref() {
                 let reset_args = wgpu::util::DrawIndirectArgs {
                     vertex_count: 36,
-                    instance_count: cpu_prepopulated_count as u32,
+                    instance_count: actual_prepop_count as u32,
                     first_vertex: 0,
                     first_instance: 0,
                 };
@@ -7028,6 +7264,24 @@ impl App {
             let max_envelope_dist_sq = self.max_envelope_distance * self.max_envelope_distance;
             let use_envelope = dist_sq > envelope_dist_sq;
 
+            // Frustum check for meshing: don't mesh what we can't see
+            let chunk_min = [key.0 as f32, key.1 as f32, key.2 as f32];
+            let chunk_max = [
+                key.0 as f32 + 16.0,
+                key.1 as f32 + 16.0,
+                key.2 as f32 + 16.0,
+            ];
+            // Allow a small radius around camera to always mesh (e.g. 32 units) to prevent pop-in when turning fast
+            let always_mesh_dist_sq = 32.0 * 32.0;
+            if dist_sq > always_mesh_dist_sq
+                && !self
+                    .camera_controller
+                    .camera
+                    .frustum_cull_aabb(chunk_min, chunk_max)
+            {
+                continue;
+            }
+
             if use_envelope && dist_sq > max_envelope_dist_sq {
                 continue;
             }
@@ -7084,6 +7338,30 @@ impl App {
         }
         mesh_result_collect_time += result_collect_start.elapsed();
 
+        // Prune pending mesh queue: remove chunks that are no longer visible
+        // This prevents wasting work on chunks that were queued but then culled
+        let prune_start = std::time::Instant::now();
+        let original_pending_count = self.pending_chunk_meshes.len();
+        self.pending_chunk_meshes.retain(|key| {
+            if leaf_chunks.contains(key) {
+                true
+            } else {
+                self.pending_chunk_set.remove(key);
+                false
+            }
+        });
+        let pruned_count = original_pending_count - self.pending_chunk_meshes.len();
+        if pruned_count > 0 && self.frame_count % 60 == 0 {
+            // Log occasionally if we're pruning a lot
+            if pruned_count > 100 {
+                eprintln!(
+                    "Pruned {} stale chunks from pending mesh queue",
+                    pruned_count
+                );
+            }
+        }
+        let _prune_time = prune_start.elapsed();
+
         let max_inflight = self.max_inflight_jobs();
         let schedule_start = std::time::Instant::now();
         while self.mesh_jobs_in_flight < max_inflight {
@@ -7137,6 +7415,12 @@ impl App {
                 break;
             };
             let job_create_start = std::time::Instant::now();
+
+            // Skip chunks that are no longer visible (they may have been queued before culling removed them)
+            if !leaf_chunks.contains(&key) {
+                self.pending_chunk_set.remove(&key);
+                continue;
+            }
 
             // Determine if we need an envelope or standard mesh
             let cam_pos = self.camera_controller.camera.position;
@@ -8029,6 +8313,9 @@ impl App {
             lod_distance: self.lod_distance,
             envelope_distance: self.envelope_distance,
             envelope_fade_range: self.envelope_fade_range,
+            water_level: self.water_level,
+            water_visibility: self.water_visibility,
+            _water_pad: [0.0; 2],
             inverse_view: inverse_view_cols,
             inverse_proj: inverse_proj_cols,
         };
@@ -9346,6 +9633,18 @@ impl App {
                 , processed_meshes
                     , frame_mesh_upload_limit
             );
+            // Print culling statistics grouped by reason
+            println!(
+                "  Cull Stats: examined={}, visible={}, frustum={}, marginal={}, shell={}, empty={}, no_shell={}, depth={}",
+                self.cull_stats.chunks_examined,
+                self.cull_stats.chunks_visible,
+                self.cull_stats.frustum_aabb_culled,
+                self.cull_stats.marginal_bitmap_culled,
+                self.cull_stats.hierarchy_shell_culled,
+                self.cull_stats.empty_chunk_culled,
+                self.cull_stats.no_shell_available,
+                depth_culled_count,
+            );
 
             // Update UI overlay stats
             self.visible_count = total_visible;
@@ -9382,20 +9681,6 @@ impl App {
             self.ready_mesh_count = ready_count;
             self.jobs_in_flight = jobs_in_flight;
             self.jobs_per_sec_snapshot = jobs_per_sec;
-            // Print Kawase timing ones per second to avoid spamming
-            if self.kawase_acc_frames > 0 {
-                let avg_write =
-                    self.kawase_write_acc.as_secs_f64() * 1000.0 / self.kawase_acc_frames as f64;
-                let avg_pass =
-                    self.kawase_pass_acc.as_secs_f64() * 1000.0 / self.kawase_acc_frames as f64;
-                println!(
-                    "Kawase write avg: {:.3}ms, pass avg: {:.3}ms (over {} frames)",
-                    avg_write, avg_pass, self.kawase_acc_frames
-                );
-                self.kawase_write_acc = std::time::Duration::from_secs(0);
-                self.kawase_pass_acc = std::time::Duration::from_secs(0);
-                self.kawase_acc_frames = 0;
-            }
             self.frame_count = 0;
             self.last_fps_print = now;
         }

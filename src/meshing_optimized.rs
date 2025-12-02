@@ -272,7 +272,7 @@ pub fn generate_chunk_mesh_optimized(
                     let voxel_type = if envelope {
                         0
                     } else {
-                        chunk.get_type(x as u8, y as u8, z as u8).unwrap_or(1)
+                        chunk.get_type(x as u8, y as u8, z as u8).unwrap_or(0)
                     };
                     let ao =
                         calculate_ao(chunk, neighbors, x as i32, y as i32, z as i32, face_axis);

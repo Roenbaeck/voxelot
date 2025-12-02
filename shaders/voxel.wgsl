@@ -19,6 +19,11 @@ struct Uniforms {
     lod_distance: f32,
     envelope_distance: f32,
     envelope_fade_range: f32,
+    water_level: f32,
+    water_visibility: f32,
+    _water_pad: vec2<f32>,
+    inverse_view: mat4x4<f32>,
+    inverse_proj: mat4x4<f32>,
 }
 
 struct LightProbe {
@@ -31,6 +36,7 @@ struct LightProbe {
 @group(0) @binding(1) var shadow_map: texture_depth_2d;
 @group(0) @binding(2) var shadow_sampler: sampler_comparison;
 @group(0) @binding(3) var<storage, read> light_probes: array<LightProbe>;
+@group(0) @binding(4) var<storage, read> palette: array<vec4<f32>>;
 
 
 struct VertexOutputInstanced {
@@ -93,32 +99,9 @@ const CUBE_NORMALS: array<vec3<f32>, 6> = array<vec3<f32>, 6>(
 );
 
 fn get_voxel_color(voxel_type: u32) -> vec3<f32> {
-    switch (voxel_type) {
-        case 1u: {
-            return vec3<f32>(0.1, 0.9, 0.3); // Neon grass highlights
-        }
-        case 2u: {
-            return vec3<f32>(1.0, 0.35, 0.35); // Sunlit red concrete
-        }
-        case 3u: {
-            return vec3<f32>(0.35, 0.5, 1.0); // Electric blue panels
-        }
-        case 4u: {
-            return vec3<f32>(0.95, 0.9, 0.35); // Warm accent lighting
-        }
-        case 5u: {
-            return vec3<f32>(0.95, 0.4, 1.0); // Vibrant magenta glass
-        }
-        case 6u: {
-            return vec3<f32>(0.3, 0.95, 1.0); // Cyan signage glow
-        }
-        case 7u: {
-            return vec3<f32>(0.85, 0.85, 0.85); // Bright concrete walls
-        }
-        default: {
-            return vec3<f32>(1.0, 1.0, 1.0); // White default
-        }
-    }
+    // Look up color from palette buffer (clamped to 0-255 range)
+    let idx = min(voxel_type, 255u);
+    return palette[idx].rgb;
 }
 
 @vertex
@@ -248,10 +231,9 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     let fade_end = uniforms.lod_distance * 0.95;
     let fade_factor = smoothstep(fade_start, fade_end, distance);
     
-    // Use world position hash for stable, deterministic alpha testing
-    // Higher frequency (50.0) creates finer noise that blurs better
-    let hash_pos = floor(relative_pos * 50.0);
-    let hash_val = fract(sin(dot(hash_pos, vec3<f32>(12.9898, 78.233, 45.164))) * 43758.5453);
+    // Use improved noise for stable, deterministic alpha testing with less moiré
+    let noise_pos = relative_pos * 7.3 + vec3<f32>(input.world_pos.x * 0.1, input.world_pos.y * 0.1, input.world_pos.z * 0.1);
+    let hash_val = fract(sin(dot(floor(noise_pos), vec3<f32>(127.1, 311.7, 74.7))) * 43758.5453);
     
     if fade_factor > hash_val {
         discard;
@@ -280,11 +262,55 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
         brightened = mix(brightened, env_fogged, env_fade_factor);
     }
     
+    // Underwater depth fade: fade geometry based on depth below water surface
+    // Similar to distance fade, but based on y-coordinate depth from water_level (Y is up)
+    let water_level = uniforms.water_level;
+    let water_vis = uniforms.water_visibility;
+    let underwater_depth = water_level - input.world_pos.y;
+    var underwater_alpha = 1.0;
+    
+    // Only apply underwater fade if the geometry is actually underwater
+    if (underwater_depth > 0.0 && water_vis > 0.0) {
+        // Calculate fade factor: 0 at surface, 1 at max visibility depth
+        let underwater_fade = smoothstep(0.0, water_vis, underwater_depth);
+        
+        // Multi-frequency noise for organic water-like diffusion
+        // Layer multiple noise octaves to create softer, more natural underwater appearance
+        let noise_pos1 = input.world_pos * 7.3 + vec3<f32>(relative_pos.x * 0.1, relative_pos.y * 0.1, relative_pos.z * 0.1);
+        let noise_pos2 = input.world_pos * 3.7 + vec3<f32>(relative_pos.x * 0.05, relative_pos.y * 0.05, relative_pos.z * 0.05);
+        let noise_pos3 = input.world_pos * 13.9 + vec3<f32>(relative_pos.x * 0.15, relative_pos.y * 0.15, relative_pos.z * 0.15);
+        
+        let hash1 = fract(sin(dot(floor(noise_pos1), vec3<f32>(127.1, 311.7, 74.7))) * 43758.5453);
+        let hash2 = fract(sin(dot(floor(noise_pos2), vec3<f32>(269.5, 183.3, 421.9))) * 43758.5453);
+        let hash3 = fract(sin(dot(floor(noise_pos3), vec3<f32>(419.2, 371.9, 168.4))) * 43758.5453);
+        
+        // Use primary hash for dithering, but modulate the fade threshold with secondary noise
+        // This adds organic variation without biasing the statistical distribution
+        let detail_variation = (hash2 - 0.5) * 0.15 + (hash3 - 0.5) * 0.08; // Range: ~[-0.115, +0.115]
+        let modulated_fade = underwater_fade + detail_variation;
+        
+        // Use dithering to discard pixels as they get deeper
+        if (modulated_fade > hash1) {
+            discard;
+        }
+        
+        // Alpha fade using Beer-Lambert exponential decay (how light behaves in water)
+        // exp(-k*d) where k controls absorption rate, d is depth
+        // At depth = water_vis, we want alpha to be near 0
+        // exp(-3) ≈ 0.05, so k = 3/water_vis gives ~5% visibility at max depth
+        let absorption_coefficient = 3.0 / water_vis;
+        underwater_alpha = exp(-absorption_coefficient * underwater_depth);
+        
+        // Also tint remaining pixels toward a darker blue-green for underwater atmosphere
+        let water_tint = vec3<f32>(0.1, 0.3, 0.4);
+        brightened = mix(brightened, water_tint * ambient, underwater_fade * 0.7);
+    }
+    
     // Add gradual alpha fading for smoother transitions
     // Alpha fades 60-95% while dithering operates 80-95% on semi-transparent fragments
     let alpha_fade_start = uniforms.lod_distance * 0.60;
     let alpha_fade_end = uniforms.lod_distance * 0.95;
-    let alpha = 1.0 - smoothstep(alpha_fade_start, alpha_fade_end, distance);
+    let alpha = (1.0 - smoothstep(alpha_fade_start, alpha_fade_end, distance)) * underwater_alpha;
 
     var out: FragmentOutput;
     out.color = vec4<f32>(brightened, alpha);
@@ -390,12 +416,11 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     let fade_end = uniforms.lod_distance * 0.95;
     let fade_factor = smoothstep(fade_start, fade_end, distance);
     
-    // Use world position hash for stable, deterministic alpha testing
-    // Higher frequency (50.0) creates finer noise that blurs better
-    let hash_pos = floor(input.world_pos * 50.0);
-    let hash_val = fract(sin(dot(hash_pos, vec3<f32>(12.9898, 78.233, 45.164))) * 43758.5453);
+    // Use improved noise function - lower frequency reduces moiré patterns
+    let hash_pos2 = floor(input.world_pos * 7.3);  // Lower frequency
+    let hash_val2 = fract(sin(dot(hash_pos2, vec3<f32>(17.0, 59.4, 113.0))) * 1e4);
     
-    if fade_factor > hash_val {
+    if fade_factor > hash_val2 {
         discard;
     }
     
@@ -421,11 +446,52 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
         brightened = mix(brightened, env_fogged, env_fade_factor);
     }
     
+    // Underwater depth fade: fade geometry based on depth below water surface
+    // Similar to distance fade, but based on y-coordinate depth from water_level (Y is up)
+    let water_level_mesh = uniforms.water_level;
+    let water_vis_mesh = uniforms.water_visibility;
+    let underwater_depth_mesh = water_level_mesh - input.world_pos.y;
+    var underwater_alpha_mesh = 1.0;
+    
+    // Only apply underwater fade if the geometry is actually underwater
+    if (underwater_depth_mesh > 0.0 && water_vis_mesh > 0.0) {
+        // Calculate fade factor: 0 at surface, 1 at max visibility depth
+        let underwater_fade_mesh = smoothstep(0.0, water_vis_mesh, underwater_depth_mesh);
+        
+        // Multi-frequency noise for organic water-like diffusion
+        // Layer multiple noise octaves to create softer, more natural underwater appearance
+        let noise_pos1_mesh = input.world_pos * 7.3 + vec3<f32>(relative_pos.x * 0.1, relative_pos.y * 0.1, relative_pos.z * 0.1);
+        let noise_pos2_mesh = input.world_pos * 3.7 + vec3<f32>(relative_pos.x * 0.05, relative_pos.y * 0.05, relative_pos.z * 0.05);
+        let noise_pos3_mesh = input.world_pos * 13.9 + vec3<f32>(relative_pos.x * 0.15, relative_pos.y * 0.15, relative_pos.z * 0.15);
+        
+        let hash1_mesh = fract(sin(dot(floor(noise_pos1_mesh), vec3<f32>(127.1, 311.7, 74.7))) * 43758.5453);
+        let hash2_mesh = fract(sin(dot(floor(noise_pos2_mesh), vec3<f32>(269.5, 183.3, 421.9))) * 43758.5453);
+        let hash3_mesh = fract(sin(dot(floor(noise_pos3_mesh), vec3<f32>(419.2, 371.9, 168.4))) * 43758.5453);
+        
+        // Use primary hash for dithering, but modulate the fade threshold with secondary noise
+        // This adds organic variation without biasing the statistical distribution
+        let detail_variation_mesh = (hash2_mesh - 0.5) * 0.15 + (hash3_mesh - 0.5) * 0.08; // Range: ~[-0.115, +0.115]
+        let modulated_fade_mesh = underwater_fade_mesh + detail_variation_mesh;
+        
+        // Use dithering to discard pixels as they get deeper
+        if (modulated_fade_mesh > hash1_mesh) {
+            discard;
+        }
+        
+        // Alpha fade using Beer-Lambert exponential decay (how light behaves in water)
+        let absorption_coefficient_mesh = 3.0 / water_vis_mesh;
+        underwater_alpha_mesh = exp(-absorption_coefficient_mesh * underwater_depth_mesh);
+        
+        // Also tint remaining pixels toward a darker blue-green for underwater atmosphere
+        let water_tint_mesh = vec3<f32>(0.1, 0.3, 0.4);
+        brightened = mix(brightened, water_tint_mesh * ambient, underwater_fade_mesh * 0.7);
+    }
+    
     // Add gradual alpha fading for smoother transitions
     // Alpha fades 60-95% while dithering operates 80-95% on semi-transparent fragments
     let alpha_fade_start = uniforms.lod_distance * 0.60;
     let alpha_fade_end = uniforms.lod_distance * 0.95;
-    let alpha = 1.0 - smoothstep(alpha_fade_start, alpha_fade_end, distance);
+    let alpha = (1.0 - smoothstep(alpha_fade_start, alpha_fade_end, distance)) * underwater_alpha_mesh;
     
     var out: FragmentOutput;
     out.color = vec4<f32>(brightened, alpha);

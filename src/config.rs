@@ -32,6 +32,8 @@ pub struct WorldConfig {
     pub camera_position: [f32; 3],
     #[serde(default = "default_water_level")]
     pub water_level: f32,
+    #[serde(default = "default_water_visibility")]
+    pub water_visibility: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +208,9 @@ pub struct PerformanceConfig {
     pub max_draw_capacity: usize,
     #[serde(default = "default_render_scale")]
     pub render_scale: f32,
+    /// Maximum number of GPU instances (chunks + fallback voxels). Limits memory usage.
+    #[serde(default = "default_max_gpu_instances")]
+    pub max_gpu_instances: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,6 +236,10 @@ fn default_camera_position() -> [f32; 3] {
 
 fn default_water_level() -> f32 {
     16.0
+}
+
+fn default_water_visibility() -> f32 {
+    20.0
 }
 
 fn default_lod_subdivide_distance() -> f32 {
@@ -475,6 +484,10 @@ fn default_render_scale() -> f32 {
     1.0
 }
 
+fn default_max_gpu_instances() -> usize {
+    6_000_000 // ~384MB for VoxelInstanceRaw (64 bytes each)
+}
+
 fn default_true() -> bool {
     true
 }
@@ -487,6 +500,7 @@ impl Default for WorldConfig {
             palette: default_palette_file(),
             camera_position: default_camera_position(),
             water_level: default_water_level(),
+            water_visibility: default_water_visibility(),
         }
     }
 }
@@ -610,6 +624,7 @@ impl Default for PerformanceConfig {
             mega_index_buffer_mb: default_mega_index_buffer_mb(),
             max_draw_capacity: default_max_draw_capacity(),
             render_scale: default_render_scale(),
+            max_gpu_instances: default_max_gpu_instances(),
         }
     }
 }
