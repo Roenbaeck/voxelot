@@ -6468,6 +6468,61 @@ impl App {
 
         self.recreate_offscreen_targets();
 
+        // Initial CPU cull and seeding of pending meshing queue to avoid enqueueing
+        // everything before the first render pass. This primes the mesh worker queue
+        // with only visible chunks and gives accurate cull_stats / visible counts.
+        {
+            let (all_visible, stats) = cull_visible_voxels_parallel(&self.world, &self.camera_controller.camera);
+            self.cull_stats = stats;
+
+            // Depth cull like in render loop: hide geometry fully below water
+            let min_visible_y = self.water_level - self.water_visibility;
+            let visible: Vec<_> = all_visible
+                .into_iter()
+                .filter(|v| {
+                    let max_y = v.position[1] as f32 + v.scale[1];
+                    max_y >= min_visible_y
+                })
+                .collect();
+
+            // Seed the pending meshing queue with visible leaf chunks
+            if self.mesh_worker_count > 0 {
+                let mut seen = FxHashSet::default();
+                for v in visible.iter() {
+                    if !v.is_leaf_chunk {
+                        continue;
+                    }
+                    let key = (v.position[0], v.position[1], v.position[2]);
+                    if seen.contains(&key) { continue; }
+                    seen.insert(key);
+
+                    // Skip if we already have meshes; queue only missing ones
+                    let has_standard = self.mesh_cache.contains_key(&key);
+                    let has_envelope = self.envelope_mesh_cache.contains_key(&key);
+                    if has_standard || has_envelope { continue; }
+
+                    // LOD distance prioritization
+                    let cam_pos = self.camera_controller.camera.position;
+                    let chunk_center = [key.0 as f32 + 8.0, key.1 as f32 + 8.0, key.2 as f32 + 8.0];
+                    let dx = chunk_center[0] - cam_pos[0];
+                    let dy = chunk_center[1] - cam_pos[1];
+                    let dz = chunk_center[2] - cam_pos[2];
+                    let dist_sq = dx * dx + dy * dy + dz * dz;
+                    let lod_sq = self.lod_distance * self.lod_distance;
+                    if dist_sq <= lod_sq {
+                        self.pending_chunk_meshes.push_front(key);
+                    } else {
+                        self.pending_chunk_meshes.push_back(key);
+                    }
+                    self.pending_chunk_set.insert(key);
+                }
+            }
+
+            // For now, avoid calling run_gpu_culling here because it requires a mutable self borrow
+            // while we already hold immutable borrows. Optionally, we could schedule an initial
+            // GPU cull on the first frame instead.
+        }
+
         viewer_debug!("DEBUG: mesh_pipeline created successfully");
         println!("wgpu initialized");
         println!(
