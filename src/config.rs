@@ -32,6 +32,8 @@ pub struct WorldConfig {
     pub camera_position: [f32; 3],
     #[serde(default = "default_water_level")]
     pub water_level: f32,
+    #[serde(default = "default_water_visibility")]
+    pub water_visibility: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,6 +236,10 @@ fn default_camera_position() -> [f32; 3] {
 
 fn default_water_level() -> f32 {
     16.0
+}
+
+fn default_water_visibility() -> f32 {
+    20.0
 }
 
 fn default_lod_subdivide_distance() -> f32 {
@@ -494,6 +500,7 @@ impl Default for WorldConfig {
             palette: default_palette_file(),
             camera_position: default_camera_position(),
             water_level: default_water_level(),
+            water_visibility: default_water_visibility(),
         }
     }
 }

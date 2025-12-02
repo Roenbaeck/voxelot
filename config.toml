@@ -1,5 +1,5 @@
 [world]
-file = "test_verify.oct"
+file = "test_world_v3.oct"
 palette = "worlds/palette.txt"
 camera_position = [
     320.0,
@@ -7,6 +7,7 @@ camera_position = [
     320.0,
 ]
 water_level = 500.0
+water_visibility = 50.0
 
 [rendering]
 lod_subdivide_distance = 2000.0
@@ -21,7 +22,7 @@ window_height = 720
 
 [atmosphere]
 fog_density = 0.00019999995
-time_of_day = 0.35173547
+time_of_day = 0.38432273
 night_skybox_brightness = 0.02
 horizon_fade_up = 0.05
 horizon_fade_down = 0.25
