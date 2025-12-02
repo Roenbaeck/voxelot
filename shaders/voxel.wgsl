@@ -274,13 +274,23 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
         // Calculate fade factor: 0 at surface, 1 at max visibility depth
         let underwater_fade = smoothstep(0.0, water_vis, underwater_depth);
         
-        // Use improved noise for underwater dithering to reduce moiré patterns
-        // Combine world position with screen-space variation for more organic noise
-        let noise_pos = input.world_pos * 7.3 + vec3<f32>(relative_pos.x * 0.1, relative_pos.y * 0.1, relative_pos.z * 0.1);
-        let underwater_hash = fract(sin(dot(floor(noise_pos), vec3<f32>(127.1, 311.7, 74.7))) * 43758.5453);
+        // Multi-frequency noise for organic water-like diffusion
+        // Layer multiple noise octaves to create softer, more natural underwater appearance
+        let noise_pos1 = input.world_pos * 7.3 + vec3<f32>(relative_pos.x * 0.1, relative_pos.y * 0.1, relative_pos.z * 0.1);
+        let noise_pos2 = input.world_pos * 3.7 + vec3<f32>(relative_pos.x * 0.05, relative_pos.y * 0.05, relative_pos.z * 0.05);
+        let noise_pos3 = input.world_pos * 13.9 + vec3<f32>(relative_pos.x * 0.15, relative_pos.y * 0.15, relative_pos.z * 0.15);
+        
+        let hash1 = fract(sin(dot(floor(noise_pos1), vec3<f32>(127.1, 311.7, 74.7))) * 43758.5453);
+        let hash2 = fract(sin(dot(floor(noise_pos2), vec3<f32>(269.5, 183.3, 421.9))) * 43758.5453);
+        let hash3 = fract(sin(dot(floor(noise_pos3), vec3<f32>(419.2, 371.9, 168.4))) * 43758.5453);
+        
+        // Use primary hash for dithering, but modulate the fade threshold with secondary noise
+        // This adds organic variation without biasing the statistical distribution
+        let detail_variation = (hash2 - 0.5) * 0.15 + (hash3 - 0.5) * 0.08; // Range: ~[-0.115, +0.115]
+        let modulated_fade = underwater_fade + detail_variation;
         
         // Use dithering to discard pixels as they get deeper
-        if (underwater_fade > underwater_hash) {
+        if (modulated_fade > hash1) {
             discard;
         }
         
@@ -448,12 +458,23 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
         // Calculate fade factor: 0 at surface, 1 at max visibility depth
         let underwater_fade_mesh = smoothstep(0.0, water_vis_mesh, underwater_depth_mesh);
         
-        // Use improved noise for underwater dithering to reduce moiré patterns
-        let noise_pos_mesh = input.world_pos * 7.3 + vec3<f32>(relative_pos.x * 0.1, relative_pos.y * 0.1, relative_pos.z * 0.1);
-        let underwater_hash_mesh = fract(sin(dot(floor(noise_pos_mesh), vec3<f32>(127.1, 311.7, 74.7))) * 43758.5453);
+        // Multi-frequency noise for organic water-like diffusion
+        // Layer multiple noise octaves to create softer, more natural underwater appearance
+        let noise_pos1_mesh = input.world_pos * 7.3 + vec3<f32>(relative_pos.x * 0.1, relative_pos.y * 0.1, relative_pos.z * 0.1);
+        let noise_pos2_mesh = input.world_pos * 3.7 + vec3<f32>(relative_pos.x * 0.05, relative_pos.y * 0.05, relative_pos.z * 0.05);
+        let noise_pos3_mesh = input.world_pos * 13.9 + vec3<f32>(relative_pos.x * 0.15, relative_pos.y * 0.15, relative_pos.z * 0.15);
+        
+        let hash1_mesh = fract(sin(dot(floor(noise_pos1_mesh), vec3<f32>(127.1, 311.7, 74.7))) * 43758.5453);
+        let hash2_mesh = fract(sin(dot(floor(noise_pos2_mesh), vec3<f32>(269.5, 183.3, 421.9))) * 43758.5453);
+        let hash3_mesh = fract(sin(dot(floor(noise_pos3_mesh), vec3<f32>(419.2, 371.9, 168.4))) * 43758.5453);
+        
+        // Use primary hash for dithering, but modulate the fade threshold with secondary noise
+        // This adds organic variation without biasing the statistical distribution
+        let detail_variation_mesh = (hash2_mesh - 0.5) * 0.15 + (hash3_mesh - 0.5) * 0.08; // Range: ~[-0.115, +0.115]
+        let modulated_fade_mesh = underwater_fade_mesh + detail_variation_mesh;
         
         // Use dithering to discard pixels as they get deeper
-        if (underwater_fade_mesh > underwater_hash_mesh) {
+        if (modulated_fade_mesh > hash1_mesh) {
             discard;
         }
         

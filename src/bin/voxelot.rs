@@ -26,8 +26,8 @@ use std::collections::VecDeque;
 use sysinfo::{Pid, ProcessExt, System, SystemExt};
 use voxelot::SlabAllocator;
 use voxelot::{
-    bbox_local_to_world, cull_visible_voxels_parallel, Camera, Chunk, ChunkMesh, CullStats, Palette,
-    RenderConfig, VoxelInstance, World, WorldPos,
+    bbox_local_to_world, cull_visible_voxels_parallel, Camera, Chunk, ChunkMesh, CullStats,
+    Palette, RenderConfig, VoxelInstance, World, WorldPos,
 };
 
 macro_rules! viewer_debug {
@@ -1212,15 +1212,15 @@ impl App {
         // Failsafe: Ensure camera spawns above terrain
         let mut cam_pos = initial_camera;
         let start_y = cam_pos[1];
-        
+
         // Strategy: Search from top of world down to find the highest solid voxel at camera X,Z
         // Then place camera 10 units above that point
         let world_height = world.world_size() as i64;
         let cam_x = cam_pos[0].floor() as i64;
         let cam_z = cam_pos[2].floor() as i64;
-        
+
         let mut highest_solid_y: Option<i64> = None;
-        
+
         // Search from near the top of the world downward
         for y in (0..world_height).rev() {
             let wp = WorldPos::new(cam_x, y, cam_z);
@@ -1231,7 +1231,7 @@ impl App {
                 }
             }
         }
-        
+
         // Place camera above the highest solid voxel found, or use a reasonable default
         if let Some(solid_y) = highest_solid_y {
             let safe_y = (solid_y + 10) as f32;
@@ -3862,7 +3862,7 @@ impl App {
                 // evicted += 1;
             }
         }
-        /* 
+        /*
         if evicted > 0 {
             println!(
                 "Evicted {} envelope meshes, freed {:.1} MB (current usage {:.1} MB)",
@@ -6507,14 +6507,16 @@ impl App {
 
         // Gather candidate voxels for GPU culling using CPU hierarchy traversal
         let cull_start = Instant::now();
-        let (all_visible, cull_stats) = cull_visible_voxels_parallel(&self.world, &self.camera_controller.camera);
+        let (all_visible, cull_stats) =
+            cull_visible_voxels_parallel(&self.world, &self.camera_controller.camera);
         self.cull_stats = cull_stats;
         let cull_time = cull_start.elapsed();
-        
+
         // CPU cull: filter out chunks that are completely below water visibility threshold
         // Any chunk whose max y-value is below (water_level - water_visibility) is invisible
         // Y is the up axis in this engine
         let min_visible_y = self.water_level - self.water_visibility;
+        let pre_depth_cull_count = all_visible.len();
         let visible: Vec<_> = all_visible
             .into_iter()
             .filter(|v| {
@@ -6523,6 +6525,7 @@ impl App {
                 max_y >= min_visible_y
             })
             .collect();
+        let depth_culled_count = pre_depth_cull_count - visible.len();
 
         let mut _voxel_expansion_count = 0;
         // Reuse persistent allocation across frames to avoid heap churn
@@ -7042,7 +7045,7 @@ impl App {
             if cpu_prepopulated_count > 0 {
                 // Ensure fallback instance buffer has room for prepopulated + new appended instances
                 self.ensure_gpu_input_buffer(&device, gpu_candidate_count + cpu_prepopulated_count);
-                
+
                 // Clamp to actual buffer capacity to prevent overflow
                 let write_count = cpu_prepopulated_count.min(self.fallback_instance_capacity);
                 if write_count < cpu_prepopulated_count {
@@ -7051,7 +7054,7 @@ impl App {
                         cpu_prepopulated_count, self.fallback_instance_capacity
                     );
                 }
-                
+
                 if write_count > 0 {
                     if let Some(buffer) = self.fallback_instance_buffer.as_ref() {
                         queue.write_buffer(
@@ -7060,9 +7063,8 @@ impl App {
                             bytemuck::cast_slice(&self.cpu_prepopulated_instances[..write_count]),
                         );
                         // Count the CPU-prepopulated instances written into the fallback instance buffer
-                        self.gpu_buffer_items_frame = self
-                            .gpu_buffer_items_frame
-                            .saturating_add(write_count);
+                        self.gpu_buffer_items_frame =
+                            self.gpu_buffer_items_frame.saturating_add(write_count);
                     }
                 }
             }
@@ -7297,7 +7299,10 @@ impl App {
         if pruned_count > 0 && self.frame_count % 60 == 0 {
             // Log occasionally if we're pruning a lot
             if pruned_count > 100 {
-                eprintln!("Pruned {} stale chunks from pending mesh queue", pruned_count);
+                eprintln!(
+                    "Pruned {} stale chunks from pending mesh queue",
+                    pruned_count
+                );
             }
         }
         let _prune_time = prune_start.elapsed();
@@ -9575,7 +9580,7 @@ impl App {
             );
             // Print culling statistics grouped by reason
             println!(
-                "  Cull Stats: examined={}, visible={}, frustum={}, marginal={}, shell={}, empty={}, no_shell={}",
+                "  Cull Stats: examined={}, visible={}, frustum={}, marginal={}, shell={}, empty={}, no_shell={}, depth={}",
                 self.cull_stats.chunks_examined,
                 self.cull_stats.chunks_visible,
                 self.cull_stats.frustum_aabb_culled,
@@ -9583,6 +9588,7 @@ impl App {
                 self.cull_stats.hierarchy_shell_culled,
                 self.cull_stats.empty_chunk_culled,
                 self.cull_stats.no_shell_available,
+                depth_culled_count,
             );
 
             // Update UI overlay stats
