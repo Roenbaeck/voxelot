@@ -17,6 +17,9 @@ struct CameraUniforms {
     lod_distance: f32,
     envelope_distance: f32,
     envelope_fade_range: f32,
+    water_level: f32,
+    water_visibility: f32,
+    _water_pad: vec2<f32>,
     inverse_view: mat4x4<f32>,
     inverse_proj: mat4x4<f32>,
 };

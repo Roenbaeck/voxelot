@@ -216,6 +216,9 @@ struct Uniforms {
     lod_distance: f32, // LOD render distance for fade calculation
     envelope_distance: f32,
     envelope_fade_range: f32,
+    water_level: f32,
+    water_visibility: f32,
+    _water_pad: [f32; 2], // Padding for alignment
     inverse_view: [[f32; 4]; 4],
     inverse_proj: [[f32; 4]; 4],
 }
@@ -884,6 +887,7 @@ struct App {
 
     // Water state
     water_level: f32,
+    water_visibility: f32,
 
     // Post-processing state
     dof_coc_pipeline: Option<wgpu::RenderPipeline>,
@@ -1516,6 +1520,7 @@ impl App {
             light_probe_capacity: 0,
             lod_distance: cfg.rendering.chunk_lod_distance,
             water_level: cfg.world.water_level,
+            water_visibility: cfg.world.water_visibility,
             emissive_texture: None,
             emissive_view: None,
             emissive_texture_bytes: 0,
@@ -1726,6 +1731,7 @@ impl App {
 
             // World settings
             full_cfg.world.water_level = self.water_level;
+            full_cfg.world.water_visibility = self.water_visibility;
 
             // DoF settings
             full_cfg.effects.depth_of_field.enabled = self.dof_enabled;
@@ -5875,6 +5881,9 @@ impl App {
             lod_distance: 800.0,
             envelope_distance: 256.0,
             envelope_fade_range: 32.0,
+            water_level: self.water_level,
+            water_visibility: self.water_visibility,
+            _water_pad: [0.0; 2],
             inverse_view: [[0.0; 4]; 4],
             inverse_proj: [[0.0; 4]; 4],
         };
@@ -6501,6 +6510,19 @@ impl App {
         let (visible, cull_stats) = cull_visible_voxels_parallel(&self.world, &self.camera_controller.camera);
         self.cull_stats = cull_stats;
         let cull_time = cull_start.elapsed();
+        
+        // CPU cull: filter out chunks that are completely below water visibility threshold
+        // Any chunk whose max z-value is below (water_level - water_visibility) is invisible
+        // NOTE: This optimization is disabled for now - the shader handles the fade effect
+        // TODO: Re-enable once we verify the shader underwater fade works correctly
+        // let min_visible_z = self.water_level - self.water_visibility;
+        // let visible: Vec<_> = all_visible
+        //     .into_iter()
+        //     .filter(|v| {
+        //         let max_z = v.position[2] as f32 + v.scale[2];
+        //         max_z >= min_visible_z
+        //     })
+        //     .collect();
 
         let mut _voxel_expansion_count = 0;
         // Reuse persistent allocation across frames to avoid heap churn
@@ -8231,6 +8253,9 @@ impl App {
             lod_distance: self.lod_distance,
             envelope_distance: self.envelope_distance,
             envelope_fade_range: self.envelope_fade_range,
+            water_level: self.water_level,
+            water_visibility: self.water_visibility,
+            _water_pad: [0.0; 2],
             inverse_view: inverse_view_cols,
             inverse_proj: inverse_proj_cols,
         };

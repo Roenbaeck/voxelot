@@ -19,6 +19,11 @@ struct Uniforms {
     lod_distance: f32,
     envelope_distance: f32,
     envelope_fade_range: f32,
+    water_level: f32,
+    water_visibility: f32,
+    _water_pad: vec2<f32>,
+    inverse_view: mat4x4<f32>,
+    inverse_proj: mat4x4<f32>,
 }
 
 struct LightProbe {
@@ -258,6 +263,28 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
         brightened = mix(brightened, env_fogged, env_fade_factor);
     }
     
+    // Underwater depth fade: fade geometry based on depth below water surface
+    // Similar to distance fade, but based on y-coordinate depth from water_level (Y is up)
+    let water_level = uniforms.water_level;
+    let water_vis = uniforms.water_visibility;
+    let underwater_depth = water_level - input.world_pos.y;
+    
+    // Only apply underwater fade if the geometry is actually underwater
+    if (underwater_depth > 0.0 && water_vis > 0.0) {
+        // Calculate fade factor: 0 at surface, 1 at max visibility depth
+        let underwater_fade = smoothstep(0.0, water_vis, underwater_depth);
+        
+        // Use dithering to discard pixels as they get deeper (same technique as distance fade)
+        // This creates a soft dissolve effect rather than a hard cutoff
+        if (underwater_fade > hash_val) {
+            discard;
+        }
+        
+        // Also tint remaining pixels toward a darker blue-green for underwater atmosphere
+        let water_tint = vec3<f32>(0.1, 0.3, 0.4);
+        brightened = mix(brightened, water_tint * ambient, underwater_fade * 0.7);
+    }
+    
     // Add gradual alpha fading for smoother transitions
     // Alpha fades 60-95% while dithering operates 80-95% on semi-transparent fragments
     let alpha_fade_start = uniforms.lod_distance * 0.60;
@@ -397,6 +424,27 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
         let env_fogged = mix(env_lit, fog_color + inscatter, fog_factor);
         
         brightened = mix(brightened, env_fogged, env_fade_factor);
+    }
+    
+    // Underwater depth fade: fade geometry based on depth below water surface
+    // Similar to distance fade, but based on y-coordinate depth from water_level (Y is up)
+    let water_level_mesh = uniforms.water_level;
+    let water_vis_mesh = uniforms.water_visibility;
+    let underwater_depth_mesh = water_level_mesh - input.world_pos.y;
+    
+    // Only apply underwater fade if the geometry is actually underwater
+    if (underwater_depth_mesh > 0.0 && water_vis_mesh > 0.0) {
+        // Calculate fade factor: 0 at surface, 1 at max visibility depth
+        let underwater_fade_mesh = smoothstep(0.0, water_vis_mesh, underwater_depth_mesh);
+        
+        // Use dithering to discard pixels as they get deeper (same technique as distance fade)
+        if (underwater_fade_mesh > hash_val) {
+            discard;
+        }
+        
+        // Also tint remaining pixels toward a darker blue-green for underwater atmosphere
+        let water_tint_mesh = vec3<f32>(0.1, 0.3, 0.4);
+        brightened = mix(brightened, water_tint_mesh * ambient, underwater_fade_mesh * 0.7);
     }
     
     // Add gradual alpha fading for smoother transitions
