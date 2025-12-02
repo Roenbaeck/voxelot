@@ -268,17 +268,26 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     let water_level = uniforms.water_level;
     let water_vis = uniforms.water_visibility;
     let underwater_depth = water_level - input.world_pos.y;
+    var underwater_alpha = 1.0;
     
     // Only apply underwater fade if the geometry is actually underwater
     if (underwater_depth > 0.0 && water_vis > 0.0) {
         // Calculate fade factor: 0 at surface, 1 at max visibility depth
         let underwater_fade = smoothstep(0.0, water_vis, underwater_depth);
         
-        // Use dithering to discard pixels as they get deeper (same technique as distance fade)
-        // This creates a soft dissolve effect rather than a hard cutoff
-        if (underwater_fade > hash_val) {
+        // Use improved noise for underwater dithering to reduce moiré patterns
+        // Combine world position with screen-space variation for more organic noise
+        let noise_pos = input.world_pos * 7.3 + vec3<f32>(relative_pos.x * 0.1, relative_pos.y * 0.1, relative_pos.z * 0.1);
+        let underwater_hash = fract(sin(dot(floor(noise_pos), vec3<f32>(127.1, 311.7, 74.7))) * 43758.5453);
+        
+        // Use dithering to discard pixels as they get deeper
+        if (underwater_fade > underwater_hash) {
             discard;
         }
+        
+        // Alpha fade: geometry becomes more transparent with depth
+        // Fully transparent at 80% of water_visibility
+        underwater_alpha = 1.0 - smoothstep(0.0, water_vis * 0.8, underwater_depth);
         
         // Also tint remaining pixels toward a darker blue-green for underwater atmosphere
         let water_tint = vec3<f32>(0.1, 0.3, 0.4);
@@ -289,7 +298,7 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     // Alpha fades 60-95% while dithering operates 80-95% on semi-transparent fragments
     let alpha_fade_start = uniforms.lod_distance * 0.60;
     let alpha_fade_end = uniforms.lod_distance * 0.95;
-    let alpha = 1.0 - smoothstep(alpha_fade_start, alpha_fade_end, distance);
+    let alpha = (1.0 - smoothstep(alpha_fade_start, alpha_fade_end, distance)) * underwater_alpha;
 
     var out: FragmentOutput;
     out.color = vec4<f32>(brightened, alpha);
@@ -431,16 +440,25 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     let water_level_mesh = uniforms.water_level;
     let water_vis_mesh = uniforms.water_visibility;
     let underwater_depth_mesh = water_level_mesh - input.world_pos.y;
+    var underwater_alpha_mesh = 1.0;
     
     // Only apply underwater fade if the geometry is actually underwater
     if (underwater_depth_mesh > 0.0 && water_vis_mesh > 0.0) {
         // Calculate fade factor: 0 at surface, 1 at max visibility depth
         let underwater_fade_mesh = smoothstep(0.0, water_vis_mesh, underwater_depth_mesh);
         
-        // Use dithering to discard pixels as they get deeper (same technique as distance fade)
-        if (underwater_fade_mesh > hash_val) {
+        // Use improved noise for underwater dithering to reduce moiré patterns
+        let noise_pos_mesh = input.world_pos * 7.3 + vec3<f32>(relative_pos.x * 0.1, relative_pos.y * 0.1, relative_pos.z * 0.1);
+        let underwater_hash_mesh = fract(sin(dot(floor(noise_pos_mesh), vec3<f32>(127.1, 311.7, 74.7))) * 43758.5453);
+        
+        // Use dithering to discard pixels as they get deeper
+        if (underwater_fade_mesh > underwater_hash_mesh) {
             discard;
         }
+        
+        // Alpha fade: geometry becomes more transparent with depth
+        // Fully transparent at 80% of water_visibility
+        underwater_alpha_mesh = 1.0 - smoothstep(0.0, water_vis_mesh * 0.8, underwater_depth_mesh);
         
         // Also tint remaining pixels toward a darker blue-green for underwater atmosphere
         let water_tint_mesh = vec3<f32>(0.1, 0.3, 0.4);
@@ -451,7 +469,7 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     // Alpha fades 60-95% while dithering operates 80-95% on semi-transparent fragments
     let alpha_fade_start = uniforms.lod_distance * 0.60;
     let alpha_fade_end = uniforms.lod_distance * 0.95;
-    let alpha = 1.0 - smoothstep(alpha_fade_start, alpha_fade_end, distance);
+    let alpha = (1.0 - smoothstep(alpha_fade_start, alpha_fade_end, distance)) * underwater_alpha_mesh;
     
     var out: FragmentOutput;
     out.color = vec4<f32>(brightened, alpha);

@@ -344,8 +344,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     
     // Depth-based visibility: deeper underwater = more obscured
     // depth_diff is how far below water level (in world units/voxels)
-    // At 50 units deep, visibility should be very low
-    let depth_visibility_falloff = 50.0; // Units at which visibility is near zero
+    // Use water_visibility from config to control falloff
+    let depth_visibility_falloff = camera.water_visibility;
     let depth_factor = clamp(depth_diff / depth_visibility_falloff, 0.0, 1.0);
     
     // Increase opacity with depth (objects deeper are harder to see through water)
