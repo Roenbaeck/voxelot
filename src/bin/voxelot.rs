@@ -6474,7 +6474,8 @@ impl App {
         // everything before the first render pass. This primes the mesh worker queue
         // with only visible chunks and gives accurate cull_stats / visible counts.
         {
-            let (all_visible, stats) = cull_visible_voxels_parallel(&self.world, &self.camera_controller.camera);
+            let (all_visible, stats) =
+                cull_visible_voxels_parallel(&self.world, &self.camera_controller.camera);
             self.cull_stats = stats;
 
             // Depth cull like in render loop: hide geometry fully below water
@@ -6495,13 +6496,17 @@ impl App {
                         continue;
                     }
                     let key = (v.position[0], v.position[1], v.position[2]);
-                    if seen.contains(&key) { continue; }
+                    if seen.contains(&key) {
+                        continue;
+                    }
                     seen.insert(key);
 
                     // Skip if we already have meshes; queue only missing ones
                     let has_standard = self.mesh_cache.contains_key(&key);
                     let has_envelope = self.envelope_mesh_cache.contains_key(&key);
-                    if has_standard || has_envelope { continue; }
+                    if has_standard || has_envelope {
+                        continue;
+                    }
 
                     // LOD distance prioritization
                     let cam_pos = self.camera_controller.camera.position;
@@ -6591,7 +6596,7 @@ impl App {
         self.gpu_inputs.clear();
         // Reserve visibility-derived capacities for fewer reallocations
         self.gpu_inputs.reserve(visible.len());
-        for (i, v) in visible.iter().enumerate() {
+        for v in visible.iter() {
             let key = (v.position[0], v.position[1], v.position[2]);
             let has_mesh = v.is_leaf_chunk && self.mesh_cache.contains_key(&key);
             let has_envelope = v.is_leaf_chunk && self.envelope_mesh_cache.contains_key(&key);
@@ -6752,8 +6757,8 @@ impl App {
                             ],
                             voxel_type: v.voxel_type as u32,
                             flags,
-                            mesh_index: i as u32,
-                            envelope_index: i as u32,
+                            mesh_index: self.gpu_inputs.len() as u32,
+                            envelope_index: self.gpu_inputs.len() as u32,
                         });
                         continue;
                     }
@@ -6881,8 +6886,8 @@ impl App {
                 ],
                 voxel_type: v.voxel_type as u32,
                 flags,
-                mesh_index: i as u32,
-                envelope_index: i as u32,
+                mesh_index: self.gpu_inputs.len() as u32,
+                envelope_index: self.gpu_inputs.len() as u32,
             });
         }
         // Flatten any outputs (we pushed directly to gpu_inputs where needed)
