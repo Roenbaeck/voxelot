@@ -218,7 +218,7 @@ struct Uniforms {
     envelope_fade_range: f32,
     water_level: f32,
     water_visibility: f32,
-    _water_pad: [f32; 2], // Padding for alignment
+    water_elapsed_pad: [f32; 2], // x = elapsed time for animation, y = padding
     inverse_view: [[f32; 4]; 4],
     inverse_proj: [[f32; 4]; 4],
 }
@@ -857,6 +857,7 @@ struct App {
     vb_data_tmp: Vec<MeshVertexRaw>,
 
     last_frame: Instant,
+    elapsed_time: f32,
     frame_count: u64,
     frame_index: u64,
     skybox_angle: f32,
@@ -1499,6 +1500,7 @@ impl App {
             pending_chunk_meshes: VecDeque::new(),
             pending_chunk_set: FxHashSet::default(),
             last_frame: Instant::now(),
+            elapsed_time: 0.0,
             frame_count: 0,
             frame_index: 0,
             skybox_angle: 0.0,
@@ -5883,7 +5885,7 @@ impl App {
             envelope_fade_range: 32.0,
             water_level: self.water_level,
             water_visibility: self.water_visibility,
-            _water_pad: [0.0; 2],
+            water_elapsed_pad: [0.0, 0.0], // Will be updated in render loop
             inverse_view: [[0.0; 4]; 4],
             inverse_proj: [[0.0; 4]; 4],
         };
@@ -6542,6 +6544,7 @@ impl App {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
+        self.elapsed_time += dt;
         self.frame_index = self.frame_index.wrapping_add(1);
 
         let fps = if dt > 0.0 { 1.0 / dt } else { f32::INFINITY };
@@ -8315,7 +8318,7 @@ impl App {
             envelope_fade_range: self.envelope_fade_range,
             water_level: self.water_level,
             water_visibility: self.water_visibility,
-            _water_pad: [0.0; 2],
+            water_elapsed_pad: [self.elapsed_time, 0.0],
             inverse_view: inverse_view_cols,
             inverse_proj: inverse_proj_cols,
         };

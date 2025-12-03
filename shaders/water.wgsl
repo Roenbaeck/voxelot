@@ -18,7 +18,7 @@ struct CameraUniforms {
     envelope_fade_range: f32,
     water_level: f32,
     water_visibility: f32,
-    _water_pad: vec2<f32>,
+    water_elapsed_pad: vec2<f32>, // x = elapsed time for animation
     inverse_view: mat4x4<f32>,
     inverse_proj: mat4x4<f32>,
 };
@@ -372,7 +372,7 @@ fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Get time from camera uniforms
-    let time = camera.fog_time_pad.y;
+    let time = camera.water_elapsed_pad.x; // Elapsed time for animation
     let brightness = camera.fog_time_pad.w;
     
     // Reconstruct ray direction
