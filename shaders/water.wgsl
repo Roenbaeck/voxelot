@@ -229,23 +229,10 @@ fn get_shore_foam(depth_diff: f32, world_pos: vec3<f32>, time: f32) -> f32 {
     return max(foam * foam_mask, edge_foam);
 }
 
-// Surface foam for open water
+// Surface foam for open water - disabled for smoother look
 fn get_surface_foam(world_pos: vec3<f32>, time: f32) -> f32 {
-    let pos = world_pos.xz;
-    let foam_speed = water.speed * 0.1;
-    let foam_scale = 0.03;
-    
-    // Distort UVs with sine waves for organic movement
-    var foam_uv = pos * foam_scale;
-    foam_uv.y += 0.01 * (sin(foam_uv.x * 3.5 + time * 0.35) + sin(foam_uv.x * 4.8 + time * 1.05)) / 2.0;
-    foam_uv.x += 0.012 * (sin(foam_uv.y * 4.0 + time * 0.50) + sin(foam_uv.y * 6.8 + time * 0.75)) / 2.0;
-    
-    let foam_noise = fbm(foam_uv + vec2<f32>(time * foam_speed), 4);
-    
-    // Very sparse surface foam
-    let foam = smoothstep(0.7, 0.85, foam_noise) * 0.3;
-    
-    return foam;
+    // Disabled - was creating too much noise on water surface
+    return 0.0;
 }
 
 // ============================================================================
@@ -254,15 +241,20 @@ fn get_surface_foam(world_pos: vec3<f32>, time: f32) -> f32 {
 
 fn get_caustics(world_pos: vec3<f32>, time: f32) -> f32 {
     let pos = world_pos.xz;
-    let caustic_scale = 0.12;
-    let caustic_speed = water.speed * 0.4;
+    let caustic_scale = 0.06; // Larger scale = smoother pattern
+    let caustic_speed = water.speed * 0.25;
     
-    // Two overlapping caustic patterns
-    let c1 = fbm(pos * caustic_scale + vec2<f32>(time * caustic_speed, time * caustic_speed * 0.7), 3);
-    let c2 = fbm(pos * caustic_scale * 1.2 - vec2<f32>(time * caustic_speed * 0.8, time * caustic_speed), 3);
+    // Use smooth sine-based pattern instead of noise
+    let p1 = pos * caustic_scale + vec2<f32>(time * caustic_speed, time * caustic_speed * 0.7);
+    let p2 = pos * caustic_scale * 0.8 - vec2<f32>(time * caustic_speed * 0.6, time * caustic_speed * 0.9);
     
-    // Create caustic pattern from interference
-    let caustics = pow(c1 * c2, 0.5) * 2.0;
+    // Smooth sine-based caustic pattern
+    let c1 = sin(p1.x * 2.0 + p1.y * 1.5) * 0.5 + 0.5;
+    let c2 = sin(p2.x * 1.8 - p2.y * 2.2) * 0.5 + 0.5;
+    let c3 = sin((p1.x + p2.y) * 1.2) * 0.5 + 0.5;
+    
+    // Combine for caustic-like interference
+    let caustics = c1 * c2 * c3 * 1.5;
     
     return clamp(caustics, 0.0, 1.0);
 }
