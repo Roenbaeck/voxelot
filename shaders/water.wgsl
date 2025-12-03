@@ -223,8 +223,8 @@ fn get_shore_foam(depth_diff: f32, world_pos: vec3<f32>, time: f32) -> f32 {
     let cutoff = mix(0.25, 0.55, depth_normalized);
     let foam = smoothstep(cutoff - 0.15, cutoff + 0.05, foam_pattern);
     
-    // Add a solid foam line right at the water's edge
-    let edge_foam = smoothstep(0.8, 0.0, depth_diff) * 0.7;
+    // Add a subtle foam line right at the water's edge (reduced intensity)
+    let edge_foam = smoothstep(0.5, 0.0, depth_diff) * 0.4;
     
     return max(foam * foam_mask, edge_foam);
 }
@@ -566,16 +566,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let surface_foam = get_surface_foam(hit_pos, time);
     let total_foam = clamp(shore_foam + surface_foam, 0.0, 1.0);
     
-    // Bright white foam with slight blue tint
-    let foam_color = vec3<f32>(0.95, 0.97, 1.0) * max(brightness, 0.3);
-    
-    // ========================================================================
-    // HORIZON COLOR (Fresnel-based)
-    // ========================================================================
-    
-    // Add horizon color for distant water
-    let horizon_color = vec3<f32>(0.4, 0.5, 0.55) * brightness;
-    let horizon_blend = pow(1.0 - ndotv, 3.0) * 0.5;
+    // Foam color darkens with scene brightness
+    let foam_color = vec3<f32>(0.9, 0.92, 0.95) * brightness;
     
     // ========================================================================
     // FINAL COMPOSITION
@@ -583,9 +575,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     
     // Mix water color with reflection based on Fresnel
     var final_color = mix(water_color, reflection_color, reflection_strength);
-    
-    // Add horizon tint
-    final_color = mix(final_color, horizon_color, horizon_blend * 0.3);
     
     // Add specular highlights
     final_color += sun_color * specular * 0.8;
