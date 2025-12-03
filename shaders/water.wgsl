@@ -196,33 +196,37 @@ fn get_refraction_offset(world_pos: vec3<f32>, time: f32) -> vec2<f32> {
 
 // Shore/intersection foam based on depth
 fn get_shore_foam(depth_diff: f32, world_pos: vec3<f32>, time: f32) -> f32 {
-    let foam_depth = 1.5; // Maximum depth for foam visibility
+    let foam_depth = 4.0; // Maximum depth for foam visibility (increased)
     
-    if (depth_diff > foam_depth) {
+    if (depth_diff > foam_depth || depth_diff < 0.0) {
         return 0.0;
     }
     
-    // Base foam mask from depth
-    let foam_mask = 1.0 - smoothstep(0.0, foam_depth, depth_diff);
+    // Base foam mask from depth - stronger near shore
+    let depth_normalized = depth_diff / foam_depth;
+    let foam_mask = pow(1.0 - depth_normalized, 1.5);
     
     // Animated foam texture using noise
     let pos = world_pos.xz;
-    let foam_speed = water.speed * 0.2;
-    let foam_scale = 0.15;
+    let foam_speed = water.speed * 0.15;
+    let foam_scale = 0.25; // Larger scale for more visible foam patches
     
     // Multiple foam noise layers
     let foam_uv1 = pos * foam_scale + vec2<f32>(time * foam_speed, time * foam_speed * 0.7);
-    let foam_uv2 = pos * foam_scale * 1.5 - vec2<f32>(time * foam_speed * 0.8, time * foam_speed * 0.5);
+    let foam_uv2 = pos * foam_scale * 0.7 - vec2<f32>(time * foam_speed * 0.6, time * foam_speed * 0.4);
     
     let foam_noise1 = fbm(foam_uv1, 3);
     let foam_noise2 = fbm(foam_uv2, 3);
     let foam_pattern = (foam_noise1 + foam_noise2) * 0.5;
     
-    // Cutoff threshold that varies with depth - more foam near shore
-    let cutoff = mix(0.3, 0.7, depth_diff / foam_depth);
-    let foam = smoothstep(cutoff - 0.1, cutoff + 0.1, foam_pattern);
+    // Lower cutoff threshold for more visible foam
+    let cutoff = mix(0.25, 0.55, depth_normalized);
+    let foam = smoothstep(cutoff - 0.15, cutoff + 0.05, foam_pattern);
     
-    return foam * foam_mask * foam_mask; // Square for sharper falloff
+    // Add a solid foam line right at the water's edge
+    let edge_foam = smoothstep(0.8, 0.0, depth_diff) * 0.7;
+    
+    return max(foam * foam_mask, edge_foam);
 }
 
 // Surface foam for open water
@@ -570,7 +574,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let surface_foam = get_surface_foam(hit_pos, time);
     let total_foam = clamp(shore_foam + surface_foam, 0.0, 1.0);
     
-    let foam_color = vec3<f32>(0.9, 0.95, 1.0) * brightness;
+    // Bright white foam with slight blue tint
+    let foam_color = vec3<f32>(0.95, 0.97, 1.0) * max(brightness, 0.3);
     
     // ========================================================================
     // HORIZON COLOR (Fresnel-based)
