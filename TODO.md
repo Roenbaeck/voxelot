@@ -29,5 +29,5 @@
 ---
 Generate a large world for stress testing:
 ```
-cargo run --release --bin generate_world -- --water-level 25.0 --height-range 50.0 --tile-width 32 --tile-height 32 --output-name large_world
+cargo run --release --bin generate_world -- --water-level 25.0 --height-range 50.0 --tile-width 32 --tile-height 32 --output-name worlds/large_world_test
 ```

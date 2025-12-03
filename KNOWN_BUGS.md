@@ -14,5 +14,5 @@
 - ✅ There's a 1-voxel raised ridge in many places (between every tile?). 
 
 - 🛑 Trees are generated under water level.
-
+- 🛑 The jungle is too dense, so it looks almost flat green from the top. I think you could make trees even taller, and have even wider canopies. Something like 10-15 on a tile, then add some ground vegetation instead, so we get different levels of vegetation in the jungle. Also, the border blending doesn't seem to be in place, so the jungle ends in straight lines.
 

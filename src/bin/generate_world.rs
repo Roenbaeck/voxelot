@@ -161,6 +161,7 @@ enum Biome {
     City,
     Hill,
     Beach,
+    Jungle,
 }
 
 // Material Indices (matching palette.txt)
@@ -274,11 +275,19 @@ impl TileFetcher {
             // Tile has areas very close to water level - Beach biome
             Biome::Beach
         } else if avg_h < water_level + threshold_avg {
-            // Tile is low-lying but above beach threshold - prefer Hill biome for more natural look
-            Biome::Hill
+            // Tile is low-lying but above beach threshold - prefer Hill/Jungle biome for more natural look
+            if rng.gen_bool(0.3) {
+                Biome::Jungle
+            } else {
+                Biome::Hill
+            }
         } else if biome_noise < 0.4 {
             // Random selection for higher terrain
-            Biome::Hill
+            if rng.gen_bool(0.4) {
+                Biome::Jungle
+            } else {
+                Biome::Hill
+            }
         } else {
             Biome::City
         };
@@ -1381,6 +1390,7 @@ fn voxelize_tile(
         ),
         Biome::Hill => voxelize_hill(tile, data, space, max_height_voxels),
         Biome::Beach => voxelize_beach(tile, data, space, max_height_voxels),
+        Biome::Jungle => voxelize_jungle(tile, data, space, max_height_voxels),
     }
 }
 
@@ -1491,6 +1501,7 @@ fn voxelize_hill(
                         }
                         Biome::Beach => MAT_SAND,
                         Biome::City => MAT_CONCRETE,
+                        Biome::Jungle => MAT_GRASS_DARK,
                     }
                 };
                 voxels.push(VoxelRecord {
@@ -1535,6 +1546,27 @@ fn voxelize_hill(
     let veg_density = 0.02 + (rng.gen::<f64>() * 0.04);
     for xi in 0..size {
         for zi in 0..size {
+            // Recalculate actual_biome for vegetation placement
+            let actual_biome = if let Some(ref neighbors) = data.neighbor_biomes {
+                get_biome_at_position(
+                    data.biome,
+                    neighbors,
+                    xi,
+                    0,
+                    zi,
+                    size,
+                    &perlin_transition,
+                    (tile.x, tile.y),
+                )
+            } else {
+                data.biome
+            };
+
+            // Only place Hill vegetation if the local biome is actually Hill
+            if actual_biome != Biome::Hill {
+                continue;
+            }
+
             let voxel_z = (size - 1 - zi) as i64; // Flip Z coordinate
             if rng.gen_bool(veg_density) {
                 let h_m = heights_m[xi + zi * size];
@@ -1638,6 +1670,211 @@ fn voxelize_hill(
     }
 }
 
+fn voxelize_jungle(
+    tile: TileId,
+    data: TileData,
+    space: &TileSpace,
+    max_height_voxels: u32,
+) -> TileVoxelResult {
+    let mut voxels = Vec::new();
+    let size = space.voxel_resolution as usize;
+    let mut heights_m: Vec<f64> = if let Some(ref pre) = data.heights_m {
+        pre.clone()
+    } else {
+        sample_tile_heights(&Perlin::new(space.seed as u32), space)
+    };
+    let perlin = Perlin::new(space.seed as u32);
+
+    // River mask
+    let river_mask = compute_river_mask(space, &perlin, &heights_m, 1.0 / 3000.0, -0.35);
+    for xi in 0..size {
+        for zi in 0..size {
+            let idx = xi + zi * size;
+            if river_mask[idx] {
+                heights_m[idx] = (heights_m[idx] - 2.0).max(0.5);
+            }
+        }
+    }
+
+    let perlin_transition = Perlin::new((space.seed + 999) as u32);
+    for xi in 0..size {
+        for zi in 0..size {
+            // Determine actual biome
+            let actual_biome = if let Some(ref neighbors) = data.neighbor_biomes {
+                get_biome_at_position(
+                    data.biome,
+                    neighbors,
+                    xi,
+                    0,
+                    zi,
+                    size,
+                    &perlin_transition,
+                    (tile.x, tile.y),
+                )
+            } else {
+                data.biome
+            };
+
+            let voxel_z = (size - 1 - zi) as i64;
+            let h_m = heights_m[xi + zi * size];
+            let h_vox = (h_m / space.meters_per_voxel).round() as i64;
+            let h_vox = h_vox.clamp(1, max_height_voxels as i64);
+
+            let center = heights_m[xi + zi * size];
+            let neighbor_x = if xi + 1 < size {
+                heights_m[(xi + 1) + zi * size]
+            } else {
+                center
+            };
+            let neighbor_z = if zi + 1 < size {
+                heights_m[xi + (zi + 1) * size]
+            } else {
+                center
+            };
+            let slope_x = (neighbor_x - center).abs();
+            let slope_z = (neighbor_z - center).abs();
+            let slope = (slope_x + slope_z) * 0.5 / space.meters_per_voxel;
+
+            for y in space.base_y_vox..h_vox {
+                let mat = if slope > 3.0 {
+                    MAT_STONE
+                } else if y < h_vox - 4 {
+                    MAT_STONE
+                } else if y < h_vox - 1 {
+                    MAT_DIRT
+                } else {
+                    match actual_biome {
+                        Biome::Hill => {
+                            if (xi + zi) % 3 == 0 {
+                                MAT_GRASS_LIGHT
+                            } else {
+                                MAT_GRASS_DARK
+                            }
+                        }
+                        Biome::Beach => MAT_SAND,
+                        Biome::City => MAT_CONCRETE,
+                        Biome::Jungle => MAT_GRASS_DARK,
+                    }
+                };
+                voxels.push(VoxelRecord {
+                    x: xi as i64,
+                    y,
+                    z: voxel_z,
+                    material_index: mat,
+                });
+            }
+
+            let water_level_vox = (space.water_level_m / space.meters_per_voxel).round() as i64;
+            if h_vox <= water_level_vox + 2 || river_mask[xi + zi * size] {
+                if let Some(last) = voxels.last_mut() {
+                    if last.x == xi as i64 && last.z == voxel_z && last.y == h_vox {
+                        last.material_index = MAT_SAND;
+                    }
+                }
+            }
+        }
+    }
+
+    // Dense vegetation for Jungle
+    let mut rng = StdRng::seed_from_u64(stable_mix(&[
+        tile.x as u64,
+        tile.y as u64,
+        tile.z as u64,
+        0x504E474C, // JUNGLE
+    ]));
+    // Lower density: 0.02 base + random
+    let veg_density = 0.02 + (rng.gen::<f64>() * 0.02);
+
+    for xi in 0..size {
+        for zi in 0..size {
+            // Recalculate actual_biome for vegetation placement
+            let actual_biome = if let Some(ref neighbors) = data.neighbor_biomes {
+                get_biome_at_position(
+                    data.biome,
+                    neighbors,
+                    xi,
+                    0,
+                    zi,
+                    size,
+                    &perlin_transition,
+                    (tile.x, tile.y),
+                )
+            } else {
+                data.biome
+            };
+
+            // Only place Jungle vegetation if the local biome is actually Jungle
+            if actual_biome != Biome::Jungle {
+                continue;
+            }
+
+            let voxel_z = (size - 1 - zi) as i64;
+            let h_m = heights_m[xi + zi * size];
+            if h_m <= space.water_level_m + 0.5 {
+                continue;
+            }
+            let h_vox = (h_m / space.meters_per_voxel).round() as i64;
+
+            if rng.gen_bool(veg_density) {
+                // Tall trees (12-24m)
+                let trunk_h = rng.gen_range(12..24);
+                for ty in 0..trunk_h {
+                    voxels.push(VoxelRecord {
+                        x: xi as i64,
+                        y: h_vox + ty,
+                        z: voxel_z,
+                        material_index: MAT_TRUNK_DARK,
+                    });
+                }
+
+                // Wide canopy (radius 3-5)
+                let canopy_radius = rng.gen_range(3..=5);
+                let canopy_base = h_vox + trunk_h - 3;
+                for cx in -canopy_radius..=canopy_radius {
+                    for cz in -canopy_radius..=canopy_radius {
+                        for cy_offset in 0..=4 {
+                            let cy = canopy_base + cy_offset;
+                            if cy >= h_vox && cy < max_height_voxels as i64 {
+                                let dist = (cx as i32).abs()
+                                    + (cz as i32).abs()
+                                    + (cy_offset as i32).abs();
+                                if dist <= canopy_radius + 1 {
+                                    voxels.push(VoxelRecord {
+                                        x: (xi as i64 + cx as i64).clamp(0, size as i64 - 1),
+                                        y: cy,
+                                        z: (voxel_z + cz as i64).clamp(0, size as i64 - 1),
+                                        material_index: MAT_LEAVES_DARK,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if rng.gen_bool(0.25) {
+                // Undergrowth - varied height
+                let bush_h = rng.gen_range(1..=3);
+                for by in 0..bush_h {
+                    voxels.push(VoxelRecord {
+                        x: xi as i64,
+                        y: h_vox + by,
+                        z: voxel_z,
+                        material_index: MAT_LEAVES_MED,
+                    });
+                }
+            }
+        }
+    }
+
+    let mut stats = data.stats.clone();
+    stats.voxel_count = voxels.len();
+    TileVoxelResult {
+        tile,
+        voxels,
+        stats,
+        voxel_resolution: space.voxel_resolution,
+    }
+}
+
 fn voxelize_beach(
     tile: TileId,
     data: TileData,
@@ -1695,6 +1932,7 @@ fn voxelize_beach(
                             }
                         }
                         Biome::City => MAT_CONCRETE,
+                        Biome::Jungle => MAT_GRASS_DARK,
                     }
                 };
                 voxels.push(VoxelRecord {
