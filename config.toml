@@ -1,12 +1,12 @@
 [world]
-file = "worlds/world_1.oct"
+file = "worlds/flat_city_test.oct"
 palette = "worlds/palette.txt"
 camera_position = [
-    320.0,
-    650.0,
-    320.0,
+    511.0,
+    150.0,
+    511.0,
 ]
-water_level = 465.0
+water_level = 25.0
 water_visibility = 15.0
 
 [rendering]
@@ -22,7 +22,7 @@ window_height = 720
 
 [atmosphere]
 fog_density = 0.00019999995
-time_of_day = 0.5
+time_of_day = 0.62806714
 night_skybox_brightness = 0.02
 horizon_fade_up = 0.05
 horizon_fade_down = 0.25

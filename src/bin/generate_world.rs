@@ -13,6 +13,8 @@ use noise::{NoiseFn, Perlin};
 use voxelot::{octree_format::save_world_file, Palette, World, WorldPos};
 
 const EARTH_RADIUS_METERS: f64 = 6_378_137.0;
+// Total amplitude of noise layers (350 + 100 + 20)
+const BASE_HEIGHT_RANGE: f64 = 470.0;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -65,11 +67,15 @@ struct Args {
     #[arg(long, default_value_t = 500.0)]
     water_level: f64,
 
+    /// Target height difference from lowest to highest point (approximate)
+    #[arg(long, default_value_t = 470.0)]
+    height_range: f64,
+
     /// Sample heights across the whole world grid instead of per-tile sampling
     #[arg(long, default_value_t = false)]
     sample_global: bool,
 
-    #[arg(long = "output-name", default_value = "world_1")]
+    #[arg(long = "output-name", default_value = "world_file")]
     output_name: String,
 
     #[arg(long, value_enum, default_value_t = OutputFormat::Oct)]
@@ -188,11 +194,16 @@ const MAT_NEON_BLUE: usize = 46;
 struct TileFetcher {
     seed: u64,
     water_level: f64,
+    height_scale: f64,
 }
 
 impl TileFetcher {
-    fn new(seed: u64, water_level: f64) -> Self {
-        Self { seed, water_level }
+    fn new(seed: u64, water_level: f64, height_scale: f64) -> Self {
+        Self {
+            seed,
+            water_level,
+            height_scale,
+        }
     }
 
     fn fetch(&self, tile: TileId) -> TileData {
@@ -220,7 +231,17 @@ impl TileFetcher {
                 let sample_lon = min_lon + (max_lon - min_lon) * frac_x;
                 let sample_lat = south_lat + (north_lat - south_lat) * frac_y;
                 let (sx_m, sy_m) = lon_lat_to_mercator_meters(sample_lon, sample_lat);
-                let h = get_global_height(&perlin, sx_m, sy_m);
+                let (sx_m, sy_m) = lon_lat_to_mercator_meters(sample_lon, sample_lat);
+                // Create a temporary TileSpace to pass parameters
+                let temp_space = TileSpace::new(
+                    tile,
+                    1,   // dummy resolution
+                    1.0, // dummy meters_per_voxel
+                    self.seed,
+                    self.water_level,
+                    self.height_scale,
+                );
+                let h = get_global_height(&perlin, sx_m, sy_m, &temp_space);
                 min_h = min_h.min(h);
                 sum_h += h;
             }
@@ -235,11 +256,13 @@ impl TileFetcher {
 
         // Only allow City biome if the tile's minimum height is well above water level
         // This prevents cities from being placed on terrain that would be partially underwater
-        // Require min_h to be at least 50m above water (was 10m) to ensure no artificial ground raising
-        let biome = if min_h < water_level + 50.0 {
+        // Require min_h to be at least 50m * scale above water to ensure no artificial ground raising
+        let threshold_min = 50.0 * self.height_scale;
+        let threshold_avg = 80.0 * self.height_scale;
+        let biome = if min_h < water_level + threshold_min {
             // Tile has areas too close to water level - use Hill for natural terrain
             Biome::Hill
-        } else if avg_h < water_level + 80.0 {
+        } else if avg_h < water_level + threshold_avg {
             // Tile is low-lying - prefer Hill biome for more natural look
             Biome::Hill
         } else if biome_noise < 0.4 {
@@ -1088,10 +1111,13 @@ fn clamp_small_edge_deltas(smoothed_map: &mut HashMap<TileId, Vec<i64>>, size: u
     applied
 }
 
-fn get_global_height(perlin: &Perlin, x: f64, y: f64) -> f64 {
+fn get_global_height(perlin: &Perlin, x: f64, y: f64, space: &TileSpace) -> f64 {
     // Large scale terrain for mountains/lakes
-    // Base is above water level (500m) so more terrain is above water
-    let base = 580.0;
+    // Base is above water level so more terrain is above water.
+    // We scale the base offset by height_scale as well to keep proportions similar,
+    // or we can keep it fixed relative to water.
+    // Let's make it relative to water level + some base offset scaled.
+    let base = space.water_level_m + 80.0 * space.height_scale;
 
     // Very large scale features (continents/ranges)
     let large = fbm(perlin, x * 0.0002, y * 0.0002, 4, 2.0, 0.5) * 350.0;
@@ -1102,7 +1128,7 @@ fn get_global_height(perlin: &Perlin, x: f64, y: f64) -> f64 {
     // Detail
     let detail = fbm(perlin, x * 0.005, y * 0.005, 3, 2.0, 0.5) * 20.0;
 
-    base + large + mid + detail
+    base + (large + mid + detail) * space.height_scale
 }
 
 fn sample_tile_heights(perlin: &Perlin, space: &TileSpace) -> Vec<f64> {
@@ -1115,7 +1141,7 @@ fn sample_tile_heights(perlin: &Perlin, space: &TileSpace) -> Vec<f64> {
                 space.min_x_m + ((xi as f64 + 0.5) / size as f64) * (space.max_x_m - space.min_x_m);
             let wz =
                 space.min_y_m + ((zi as f64 + 0.5) / size as f64) * (space.max_y_m - space.min_y_m);
-            heights[xi + zi * size] = get_global_height(perlin, wx, wz).max(1.0);
+            heights[xi + zi * size] = get_global_height(perlin, wx, wz, space).max(1.0);
         }
     }
     heights
@@ -1176,6 +1202,7 @@ struct TileSpace {
     max_y_m: f64,
     seed: u64,
     water_level_m: f64,
+    height_scale: f64,
     /// Global minimum Y voxel level - voxels below this are not generated
     base_y_vox: i64,
 }
@@ -1187,6 +1214,7 @@ impl TileSpace {
         meters_per_voxel: f64,
         seed: u64,
         water_level_m: f64,
+        height_scale: f64,
     ) -> Self {
         let ((min_lon, max_lon), (north_lat, south_lat)) = tile.lon_lat_bounds();
         let (min_x_m, min_y_m) = lon_lat_to_mercator_meters(min_lon, south_lat);
@@ -1211,6 +1239,7 @@ impl TileSpace {
             max_y_m,
             seed,
             water_level_m,
+            height_scale,
             base_y_vox: 0, // Will be set later after global min is computed
         }
     }
@@ -1963,7 +1992,8 @@ fn generate_area(args: &Args) -> Vec<TileVoxelResult> {
         "Center tile: ({}, {}, {})",
         center_tile.x, center_tile.y, center_tile.z
     );
-    let fetcher = TileFetcher::new(args.seed, args.water_level);
+    let height_scale = args.height_range / BASE_HEIGHT_RANGE;
+    let fetcher = TileFetcher::new(args.seed, args.water_level, height_scale);
     let mut results = Vec::new();
     let perlin = Perlin::new(args.seed as u32);
     // Collect tile metadata and precompute heights
@@ -1998,6 +2028,7 @@ fn generate_area(args: &Args) -> Vec<TileVoxelResult> {
                 args.meters_per_voxel,
                 args.seed,
                 args.water_level,
+                height_scale,
             );
             let heights = sample_tile_heights(&perlin, &space);
             data.heights_m = Some(heights);
@@ -2039,7 +2070,19 @@ fn generate_area(args: &Args) -> Vec<TileVoxelResult> {
                     + ((gx as f64 + 0.5) / grid_w as f64) * (global_max_x - global_min_x);
                 let wz = global_min_y
                     + ((gz as f64 + 0.5) / grid_h as f64) * (global_max_y - global_min_y);
-                global_heights[gx + gz * grid_w] = get_global_height(&perlin, wx, wz).max(1.0);
+                let wz = global_min_y
+                    + ((gz as f64 + 0.5) / grid_h as f64) * (global_max_y - global_min_y);
+                // Create a temporary space for global sampling
+                let temp_space = TileSpace::new(
+                    center_tile, // Use center tile as reference
+                    args.voxel_resolution,
+                    args.meters_per_voxel,
+                    args.seed,
+                    args.water_level,
+                    height_scale,
+                );
+                global_heights[gx + gz * grid_w] =
+                    get_global_height(&perlin, wx, wz, &temp_space).max(1.0);
             }
         }
         // Copy slices from global_heights into each tile's `heights_m`
