@@ -3920,6 +3920,41 @@ impl App {
         }
     }
 
+    fn evict_entry(&mut self, key: (i64, i64, i64), entry: MeshCacheEntry) -> u64 {
+        let entry_bytes = entry.total_bytes();
+        // If this was a placeholder (shared empty buffers), do not destroy the buffer
+        // as it is owned globally. Only destroy buffers for normal entries.
+        if !entry.is_placeholder {
+            // Free regions in allocators
+            self.vertex_allocator
+                .free(entry.vertex_offset, entry.vertex_bytes);
+            self.index_allocator
+                .free(entry.index_offset, entry.index_bytes);
+            self.mesh_cache_bytes = self.mesh_cache_bytes.saturating_sub(entry_bytes);
+        }
+        self.chunk_emitters.remove(&key);
+        // Also drop any cached Arc<Chunk> snapshot for this chunk to free memory
+        self.mesh_chunk_arc_cache.remove(&key);
+        entry_bytes
+    }
+
+    fn force_evict_lru(&mut self) -> bool {
+        // Find oldest entry
+        let oldest = self
+            .mesh_cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used_frame)
+            .map(|(k, _)| *k);
+
+        if let Some(key) = oldest {
+            if let Some(entry) = self.mesh_cache.remove(&key) {
+                self.evict_entry(key, entry);
+                return true;
+            }
+        }
+        false
+    }
+
     fn evict_mesh_cache(&mut self) {
         let budget = self.mesh_cache_byte_budget();
         if self.mesh_cache_bytes <= budget {
@@ -3942,21 +3977,7 @@ impl App {
             }
 
             if let Some(entry) = self.mesh_cache.remove(&key) {
-                let entry_bytes = entry.total_bytes();
-                // If this was a placeholder (shared empty buffers), do not destroy the buffer
-                // as it is owned globally. Only destroy buffers for normal entries.
-                if !entry.is_placeholder {
-                    // Free regions in allocators
-                    self.vertex_allocator
-                        .free(entry.vertex_offset, entry.vertex_bytes);
-                    self.index_allocator
-                        .free(entry.index_offset, entry.index_bytes);
-                    self.mesh_cache_bytes = self.mesh_cache_bytes.saturating_sub(entry_bytes);
-                }
-                self.chunk_emitters.remove(&key);
-                // Also drop any cached Arc<Chunk> snapshot for this chunk to free memory
-                self.mesh_chunk_arc_cache.remove(&key);
-                freed_bytes += entry_bytes;
+                freed_bytes += self.evict_entry(key, entry);
                 evicted += 1;
             }
         }
@@ -7652,9 +7673,36 @@ impl App {
             }));
             mesh_build_vb_time += vb_build_start.elapsed();
             let vbuf_start = std::time::Instant::now();
-            let (vertex_offset, index_offset) = self
-                .allocate_mesh_in_megabuffer(&device, &queue, &vb_local, &mesh.indices)
-                .expect("Failed to allocate in mega-buffers");
+            let (vertex_offset, index_offset) =
+                match self.allocate_mesh_in_megabuffer(&device, &queue, &vb_local, &mesh.indices) {
+                    Ok(res) => res,
+                    Err(_) => {
+                        // Try to evict and retry
+                        let mut evicted_count = 0;
+                        loop {
+                            if !self.force_evict_lru() {
+                                panic!(
+                                    "Failed to allocate in mega-buffers: OutOfMemory (cache empty)"
+                                );
+                            }
+                            evicted_count += 1;
+                            if let Ok(res) = self.allocate_mesh_in_megabuffer(
+                                &device,
+                                &queue,
+                                &vb_local,
+                                &mesh.indices,
+                            ) {
+                                if cfg!(feature = "viewer-debug") {
+                                    viewer_debug!(
+                                        "Forced eviction of {} entries to fit new mesh",
+                                        evicted_count
+                                    );
+                                }
+                                break res;
+                            }
+                        }
+                    }
+                };
             mesh_upload_vbuf_time += vbuf_start.elapsed();
             let ibuf_start = std::time::Instant::now();
             mesh_upload_ibuf_time += ibuf_start.elapsed();

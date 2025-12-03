@@ -123,9 +123,19 @@ struct TileData {
     heights_m: Option<Vec<f64>>,
     // Optional per-cell base ground heights (voxel Y levels), used to ensure pad continuity.
     base_ground_vox: Option<Vec<i64>>,
+    // Neighbor biomes for organic transitions
+    neighbor_biomes: Option<NeighborBiomes>,
 }
 
 type Polygon = Vec<[f64; 2]>;
+
+#[derive(Clone, Debug)]
+struct NeighborBiomes {
+    north: Option<Biome>,
+    south: Option<Biome>,
+    east: Option<Biome>,
+    west: Option<Biome>,
+}
 
 #[derive(Clone, Debug)]
 struct BuildingEntry {
@@ -150,6 +160,7 @@ struct TileStats {
 enum Biome {
     City,
     Hill,
+    Beach,
 }
 
 // Material Indices (matching palette.txt)
@@ -260,10 +271,10 @@ impl TileFetcher {
         let threshold_min = 50.0 * self.height_scale;
         let threshold_avg = 80.0 * self.height_scale;
         let biome = if min_h < water_level + threshold_min {
-            // Tile has areas too close to water level - use Hill for natural terrain
-            Biome::Hill
+            // Tile has areas very close to water level - Beach biome
+            Biome::Beach
         } else if avg_h < water_level + threshold_avg {
-            // Tile is low-lying - prefer Hill biome for more natural look
+            // Tile is low-lying but above beach threshold - prefer Hill biome for more natural look
             Biome::Hill
         } else if biome_noise < 0.4 {
             // Random selection for higher terrain
@@ -281,7 +292,7 @@ impl TileFetcher {
         // For now, we'll keep the city generation but maybe clear it if it's a pure nature biome,
         // or we can mix them. Let's make Lake and Hill distinct for now.
 
-        if biome != Biome::City {
+        if biome != Biome::City && biome != Biome::Beach {
             return TileData {
                 roads: Vec::new(),
                 parks: Vec::new(),
@@ -300,6 +311,7 @@ impl TileFetcher {
                 },
                 heights_m: None,
                 base_ground_vox: None,
+                neighbor_biomes: None,
             };
         }
 
@@ -565,6 +577,7 @@ impl TileFetcher {
             heights_m: None,
             base_ground_vox: None,
             biome,
+            neighbor_biomes: None,
         }
     }
 }
@@ -1367,6 +1380,7 @@ fn voxelize_tile(
             no_building_pad,
         ),
         Biome::Hill => voxelize_hill(tile, data, space, max_height_voxels),
+        Biome::Beach => voxelize_beach(tile, data, space, max_height_voxels),
     }
 }
 
@@ -1408,8 +1422,24 @@ fn voxelize_hill(
     // This ensures that when tiles are stacked (tile.y increases southward), adjacent tile edges match:
     // - Our tile's zi=0 (south) → voxel.z=size-1 → world Z = tile_offset + size-1
     // - South neighbor's zi=size-1 (north) → voxel.z=0 → world Z = tile_offset + size + 0
+    let perlin_transition = Perlin::new((space.seed + 999) as u32);
     for xi in 0..size {
         for zi in 0..size {
+            // Determine actual biome at this position
+            let actual_biome = if let Some(ref neighbors) = data.neighbor_biomes {
+                get_biome_at_position(
+                    data.biome,
+                    neighbors,
+                    xi,
+                    0,
+                    zi,
+                    size,
+                    &perlin_transition,
+                    (tile.x, tile.y),
+                )
+            } else {
+                data.biome
+            };
             let voxel_z = (size - 1 - zi) as i64; // Flip Z coordinate
             let h_m = heights_m[xi + zi * size];
             let h_vox = (h_m / space.meters_per_voxel).round() as i64;
@@ -1446,14 +1476,21 @@ fn voxelize_hill(
                     MAT_DIRT
                 } else {
                     // topmost
-                    if h_m > 140.0 {
-                        MAT_SNOW
-                    } else {
-                        if (xi + zi) % 3 == 0 {
-                            MAT_GRASS_LIGHT
-                        } else {
-                            MAT_GRASS_DARK
+                    // topmost
+                    match actual_biome {
+                        Biome::Hill => {
+                            if h_m > 140.0 {
+                                MAT_SNOW
+                            } else {
+                                if (xi + zi) % 3 == 0 {
+                                    MAT_GRASS_LIGHT
+                                } else {
+                                    MAT_GRASS_DARK
+                                }
+                            }
                         }
+                        Biome::Beach => MAT_SAND,
+                        Biome::City => MAT_CONCRETE,
                     }
                 };
                 voxels.push(VoxelRecord {
@@ -1599,6 +1636,217 @@ fn voxelize_hill(
         stats,
         voxel_resolution: space.voxel_resolution,
     }
+}
+
+fn voxelize_beach(
+    tile: TileId,
+    data: TileData,
+    space: &TileSpace,
+    max_height_voxels: u32,
+) -> TileVoxelResult {
+    let mut voxels = Vec::new();
+    let size = space.voxel_resolution as usize;
+
+    // Use precomputed heights or sample
+    let heights_m: Vec<f64> = if let Some(ref pre) = data.heights_m {
+        pre.clone()
+    } else {
+        sample_tile_heights(&Perlin::new(space.seed as u32), space)
+    };
+
+    let perlin_transition = Perlin::new((space.seed + 999) as u32);
+
+    // Voxelize sandy terrain
+    for xi in 0..size {
+        for zi in 0..size {
+            // Determine actual biome at this position
+            let actual_biome = if let Some(ref neighbors) = data.neighbor_biomes {
+                get_biome_at_position(
+                    data.biome,
+                    neighbors,
+                    xi,
+                    0,
+                    zi,
+                    size,
+                    &perlin_transition,
+                    (tile.x, tile.y),
+                )
+            } else {
+                data.biome
+            };
+
+            let voxel_z = (size - 1 - zi) as i64;
+            let h_m = heights_m[xi + zi * size];
+            let h_vox = (h_m / space.meters_per_voxel).round() as i64;
+            let h_vox = h_vox.clamp(1, max_height_voxels as i64);
+
+            // Beach terrain: mostly sand with some stone underneath
+            for y in space.base_y_vox..h_vox {
+                let mat = if y < h_vox - 3 {
+                    MAT_STONE // Deep layer
+                } else {
+                    match actual_biome {
+                        Biome::Beach => MAT_SAND,
+                        Biome::Hill => {
+                            if (xi + zi) % 3 == 0 {
+                                MAT_GRASS_LIGHT
+                            } else {
+                                MAT_GRASS_DARK
+                            }
+                        }
+                        Biome::City => MAT_CONCRETE,
+                    }
+                };
+                voxels.push(VoxelRecord {
+                    x: xi as i64,
+                    y,
+                    z: voxel_z,
+                    material_index: mat,
+                });
+            }
+        }
+    }
+
+    // Add sparse palm trees
+    let mut rng = StdRng::seed_from_u64(stable_mix(&[
+        tile.x as u64,
+        tile.y as u64,
+        tile.z as u64,
+        0xBEAC401,
+    ]));
+
+    for xi in 0..size {
+        for zi in 0..size {
+            if rng.gen_bool(0.01) {
+                // Sparse palm trees
+                let voxel_z = (size - 1 - zi) as i64;
+                let h_m = heights_m[xi + zi * size];
+
+                // Only place palms above water
+                if h_m > space.water_level_m + 1.0 {
+                    let h_vox = (h_m / space.meters_per_voxel).round() as i64;
+
+                    // Palm trunk (taller and thinner than regular trees)
+                    let trunk_h = rng.gen_range(5..8);
+                    for ty in 0..trunk_h {
+                        voxels.push(VoxelRecord {
+                            x: xi as i64,
+                            y: h_vox + ty,
+                            z: voxel_z,
+                            material_index: MAT_TRUNK_LIGHT,
+                        });
+                    }
+
+                    // Palm fronds (smaller, flatter canopy)
+                    let canopy_y = h_vox + trunk_h;
+                    for cx in -2i64..=2 {
+                        for cz in -2i64..=2 {
+                            if (cx.abs() + cz.abs()) <= 2 {
+                                voxels.push(VoxelRecord {
+                                    x: (xi as i64 + cx).clamp(0, size as i64 - 1),
+                                    y: canopy_y,
+                                    z: (voxel_z + cz).clamp(0, size as i64 - 1),
+                                    material_index: MAT_LEAVES_LIGHT,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut stats = data.stats.clone();
+    stats.voxel_count = voxels.len();
+    TileVoxelResult {
+        tile,
+        voxels,
+        stats,
+        voxel_resolution: space.voxel_resolution,
+    }
+}
+
+// Determine which biome to use at a specific voxel position, using noise for organic transitions
+// Determine which biome to use at a specific voxel position, using noise for organic transitions
+fn get_biome_at_position(
+    base_biome: Biome,
+    neighbors: &NeighborBiomes,
+    x: usize,
+    _y: usize,
+    z: usize,
+    size: usize,
+    perlin: &Perlin,
+    tile_pos: (i32, i32),
+) -> Biome {
+    const TRANSITION_WIDTH: usize = 16; // Voxels from edge where transitions occur
+
+    // Calculate distance from each edge
+    let dist_west = x;
+    let dist_east = size - 1 - x;
+    let dist_south = z;
+    let dist_north = size - 1 - z;
+
+    // Sample noise for organic boundary (world coordinates for seamless transitions)
+    let noise_scale = 0.05; // Controls transition roughness
+    let world_x = tile_pos.0 as f64 * size as f64 + x as f64;
+    let world_z = tile_pos.1 as f64 * size as f64 + z as f64;
+    let noise = perlin.get([world_x * noise_scale, world_z * noise_scale]);
+    // Map noise from [-1, 1] to [0, TRANSITION_WIDTH]
+    let noise_offset = ((noise + 1.0) * 0.5 * TRANSITION_WIDTH as f64) as usize;
+
+    // Helper for deterministic edge hashing
+    let edge_hash = |u: i32, v: i32| -> u64 { stable_mix(&[u as u64, v as u64, 0xED6E4A54]) };
+
+    // Check each edge for transitions
+    // West Edge (neighbor x-1)
+    if dist_west < TRANSITION_WIDTH {
+        // Rule: hash(tile_x, tile_y) % 2 == 0 => West invades East (Us)
+        if edge_hash(tile_pos.0, tile_pos.1) % 2 == 0 {
+            if let Some(west_biome) = neighbors.west {
+                if dist_west < noise_offset {
+                    return west_biome;
+                }
+            }
+        }
+    }
+
+    // East Edge (neighbor x+1)
+    if dist_east < TRANSITION_WIDTH {
+        // Rule: hash(tile_x + 1, tile_y) % 2 != 0 => East invades West (Us)
+        if edge_hash(tile_pos.0 + 1, tile_pos.1) % 2 != 0 {
+            if let Some(east_biome) = neighbors.east {
+                if dist_east < noise_offset {
+                    return east_biome;
+                }
+            }
+        }
+    }
+
+    // South Edge (neighbor y+1)
+    if dist_south < TRANSITION_WIDTH {
+        // Rule: hash(tile_x, tile_y + 1) % 2 != 0 => South invades North (Us)
+        if edge_hash(tile_pos.0, tile_pos.1 + 1) % 2 != 0 {
+            if let Some(south_biome) = neighbors.south {
+                if dist_south < noise_offset {
+                    return south_biome;
+                }
+            }
+        }
+    }
+
+    // North Edge (neighbor y-1)
+    if dist_north < TRANSITION_WIDTH {
+        // Rule: hash(tile_x, tile_y) % 2 == 0 => North invades South (Us)
+        if edge_hash(tile_pos.0, tile_pos.1) % 2 == 0 {
+            if let Some(north_biome) = neighbors.north {
+                if dist_north < noise_offset {
+                    return north_biome;
+                }
+            }
+        }
+    }
+
+    base_biome
 }
 
 fn voxelize_city(
@@ -2035,6 +2283,47 @@ fn generate_area(args: &Args) -> Vec<TileVoxelResult> {
             tile_map.insert(tile, data);
             tile_spaces.insert(tile, space);
             tiles.push(tile);
+        }
+    }
+
+    // Populate neighbor biomes for organic transitions
+    for tile_id in &tiles {
+        let north_biome = tile_map
+            .get(&TileId {
+                z: tile_id.z,
+                x: tile_id.x,
+                y: tile_id.y - 1,
+            })
+            .map(|t| t.biome);
+        let south_biome = tile_map
+            .get(&TileId {
+                z: tile_id.z,
+                x: tile_id.x,
+                y: tile_id.y + 1,
+            })
+            .map(|t| t.biome);
+        let east_biome = tile_map
+            .get(&TileId {
+                z: tile_id.z,
+                x: tile_id.x + 1,
+                y: tile_id.y,
+            })
+            .map(|t| t.biome);
+        let west_biome = tile_map
+            .get(&TileId {
+                z: tile_id.z,
+                x: tile_id.x - 1,
+                y: tile_id.y,
+            })
+            .map(|t| t.biome);
+
+        if let Some(data) = tile_map.get_mut(tile_id) {
+            data.neighbor_biomes = Some(NeighborBiomes {
+                north: north_biome,
+                south: south_biome,
+                east: east_biome,
+                west: west_biome,
+            });
         }
     }
 

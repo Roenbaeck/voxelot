@@ -1,5 +1,5 @@
 [world]
-file = "worlds/flat_city_test.oct"
+file = "worlds/large_world_test.oct"
 palette = "worlds/palette.txt"
 camera_position = [
     511.0,
@@ -22,7 +22,7 @@ window_height = 720
 
 [atmosphere]
 fog_density = 0.00019999995
-time_of_day = 0.48046634
+time_of_day = 0.7530691
 night_skybox_brightness = 0.02
 horizon_fade_up = 0.05
 horizon_fade_down = 0.25

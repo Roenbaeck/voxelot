@@ -1,3 +1,4 @@
+# TODO 
 - ✅ Is it possible to rotate the skybox very slowly to make it look less static?
 - ✅ Can we make the skybox gradually darker during night, almost black at midnight?
 - ✅ The sky reflected in the water should also be dark at night.
@@ -18,10 +19,15 @@
 - ✅ Why is the fullscreen render so much slower than the windowed render? It drops from 120FPS to 20FPS when I go fullscreen.
 - ✅ The underwater geometry looks a little bit sharp. See the encircled area in the screenshot for an example. What do you suggest? Can we make it even more water-like?
 - ✅ Print how many chunks are culled by the depth culler.
+- ✅ It would be very neat if there could be a shoreline somewhere.
+- ✅ Add a beach biome.
 
 - 🛑 Reflections should be stronger at night than in the day, since nothing is drowning out the light.
 - 🛑 Sliders instead of buttons to change settings.
 - 🛑 Can all of our code be compiled as wasm?
-- 🛑 It would be very neat if there could be a shoreline somewhere.
 
-
+---
+Generate a large world for stress testing:
+```
+cargo run --release --bin generate_world -- --water-level 25.0 --height-range 50.0 --tile-width 32 --tile-height 32 --output-name large_world
+```
