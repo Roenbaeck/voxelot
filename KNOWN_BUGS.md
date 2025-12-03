@@ -8,5 +8,6 @@
 - ✅ Fade out in the far distance gone?
 - ✅  It still looks like some (or all?) chunks are present when the viewer starts. I can see underwater chunks as I move the camera towards water, that quickly disappear afterwards (culled). Why is that? Can we perform an initial cull first, so not everything is added? It's either that or we see chunks that are not yet meshed, and they behave differently under water than their meshed counterparts.
 
+- 🛑 Geometry below water surface level dissolves into white pixels (should be water color).
 - 🛑 There's a 1-voxel raised ridge in many places (between every tile?). The issue is clearly visible in the screenshot. Can you possibly fix this?
 - 🛑 Trees are generated under water level.
