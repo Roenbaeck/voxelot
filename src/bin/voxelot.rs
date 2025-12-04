@@ -50,6 +50,10 @@ struct ViewerArgs {
     /// Path to config TOML file
     #[arg(long, default_value = DEFAULT_CONFIG_FILE)]
     config: String,
+    /// Optional positional argument for config path. If provided, this will be used
+    /// as the config file unless `--config` is explicitly supplied.
+    #[arg(value_name = "CONFIG", index = 1)]
+    config_arg: Option<String>,
 }
 const GPU_CULL_WORKGROUP_SIZE: u32 = 64;
 const SHADOW_FRUSTUM_EXTENT_MIN: f32 = 150.0;
@@ -9909,9 +9913,10 @@ fn main() {
     println!("  ESC - Quit\n");
 
     let args = ViewerArgs::parse();
+    let config_path = args.config_arg.unwrap_or(args.config);
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = App::new(&args.config);
+    let mut app = App::new(&config_path);
     event_loop.run_app(&mut app).unwrap();
 }
