@@ -193,20 +193,22 @@ const MAT_LEAVES_DARK: usize = 34;
 const MAT_LEAVES_MED: usize = 35;
 const MAT_LEAVES_LIGHT: usize = 36;
 const MAT_LEAVES_AUTUMN: usize = 37;
+const MAT_PALM_FROND_DARK: usize = 38;
+const MAT_PALM_FROND_MID: usize = 39;
 
-const MAT_LIGHT_WARM: usize = 40;
-const MAT_LIGHT_COOL: usize = 41;
-const MAT_WINDOW_WARM: usize = 42;
-const MAT_WINDOW_COOL: usize = 43;
-const MAT_NEON_RED: usize = 44;
-const MAT_NEON_GREEN: usize = 45;
-const MAT_NEON_BLUE: usize = 46;
+const MAT_LIGHT_WARM: usize = 40; // Becomes 41 after +1 offset
+const MAT_LIGHT_COOL: usize = 41; // Becomes 42 after +1 offset
+const MAT_WINDOW_WARM: usize = 42; // Becomes 43 after +1 offset
+const MAT_WINDOW_COOL: usize = 43; // Becomes 44 after +1 offset
+const MAT_NEON_RED: usize = 44; // Becomes 45 after +1 offset
+const MAT_NEON_GREEN: usize = 45; // Becomes 46 after +1 offset
+const MAT_NEON_BLUE: usize = 46; // Becomes 47 after +1 offset
 
 // Jungle parameters (tweakable)
 const JUNGLE_MIN_TREES: usize = 10;
 const JUNGLE_MAX_TREES: usize = 15;
-const JUNGLE_CANOPY_MIN: usize = 6; // radius in voxels (was ~3)
-const JUNGLE_CANOPY_MAX: usize = 10; // radius in voxels (was ~5)
+const JUNGLE_FROND_LENGTH: i64 = 8; // length of palm fronds in voxels
+const JUNGLE_FROND_COUNT: usize = 6; // number of fronds per palm top
 const JUNGLE_SPLIT_SEPARATION: usize = 12; // min separation between large jungle trees
 
 #[derive(Clone, Debug)]
@@ -1802,7 +1804,8 @@ fn voxelize_jungle(
                 continue;
             }
             let h_vox = (h_m / space.meters_per_voxel).round() as i64;
-            if h_vox + 24 >= max_height_voxels as i64 { // avoid extremely tall or off-grid trees
+            if h_vox + 24 >= max_height_voxels as i64 {
+                // avoid extremely tall or off-grid trees
                 continue;
             }
             // Gentle slope only
@@ -1838,7 +1841,7 @@ fn voxelize_jungle(
             break;
         }
         let mut too_close = false;
-            for &(sx, sz) in &selected_trees {
+        for &(sx, sz) in &selected_trees {
             let dx = (sx as i64 - cx as i64).abs() as usize;
             let dz = (sz as i64 - cz as i64).abs() as usize;
             if dx <= JUNGLE_SPLIT_SEPARATION && dz <= JUNGLE_SPLIT_SEPARATION {
@@ -1857,7 +1860,10 @@ fn voxelize_jungle(
         let dist_east = size - 1 - x;
         let dist_south = z;
         let dist_north = size - 1 - z;
-        let min_dist = *[dist_west, dist_east, dist_south, dist_north].iter().min().unwrap();
+        let min_dist = *[dist_west, dist_east, dist_south, dist_north]
+            .iter()
+            .min()
+            .unwrap();
         // Determine if any neighbor biome is NOT Jungle on the closest edge
         let mut edge_different = false;
         if let Some(ref nb) = data.neighbor_biomes {
@@ -1922,13 +1928,19 @@ fn voxelize_jungle(
         let edge_reduction = if edge_diff { 0.6 } else { 1.0 };
 
         // Tall trees (base 12-24m), but apply edge scaling
-            let base_trunk_h = rng.gen_range(12..24) as f64;
+        let base_trunk_h = rng.gen_range(12..24) as f64;
         let trunk_h_f = (base_trunk_h * edge_factor * edge_reduction).max(6.0);
         let trunk_h = trunk_h_f.round() as i64;
 
         // Plant main trunk up to split point
         // Choose a split: 1..=3 branches (1 = no split), make splits common
-        let split_count = if rng.gen_bool(0.6) { 2 } else if rng.gen_bool(0.2) { 3 } else { 1 };
+        let split_count = if rng.gen_bool(0.6) {
+            2
+        } else if rng.gen_bool(0.2) {
+            3
+        } else {
+            1
+        };
         let split_height = (trunk_h as f64 * rng.gen_range(0.35..0.65)).round() as i64;
 
         // Place main trunk blocks up to split_height
@@ -1955,7 +1967,9 @@ fn voxelize_jungle(
                 let bx = (xi as i64 + ox).clamp(0, size as i64 - 1);
                 let bz = (voxel_z + oz).clamp(0, size as i64 - 1);
                 let add_h = rng.gen_range(6..12) as f64;
-                let sub_trunk_h = ((trunk_h - split_height) as f64 * rng.gen_range(0.6..1.0) + add_h).round() as i64;
+                let sub_trunk_h = ((trunk_h - split_height) as f64 * rng.gen_range(0.6..1.0)
+                    + add_h)
+                    .round() as i64;
                 // Build the sub-trunk: straight or slightly tilted upward
                 let mut tx = bx;
                 let mut tz = bz;
@@ -1980,56 +1994,132 @@ fn voxelize_jungle(
             }
         }
 
-        // Canopy — larger than before (approx twice), combine contributions from each split trunk
-        // Canopy radius base: 6..=10 (up from 3..=5)
+        // Palm-like fronds: long drooping leaves radiating from the top of each trunk
+        // Unlike a spherical canopy, palm fronds extend outward and droop downward
         for &(hx, hz, hy_top) in &trunk_heads {
-            let canopy_radius = rng.gen_range(JUNGLE_CANOPY_MIN..=JUNGLE_CANOPY_MAX) as i64;
-            let canopy_base = hy_top - 4; // slightly below top
-            for cx in -canopy_radius..=canopy_radius {
-                for cz in -canopy_radius..=canopy_radius {
-                    for cy_offset in 0..=6 {
-                        let cy = canopy_base + cy_offset;
-                        if cy >= h_vox && cy < max_height_voxels as i64 {
-                            let dist2 = (cx * cx) + (cz * cz) + (cy_offset as i64 * cy_offset as i64);
-                            // approximate spherical canopy
-                            if dist2 <= (canopy_radius * canopy_radius + 3) {
-                                let px = (hx + cx).clamp(0, size as i64 - 1);
-                                let pz = (hz + cz).clamp(0, size as i64 - 1);
-                                // If canopy would be placed near a border towards a different biome, reduce by edge factor
-                                let (dist_to_edge, edge_diff) = compute_edge_info(px as usize, pz as usize);
-                                let edge_scale = if dist_to_edge >= transition_width { 1.0 } else { (dist_to_edge as f64) / (transition_width as f64) };
-                                let place_prob = if edge_diff { edge_scale } else { 1.0 };
-                                // To smooth canopy across borders: check the biome at leaf's target cell
-                                let local_biome = if let Some(ref neighbors) = data.neighbor_biomes {
-                                    get_biome_at_position(
-                                        data.biome,
-                                        neighbors,
-                                        px as usize,
-                                        0,
-                                        pz as usize,
-                                        size,
-                                        &perlin_transition,
-                                        (tile.x, tile.y),
-                                    )
+            // Add a small crown at the very top (where fronds emerge)
+            for crown_dx in -1i64..=1 {
+                for crown_dz in -1i64..=1 {
+                    if crown_dx.abs() + crown_dz.abs() <= 1 {
+                        let px = (hx + crown_dx).clamp(0, size as i64 - 1);
+                        let pz = (hz + crown_dz).clamp(0, size as i64 - 1);
+                        voxels.push(VoxelRecord {
+                            x: px,
+                            y: hy_top,
+                            z: pz,
+                            material_index: MAT_PALM_FROND_DARK,
+                        });
+                    }
+                }
+            }
+
+            // Generate fronds radiating outward and drooping down
+            let frond_count = rng.gen_range(JUNGLE_FROND_COUNT..=JUNGLE_FROND_COUNT + 3);
+            let base_frond_length =
+                rng.gen_range(JUNGLE_FROND_LENGTH - 2..=JUNGLE_FROND_LENGTH + 2);
+
+            for frond_idx in 0..frond_count {
+                // Angle around the trunk (evenly distributed with some randomness)
+                let base_angle =
+                    (frond_idx as f64) * (2.0 * std::f64::consts::PI / frond_count as f64);
+                let angle = base_angle + rng.gen_range(-0.3..0.3);
+
+                // Frond length varies slightly
+                let frond_length = base_frond_length + rng.gen_range(-1..=1);
+
+                // Trace the frond from trunk top outward and downward
+                // Palm fronds curve: start going out and slightly up, then droop down
+                for step in 0..frond_length {
+                    let t = step as f64 / frond_length as f64; // 0 to 1 along frond
+
+                    // Horizontal distance increases linearly
+                    let horiz_dist = (step as f64 + 1.0) * 1.0;
+
+                    // Vertical offset: slight rise at start, then droop (parabolic curve)
+                    // y = -a*(t-0.2)^2 + peak at t=0.2, then droop
+                    let rise_peak = 1.5;
+                    let droop_rate = 4.0;
+                    let y_offset =
+                        rise_peak * (1.0 - (t - 0.15).powi(2) * droop_rate) - (t * t * 3.0);
+                    let y_offset = y_offset.round() as i64;
+
+                    let fx = hx + (angle.cos() * horiz_dist).round() as i64;
+                    let fz = hz + (angle.sin() * horiz_dist).round() as i64;
+                    let fy = hy_top + y_offset;
+
+                    // Clamp to valid range
+                    let px = fx.clamp(0, size as i64 - 1);
+                    let pz = fz.clamp(0, size as i64 - 1);
+
+                    if fy >= h_vox && fy < max_height_voxels as i64 {
+                        // Check edge proximity for biome transition blending
+                        let (dist_to_edge, edge_diff) = compute_edge_info(px as usize, pz as usize);
+                        let edge_scale = if dist_to_edge >= transition_width {
+                            1.0
+                        } else {
+                            (dist_to_edge as f64) / (transition_width as f64)
+                        };
+                        let place_prob = if edge_diff { edge_scale } else { 1.0 };
+
+                        // Check local biome for smoother transitions
+                        let local_biome = if let Some(ref neighbors) = data.neighbor_biomes {
+                            get_biome_at_position(
+                                data.biome,
+                                neighbors,
+                                px as usize,
+                                0,
+                                pz as usize,
+                                size,
+                                &perlin_transition,
+                                (tile.x, tile.y),
+                            )
+                        } else {
+                            data.biome
+                        };
+                        let local_place_prob = if local_biome == Biome::Jungle {
+                            place_prob
+                        } else {
+                            (place_prob * 0.35).max(0.15)
+                        };
+
+                        if rng.gen_bool(local_place_prob.max(0.15)) {
+                            // Use darker green at base, lighter toward tips
+                            let frond_mat = if t < 0.4 {
+                                MAT_PALM_FROND_DARK
+                            } else if t < 0.7 {
+                                MAT_PALM_FROND_MID
+                            } else {
+                                // Slight variation at tips
+                                if rng.gen_bool(0.3) {
+                                    MAT_LEAVES_DARK
                                 } else {
-                                    data.biome
-                                };
-                                let local_place_prob = if local_biome == Biome::Jungle { place_prob } else { (place_prob * 0.35).max(0.15) };
-                                if rng.gen_bool(local_place_prob.max(0.15)) {
-                                    let leaf_choice = if rng.gen_bool(0.12) {
-                                        MAT_LEAVES_AUTUMN
-                                    } else if rng.gen_bool(0.25) {
-                                        MAT_LEAVES_LIGHT
-                                    } else {
-                                        MAT_LEAVES_DARK
-                                    };
-                                    voxels.push(VoxelRecord {
-                                        x: px,
-                                        y: cy,
-                                        z: pz,
-                                        material_index: leaf_choice,
-                                    });
+                                    MAT_PALM_FROND_MID
                                 }
+                            };
+
+                            voxels.push(VoxelRecord {
+                                x: px,
+                                y: fy,
+                                z: pz,
+                                material_index: frond_mat,
+                            });
+
+                            // Add some width to the frond (palm leaves have width)
+                            if step > 0 && step < frond_length - 1 && rng.gen_bool(0.6) {
+                                // Perpendicular direction for frond width
+                                let perp_angle = angle + std::f64::consts::PI / 2.0;
+                                let side = if rng.gen_bool(0.5) { 1.0 } else { -1.0 };
+                                let wx = fx + (perp_angle.cos() * side).round() as i64;
+                                let wz = fz + (perp_angle.sin() * side).round() as i64;
+                                let wpx = wx.clamp(0, size as i64 - 1);
+                                let wpz = wz.clamp(0, size as i64 - 1);
+
+                                voxels.push(VoxelRecord {
+                                    x: wpx,
+                                    y: fy,
+                                    z: wpz,
+                                    material_index: frond_mat,
+                                });
                             }
                         }
                     }
@@ -2056,7 +2146,9 @@ fn voxelize_jungle(
                 data.biome
             };
             // Allow undergrowth both in jungle and in nearby border cells (blend area)
-            let allow_undergrowth = if actual_biome == Biome::Jungle { true } else {
+            let allow_undergrowth = if actual_biome == Biome::Jungle {
+                true
+            } else {
                 // check whether adjacent neighbor is Jungle and we're within blend width
                 let blend_width = 8usize;
                 let mut near_jungle = false;
@@ -2066,10 +2158,18 @@ fn voxelize_jungle(
                     let dist_east = size - 1 - xi;
                     let dist_south = zi;
                     let dist_north = size - 1 - zi;
-                    if nb.west == Some(Biome::Jungle) && dist_west < blend_width { near_jungle = true; }
-                    if nb.east == Some(Biome::Jungle) && dist_east < blend_width { near_jungle = true; }
-                    if nb.south == Some(Biome::Jungle) && dist_south < blend_width { near_jungle = true; }
-                    if nb.north == Some(Biome::Jungle) && dist_north < blend_width { near_jungle = true; }
+                    if nb.west == Some(Biome::Jungle) && dist_west < blend_width {
+                        near_jungle = true;
+                    }
+                    if nb.east == Some(Biome::Jungle) && dist_east < blend_width {
+                        near_jungle = true;
+                    }
+                    if nb.south == Some(Biome::Jungle) && dist_south < blend_width {
+                        near_jungle = true;
+                    }
+                    if nb.north == Some(Biome::Jungle) && dist_north < blend_width {
+                        near_jungle = true;
+                    }
                 }
                 near_jungle
             };
@@ -2085,7 +2185,11 @@ fn voxelize_jungle(
             // Undergrowth density varied; blend with border influence
             let base_prob = 0.18; // more undergrowth in jungle
             let (min_edge_dist, _) = compute_edge_info(xi, zi);
-            let edge_prob = if min_edge_dist >= 12 { 1.0 } else { (min_edge_dist as f64) / 12.0 };
+            let edge_prob = if min_edge_dist >= 12 {
+                1.0
+            } else {
+                (min_edge_dist as f64) / 12.0
+            };
             let probability = (base_prob as f64) * edge_prob as f64;
             if rng.gen_bool(probability.max(0.06)) {
                 let bush_h = rng.gen_range(1..=4);

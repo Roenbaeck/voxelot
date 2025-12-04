@@ -1,0 +1,96 @@
+[world]
+file = "world_1.oct"
+palette = "worlds/palette.txt"
+camera_position = [
+    320.0,
+    100.0,
+    320.0,
+]
+water_level = 16.0
+water_visibility = 20.0
+
+[rendering]
+lod_subdivide_distance = 500.0
+lod_merge_distance = 1000.0
+chunk_lod_distance = 800.0
+fov_degrees = 70.0
+near_plane = 0.1
+far_plane = 5000.0
+camera_speed_multiplier = 1.0
+window_width = 1280
+window_height = 720
+
+[atmosphere]
+fog_density = 0.003
+time_of_day = 0.5
+night_skybox_brightness = 0.02
+horizon_fade_up = 0.05
+horizon_fade_down = 0.25
+skybox_fade_up = 0.05
+skybox_fade_down = 0.6
+skybox_min_saturation = 0.16
+skybox_night_tint = [
+    0.09,
+    0.12,
+    0.24,
+]
+skybox_tint_strength = 0.5
+
+[effects.depth_of_field]
+enabled = true
+focal_distance = 120.0
+focal_range = 16.0
+blur_strength = 1.6
+kawase_iterations = 3
+kawase_offset = 1.0
+kawase_enabled = false
+
+[effects.bloom]
+enabled = true
+threshold = 0.7
+knee = 0.6
+intensity = 1.8
+bloom_strength = 1.6
+saturation_boost = 1.5
+exposure = 1.18
+blur_radius = 3.8
+kawase_enabled = true
+kawase_iterations = 4
+kawase_offset = 0.5
+
+[effects.ssao]
+enabled = true
+sample_count = 8
+slice_count = 4
+radius = 4.0
+thickness = 0.5
+strength = 1.0
+blur_enabled = true
+blur_radius = 2.0
+
+[shadows]
+map_size = 4096
+darkness = 1.0
+backface_ambient_scale = 0.7
+pcf_radius = 1.0
+pcf_poisson_samples = 0
+
+[performance]
+mesh_cache_budget_mb = 256
+mesh_upload_baseline = 4
+envelope_distance = 256.0
+envelope_fade_range = 32.0
+max_envelope_distance = 1000.0
+hzb_enabled = true
+fallback_detail_distance = 500.0
+mesh_priority_sort_interval_frames = 30
+mesh_buffer_pool_entries = 256
+mega_vertex_buffer_mb = 512
+mega_index_buffer_mb = 256
+max_draw_capacity = 20000
+render_scale = 1.0
+max_gpu_instances = 6000000
+
+[debug]
+show_fps = true
+show_chunk_stats = true
