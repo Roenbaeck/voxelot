@@ -203,6 +203,7 @@ const MAT_WINDOW_COOL: usize = 43; // Becomes 44 after +1 offset
 const MAT_NEON_RED: usize = 44; // Becomes 45 after +1 offset
 const MAT_NEON_GREEN: usize = 45; // Becomes 46 after +1 offset
 const MAT_NEON_BLUE: usize = 46; // Becomes 47 after +1 offset
+const MAT_DUNE_GRASS: usize = 47; // Becomes 48 after +1 offset
 
 // Jungle parameters (tweakable)
 const JUNGLE_MIN_TREES: usize = 10;
@@ -2233,7 +2234,15 @@ fn voxelize_beach(
 
     let perlin_transition = Perlin::new((space.seed + 999) as u32);
 
-    // Voxelize sandy terrain
+    // Vegetation RNG
+    let mut rng = StdRng::seed_from_u64(stable_mix(&[
+        tile.x as u64,
+        tile.y as u64,
+        tile.z as u64,
+        0xBEAC401,
+    ]));
+
+    // Voxelize terrain
     for xi in 0..size {
         for zi in 0..size {
             // Determine actual biome at this position
@@ -2257,19 +2266,23 @@ fn voxelize_beach(
             let h_vox = (h_m / space.meters_per_voxel).round() as i64;
             let h_vox = h_vox.clamp(1, max_height_voxels as i64);
 
+            let dist_from_water = h_m - space.water_level_m;
+
             // Beach terrain: mostly sand with some stone underneath
             for y in space.base_y_vox..h_vox {
                 let mat = if y < h_vox - 3 {
                     MAT_STONE // Deep layer
                 } else {
-                    match actual_biome {
-                        Biome::Beach => MAT_SAND,
-                        Biome::Hill => {
-                            // Plain green: prefer MAT_GRASS_DARK for seamless look
-                            MAT_GRASS_DARK
+                    // Shore zone (0-5m from water) is always sand
+                    if dist_from_water < 5.0 {
+                        MAT_SAND
+                    } else {
+                        match actual_biome {
+                            Biome::Beach => MAT_SAND,
+                            Biome::Hill => MAT_GRASS_DARK,
+                            Biome::City => MAT_CONCRETE,
+                            Biome::Jungle => MAT_GRASS_DARK,
                         }
-                        Biome::City => MAT_CONCRETE,
-                        Biome::Jungle => MAT_GRASS_DARK,
                     }
                 };
                 voxels.push(VoxelRecord {
@@ -2279,50 +2292,83 @@ fn voxelize_beach(
                     material_index: mat,
                 });
             }
-        }
-    }
 
-    // Add sparse palm trees
-    let mut rng = StdRng::seed_from_u64(stable_mix(&[
-        tile.x as u64,
-        tile.y as u64,
-        tile.z as u64,
-        0xBEAC401,
-    ]));
+            // Vegetation placement
+            // Only place vegetation if we are in the Beach biome (or blending into it)
+            if actual_biome == Biome::Beach && h_m > space.water_level_m {
+                // Zone 1: Shore (0-5m) - No vegetation, pure sand
 
-    for xi in 0..size {
-        for zi in 0..size {
-            if rng.gen_bool(0.01) {
-                // Sparse palm trees
-                let voxel_z = (size - 1 - zi) as i64;
-                let h_m = heights_m[xi + zi * size];
+                // Zone 2: Dunes (5-15m) - Coastal grass
+                if dist_from_water >= 5.0 && dist_from_water < 15.0 {
+                    // Clumpy grass distribution
+                    // Use a simple noise function or just RNG with clustering
+                    if rng.gen_bool(0.15) {
+                        let grass_h = rng.gen_range(1..=2);
+                        for gy in 0..grass_h {
+                            voxels.push(VoxelRecord {
+                                x: xi as i64,
+                                y: h_vox + gy,
+                                z: voxel_z,
+                                material_index: MAT_DUNE_GRASS,
+                            });
+                        }
+                    }
+                }
 
-                // Only place palms above water
-                if h_m > space.water_level_m + 1.0 {
-                    let h_vox = (h_m / space.meters_per_voxel).round() as i64;
+                // Zone 3: Inland (>8m) - Sparse Palm Trees
+                // Overlaps slightly with dunes, but mostly further back
+                if dist_from_water >= 8.0 {
+                    // Much lower density (0.3%)
+                    if rng.gen_bool(0.003) {
+                        // Palm trunk (taller and thinner than regular trees)
+                        let trunk_h = rng.gen_range(6..10); // Slightly taller
+                        for ty in 0..trunk_h {
+                            voxels.push(VoxelRecord {
+                                x: xi as i64,
+                                y: h_vox + ty,
+                                z: voxel_z,
+                                material_index: MAT_TRUNK_LIGHT,
+                            });
+                        }
 
-                    // Palm trunk (taller and thinner than regular trees)
-                    let trunk_h = rng.gen_range(5..8);
-                    for ty in 0..trunk_h {
+                        // Palm fronds (drooping style using new colors)
+                        let canopy_y = h_vox + trunk_h;
+
+                        // Small crown
                         voxels.push(VoxelRecord {
                             x: xi as i64,
-                            y: h_vox + ty,
+                            y: canopy_y,
                             z: voxel_z,
-                            material_index: MAT_TRUNK_LIGHT,
+                            material_index: MAT_PALM_FROND_DARK,
                         });
-                    }
 
-                    // Palm fronds (smaller, flatter canopy)
-                    let canopy_y = h_vox + trunk_h;
-                    for cx in -2i64..=2 {
-                        for cz in -2i64..=2 {
-                            if (cx.abs() + cz.abs()) <= 2 {
-                                voxels.push(VoxelRecord {
-                                    x: (xi as i64 + cx).clamp(0, size as i64 - 1),
-                                    y: canopy_y,
-                                    z: (voxel_z + cz).clamp(0, size as i64 - 1),
-                                    material_index: MAT_LEAVES_LIGHT,
-                                });
+                        // Generate fronds
+                        let frond_count = rng.gen_range(5..=7);
+                        for frond_idx in 0..frond_count {
+                            let angle = (frond_idx as f64)
+                                * (2.0 * std::f64::consts::PI / frond_count as f64);
+                            let length = rng.gen_range(5..=7); // Slightly shorter than jungle palms
+
+                            for r in 1..=length {
+                                let drop = (r as f64 * 0.5).powf(1.2) as i64;
+                                let fx = (xi as f64 + angle.cos() * r as f64).round() as i64;
+                                let fz = (voxel_z as f64 + angle.sin() * r as f64).round() as i64;
+                                let fy = canopy_y - drop;
+
+                                if fx >= 0 && fx < size as i64 && fz >= 0 && fz < size as i64 {
+                                    let mat = if r < 3 {
+                                        MAT_PALM_FROND_DARK
+                                    } else {
+                                        MAT_PALM_FROND_MID
+                                    };
+
+                                    voxels.push(VoxelRecord {
+                                        x: fx,
+                                        y: fy,
+                                        z: fz,
+                                        material_index: mat,
+                                    });
+                                }
                             }
                         }
                     }

@@ -86,3 +86,7 @@
 46 50 255 50 255 50 255 50 200
 # Neon Blue
 47 50 50 255 255 50 50 255 200
+
+# 48-55: Coastal / Beach
+# Dune Grass (yellowish-green coastal grass)
+48 140 160 80 255 0 0 0 0
