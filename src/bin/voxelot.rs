@@ -1213,7 +1213,7 @@ impl App {
                         "ERROR: Failed to load world file '{}': {}",
                         cfg.world.file, e
                     );
-                    eprintln!("Please check that the file path in config.toml is correct.");
+                    eprintln!("Please check that the file path in your configuration is correct.");
                     std::process::exit(1);
                 },
             );

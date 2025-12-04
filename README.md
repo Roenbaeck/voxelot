@@ -43,8 +43,12 @@ Storage is proportional to *entropy*, not volume.
 ## Quick Start
 
 ```bash
-# Run the interactive viewer (release recommended)
+# Run the interactive viewer (release recommended). Use the default `config.toml` in the
+# current working directory, or pass a custom config via `--config` or as a single positional
+# argument (the positional argument is identical to providing `--config` explicitly):
 cargo run --release --bin voxelot
+cargo run --release --bin voxelot -- --config worlds/flat_city_test.toml
+cargo run --release --bin voxelot -- worlds/flat_city_test.toml
 
 # Show generator help (Rust)
 cargo run --bin generate_world -- --help
@@ -54,7 +58,7 @@ cargo run --bin generate_world -- --help
 
 **Movement:**
 - `WASD` - Move forward/left/backward/right
-- `Q` / `E` / `Space` - Move down/up/up
+- `Q` / `E` - Move down/up
 - `Right Mouse + Drag` - Free-look
 
 **Rotation:**
@@ -65,14 +69,14 @@ cargo run --bin generate_world -- --help
 - `-` / `+` - Decrease/increase camera speed multiplier
 - `0` - Reset camera speed multiplier
 
-**Runtime Configuration:**
+- **Runtime Configuration:**
 - `R` / `T` - Decrease/increase camera LOD subdivide distance
 - `Z` / `C` - Decrease/increase draw distance (far plane)
 - `K` / `L` - Decrease/increase chunk LOD render distance (100-5000 units)
 - `F` / `G` - Decrease/increase fog density
 - `ESC` - Save config and quit
 
-**Time & Environment:**
+- **Time & Environment:**
 - `T` - Cycle time of day (day → dusk → night → dawn)
 - `Y` / `M` - Lower/raise water level
 
@@ -93,12 +97,37 @@ cargo run --bin generate_world -- --help
 - `R` - Toggle SSR (Screen Space Reflections - experimental)
 - `J` - Toggle HZB (Hierarchical Z-Buffer) culling
 
-**Configuration:** The viewer uses `config.toml` for all settings including world file path, camera position, rendering options, and visual effects. Edit this file to customize your experience.
+**Configuration:** The viewer reads and writes settings in a unified TOML configuration file.
+
+- Default behavior: If a `config.toml` file is present in the current working directory, the viewer will use that by default.
+- Override with a file path: Use the `--config <path>` flag or pass the path as the first positional argument (e.g. `cargo run --bin voxelot -- worlds/flat_city_test.toml`). The viewer will load from and save to that file.
+
+
+This file controls the world file path, camera position, rendering options, and visual effects. Edit it to customize your experience.
+
+**Known Issues / Key Conflicts**
+- The keys `R` and `T` are used in multiple places in the viewer and can trigger more than one action when pressed (e.g., `R` toggles SSR and also affects LOD subdivide; `T` toggles the time-of-day pause and may affect LOD settings). These duplicate bindings are a known inconsistency and will be addressed in a future update.
 
 
 ## Configuration
 
-Configuration is saved in structured TOML `config.toml`.
+Configuration is saved in structured TOML files (default `config.toml`). When you pass a custom path the viewer will save back to that path (so per-world settings can stay in `worlds/` if you prefer).
+
+## Worlds & Per-World Configuration
+
+- Place per-world TOML config files in `worlds/` (some example files are already present). If you prefer to keep per-world settings under version control, pass them with `--config worlds/<your_world>.toml`.
+- The viewer reads `.oct` files listed inside your TOML configuration and launches with those settings.
+
+Note: We intentionally keep and use the existing TOML files in `worlds/` (do not create new ones unless needed).
+
+## Recent Updates (Changelog)
+
+- Viewer: Added `--config <path>` and optional single positional `CONFIG` argument to select which TOML file to load and save from. If no path is provided, fallback is `config.toml` in the working directory.
+- Viewer: When launched with `--config`, the viewer writes the updated configuration back to that path on exit.
+- Generator: `generate_world` — jungle biome improvements: fewer, larger canopy trees with split trunks and blended undergrowth across neighboring tiles to avoid harsh edges; reduced tree heights near tile borders for smoother transitions.
+- Generator: `generate_world` — removed the hill tile banding (the previous `(x + z) % 3` grass variant banding has been replaced with more natural grass tone selection).
+
+If you find mismatches between the viewer world and generator outputs, the generator still uses explicit CLI flags (no `--config` support yet) so ensure your generator values match the world file in `worlds/`.
 
 **Structure:**
 
@@ -161,7 +190,6 @@ Two generators are provided:
 **File Format:** The preferred runtime format is the compact binary octree (`.oct`).
 
 **Example: Generating a World (Rust)**
-
 ```bash
 cargo run --bin generate_world -- \
     --center-lon=-74.0060 \
@@ -175,6 +203,8 @@ cargo run --bin generate_world -- \
     --output-name=worlds/world_1 \
     --format=oct
 ```
+
+Note: The `generate_world` binary does not currently accept a `--config` path — the command-line flags listed above control generation parameters. To run with a world-config TOML file, launch the viewer with `--config` and adjust parameters to re-run the generator yourself if needed.
 
 ## Architecture
 

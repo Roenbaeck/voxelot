@@ -14,4 +14,5 @@
 - ✅ There's a 1-voxel raised ridge in many places (between every tile?). 
 
 - 🛑 Trees are generated under water level.
+ - 🛑 Keybinding conflict: `R` and `T` may trigger multiple actions (LOD/SSR/time pause) due to duplicate handler usage. Remap or separate handlers to avoid combined actions.
 
