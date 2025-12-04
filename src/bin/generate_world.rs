@@ -202,6 +202,13 @@ const MAT_NEON_RED: usize = 44;
 const MAT_NEON_GREEN: usize = 45;
 const MAT_NEON_BLUE: usize = 46;
 
+// Jungle parameters (tweakable)
+const JUNGLE_MIN_TREES: usize = 10;
+const JUNGLE_MAX_TREES: usize = 15;
+const JUNGLE_CANOPY_MIN: usize = 6; // radius in voxels (was ~3)
+const JUNGLE_CANOPY_MAX: usize = 10; // radius in voxels (was ~5)
+const JUNGLE_SPLIT_SEPARATION: usize = 12; // min separation between large jungle trees
+
 #[derive(Clone, Debug)]
 struct TileFetcher {
     seed: u64,
@@ -242,7 +249,7 @@ impl TileFetcher {
                 let frac_y = (sj as f64 + 0.5) / sample_grid as f64;
                 let sample_lon = min_lon + (max_lon - min_lon) * frac_x;
                 let sample_lat = south_lat + (north_lat - south_lat) * frac_y;
-                let (sx_m, sy_m) = lon_lat_to_mercator_meters(sample_lon, sample_lat);
+                let (_sx_m, _sy_m) = lon_lat_to_mercator_meters(sample_lon, sample_lat);
                 let (sx_m, sy_m) = lon_lat_to_mercator_meters(sample_lon, sample_lat);
                 // Create a temporary TileSpace to pass parameters
                 let temp_space = TileSpace::new(
@@ -1492,11 +1499,8 @@ fn voxelize_hill(
                             if h_m > 140.0 {
                                 MAT_SNOW
                             } else {
-                                if (xi + zi) % 3 == 0 {
-                                    MAT_GRASS_LIGHT
-                                } else {
-                                    MAT_GRASS_DARK
-                                }
+                                // Plain green: use the darker grass variant to match Jungle
+                                MAT_GRASS_DARK
                             }
                         }
                         Biome::Beach => MAT_SAND,
@@ -1745,7 +1749,12 @@ fn voxelize_jungle(
                 } else {
                     match actual_biome {
                         Biome::Hill => {
-                            if (xi + zi) % 3 == 0 {
+                            // Use perlin noise for natural variation rather than strict grid bands
+                            let noise_scale = 0.07;
+                            let world_x = tile.x as f64 * size as f64 + xi as f64;
+                            let world_z = tile.y as f64 * size as f64 + zi as f64;
+                            let n = perlin.get([world_x * noise_scale, world_z * noise_scale]);
+                            if n > 0.15 {
                                 MAT_GRASS_LIGHT
                             } else {
                                 MAT_GRASS_DARK
@@ -1776,18 +1785,262 @@ fn voxelize_jungle(
     }
 
     // Dense vegetation for Jungle
+    // We'll select a fixed-ish number of canopy trees per tile (10-15) with larger combined canopies
     let mut rng = StdRng::seed_from_u64(stable_mix(&[
         tile.x as u64,
         tile.y as u64,
         tile.z as u64,
         0x504E474C, // JUNGLE
     ]));
-    // Lower density: 0.02 base + random
-    let veg_density = 0.02 + (rng.gen::<f64>() * 0.02);
 
+    // Collect candidate positions for trees (gentle slope, above water)
+    let mut candidates: Vec<(usize, usize)> = Vec::new();
     for xi in 0..size {
         for zi in 0..size {
-            // Recalculate actual_biome for vegetation placement
+            let h_m = heights_m[xi + zi * size];
+            if h_m <= space.water_level_m + 0.5 {
+                continue;
+            }
+            let h_vox = (h_m / space.meters_per_voxel).round() as i64;
+            if h_vox + 24 >= max_height_voxels as i64 { // avoid extremely tall or off-grid trees
+                continue;
+            }
+            // Gentle slope only
+            let center = heights_m[xi + zi * size];
+            let neighbor_x = if xi + 1 < size {
+                heights_m[(xi + 1) + zi * size]
+            } else {
+                center
+            };
+            let neighbor_z = if zi + 1 < size {
+                heights_m[xi + (zi + 1) * size]
+            } else {
+                center
+            };
+            let slope_x = (neighbor_x - center).abs();
+            let slope_z = (neighbor_z - center).abs();
+            let slope = (slope_x + slope_z) * 0.5 / space.meters_per_voxel;
+            if slope >= 1.5 {
+                // Too steep
+                continue;
+            }
+            candidates.push((xi, zi));
+        }
+    }
+
+    // Select a limited number of trees per tile: target 10 - 15
+    let desired_trees = rng.gen_range(JUNGLE_MIN_TREES..=JUNGLE_MAX_TREES);
+    candidates.shuffle(&mut rng);
+    let mut selected_trees: Vec<(usize, usize)> = Vec::new();
+    // Keep trees separated to avoid overlapping huge canopies
+    for (cx, cz) in candidates.into_iter() {
+        if selected_trees.len() >= desired_trees {
+            break;
+        }
+        let mut too_close = false;
+            for &(sx, sz) in &selected_trees {
+            let dx = (sx as i64 - cx as i64).abs() as usize;
+            let dz = (sz as i64 - cz as i64).abs() as usize;
+            if dx <= JUNGLE_SPLIT_SEPARATION && dz <= JUNGLE_SPLIT_SEPARATION {
+                too_close = true;
+                break;
+            }
+        }
+        if !too_close {
+            selected_trees.push((cx, cz));
+        }
+    }
+
+    // Helper: compute distance to nearest edge and whether neighbor biome is not jungle at that edge
+    let compute_edge_info = |x: usize, z: usize| -> (usize, bool) {
+        let dist_west = x;
+        let dist_east = size - 1 - x;
+        let dist_south = z;
+        let dist_north = size - 1 - z;
+        let min_dist = *[dist_west, dist_east, dist_south, dist_north].iter().min().unwrap();
+        // Determine if any neighbor biome is NOT Jungle on the closest edge
+        let mut edge_different = false;
+        if let Some(ref nb) = data.neighbor_biomes {
+            if dist_west == min_dist {
+                if nb.west != Some(Biome::Jungle) {
+                    edge_different = true;
+                }
+            }
+            if dist_east == min_dist {
+                if nb.east != Some(Biome::Jungle) {
+                    edge_different = true;
+                }
+            }
+            if dist_south == min_dist {
+                if nb.south != Some(Biome::Jungle) {
+                    edge_different = true;
+                }
+            }
+            if dist_north == min_dist {
+                if nb.north != Some(Biome::Jungle) {
+                    edge_different = true;
+                }
+            }
+        }
+        (min_dist, edge_different)
+    };
+
+    for &(xi, zi) in &selected_trees {
+        // Calculate actual biome and check
+        let actual_biome = if let Some(ref neighbors) = data.neighbor_biomes {
+            get_biome_at_position(
+                data.biome,
+                neighbors,
+                xi,
+                0,
+                zi,
+                size,
+                &perlin_transition,
+                (tile.x, tile.y),
+            )
+        } else {
+            data.biome
+        };
+        if actual_biome != Biome::Jungle {
+            continue;
+        }
+
+        let voxel_z = (size - 1 - zi) as i64;
+        let h_m = heights_m[xi + zi * size];
+        let h_vox = (h_m / space.meters_per_voxel).round() as i64;
+
+        // Determine proximity to tile edge to scale down height/canopy near borders
+        let (min_edge_dist, edge_diff) = compute_edge_info(xi, zi);
+        // Normalize distance in [0..TRANSITION_WIDTH]; reuse get_biome_at_position TRANSITION_WIDTH
+        let transition_width = 16usize;
+        let edge_factor = if min_edge_dist >= transition_width {
+            1.0
+        } else {
+            (min_edge_dist as f64) / (transition_width as f64)
+        };
+        // If neighbor is different biome, reduce height even more
+        let edge_reduction = if edge_diff { 0.6 } else { 1.0 };
+
+        // Tall trees (base 12-24m), but apply edge scaling
+            let base_trunk_h = rng.gen_range(12..24) as f64;
+        let trunk_h_f = (base_trunk_h * edge_factor * edge_reduction).max(6.0);
+        let trunk_h = trunk_h_f.round() as i64;
+
+        // Plant main trunk up to split point
+        // Choose a split: 1..=3 branches (1 = no split), make splits common
+        let split_count = if rng.gen_bool(0.6) { 2 } else if rng.gen_bool(0.2) { 3 } else { 1 };
+        let split_height = (trunk_h as f64 * rng.gen_range(0.35..0.65)).round() as i64;
+
+        // Place main trunk blocks up to split_height
+        for ty in 0..split_height {
+            voxels.push(VoxelRecord {
+                x: xi as i64,
+                y: h_vox + ty,
+                z: voxel_z,
+                material_index: MAT_TRUNK_DARK,
+            });
+        }
+
+        // Create split trunks
+        let mut trunk_heads: Vec<(i64, i64, i64)> = Vec::new(); // (x, z, base_y)
+        if split_count == 1 {
+            trunk_heads.push((xi as i64, voxel_z, h_vox + split_height));
+        } else {
+            for si in 0..split_count {
+                // Angle & offset
+                let angle = (si as f64) * (2.0 * std::f64::consts::PI / split_count as f64)
+                    + rng.gen_range(-0.4..0.4);
+                let ox = (angle.cos() * rng.gen_range(0.0..2.2)).round() as i64;
+                let oz = (angle.sin() * rng.gen_range(0.0..2.2)).round() as i64;
+                let bx = (xi as i64 + ox).clamp(0, size as i64 - 1);
+                let bz = (voxel_z + oz).clamp(0, size as i64 - 1);
+                let add_h = rng.gen_range(6..12) as f64;
+                let sub_trunk_h = ((trunk_h - split_height) as f64 * rng.gen_range(0.6..1.0) + add_h).round() as i64;
+                // Build the sub-trunk: straight or slightly tilted upward
+                let mut tx = bx;
+                let mut tz = bz;
+                for ty in 0..sub_trunk_h {
+                    let py = h_vox + split_height + ty;
+                    voxels.push(VoxelRecord {
+                        x: tx.clamp(0, size as i64 - 1),
+                        y: py,
+                        z: tz.clamp(0, size as i64 - 1),
+                        material_index: MAT_TRUNK_DARK,
+                    });
+                    // Slight drift: shift every few steps
+                    if rng.gen_bool(0.15) {
+                        // drift horizontally by 0 or +-1 on x/z
+                        let dx = rng.gen_range(-1..=1);
+                        let dz = rng.gen_range(-1..=1);
+                        tx = (tx + dx).clamp(0, size as i64 - 1);
+                        tz = (tz + dz).clamp(0, size as i64 - 1);
+                    }
+                }
+                trunk_heads.push((tx, tz, h_vox + split_height + sub_trunk_h));
+            }
+        }
+
+        // Canopy — larger than before (approx twice), combine contributions from each split trunk
+        // Canopy radius base: 6..=10 (up from 3..=5)
+        for &(hx, hz, hy_top) in &trunk_heads {
+            let canopy_radius = rng.gen_range(JUNGLE_CANOPY_MIN..=JUNGLE_CANOPY_MAX) as i64;
+            let canopy_base = hy_top - 4; // slightly below top
+            for cx in -canopy_radius..=canopy_radius {
+                for cz in -canopy_radius..=canopy_radius {
+                    for cy_offset in 0..=6 {
+                        let cy = canopy_base + cy_offset;
+                        if cy >= h_vox && cy < max_height_voxels as i64 {
+                            let dist2 = (cx * cx) + (cz * cz) + (cy_offset as i64 * cy_offset as i64);
+                            // approximate spherical canopy
+                            if dist2 <= (canopy_radius * canopy_radius + 3) {
+                                let px = (hx + cx).clamp(0, size as i64 - 1);
+                                let pz = (hz + cz).clamp(0, size as i64 - 1);
+                                // If canopy would be placed near a border towards a different biome, reduce by edge factor
+                                let (dist_to_edge, edge_diff) = compute_edge_info(px as usize, pz as usize);
+                                let edge_scale = if dist_to_edge >= transition_width { 1.0 } else { (dist_to_edge as f64) / (transition_width as f64) };
+                                let place_prob = if edge_diff { edge_scale } else { 1.0 };
+                                // To smooth canopy across borders: check the biome at leaf's target cell
+                                let local_biome = if let Some(ref neighbors) = data.neighbor_biomes {
+                                    get_biome_at_position(
+                                        data.biome,
+                                        neighbors,
+                                        px as usize,
+                                        0,
+                                        pz as usize,
+                                        size,
+                                        &perlin_transition,
+                                        (tile.x, tile.y),
+                                    )
+                                } else {
+                                    data.biome
+                                };
+                                let local_place_prob = if local_biome == Biome::Jungle { place_prob } else { (place_prob * 0.35).max(0.15) };
+                                if rng.gen_bool(local_place_prob.max(0.15)) {
+                                    let leaf_choice = if rng.gen_bool(0.12) {
+                                        MAT_LEAVES_AUTUMN
+                                    } else if rng.gen_bool(0.25) {
+                                        MAT_LEAVES_LIGHT
+                                    } else {
+                                        MAT_LEAVES_DARK
+                                    };
+                                    voxels.push(VoxelRecord {
+                                        x: px,
+                                        y: cy,
+                                        z: pz,
+                                        material_index: leaf_choice,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Add undergrowth: keep undergrowth across tile, but allow smooth transition on edges.
+    for xi in 0..size {
+        for zi in 0..size {
             let actual_biome = if let Some(ref neighbors) = data.neighbor_biomes {
                 get_biome_at_position(
                     data.biome,
@@ -1802,57 +2055,40 @@ fn voxelize_jungle(
             } else {
                 data.biome
             };
-
-            // Only place Jungle vegetation if the local biome is actually Jungle
-            if actual_biome != Biome::Jungle {
+            // Allow undergrowth both in jungle and in nearby border cells (blend area)
+            let allow_undergrowth = if actual_biome == Biome::Jungle { true } else {
+                // check whether adjacent neighbor is Jungle and we're within blend width
+                let blend_width = 8usize;
+                let mut near_jungle = false;
+                if let Some(ref nb) = data.neighbor_biomes {
+                    // If any neighbor is Jungle and this cell is within blend width of that border, allow
+                    let dist_west = xi;
+                    let dist_east = size - 1 - xi;
+                    let dist_south = zi;
+                    let dist_north = size - 1 - zi;
+                    if nb.west == Some(Biome::Jungle) && dist_west < blend_width { near_jungle = true; }
+                    if nb.east == Some(Biome::Jungle) && dist_east < blend_width { near_jungle = true; }
+                    if nb.south == Some(Biome::Jungle) && dist_south < blend_width { near_jungle = true; }
+                    if nb.north == Some(Biome::Jungle) && dist_north < blend_width { near_jungle = true; }
+                }
+                near_jungle
+            };
+            if !allow_undergrowth {
                 continue;
             }
-
             let voxel_z = (size - 1 - zi) as i64;
             let h_m = heights_m[xi + zi * size];
             if h_m <= space.water_level_m + 0.5 {
                 continue;
             }
             let h_vox = (h_m / space.meters_per_voxel).round() as i64;
-
-            if rng.gen_bool(veg_density) {
-                // Tall trees (12-24m)
-                let trunk_h = rng.gen_range(12..24);
-                for ty in 0..trunk_h {
-                    voxels.push(VoxelRecord {
-                        x: xi as i64,
-                        y: h_vox + ty,
-                        z: voxel_z,
-                        material_index: MAT_TRUNK_DARK,
-                    });
-                }
-
-                // Wide canopy (radius 3-5)
-                let canopy_radius = rng.gen_range(3..=5);
-                let canopy_base = h_vox + trunk_h - 3;
-                for cx in -canopy_radius..=canopy_radius {
-                    for cz in -canopy_radius..=canopy_radius {
-                        for cy_offset in 0..=4 {
-                            let cy = canopy_base + cy_offset;
-                            if cy >= h_vox && cy < max_height_voxels as i64 {
-                                let dist = (cx as i32).abs()
-                                    + (cz as i32).abs()
-                                    + (cy_offset as i32).abs();
-                                if dist <= canopy_radius + 1 {
-                                    voxels.push(VoxelRecord {
-                                        x: (xi as i64 + cx as i64).clamp(0, size as i64 - 1),
-                                        y: cy,
-                                        z: (voxel_z + cz as i64).clamp(0, size as i64 - 1),
-                                        material_index: MAT_LEAVES_DARK,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            } else if rng.gen_bool(0.25) {
-                // Undergrowth - varied height
-                let bush_h = rng.gen_range(1..=3);
+            // Undergrowth density varied; blend with border influence
+            let base_prob = 0.18; // more undergrowth in jungle
+            let (min_edge_dist, _) = compute_edge_info(xi, zi);
+            let edge_prob = if min_edge_dist >= 12 { 1.0 } else { (min_edge_dist as f64) / 12.0 };
+            let probability = (base_prob as f64) * edge_prob as f64;
+            if rng.gen_bool(probability.max(0.06)) {
+                let bush_h = rng.gen_range(1..=4);
                 for by in 0..bush_h {
                     voxels.push(VoxelRecord {
                         x: xi as i64,
@@ -1925,11 +2161,8 @@ fn voxelize_beach(
                     match actual_biome {
                         Biome::Beach => MAT_SAND,
                         Biome::Hill => {
-                            if (xi + zi) % 3 == 0 {
-                                MAT_GRASS_LIGHT
-                            } else {
-                                MAT_GRASS_DARK
-                            }
+                            // Plain green: prefer MAT_GRASS_DARK for seamless look
+                            MAT_GRASS_DARK
                         }
                         Biome::City => MAT_CONCRETE,
                         Biome::Jungle => MAT_GRASS_DARK,
@@ -2595,8 +2828,6 @@ fn generate_area(args: &Args) -> Vec<TileVoxelResult> {
             for gx in 0..grid_w {
                 let wx = global_min_x
                     + ((gx as f64 + 0.5) / grid_w as f64) * (global_max_x - global_min_x);
-                let wz = global_min_y
-                    + ((gz as f64 + 0.5) / grid_h as f64) * (global_max_y - global_min_y);
                 let wz = global_min_y
                     + ((gz as f64 + 0.5) / grid_h as f64) * (global_max_y - global_min_y);
                 // Create a temporary space for global sampling
