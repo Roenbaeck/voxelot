@@ -31,9 +31,11 @@ Voxelot leverages **Roaring Bitmaps** and bitwise arithmetic for extreme perform
 ### Cinematic Rendering
 A modern rendering pipeline built on `wgpu` that goes beyond standard voxel looks:
 - **SSAO**: Horizon-based ambient occlusion for depth perception.
+- **SSR**: Screen-space reflections and lighting.
 - **Dual-Kawase Bloom**: High-quality, multi-pass bloom for glowing voxels.
 - **Cinematic Depth of Field**: Bokeh-style blur with focus control.
-- **Dynamic Atmosphere**: Day/night cycle with scattering-approximated fog and HDR skybox.
+- **Dynamic Atmosphere**: Day/night cycle with scattering-approximated fog and rotating HDR skybox.
+- **Realistic water**: Animated water with depth fading, reflections, and shoreline foam.
 
 ### Optimal Sparsity
 Storage is proportional to *entropy*, not volume.
