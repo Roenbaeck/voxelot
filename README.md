@@ -12,16 +12,18 @@ AI can still run wild and mess up large portions of the code base. If you experi
 ## Key Features
 
 ### Recursive "Chunks All The Way"
-Unlike traditional engines that separate "World", "Region", and "Chunk" classes, Voxelot uses a **uniform recursive structure**. The entire World is a Chunk, which contains sub-Chunks, down to the leaf level.
+Unlike traditional engines that separate "World", "Region", and "Chunk" classes, Voxelot uses a **uniform recursive structure**. The entire World is a Chunk, which contains sub-Chunks, down to the leaf level. Each chunk, regardless of level, has a side length of 16.
 - **Unified Logic**: Culling, raycasting, and storage work identically at all scales.
-- **Massive Scale**: A hierarchy depth of 4 gives you a **65,536³** voxel world (281 trillion potential voxels) addressable with simple integer coordinates.
+- **Massive Scale**: A hierarchy depth of 4 gives you a **(16³)⁴** voxel world (281 trillion potential voxels) addressable with simple integer coordinates.
 
 ### Bitwise Performance Pipeline
 Voxelot leverages **Roaring Bitmaps** and bitwise arithmetic for extreme performance:
-- **3-Stage Culling**:
+- **Multi-stage Culling**:
     1. **Frustum AABB**: Standard intersection check.
     2. **Marginal Bitmaps**: `u16` bitmasks (px/py/pz) instantly reject empty slices.
     3. **Roaring Intersection**: Exact boolean operations isolate *only* the visible voxels within the frustum.
+    4. **Visible shell cache**: Non-leaf chunks calculate a shell with a visibility mask, quickly discarding non-visible chunks from any angle.
+    5. **Submerged chunks**: Chunks so deep below water level that they would not be visible are culled.
 - **Binary Greedy Meshing**: Meshes are generated using bitwise face detection (`col & !(col << 1)`), merging faces into optimal quads faster than standard iteration.
 - **Mesh Streaming**: Greedy-meshed leaf chunks stream in gradually with fallback previews.
 - **Parallel Processing**: Multi-threaded chunk updates and culling using `rayon`.
@@ -37,7 +39,7 @@ A modern rendering pipeline built on `wgpu` that goes beyond standard voxel look
 ### Optimal Sparsity
 Storage is proportional to *entropy*, not volume.
 - **Roaring Bitmaps**: Compressed bitmap indices mean empty space takes zero memory.
-- **Compact Storage**: An 85 million voxel world can be stored in just **~10MB** (`.oct` format).
+- **Compact Storage**: A 500 million voxel world can be stored in just **~50MB** (`.oct` format).
 - **Exact Queries**: No false positives; if the bitmap says a voxel is there, it's there.
 
 ## Quick Start
@@ -94,41 +96,22 @@ cargo run --bin generate_world -- --help
 - `F1` / `F2` - Decrease/increase SSAO sample count
 - `F3` / `F4` - Decrease/increase SSAO radius
 - `F5` - Toggle GUI overlay (FPS counter & debug stats)
-- `R` - Toggle SSR (Screen Space Reflections - experimental)
+- `R` - Toggle SSR (Screen Space Reflections)
 - `J` - Toggle HZB (Hierarchical Z-Buffer) culling
 
-**Configuration:** The viewer reads and writes settings in a unified TOML configuration file.
+## Configuration
+
+The viewer reads and writes settings in a unified TOML configuration file.
 
 - Default behavior: If a `config.toml` file is present in the current working directory, the viewer will use that by default.
 - Override with a file path: Use the `--config <path>` flag or pass the path as the first positional argument (e.g. `cargo run --bin voxelot -- worlds/flat_city_test.toml`). The viewer will load from and save to that file.
 
-
 This file controls the world file path, camera position, rendering options, and visual effects. Edit it to customize your experience.
-
-**Known Issues / Key Conflicts**
-- Resolved: `R` / `T` key conflict — LOD subdivide reassigned to `PageDown` / `PageUp`. `T` continues to toggle time pause, and `R` still toggles SSR.
-
-
-## Configuration
-
-Configuration is saved in structured TOML files (default `config.toml`). When you pass a custom path the viewer will save back to that path (so per-world settings can stay in `worlds/` if you prefer).
 
 ## Worlds & Per-World Configuration
 
 - Place per-world TOML config files in `worlds/` (some example files are already present). If you prefer to keep per-world settings under version control, pass them with `--config worlds/<your_world>.toml`.
 - The viewer reads `.oct` files listed inside your TOML configuration and launches with those settings.
-
-Note: We intentionally keep and use the existing TOML files in `worlds/` (do not create new ones unless needed).
-
-## Recent Updates (Changelog)
-
-- Viewer: Added `--config <path>` and optional single positional `CONFIG` argument to select which TOML file to load and save from. If no path is provided, fallback is `config.toml` in the working directory.
-- Viewer: When launched with `--config`, the viewer writes the updated configuration back to that path on exit.
-- Generator: `generate_world` — jungle biome improvements: fewer, larger canopy trees with split trunks and blended undergrowth across neighboring tiles to avoid harsh edges; reduced tree heights near tile borders for smoother transitions.
-- Generator: `generate_world` — removed the hill tile banding (the previous `(x + z) % 3` grass variant banding has been replaced with more natural grass tone selection).
- - Viewer: Moved camera LOD subdivide controls to `PageDown` / `PageUp` (from `R`/`T`) to avoid conflicting key bindings — `T` remains as time pause and `R` toggles SSR.
-
-If you find mismatches between the viewer world and generator outputs, the generator still uses explicit CLI flags (no `--config` support yet) so ensure your generator values match the world file in `worlds/`.
 
 **Structure:**
 
@@ -185,8 +168,8 @@ Each line defines a voxel type:
 
 Two generators are provided:
 
-1. `voxel_generator_tiles.py` – Python prototype for synthesizing tile footprints.
-2. `generate_world` – Rust generator, faster for large areas, writes compressed `.oct` + metadata.
+1. `generate_world` – Rust generator, faster for large areas, writes compressed `.oct` + metadata.
+2. `voxel_generator_tiles.py` – Legacy Python prototype for synthesizing tile footprints (not maintained).
 
 **File Format:** The preferred runtime format is the compact binary octree (`.oct`).
 
