@@ -43,6 +43,13 @@ Storage is proportional to *entropy*, not volume.
 - **Compact Storage**: A 500 million voxel world can be stored in just **~50MB** (`.oct` format).
 - **Exact Queries**: No false positives; if the bitmap says a voxel is there, it's there.
 
+### Multiple levels of detail
+Chunks have different rendering modes depending on state and distance.
+- **Shell**: Unmeshed chunks near the camera render as individual voxels from the shell of the chunk.
+- **Meshed**: Once a chunk is meshed, the meshed surfaces are rendered for chunks near the camera.
+- **Envelope**: At medium distance uniformly colored, and thereby simpler meshes are used.
+- **Bounding box**: At large distance, or when envelopes are missing, chunks are rendered as a tight bounding box.
+
 ## Quick Start
 
 ```bash
