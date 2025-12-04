@@ -591,7 +591,7 @@ impl CameraController {
                 println!("Camera speed multiplier reset to 1.00");
             }
             // Runtime config adjustments (only on key press, not release)
-            KeyCode::KeyR if pressed => {
+            KeyCode::PageDown if pressed => {
                 self.camera.config.lod_subdivide_distance =
                     (self.camera.config.lod_subdivide_distance - 50.0).max(50.0);
                 println!(
@@ -599,7 +599,7 @@ impl CameraController {
                     self.camera.config.lod_subdivide_distance
                 );
             }
-            KeyCode::KeyT if pressed => {
+            KeyCode::PageUp if pressed => {
                 self.camera.config.lod_subdivide_distance =
                     (self.camera.config.lod_subdivide_distance + 50.0).min(2000.0);
                 println!(

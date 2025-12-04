@@ -70,7 +70,7 @@ cargo run --bin generate_world -- --help
 - `0` - Reset camera speed multiplier
 
 - **Runtime Configuration:**
-- `R` / `T` - Decrease/increase camera LOD subdivide distance
+- `PageDown` / `PageUp` - Decrease/increase camera LOD subdivide distance
 - `Z` / `C` - Decrease/increase draw distance (far plane)
 - `K` / `L` - Decrease/increase chunk LOD render distance (100-5000 units)
 - `F` / `G` - Decrease/increase fog density
@@ -106,7 +106,7 @@ cargo run --bin generate_world -- --help
 This file controls the world file path, camera position, rendering options, and visual effects. Edit it to customize your experience.
 
 **Known Issues / Key Conflicts**
-- The keys `R` and `T` are used in multiple places in the viewer and can trigger more than one action when pressed (e.g., `R` toggles SSR and also affects LOD subdivide; `T` toggles the time-of-day pause and may affect LOD settings). These duplicate bindings are a known inconsistency and will be addressed in a future update.
+- Resolved: `R` / `T` key conflict — LOD subdivide reassigned to `PageDown` / `PageUp`. `T` continues to toggle time pause, and `R` still toggles SSR.
 
 
 ## Configuration
@@ -126,6 +126,7 @@ Note: We intentionally keep and use the existing TOML files in `worlds/` (do not
 - Viewer: When launched with `--config`, the viewer writes the updated configuration back to that path on exit.
 - Generator: `generate_world` — jungle biome improvements: fewer, larger canopy trees with split trunks and blended undergrowth across neighboring tiles to avoid harsh edges; reduced tree heights near tile borders for smoother transitions.
 - Generator: `generate_world` — removed the hill tile banding (the previous `(x + z) % 3` grass variant banding has been replaced with more natural grass tone selection).
+ - Viewer: Moved camera LOD subdivide controls to `PageDown` / `PageUp` (from `R`/`T`) to avoid conflicting key bindings — `T` remains as time pause and `R` toggles SSR.
 
 If you find mismatches between the viewer world and generator outputs, the generator still uses explicit CLI flags (no `--config` support yet) so ensure your generator values match the world file in `worlds/`.
 
