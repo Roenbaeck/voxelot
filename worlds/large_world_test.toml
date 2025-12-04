@@ -3,11 +3,11 @@ file = "worlds/large_world_test.oct"
 palette = "worlds/palette.txt"
 camera_position = [
     511.0,
-    150.0,
+    100.0,
     511.0,
 ]
-water_level = 25.0
-water_visibility = 15.0
+water_level = 20.0
+water_visibility = 5.0
 
 [rendering]
 lod_subdivide_distance = 2000.0
@@ -15,15 +15,15 @@ lod_merge_distance = 750.0
 chunk_lod_distance = 1500.0
 fov_degrees = 70.0
 near_plane = 0.1
-far_plane = 7000.0
+far_plane = 30000.0
 camera_speed_multiplier = 5.9604645
 window_width = 1280
 window_height = 720
 
 [atmosphere]
 fog_density = 0.00019999995
-time_of_day = 0.9985467
-night_skybox_brightness = 0.02
+time_of_day = 0.6246803
+night_skybox_brightness = 0.01
 horizon_fade_up = 0.05
 horizon_fade_down = 0.25
 skybox_fade_up = 0.05
@@ -76,7 +76,7 @@ pcf_radius = 3.0
 pcf_poisson_samples = 8
 
 [performance]
-mesh_cache_budget_mb = 256
+mesh_cache_budget_mb = 512
 mesh_worker_count = 6
 mesh_upload_baseline = 4
 envelope_distance = 500.0
@@ -85,12 +85,12 @@ max_envelope_distance = 1000.0
 hzb_enabled = true
 fallback_detail_distance = 500.0
 mesh_priority_sort_interval_frames = 30
-mesh_buffer_pool_entries = 256
-mega_vertex_buffer_mb = 512
-mega_index_buffer_mb = 256
+mesh_buffer_pool_entries = 512
+mega_vertex_buffer_mb = 1024
+mega_index_buffer_mb = 512
 max_draw_capacity = 10000
-render_scale = 1.42
-max_gpu_instances = 6000000
+render_scale = 1.85
+max_gpu_instances = 12000000
 
 [debug]
 show_fps = true

@@ -8,6 +8,7 @@
 //! - Instanced rendering
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
+use clap::Parser;
 use glam::{Mat4, Vec3};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -40,7 +41,16 @@ macro_rules! viewer_debug {
 
 const WINDOW_WIDTH: u32 = 1280;
 const WINDOW_HEIGHT: u32 = 720;
-const CONFIG_FILE: &str = "config.toml"; // Unified TOML configuration only
+const DEFAULT_CONFIG_FILE: &str = "config.toml"; // Unified TOML configuration only
+
+#[derive(Parser, Debug)]
+#[command(author, version)]
+/// Viewer arguments
+struct ViewerArgs {
+    /// Path to config TOML file
+    #[arg(long, default_value = DEFAULT_CONFIG_FILE)]
+    config: String,
+}
 const GPU_CULL_WORKGROUP_SIZE: u32 = 64;
 const SHADOW_FRUSTUM_EXTENT_MIN: f32 = 150.0;
 const SHADOW_FRUSTUM_EXTENT_MAX: f32 = 600.0;
@@ -1064,6 +1074,8 @@ struct App {
     emissive_texture: Option<wgpu::Texture>,
     emissive_view: Option<wgpu::TextureView>,
     emissive_texture_bytes: u64,
+    // Path to loaded config file (user provided or default)
+    config_path: String,
 }
 
 impl App {
@@ -1117,13 +1129,13 @@ impl App {
         }
         total
     }
-    fn new() -> Self {
+    fn new(config_path: &str) -> Self {
         let mut system_info = System::new();
         let process_pid = Pid::from(std::process::id() as usize);
         system_info.refresh_process(process_pid);
 
         // Load configuration once for all initialization
-        let cfg = voxelot::Config::load_or_default(CONFIG_FILE);
+        let cfg = voxelot::Config::load_or_default(config_path);
 
         let mut initial_camera;
         let mut world;
@@ -1526,6 +1538,7 @@ impl App {
             emissive_texture: None,
             emissive_view: None,
             emissive_texture_bytes: 0,
+            config_path: config_path.to_string(),
             dof_coc_pipeline: None,
             dof_bind_group_layout: None,
             dof_bind_group: None,
@@ -1707,7 +1720,7 @@ impl App {
     fn save_config(&self) {
         // Persist full TOML config using unified Config (camera speed multiplier retained)
         // We read existing file, update rendering subsection relevant fields, then save.
-        if let Ok(mut full_cfg) = voxelot::Config::load(CONFIG_FILE) {
+        if let Ok(mut full_cfg) = voxelot::Config::load(&self.config_path) {
             // Rendering settings
             full_cfg.rendering.lod_subdivide_distance =
                 self.camera_controller.camera.config.lod_subdivide_distance;
@@ -1773,17 +1786,17 @@ impl App {
                 self.pending_mesh_sort_interval_frames;
             full_cfg.performance.render_scale = self.user_config.performance.render_scale;
 
-            if let Err(e) = full_cfg.save(CONFIG_FILE) {
+            if let Err(e) = full_cfg.save(&self.config_path) {
                 eprintln!("Failed to save unified config: {}", e);
             } else {
-                println!("Saved unified TOML config to {}", CONFIG_FILE);
+                println!("Saved unified TOML config to {}", self.config_path);
             }
         } else {
             eprintln!("Warning: could not load existing TOML config for update; creating default.");
             let mut full_cfg = voxelot::Config::default();
             full_cfg.rendering.lod_subdivide_distance =
                 self.camera_controller.camera.config.lod_subdivide_distance;
-            if let Err(e) = full_cfg.save(CONFIG_FILE) {
+            if let Err(e) = full_cfg.save(&self.config_path) {
                 eprintln!("Failed to write default unified config: {}", e);
             }
         }
@@ -9747,7 +9760,7 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
             // Load config (fall back to defaults if missing) to determine initial window size
-            let cfg = voxelot::Config::load_or_default(CONFIG_FILE);
+            let cfg = voxelot::Config::load_or_default(&self.config_path);
             let window_width = cfg.rendering.window_width;
             let window_height = cfg.rendering.window_height;
 
@@ -9895,9 +9908,10 @@ fn main() {
     println!("  Right Mouse - Look around");
     println!("  ESC - Quit\n");
 
+    let args = ViewerArgs::parse();
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = App::new();
+    let mut app = App::new(&args.config);
     event_loop.run_app(&mut app).unwrap();
 }
