@@ -2,8 +2,7 @@
 
 A high-performance sparse voxel engine using hierarchical chunks with Roaring Bitmaps. Theoretical framework is of human origin, but almost all code is AI-generated. The exception being when AI got completely stuck, usually on some trivial thing like an unclosed bracket. It is an experiment to see if a whole game can be created from scratch using AI-assisted coding, where the AI is assisted by experienced programmers. 
 
-Initial code by Claude 4.5, GPT-5.1 and Gemini 2.5, then the bulk by Raptor Mini (occasionally unstuck by Grok Code Fast), and lately optimizations by Gemini 3.0 Pro and Claude Opus 4.5.
-For currently being a "free" model within GitHub Copilot, Raptor Mini is surprisingly capable, and I've only had to turn to what we believe are more capable models occasionally. 
+Initial code by Claude Sonnet 4.5, GPT-5.1 and Gemini 2.5 Pro, then the bulk by Raptor Mini (occasionally unstuck by Grok Code Fast), and lately optimizations by Gemini 3.0 Pro and Claude Opus 4.5. For currently being a "free" model within GitHub Copilot, Raptor Mini is surprisingly capable, and I've only had to turn to what we believe are more capable models occasionally. 
 
 AI can still run wild and mess up large portions of the code base. If you experiment like this, git commit often. Reverting is your friend.
 
