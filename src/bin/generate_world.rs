@@ -1509,7 +1509,7 @@ fn voxelize_hill(
                         }
                         Biome::Beach => MAT_SAND,
                         Biome::City => MAT_CONCRETE,
-                        Biome::Jungle => MAT_GRASS_DARK,
+                        Biome::Jungle => MAT_GRASS_COASTAL,
                     }
                 };
                 voxels.push(VoxelRecord {
@@ -1766,7 +1766,7 @@ fn voxelize_jungle(
                         }
                         Biome::Beach => MAT_SAND,
                         Biome::City => MAT_CONCRETE,
-                        Biome::Jungle => MAT_GRASS_DARK,
+                        Biome::Jungle => MAT_GRASS_COASTAL,
                     }
                 };
                 voxels.push(VoxelRecord {
@@ -2282,7 +2282,7 @@ fn voxelize_beach(
                             Biome::Beach => MAT_SAND,
                             Biome::Hill => MAT_GRASS_COASTAL,
                             Biome::City => MAT_CONCRETE,
-                            Biome::Jungle => MAT_GRASS_DARK,
+                            Biome::Jungle => MAT_GRASS_COASTAL,
                         }
                     }
                 };
