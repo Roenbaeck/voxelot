@@ -13,5 +13,7 @@
 - ✅ There's an issue around the shoreline, where the coloring remains bright even at night, which looks strange. It should darken like everything else. It may be the foam algorith. This is also related to the new water shader, since it was not there before.
 - ✅ There's a 1-voxel raised ridge in many places (between every tile?). 
 
-- 🛑 Trees are generated under water level.
 
+- 🛑 Trees are generated under water level.
+- 🛑 The underwater dissolve looks different for the individual voxel fallback, creating a visual discontinuity when they get meshed. 
+- 🛑 No fullscreen mode in Windows.
