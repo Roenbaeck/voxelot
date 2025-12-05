@@ -204,6 +204,7 @@ const MAT_NEON_RED: usize = 44; // Becomes 45 after +1 offset
 const MAT_NEON_GREEN: usize = 45; // Becomes 46 after +1 offset
 const MAT_NEON_BLUE: usize = 46; // Becomes 47 after +1 offset
 const MAT_DUNE_GRASS: usize = 47; // Becomes 48 after +1 offset
+const MAT_GRASS_COASTAL: usize = 48; // Becomes 49 after +1 offset
 
 // Jungle parameters (tweakable)
 const JUNGLE_MIN_TREES: usize = 10;
@@ -1502,8 +1503,8 @@ fn voxelize_hill(
                             if h_m > 140.0 {
                                 MAT_SNOW
                             } else {
-                                // Plain green: use the darker grass variant to match Jungle
-                                MAT_GRASS_DARK
+                                // Use muted coastal grass to harmonize with beach
+                                MAT_GRASS_COASTAL
                             }
                         }
                         Biome::Beach => MAT_SAND,
@@ -2279,7 +2280,7 @@ fn voxelize_beach(
                     } else {
                         match actual_biome {
                             Biome::Beach => MAT_SAND,
-                            Biome::Hill => MAT_GRASS_DARK,
+                            Biome::Hill => MAT_GRASS_COASTAL,
                             Biome::City => MAT_CONCRETE,
                             Biome::Jungle => MAT_GRASS_DARK,
                         }

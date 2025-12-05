@@ -90,3 +90,5 @@
 # 48-55: Coastal / Beach
 # Dune Grass (yellowish-green coastal grass)
 48 140 160 80 255 0 0 0 0
+# Coastal Hill Grass (muted olive green)
+49 100 135 70 255 0 0 0 0
