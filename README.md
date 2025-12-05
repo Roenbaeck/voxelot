@@ -66,6 +66,9 @@ cargo run --bin generate_world -- --help
 
 ## Interactive Viewer Controls
 
+**Window mode:**
+- `F11` - Toggle fullscreen mode
+
 **Movement:**
 - `WASD` - Move forward/left/backward/right
 - `Q` / `E` - Move down/up

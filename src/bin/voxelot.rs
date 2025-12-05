@@ -7,8 +7,8 @@
 //! - LOD support
 //! - Instanced rendering
 
-use crossbeam_channel::{unbounded, Receiver, Sender};
 use clap::Parser;
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use glam::{Mat4, Vec3};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use winit::{
     event::*,
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
-    window::{Window, WindowAttributes},
+    window::{Fullscreen, Window, WindowAttributes},
 };
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -917,6 +917,7 @@ struct App {
 
     // GUI state
     gui_visible: bool,
+    is_fullscreen: bool,
     post_color_texture: Option<wgpu::Texture>,
     post_color_view: Option<wgpu::TextureView>,
     bloom_ping_texture: Option<wgpu::Texture>,
@@ -1388,6 +1389,7 @@ impl App {
         println!("Kawase DoF: X (toggle), U/I (offset -/+), O/P (iterations -/+)");
         println!("Bloom: B (toggle)");
         println!("HZB: J (toggle)");
+        println!("Fullscreen: F11 (toggle)");
         println!("Quit: ESC");
         println!("================\n");
 
@@ -1553,6 +1555,7 @@ impl App {
             offscreen_depth_texture: None,
             offscreen_depth_view: None,
             gui_visible: true,
+            is_fullscreen: false,
             post_color_texture: None,
             post_color_view: None,
             bloom_ping_texture: None,
@@ -2162,6 +2165,19 @@ impl App {
             KeyCode::KeyM => {
                 self.water_level = (self.water_level + 5.0).min(1000.0);
                 println!("Water level: {:.1}", self.water_level);
+            }
+            KeyCode::F11 => {
+                if let Some(window) = &self.window {
+                    if self.is_fullscreen {
+                        window.set_fullscreen(None);
+                        self.is_fullscreen = false;
+                        println!("Switched to windowed mode");
+                    } else {
+                        window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+                        self.is_fullscreen = true;
+                        println!("Switched to borderless fullscreen");
+                    }
+                }
             }
             _ => {}
         }
