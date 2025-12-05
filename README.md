@@ -263,5 +263,11 @@ The viewer displays a lightweight real-time overlay (top-left) showing runtime a
     - Instancing: Time spent doing the per-instance drawing path (binding, instanced draws, etc.).
 - Draws: Number of actual draw calls issued in the frame.
 
+## Background and Inspiration
+
+I came into contact with roaring bitmaps when working on a [database engine](https://github.com/roenbaeck/positorium) a few years ago, and making a voxel game is something I’ve wanted to do since childhood. The idea to base an engine completely on bitmaps, and use bitwise operations for as much logic as possible became realizable thanks to roaring. Culling and meshing, both CPU-bound, are very performant thanks to it. It’s also very efficient from a storage perspective, keeping RAM usage low.
+
+When it comes to the shaders I looked at different techniques, and there’s been a lot of progress in screen-space occlusion and lighting. There’s not much, but good info available for [SSILVB](https://cybereality.com/screen-space-indirect-lighting-with-visibility-bitmask-improvement-to-gtao-ssao-real-time-ambient-occlusion-algorithm-glsl-shader-implementation/), which again relies on bitmasks, so that was used as an inspiration. DoF is pretty standard, but I quickly realized that a Gaussian blur won’t play well with voxels, and creates artifacts almost regardless of kernel size. FrostKiwi has an excellent article on [Kawase blur](https://blog.frost.kiwi/dual-kawase/), so that’s another inspiration, and it solved the issue. Bloom is also uncomplicated, and Kawase is reused for that. Alexander Ameye has written a nice tutorial on [water shaders](https://ameye.dev/notes/stylized-water-shader/), so many ideas were taken from that. The skybox is just a rotating image. The shadow map is also standard, hooked up to a single point light source acting as the sun.
+
 ## Credits
 The skybox image is CC0, downloaded from [Polyhaven](https://polyhaven.com).
