@@ -11,7 +11,7 @@ AI can still run wild and mess up large portions of the code base. If you experi
 ## Key Features
 
 ### Recursive "Chunks All The Way"
-Unlike traditional engines that separate "World", "Region", and "Chunk" classes, Voxelot uses a **uniform recursive structure**. The entire World is a Chunk, which contains sub-Chunks, down to the leaf level. Each chunk, regardless of level, has a side length of 16.
+Many traditional engines separate "World", "Region", and "Chunk" into separate classes, Voxelot uses a **uniform recursive structure**. The entire World is a Chunk, which contains sub-Chunks, down to the leaf level. It shares similarities with an octree, but each chunk, regardless of level, has a side length of 16. 
 - **Unified Logic**: Culling, raycasting, and storage work identically at all scales.
 - **Massive Scale**: A hierarchy depth of 4 gives you a **(16³)⁴** voxel world (281 trillion potential voxels) addressable with simple integer coordinates.
 
