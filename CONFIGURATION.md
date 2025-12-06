@@ -9,10 +9,10 @@ Each entry shows the default value (as found in `src/config.rs`), a short descri
 ## World
 
 - `world.file` (string)
-  - Default: `"world_1.oct"`
-  - Description: The path to the binary octree (`.oct`) representation of the world loaded by the viewer.
+  - Default: `"world_1.vhc"`
+  - Description: The path to the hierarchical chunk (`.vhc`) representation of the world loaded by the viewer.
   - Used: `src/bin/voxelot.rs` (loading world)
-  - Effect of change: Changing this selects a different `.oct` file to load; the viewer will display the selected world.
+  - Effect of change: Changing this selects a different `.vhc` file to load; the viewer will display the selected world.
 
 - `world.palette` (string)
   - Default: `"worlds/palette.txt"`

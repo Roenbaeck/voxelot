@@ -573,6 +573,7 @@ impl Chunk {
     }
 
     /// Check if a position is occupied (contains a solid voxel or non-empty sub-chunk)
+    #[allow(dead_code)]
     fn is_occupied_at(&self, x: u8, y: u8, z: u8) -> bool {
         match self.get(x, y, z) {
             Some(Voxel::Solid(_)) => true,

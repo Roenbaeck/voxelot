@@ -47,7 +47,7 @@ Chunks have different rendering modes depending on state and distance.
 ### Optimal Sparsity
 Storage is proportional to *entropy*, not volume.
 - **Roaring Bitmaps**: Compressed bitmap indices mean empty space takes zero memory.
-- **Compact Storage**: A 500 million voxel world can be stored in just **~50MB** (`.oct` format).
+- **Compact Storage**: A 500 million voxel world can be stored in just **~50MB** (compressed `.vhc` format).
 - **Exact Queries**: No false positives; if the bitmap says a voxel is there, it's there.
 
 ## Quick Start
@@ -123,7 +123,7 @@ This file controls the world file path, camera position, rendering options, and 
 ## Worlds & Per-World Configuration
 
 - Place per-world TOML config files in `worlds/` (some example files are already present). If you prefer to keep per-world settings under version control, pass them with `--config worlds/<your_world>.toml`.
-- The viewer reads `.oct` files listed inside your TOML configuration and launches with those settings.
+- The viewer reads `.vhc` files listed inside your TOML configuration and launches with those settings.
 
 **Structure:**
 
@@ -180,10 +180,10 @@ Each line defines a voxel type:
 
 Two generators are provided:
 
-1. `generate_world` – Rust generator, faster for large areas, writes compressed `.oct` + metadata.
+1. `generate_world` – Rust generator, faster for large areas, writes compressed `.vhc` + metadata.
 2. `voxel_generator_tiles.py` – Legacy Python prototype for synthesizing tile footprints (not maintained).
 
-**File Format:** The preferred runtime format is the compact binary octree (`.oct`).
+**File Format:** The preferred runtime format is the compressed hierarchical chunk format (`.vhc`), which mirrors our `Chunk` layout. It replaces the legacy `.oct` designation.
 
 **Example: Generating a World (Rust)**
 ```bash
@@ -197,7 +197,7 @@ cargo run --bin generate_world -- \
     --max-height-voxels=192 \
     --seed=1337 \
     --output-name=worlds/world_1 \
-    --format=oct
+    --format=vhc
 ```
 
 Note: The `generate_world` binary does not currently accept a `--config` path — the command-line flags listed above control generation parameters. To run with a world-config TOML file, launch the viewer with `--config` and adjust parameters to re-run the generator yourself if needed.

@@ -10,7 +10,7 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::Serialize;
 
 use noise::{NoiseFn, Perlin};
-use voxelot::{octree_format::save_world_file, Palette, World, WorldPos};
+use voxelot::{file_format::save_world_file, Palette, World, WorldPos};
 
 const EARTH_RADIUS_METERS: f64 = 6_378_137.0;
 // Total amplitude of noise layers (350 + 100 + 20)
@@ -78,14 +78,14 @@ struct Args {
     #[arg(long = "output-name", default_value = "world_file")]
     output_name: String,
 
-    #[arg(long, value_enum, default_value_t = OutputFormat::Oct)]
+    #[arg(long, value_enum, default_value_t = OutputFormat::Vhc)]
     format: OutputFormat,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
 enum OutputFormat {
     Txt,
-    Oct,
+    Vhc,
     Both,
 }
 
@@ -115,6 +115,7 @@ impl TileId {
 struct TileData {
     roads: Vec<Polygon>,
     parks: Vec<Polygon>,
+    #[allow(dead_code)]
     water: Vec<Polygon>,
     buildings: Vec<BuildingEntry>,
     biome: Biome,
@@ -171,12 +172,15 @@ const MAT_DIRT: usize = 10;
 const MAT_STONE: usize = 11;
 const MAT_SAND: usize = 12;
 const MAT_SNOW: usize = 13;
+#[allow(dead_code)]
 const MAT_WATER_DEEP: usize = 14;
+#[allow(dead_code)]
 const MAT_WATER_SHALLOW: usize = 15;
 
 const MAT_ASPHALT: usize = 16;
 const MAT_CONCRETE: usize = 17;
 const MAT_PAVEMENT: usize = 18;
+#[allow(dead_code)]
 const MAT_COBBLE: usize = 19;
 
 const MAT_BRICK_RED: usize = 20;
@@ -196,12 +200,26 @@ const MAT_LEAVES_AUTUMN: usize = 37;
 const MAT_PALM_FROND_DARK: usize = 38;
 const MAT_PALM_FROND_MID: usize = 39;
 
+// Some palette constants are intentionally present but not always used by the
+// generator; mark them to suppress "dead_code" warnings while keeping them
+// available for palette completeness.
+#[allow(dead_code)]
 const MAT_LIGHT_WARM: usize = 40; // Becomes 41 after +1 offset
+// Some palette constants are intentionally present but not always used by the
+// generator; mark them to suppress "dead_code" warnings while keeping them
+// available for palette completeness.
+#[allow(dead_code)]
 const MAT_LIGHT_COOL: usize = 41; // Becomes 42 after +1 offset
 const MAT_WINDOW_WARM: usize = 42; // Becomes 43 after +1 offset
+#[allow(dead_code)]
 const MAT_WINDOW_COOL: usize = 43; // Becomes 44 after +1 offset
+// Neon materials are present in palette but not always used by the generator.
+#[allow(dead_code)]
 const MAT_NEON_RED: usize = 44; // Becomes 45 after +1 offset
+#[allow(dead_code)]
 const MAT_NEON_GREEN: usize = 45; // Becomes 46 after +1 offset
+// MAT_NEON_BLUE is currently defined for palette completeness but not used in generator
+#[allow(dead_code)]
 const MAT_NEON_BLUE: usize = 46; // Becomes 47 after +1 offset
 const MAT_DUNE_GRASS: usize = 47; // Becomes 48 after +1 offset
 const MAT_GRASS_COASTAL: usize = 48; // Becomes 49 after +1 offset
@@ -3588,9 +3606,9 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         println!("Wrote text format: {}", ascii_path.display());
     }
 
-    if matches!(args.format, OutputFormat::Oct | OutputFormat::Both) {
-        let oct_path = PathBuf::from(format!("{}.oct", args.output_name));
-        println!("Writing octree format to {}...", oct_path.display());
+    if matches!(args.format, OutputFormat::Vhc | OutputFormat::Both) {
+        let vhc_path = PathBuf::from(format!("{}.vhc", args.output_name));
+        println!("Writing compressed VHC (hierarchical chunk) format to {}...", vhc_path.display());
         let max_coord = *[max_x, max_y, max_z].iter().max().unwrap_or(&0);
         let depth = calculate_required_depth(max_coord);
         println!(
@@ -3618,10 +3636,10 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         world.update_all_lod_metadata(&palette);
-        save_world_file(&world, &oct_path, true)?;
+        save_world_file(&world, &vhc_path, true)?;
         println!(
-            "Octree file size: {:.1} MB",
-            std::fs::metadata(&oct_path)?.len() as f64 / 1024.0 / 1024.0
+            "VHC file size: {:.1} MB",
+            std::fs::metadata(&vhc_path)?.len() as f64 / 1024.0 / 1024.0
         );
     }
 

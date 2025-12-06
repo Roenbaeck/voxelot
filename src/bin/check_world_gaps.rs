@@ -193,7 +193,7 @@ fn instance_covers_axis(inst: &VoxelInstance, axis: Axis, coord: i64) -> bool {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: check_world_gaps <world.oct> <meta.json> [palette.txt]");
+        eprintln!("Usage: check_world_gaps <world.vhc> <meta.json> [palette.txt]");
         std::process::exit(1);
     }
 

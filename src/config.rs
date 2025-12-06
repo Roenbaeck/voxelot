@@ -248,7 +248,7 @@ pub struct PerformanceConfig {
 
 // Default values
 fn default_world_file() -> String {
-    "world_1.oct".to_string()
+    "world_1.vhc".to_string()
 }
 
 fn default_palette_file() -> String {

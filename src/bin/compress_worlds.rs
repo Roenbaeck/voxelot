@@ -2,7 +2,7 @@ use std::path::Path;
 use voxelot::{load_world_file, save_world_file};
 
 fn main() -> std::io::Result<()> {
-    let worlds = ["worlds/world_1.oct", "worlds/world_2.oct"];
+    let worlds = ["worlds/world_1.vhc", "worlds/world_2.vhc"];
     for p in worlds {
         let path = Path::new(p);
         if !path.exists() {

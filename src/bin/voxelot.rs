@@ -1205,7 +1205,7 @@ impl App {
             initial_camera = cfg.world.camera_position;
 
             println!("Loading voxel data from {}...", cfg.world.file);
-            // Load octree format from configured path — use auto-detecting loader
+            // Load hierarchical chunk format (.vhc) from configured path — loader accepts legacy .oct for compatibility
             let load_start = Instant::now();
             world = voxelot::load_world_file(std::path::Path::new(&cfg.world.file)).unwrap_or_else(
                 |e| {
@@ -3876,8 +3876,10 @@ impl App {
             .collect();
         entries.sort_by(|a, b| a.1.cmp(&b.1));
 
-        let mut freed_bytes = 0u64;
-        let mut evicted = 0usize;
+        // The envelope eviction loop currently has commented-out increments; keep
+        // placeholder variables but without `mut` so compiler doesn't warn.
+        let _freed_bytes = 0u64;
+        let _evicted = 0usize;
 
         for (key, _) in entries {
             if self.envelope_mesh_cache_bytes <= budget {

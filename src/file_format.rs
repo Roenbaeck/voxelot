@@ -1,4 +1,4 @@
-//! Compact hierarchical voxel file format
+//! Compact hierarchical voxel file format (vhc)
 //!
 //! Format mirrors the internal Chunk structure exactly:
 //! - Header: depth (u8)
@@ -19,7 +19,7 @@ use std::sync::Arc;
 use zstd::stream::read::Decoder as ZstdDecoder;
 use zstd::stream::write::Encoder as ZstdEncoder;
 
-/// Save world to compact format
+/// Save world to compact format (vhc)
 pub fn save_world(
     world: &crate::lib_hierarchical::World,
     writer: &mut impl Write,
@@ -33,10 +33,7 @@ pub fn save_world(
     Ok(())
 }
 
-/// Save world to a file path. If `compress` is true the payload is gzip-compressed
-/// and a small header is written so readers can detect the format. The function
-/// keeps backwards compatibility: files without our signature are treated as
-/// legacy uncompressed `.oct` files.
+/// Save world to a file path. The function writes compressed `.vhc` using zstd.
 pub fn save_world_file(
     world: &crate::lib_hierarchical::World,
     path: &Path,
@@ -47,8 +44,7 @@ pub fn save_world_file(
     save_world(world, &mut payload)?;
 
     let file = File::create(path)?;
-    let mut encoder =
-        ZstdEncoder::new(file, 0).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let mut encoder = ZstdEncoder::new(file, 0).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     encoder.write_all(&payload)?;
     encoder
         .finish()
@@ -89,7 +85,7 @@ fn save_chunk(chunk: &Chunk, writer: &mut impl Write) -> io::Result<()> {
     Ok(())
 }
 
-/// Load world from compact format
+/// Load world from compact format (vhc)
 pub fn load_world(reader: &mut impl Read) -> io::Result<crate::lib_hierarchical::World> {
     // Read depth
     let mut depth_byte = [0u8; 1];
@@ -105,13 +101,11 @@ pub fn load_world(reader: &mut impl Read) -> io::Result<crate::lib_hierarchical:
     Ok(world)
 }
 
-/// Load a world from a file. The loader understands both the legacy raw `.oct`
-/// format and the new signed format produced by `save_world_file` (which may be
-/// gzip-compressed). Detection is automatic.
+/// Load a world from a file.
 pub fn load_world_file(path: &Path) -> io::Result<crate::lib_hierarchical::World> {
+    // We only support zstd-compressed `.vhc` files; legacy raw `.oct` files have been removed.
     let file = File::open(path)?;
-    let mut decoder =
-        ZstdDecoder::new(file).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let mut decoder = ZstdDecoder::new(file).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     load_world(&mut decoder)
 }
 
