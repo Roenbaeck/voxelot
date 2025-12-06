@@ -3876,8 +3876,10 @@ impl App {
             .collect();
         entries.sort_by(|a, b| a.1.cmp(&b.1));
 
-        let mut _freed_bytes = 0u64;
-        let mut _evicted = 0usize;
+        // The envelope eviction loop currently has commented-out increments; keep
+        // placeholder variables but without `mut` so compiler doesn't warn.
+        let _freed_bytes = 0u64;
+        let _evicted = 0usize;
 
         for (key, _) in entries {
             if self.envelope_mesh_cache_bytes <= budget {

@@ -115,6 +115,7 @@ impl TileId {
 struct TileData {
     roads: Vec<Polygon>,
     parks: Vec<Polygon>,
+    #[allow(dead_code)]
     water: Vec<Polygon>,
     buildings: Vec<BuildingEntry>,
     biome: Biome,
@@ -171,12 +172,15 @@ const MAT_DIRT: usize = 10;
 const MAT_STONE: usize = 11;
 const MAT_SAND: usize = 12;
 const MAT_SNOW: usize = 13;
+#[allow(dead_code)]
 const MAT_WATER_DEEP: usize = 14;
+#[allow(dead_code)]
 const MAT_WATER_SHALLOW: usize = 15;
 
 const MAT_ASPHALT: usize = 16;
 const MAT_CONCRETE: usize = 17;
 const MAT_PAVEMENT: usize = 18;
+#[allow(dead_code)]
 const MAT_COBBLE: usize = 19;
 
 const MAT_BRICK_RED: usize = 20;
@@ -196,12 +200,26 @@ const MAT_LEAVES_AUTUMN: usize = 37;
 const MAT_PALM_FROND_DARK: usize = 38;
 const MAT_PALM_FROND_MID: usize = 39;
 
+// Some palette constants are intentionally present but not always used by the
+// generator; mark them to suppress "dead_code" warnings while keeping them
+// available for palette completeness.
+#[allow(dead_code)]
 const MAT_LIGHT_WARM: usize = 40; // Becomes 41 after +1 offset
+// Some palette constants are intentionally present but not always used by the
+// generator; mark them to suppress "dead_code" warnings while keeping them
+// available for palette completeness.
+#[allow(dead_code)]
 const MAT_LIGHT_COOL: usize = 41; // Becomes 42 after +1 offset
 const MAT_WINDOW_WARM: usize = 42; // Becomes 43 after +1 offset
+#[allow(dead_code)]
 const MAT_WINDOW_COOL: usize = 43; // Becomes 44 after +1 offset
+// Neon materials are present in palette but not always used by the generator.
+#[allow(dead_code)]
 const MAT_NEON_RED: usize = 44; // Becomes 45 after +1 offset
+#[allow(dead_code)]
 const MAT_NEON_GREEN: usize = 45; // Becomes 46 after +1 offset
+// MAT_NEON_BLUE is currently defined for palette completeness but not used in generator
+#[allow(dead_code)]
 const MAT_NEON_BLUE: usize = 46; // Becomes 47 after +1 offset
 const MAT_DUNE_GRASS: usize = 47; // Becomes 48 after +1 offset
 const MAT_GRASS_COASTAL: usize = 48; // Becomes 49 after +1 offset
