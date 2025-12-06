@@ -91,6 +91,4 @@ max_draw_capacity = 20000
 render_scale = 1.0
 max_gpu_instances = 6000000
 
-[debug]
-show_fps = true
-show_chunk_stats = true
+

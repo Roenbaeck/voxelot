@@ -18,8 +18,7 @@ pub struct Config {
     pub shadows: ShadowConfig,
     #[serde(default)]
     pub performance: PerformanceConfig,
-    #[serde(default)]
-    pub debug: DebugConfig,
+    // (debug config removed) debug flags were unused and have been removed to simplify configuration
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,13 +212,7 @@ pub struct PerformanceConfig {
     pub max_gpu_instances: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DebugConfig {
-    #[serde(default = "default_true")]
-    pub show_fps: bool,
-    #[serde(default = "default_true")]
-    pub show_chunk_stats: bool,
-}
+
 
 // Default values
 fn default_world_file() -> String {
@@ -488,9 +481,7 @@ fn default_max_gpu_instances() -> usize {
     6_000_000 // ~384MB for VoxelInstanceRaw (64 bytes each)
 }
 
-fn default_true() -> bool {
-    true
-}
+// default_true was used by DebugConfig, which was removed.
 
 // Implement Default for all configs
 impl Default for WorldConfig {
@@ -629,14 +620,7 @@ impl Default for PerformanceConfig {
     }
 }
 
-impl Default for DebugConfig {
-    fn default() -> Self {
-        Self {
-            show_fps: true,
-            show_chunk_stats: true,
-        }
-    }
-}
+// DebugConfig removed
 
 impl Default for Config {
     fn default() -> Self {
@@ -647,7 +631,7 @@ impl Default for Config {
             effects: EffectsConfig::default(),
             shadows: ShadowConfig::default(),
             performance: PerformanceConfig::default(),
-            debug: DebugConfig::default(),
+            // debug: no debug section; removed unused flags
         }
     }
 }
