@@ -101,10 +101,34 @@ pub struct EffectsConfig {
 pub struct SsrConfig {
     #[serde(default = "default_ssr_enabled")]
     pub enabled: bool,
+    #[serde(default = "default_ssr_max_steps")]
+    pub max_steps: u32,
+    #[serde(default = "default_ssr_max_binary_steps")]
+    pub max_binary_steps: u32,
+    #[serde(default = "default_ssr_step_size")]
+    pub step_size: f32,
+    #[serde(default = "default_ssr_thickness")]
+    pub thickness: f32,
 }
 
 fn default_ssr_enabled() -> bool {
     true
+}
+
+fn default_ssr_max_steps() -> u32 {
+    32
+}
+
+fn default_ssr_max_binary_steps() -> u32 {
+    4
+}
+
+fn default_ssr_step_size() -> f32 {
+    0.5
+}
+
+fn default_ssr_thickness() -> f32 {
+    0.5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -532,7 +556,13 @@ impl Default for AtmosphereConfig {
 
 impl Default for SsrConfig {
     fn default() -> Self {
-        Self { enabled: default_ssr_enabled() }
+        Self {
+            enabled: default_ssr_enabled(),
+            max_steps: default_ssr_max_steps(),
+            max_binary_steps: default_ssr_max_binary_steps(),
+            step_size: default_ssr_step_size(),
+            thickness: default_ssr_thickness(),
+        }
     }
 }
 

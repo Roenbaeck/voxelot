@@ -20,7 +20,7 @@ window_height = 720
 
 [atmosphere]
 fog_density = 0.00019999995
-time_of_day = 0.9582076
+time_of_day = 0.3302758
 night_skybox_brightness = 0.01
 horizon_fade_up = 0.05
 horizon_fade_down = 0.25
@@ -68,6 +68,10 @@ blur_radius = 1.0
 
 [effects.ssr]
 enabled = true
+max_steps = 32
+max_binary_steps = 4
+step_size = 0.5
+thickness = 0.5
 
 [shadows]
 map_size = 8192

@@ -68,6 +68,10 @@ blur_radius = 2.0
 
 [effects.ssr]
 enabled = true
+max_steps = 32
+max_binary_steps = 4
+step_size = 0.5
+thickness = 0.5
 
 [shadows]
 map_size = 4096

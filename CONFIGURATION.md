@@ -199,9 +199,31 @@ Each entry shows the default value (as found in `src/config.rs`), a short descri
     - Used: `src/bin/voxelot.rs` (SSR pipeline creation, toggled by runtime `R`), `shaders/ssr.wgsl` (shader implementation)
     - Effect of change: When enabled, SSR will be calculated and composited (can increase GPU usage depending on complexity). When disabled, reflections won't render from SSR.
 
+    - `max_steps` (int)
+      - Default: `32`
+      - Description: Maximum raymarch steps for SSR sampling; increase for improved coverage and fewer misses at the cost of GPU time.
+      - Used: `src/bin/voxelot.rs` (ssr uniforms and shader parameters), `shaders/ssr.wgsl` (raymarch loop)
+      - Effect of change: Higher values increase accuracy of reflections but cost more performance.
+
+    - `max_binary_steps` (int)
+      - Default: `4`
+      - Description: Number of binary search refinement steps used after raymarch finds a hit to localize the reflection point.
+      - Used: `src/bin/voxelot.rs`, `shaders/ssr.wgsl`
+      - Effect of change: More refinement steps improve precision but increase GPU workload.
+
+    - `step_size` (float)
+      - Default: `0.5`
+      - Description: The base step size multiplier for the SSR raymarch (in world units * step_size).
+      - Effect of change: Smaller values yield finer raymarch and higher accuracy, larger values speed the pass at the risk of missed intersections.
+
+    - `thickness` (float)
+      - Default: `0.5`
+      - Description: Thickness threshold used when testing ray hits against geometry; larger thickness tolerates thin surfaces and prevents leaks.
+      - Effect of change: Increasing thickness reduces holes but can produce incorrect reflections if set too large.
+
 ---
 
-### SSAO (`effects.ssao`)
+### Screen-Space Ambient Occlusion (`effects.ssao`)
 
 - `enabled` (bool)
   - Default: `true`

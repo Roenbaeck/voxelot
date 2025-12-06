@@ -1660,10 +1660,10 @@ impl App {
                 _bias: 0.01,
             },
             ssr_settings: SSRSettings {
-                max_steps: 32,
-                max_binary_steps: 4,
-                step_size: 0.5,
-                thickness: 0.5,
+                max_steps: cfg.effects.ssr.max_steps,
+                max_binary_steps: cfg.effects.ssr.max_binary_steps,
+                step_size: cfg.effects.ssr.step_size,
+                thickness: cfg.effects.ssr.thickness,
                 enabled: cfg.effects.ssr.enabled,
             },
             ssr_pipeline: None,
@@ -1789,6 +1789,10 @@ impl App {
             full_cfg.performance.render_scale = self.user_config.performance.render_scale;
             // SSR setting
             full_cfg.effects.ssr.enabled = self.ssr_settings.enabled;
+            full_cfg.effects.ssr.max_steps = self.ssr_settings.max_steps;
+            full_cfg.effects.ssr.max_binary_steps = self.ssr_settings.max_binary_steps;
+            full_cfg.effects.ssr.step_size = self.ssr_settings.step_size;
+            full_cfg.effects.ssr.thickness = self.ssr_settings.thickness;
 
             if let Err(e) = full_cfg.save(&self.config_path) {
                 eprintln!("Failed to save unified config: {}", e);
@@ -1799,6 +1803,10 @@ impl App {
             eprintln!("Warning: could not load existing TOML config for update; creating default.");
             let mut full_cfg = voxelot::Config::default();
             full_cfg.effects.ssr.enabled = self.ssr_settings.enabled;
+            full_cfg.effects.ssr.max_steps = self.ssr_settings.max_steps;
+            full_cfg.effects.ssr.max_binary_steps = self.ssr_settings.max_binary_steps;
+            full_cfg.effects.ssr.step_size = self.ssr_settings.step_size;
+            full_cfg.effects.ssr.thickness = self.ssr_settings.thickness;
             if let Err(e) = full_cfg.save(&self.config_path) {
                 eprintln!("Failed to write default unified config: {}", e);
             }
