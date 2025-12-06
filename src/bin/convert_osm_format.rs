@@ -1,4 +1,4 @@
-//! Convert osm_voxels.txt to compact octree format
+//! Convert osm_voxels.txt to compressed hierarchical chunk format (.vhc)
 //! Uses the same loading logic as the viewer to ensure compatibility
 
 use std::path::Path;
@@ -83,10 +83,10 @@ fn main() -> std::io::Result<()> {
     println!("Loaded {} voxels into world", loaded);
     println!("World.count() reports {} voxels", world.count());
 
-    // Save in octree format
-    let output_file = "world_1.oct";
+    // Save in .vhc format
+    let output_file = "world_1.vhc";
     println!("\nSaving to {}...", output_file);
-    // Save compressed .oct with gzip
+    // Save compressed `.vhc` (zstd-compressed hierarchical chunk format).
     save_world_file(&world, Path::new(output_file), true)?;
 
     // Get file sizes

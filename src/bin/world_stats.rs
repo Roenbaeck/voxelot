@@ -5,7 +5,7 @@ use voxelot::{load_world_file, Chunk, Voxel};
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: world_stats <path_to_world.oct>");
+        eprintln!("Usage: world_stats <path_to_world.vhc>");
         std::process::exit(2);
     }
     let path = Path::new(&args[1]);

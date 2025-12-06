@@ -10,7 +10,7 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::Serialize;
 
 use noise::{NoiseFn, Perlin};
-use voxelot::{octree_format::save_world_file, Palette, World, WorldPos};
+use voxelot::{file_format::save_world_file, Palette, World, WorldPos};
 
 const EARTH_RADIUS_METERS: f64 = 6_378_137.0;
 // Total amplitude of noise layers (350 + 100 + 20)
@@ -78,14 +78,14 @@ struct Args {
     #[arg(long = "output-name", default_value = "world_file")]
     output_name: String,
 
-    #[arg(long, value_enum, default_value_t = OutputFormat::Oct)]
+    #[arg(long, value_enum, default_value_t = OutputFormat::Vhc)]
     format: OutputFormat,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
 enum OutputFormat {
     Txt,
-    Oct,
+    Vhc,
     Both,
 }
 
@@ -3588,9 +3588,9 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         println!("Wrote text format: {}", ascii_path.display());
     }
 
-    if matches!(args.format, OutputFormat::Oct | OutputFormat::Both) {
-        let oct_path = PathBuf::from(format!("{}.oct", args.output_name));
-        println!("Writing octree format to {}...", oct_path.display());
+    if matches!(args.format, OutputFormat::Vhc | OutputFormat::Both) {
+        let vhc_path = PathBuf::from(format!("{}.vhc", args.output_name));
+        println!("Writing compressed VHC (hierarchical chunk) format to {}...", vhc_path.display());
         let max_coord = *[max_x, max_y, max_z].iter().max().unwrap_or(&0);
         let depth = calculate_required_depth(max_coord);
         println!(
@@ -3618,10 +3618,10 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         world.update_all_lod_metadata(&palette);
-        save_world_file(&world, &oct_path, true)?;
+        save_world_file(&world, &vhc_path, true)?;
         println!(
-            "Octree file size: {:.1} MB",
-            std::fs::metadata(&oct_path)?.len() as f64 / 1024.0 / 1024.0
+            "VHC file size: {:.1} MB",
+            std::fs::metadata(&vhc_path)?.len() as f64 / 1024.0 / 1024.0
         );
     }
 

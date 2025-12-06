@@ -1,5 +1,5 @@
 [world]
-file = "worlds/water_level_test.oct"
+file = "worlds/water_level_test.vhc"
 palette = "worlds/palette.txt"
 camera_position = [
     511.0,

@@ -1,4 +1,4 @@
-//! Verify octree file by sampling voxels
+//! Verify a hierarchical chunk world (.vhc) file by sampling voxels
 
 use std::env;
 use std::fs::File;
@@ -7,7 +7,7 @@ use voxelot::{load_world, WorldPos};
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = env::args().collect();
-    let filename = args.get(1).map(String::as_str).unwrap_or("world_1.oct");
+    let filename = args.get(1).map(String::as_str).unwrap_or("world_1.vhc");
 
     println!("Verifying {}...\n", filename);
 

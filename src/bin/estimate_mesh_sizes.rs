@@ -18,7 +18,7 @@ fn collect_leaf_chunks<'a>(chunk: &'a Chunk, out: &mut Vec<&'a Chunk>) {
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() != 3 {
-        eprintln!("Usage: estimate_mesh_sizes <world.oct> <palette.txt>");
+        eprintln!("Usage: estimate_mesh_sizes <world.vhc> <palette.txt>");
         std::process::exit(1);
     }
     let world_path = &args[1];

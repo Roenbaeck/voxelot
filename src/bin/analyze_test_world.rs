@@ -1,8 +1,8 @@
 use std::path::PathBuf;
-use voxelot::{octree_format::load_world_file, WorldPos};
+use voxelot::{file_format::load_world_file, WorldPos};
 
 fn main() {
-    let path = PathBuf::from("test_linear_hill.oct");
+    let path = PathBuf::from("test_linear_hill.vhc");
     println!("Loading {}...", path.display());
     let world = load_world_file(&path).expect("Failed to load world");
     let mut heights = Vec::new();

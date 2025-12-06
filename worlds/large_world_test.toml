@@ -1,5 +1,5 @@
 [world]
-file = "worlds/large_world_test.oct"
+file = "worlds/large_world_test.vhc"
 palette = "worlds/palette.txt"
 camera_position = [
     511.0,
@@ -20,7 +20,7 @@ window_height = 720
 
 [atmosphere]
 fog_density = 0.00019999995
-time_of_day = 0.3302758
+time_of_day = 0.5918866
 night_skybox_brightness = 0.01
 horizon_fade_up = 0.05
 horizon_fade_down = 0.25

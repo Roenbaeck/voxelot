@@ -5,7 +5,7 @@ use voxelot::{load_world_file, Chunk, Voxel};
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = env::args().collect();
-    let path_str = args.get(1).map(|s| s.as_str()).unwrap_or("worlds/world_1.oct");
+    let path_str = args.get(1).map(|s| s.as_str()).unwrap_or("worlds/world_1.vhc");
     let path = Path::new(path_str);
     println!("Loading {}", path.display());
     let world = load_world_file(path)?;

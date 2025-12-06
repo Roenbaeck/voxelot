@@ -1,5 +1,5 @@
 [world]
-file = "world_1.oct"
+file = "worlds/flat_city_test.vhc"
 palette = "worlds/palette.txt"
 camera_position = [
     320.0,
@@ -20,7 +20,7 @@ window_height = 720
 
 [atmosphere]
 fog_density = 0.003
-time_of_day = 0.5
+time_of_day = 0.8324704
 night_skybox_brightness = 0.02
 horizon_fade_up = 0.05
 horizon_fade_down = 0.25
@@ -82,6 +82,7 @@ pcf_poisson_samples = 0
 
 [performance]
 mesh_cache_budget_mb = 256
+mesh_worker_count = 6
 mesh_upload_baseline = 4
 envelope_distance = 256.0
 envelope_fade_range = 32.0
@@ -95,5 +96,3 @@ mega_index_buffer_mb = 256
 max_draw_capacity = 20000
 render_scale = 1.0
 max_gpu_instances = 6000000
-
-

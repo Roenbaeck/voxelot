@@ -5,7 +5,7 @@ pub mod config;
 pub mod culling;
 pub mod lib_hierarchical;
 pub mod meshing_optimized;
-pub mod octree_format;
+pub mod file_format;
 pub mod palette;
 
 // Re-export main types
@@ -18,5 +18,5 @@ pub use culling::{
 pub use lib_hierarchical::bbox_local_to_world;
 pub use lib_hierarchical::{Chunk, ShellVoxel, Voxel, VoxelType, World, WorldPos};
 pub use meshing_optimized::{generate_chunk_mesh_optimized, ChunkEmitter, ChunkMesh, MeshVertex};
-pub use octree_format::{load_world, load_world_file, save_world, save_world_file};
+pub use file_format::{load_world, load_world_file, save_world, save_world_file};
 pub use palette::Palette;

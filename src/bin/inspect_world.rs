@@ -8,7 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let filename = args
         .get(1)
         .map(String::as_str)
-        .unwrap_or("worlds/world.oct"); // Default path
+        .unwrap_or("worlds/world.vhc"); // Default path
 
     println!("Loading {}...", filename);
     let mut world = load_world_file(Path::new(filename))?;
