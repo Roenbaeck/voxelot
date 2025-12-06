@@ -11,19 +11,19 @@ Each entry shows the default value (as found in `src/config.rs`), a short descri
 - `world.file` (string)
   - Default: `"world_1.oct"`
   - Description: The path to the binary octree (`.oct`) representation of the world loaded by the viewer.
-  - Used: `src/bin/voxelot.rs` (loading world: lines ~1208+)
+  - Used: `src/bin/voxelot.rs` (loading world)
   - Effect of change: Changing this selects a different `.oct` file to load; the viewer will display the selected world.
 
 - `world.palette` (string)
   - Default: `"worlds/palette.txt"`
   - Description: Path to the palette definition which maps voxel indices to color/emissive values.
-  - Used: `src/bin/voxelot.rs` (palette loading: lines ~1296+), `src/palette.rs`
+  - Used: `src/bin/voxelot.rs` (palette loading), `src/palette.rs`
   - Effect of change: Changing this alters how voxel indices translate to visible colors and emissive values in the viewer.
 
 - `world.camera_position` (array [f32; 3])
   - Default: `[320.0, 100.0, 320.0]`
   - Description: Initial camera world position when the viewer starts.
-  - Used: `src/bin/voxelot.rs` (App::new, initial camera setup)
+  - Used: `src/bin/voxelot.rs` (initial camera setup)
   - Effect of change: Modifying this moves the camera to a different starting point in the loaded world.
 
 - `world.water_level` (float)
@@ -35,7 +35,7 @@ Each entry shows the default value (as found in `src/config.rs`), a short descri
 - `world.water_visibility` (float)
   - Default: `20.0`
   - Description: Camera-visible depth from the water surface (how many voxels below the water surface remain visible) — used for underwater culling and fog effects.
-  - Used: `src/bin/voxelot.rs` (water visibility; near: lines ~6536, 6635), `src/shaders/` (uniforms)
+  - Used: `src/bin/voxelot.rs` (water visibility), `src/shaders/` (uniforms)
   - Effect of change: Increase to make deeper underwater geometry visible; decreasing reduces underwater draw and simulation cost.
 
 ---
@@ -191,6 +191,15 @@ Each entry shows the default value (as found in `src/config.rs`), a short descri
   - Effect of change: More iterations increase blur and cost more GPU time.
 
 ---
+### Screen-Space Reflections (`effects.ssr`)
+
+- `enabled` (bool)
+    - Default: `true`
+    - Description: Toggle screen-space reflections rendering (SSR) — used for water and reflective materials.
+    - Used: `src/bin/voxelot.rs` (SSR pipeline creation, toggled by runtime `R`), `shaders/ssr.wgsl` (shader implementation)
+    - Effect of change: When enabled, SSR will be calculated and composited (can increase GPU usage depending on complexity). When disabled, reflections won't render from SSR.
+
+---
 
 ### SSAO (`effects.ssao`)
 
@@ -300,26 +309,3 @@ Each entry shows the default value (as found in `src/config.rs`), a short descri
 
 ---
 
-## Developer Notes
-
-- Removed `debug.show_fps` and `debug.show_chunk_stats` from configuration as they were not actively used. If desired, the GUI overlay toggle remains implemented via `F5` and will be visible at runtime.
-
----
-
-This file is a starter; next steps I recommend:
-1. I can continue writing more detailed explanations for each setting and add code references (file/line numbers) where they are used.
-2. Implement `generate_world` `--config` support to reuse config values used by the viewer and generator.
-3. Optionally lint and remove other rarely used config keys.
-I have a large documentation effort that needs to be done. 
-
-Every configurable setting in config toml files needs to be documented in CONFIGURATION.md, section by section, using a nice consistent format. I want the default value to be shown in the documentation, along with a decription of what the setting controls, and the expected effect of changing the value. 
-
-When you do this I want you to do the following things: 
-1. Confirm that the setting is used in the code. Remove it from config.toml and config.rs if not.
-2. Consider if the setting has a proper descriptive name. Change to a better one if not.
-3. Consider if the setting is in the correct section. Move it if not.
-4. Check if there are hard coded values close the where the setting is used that would also be good to have as settings.
-
-You will also need to check and compare config.rs with the example config.toml, and ensure all settings have an entry in config.toml. 
-
-Also check that section names use consistent terminology and change if you find inconsistencies.

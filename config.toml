@@ -66,6 +66,9 @@ strength = 1.0
 blur_enabled = true
 blur_radius = 2.0
 
+[effects.ssr]
+enabled = true
+
 [shadows]
 map_size = 4096
 darkness = 1.0

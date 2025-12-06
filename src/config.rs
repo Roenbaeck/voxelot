@@ -93,6 +93,18 @@ pub struct EffectsConfig {
     pub bloom: BloomConfig,
     #[serde(default)]
     pub ssao: SsaoConfig,
+    #[serde(default)]
+    pub ssr: SsrConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SsrConfig {
+    #[serde(default = "default_ssr_enabled")]
+    pub enabled: bool,
+}
+
+fn default_ssr_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -518,6 +530,12 @@ impl Default for AtmosphereConfig {
     }
 }
 
+impl Default for SsrConfig {
+    fn default() -> Self {
+        Self { enabled: default_ssr_enabled() }
+    }
+}
+
 impl Default for DepthOfFieldConfig {
     fn default() -> Self {
         Self {
@@ -556,6 +574,7 @@ impl Default for EffectsConfig {
             depth_of_field: DepthOfFieldConfig::default(),
             bloom: BloomConfig::default(),
             ssao: SsaoConfig::default(),
+            ssr: SsrConfig::default(),
         }
     }
 }

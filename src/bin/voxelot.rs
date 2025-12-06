@@ -1664,7 +1664,7 @@ impl App {
                 max_binary_steps: 4,
                 step_size: 0.5,
                 thickness: 0.5,
-                enabled: true,
+                enabled: cfg.effects.ssr.enabled,
             },
             ssr_pipeline: None,
             ssr_bind_group_layout: None,
@@ -1787,6 +1787,8 @@ impl App {
             full_cfg.performance.mesh_priority_sort_interval_frames =
                 self.pending_mesh_sort_interval_frames;
             full_cfg.performance.render_scale = self.user_config.performance.render_scale;
+            // SSR setting
+            full_cfg.effects.ssr.enabled = self.ssr_settings.enabled;
 
             if let Err(e) = full_cfg.save(&self.config_path) {
                 eprintln!("Failed to save unified config: {}", e);
@@ -1796,6 +1798,7 @@ impl App {
         } else {
             eprintln!("Warning: could not load existing TOML config for update; creating default.");
             let mut full_cfg = voxelot::Config::default();
+            full_cfg.effects.ssr.enabled = self.ssr_settings.enabled;
             if let Err(e) = full_cfg.save(&self.config_path) {
                 eprintln!("Failed to write default unified config: {}", e);
             }

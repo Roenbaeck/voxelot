@@ -108,6 +108,7 @@ cargo run --bin generate_world -- --help
 - `F3` / `F4` - Decrease/increase SSAO radius
 - `F5` - Toggle GUI overlay (FPS counter & debug stats)
 - `R` - Toggle SSR (Screen Space Reflections)
+    - Also configurable via `effects.ssr.enabled` in `config.toml` (default: true)
 - `J` - Toggle HZB (Hierarchical Z-Buffer) culling
 
 ## Configuration
