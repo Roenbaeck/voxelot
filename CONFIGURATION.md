@@ -42,23 +42,13 @@ Each entry shows the default value (as found in `src/config.rs`), a short descri
 
 ## Rendering
 
-- `rendering.lod_subdivide_distance` (float)
-  - Default: `500.0`
-  - Description: Distance threshold at which the world LOD system subdivides to a higher resolution.
-  - Used: `src/bin/voxelot.rs` (Camera & LOD update; modify at runtime: PageUp/PageDown)
-  - Effect of change: Decreasing means more detail nearer to the camera (more subdivisions); increasing means less detailed subdivisions further out.
-
-- `rendering.lod_merge_distance` (float)
-  - Default: `1000.0`
-  - Description: Distance threshold at which the LOD system merges chunks to a lower resolution.
-  - Used: `src/bin/voxelot.rs` (Camera & LOD update and saving)
-  - Effect of change: Decrease the value to force merging closer to the camera (less rendering detail), or increase to keep higher detail at greater distances.
+- Note: `rendering.lod_subdivide_distance` and `rendering.lod_merge_distance` were removed — use `rendering.chunk_lod_distance` for LOD culling thresholds and to control how far detailed chunks are rendered. Use PageUp/PageDown to tune this value at runtime.
 
 - `rendering.chunk_lod_distance` (float)
   - Default: `800.0`
-  - Description: LOD render distance for chunk LOD selection (worker/renderer uses this to choose mesh LOD for chunks).
-  - Used: `src/bin/voxelot.rs` (initial LOD settings)
-  - Effect of change: Larger values keep higher LOD for more distant chunks at the cost of performance.
+  - Description: LOD render distance for chunk LOD selection (worker/renderer uses this to choose mesh LOD for chunks). This is the canonical LOD distance and used by the culling system to toggle between a chunk's averaged LOD mesh and subdividing further.
+  - Used: `src/culling.rs` (hierarchical chunk culling), `src/bin/voxelot.rs` (initial LOD settings and runtime adjustment via PageUp/PageDown)
+  - Effect of change: Increasing this keeps chunk averaged LODs rendered further out (higher detail at a performance cost). Decreasing reduces visible detail further away, improving performance.
 
 - `rendering.fov_degrees` (float)
   - Default: `70.0`

@@ -10,8 +10,6 @@ water_level = 20.0
 water_visibility = 5.0
 
 [rendering]
-lod_subdivide_distance = 5000.0
-lod_merge_distance = 1500.0
 chunk_lod_distance = 3000.0
 fov_degrees = 70.0
 near_plane = 0.1
@@ -22,7 +20,7 @@ window_height = 720
 
 [atmosphere]
 fog_density = 0.00019999995
-time_of_day = 0.27631783
+time_of_day = 0.7545163
 night_skybox_brightness = 0.01
 horizon_fade_up = 0.05
 horizon_fade_down = 0.25
@@ -91,7 +89,3 @@ mega_index_buffer_mb = 512
 max_draw_capacity = 10000
 render_scale = 1.85
 max_gpu_instances = 12000000
-
-[debug]
-show_fps = true
-show_chunk_stats = true

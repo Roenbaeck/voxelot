@@ -83,7 +83,7 @@ cargo run --bin generate_world -- --help
 - `0` - Reset camera speed multiplier
 
 - **Runtime Configuration:**
-- `PageDown` / `PageUp` - Decrease/increase camera LOD subdivide distance
+- `PageDown` / `PageUp` - Decrease/increase LOD render distance (affects how far high-detail chunks are kept)
 - `Z` / `C` - Decrease/increase draw distance (far plane)
 - `K` / `L` - Decrease/increase chunk LOD render distance (100-5000 units)
 - `F` / `G` - Decrease/increase fog density

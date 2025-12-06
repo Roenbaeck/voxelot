@@ -10,8 +10,6 @@ water_level = 16.0
 water_visibility = 20.0
 
 [rendering]
-lod_subdivide_distance = 500.0
-lod_merge_distance = 1000.0
 chunk_lod_distance = 800.0
 fov_degrees = 70.0
 near_plane = 0.1

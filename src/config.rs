@@ -37,10 +37,6 @@ pub struct WorldConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderingConfig {
-    #[serde(default = "default_lod_subdivide_distance")]
-    pub lod_subdivide_distance: f32,
-    #[serde(default = "default_lod_merge_distance")]
-    pub lod_merge_distance: f32,
     #[serde(default = "default_chunk_lod_distance")]
     pub chunk_lod_distance: f32,
     #[serde(default = "default_fov")]
@@ -235,17 +231,12 @@ fn default_water_visibility() -> f32 {
     20.0
 }
 
-fn default_lod_subdivide_distance() -> f32 {
-    500.0
-}
-
-fn default_lod_merge_distance() -> f32 {
-    1000.0
-}
+// Note: subdivide/merge defaults removed; chunk_lod_distance is the canonical LOD cutoff.
 
 fn default_chunk_lod_distance() -> f32 {
     800.0
 }
+// Note: subdivide/merge thresholds were removed; `chunk_lod_distance` is the canonical LOD cutoff.
 
 fn default_fov() -> f32 {
     70.0
@@ -499,8 +490,6 @@ impl Default for WorldConfig {
 impl Default for RenderingConfig {
     fn default() -> Self {
         Self {
-            lod_subdivide_distance: default_lod_subdivide_distance(),
-            lod_merge_distance: default_lod_merge_distance(),
             chunk_lod_distance: default_chunk_lod_distance(),
             fov_degrees: default_fov(),
             near_plane: default_near_plane(),

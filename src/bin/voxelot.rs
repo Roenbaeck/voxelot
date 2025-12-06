@@ -537,8 +537,7 @@ impl CameraController {
     fn new(position: [f32; 3], render_cfg: &voxelot::config::RenderingConfig) -> Self {
         let rc = RenderConfig::from_rendering(render_cfg);
         println!("Loaded rendering config (TOML):");
-        println!("  LOD subdivide distance: {}", rc.lod_subdivide_distance);
-        println!("  LOD merge distance: {}", rc.lod_merge_distance);
+        println!("  LOD render distance: {}", rc.lod_render_distance);
         println!("  Far plane: {}", rc.far_plane);
         println!("  FOV: {}°", rc.fov_degrees);
 
@@ -592,19 +591,19 @@ impl CameraController {
             }
             // Runtime config adjustments (only on key press, not release)
             KeyCode::PageDown if pressed => {
-                self.camera.config.lod_subdivide_distance =
-                    (self.camera.config.lod_subdivide_distance - 50.0).max(50.0);
+                self.camera.config.lod_render_distance =
+                    (self.camera.config.lod_render_distance - 50.0).max(50.0);
                 println!(
-                    "LOD subdivide distance: {:.0}",
-                    self.camera.config.lod_subdivide_distance
+                    "LOD render distance: {:.0}",
+                    self.camera.config.lod_render_distance
                 );
             }
             KeyCode::PageUp if pressed => {
-                self.camera.config.lod_subdivide_distance =
-                    (self.camera.config.lod_subdivide_distance + 50.0).min(2000.0);
+                self.camera.config.lod_render_distance =
+                    (self.camera.config.lod_render_distance + 50.0).min(2000.0);
                 println!(
-                    "LOD subdivide distance: {:.0}",
-                    self.camera.config.lod_subdivide_distance
+                    "LOD render distance: {:.0}",
+                    self.camera.config.lod_render_distance
                 );
             }
             KeyCode::KeyZ if pressed => {
@@ -1729,10 +1728,6 @@ impl App {
         // We read existing file, update rendering subsection relevant fields, then save.
         if let Ok(mut full_cfg) = voxelot::Config::load(&self.config_path) {
             // Rendering settings
-            full_cfg.rendering.lod_subdivide_distance =
-                self.camera_controller.camera.config.lod_subdivide_distance;
-            full_cfg.rendering.lod_merge_distance =
-                self.camera_controller.camera.config.lod_merge_distance;
             full_cfg.rendering.chunk_lod_distance =
                 self.camera_controller.camera.config.lod_render_distance;
             full_cfg.rendering.fov_degrees = self.camera_controller.camera.config.fov_degrees;
@@ -1801,8 +1796,6 @@ impl App {
         } else {
             eprintln!("Warning: could not load existing TOML config for update; creating default.");
             let mut full_cfg = voxelot::Config::default();
-            full_cfg.rendering.lod_subdivide_distance =
-                self.camera_controller.camera.config.lod_subdivide_distance;
             if let Err(e) = full_cfg.save(&self.config_path) {
                 eprintln!("Failed to write default unified config: {}", e);
             }

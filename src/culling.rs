@@ -8,8 +8,6 @@ use rustc_hash::FxHashMap as HashMap;
 /// Legacy render config replaced by unified TOML config (`Config.rendering`).
 /// Keep a minimal struct so existing code compiles; construct only from `RenderingConfig`.
 pub struct RenderConfig {
-    pub lod_subdivide_distance: f32,
-    pub lod_merge_distance: f32,
     pub lod_render_distance: f32,
     pub far_plane: f32,
     pub fov_degrees: f32,
@@ -20,8 +18,6 @@ impl Default for RenderConfig {
     fn default() -> Self {
         // Fallback values if TOML not yet loaded; should be replaced by `RenderingConfig` data.
         Self {
-            lod_subdivide_distance: 500.0,
-            lod_merge_distance: 1000.0,
             lod_render_distance: 800.0,
             far_plane: 5000.0,
             fov_degrees: 70.0,
@@ -34,8 +30,6 @@ impl RenderConfig {
     /// Construct from unified TOML `RenderingConfig` (serde-loaded).
     pub fn from_rendering(cfg: &crate::config::RenderingConfig) -> Self {
         Self {
-            lod_subdivide_distance: cfg.lod_subdivide_distance,
-            lod_merge_distance: cfg.lod_merge_distance,
             lod_render_distance: cfg.chunk_lod_distance,
             far_plane: cfg.far_plane,
             fov_degrees: cfg.fov_degrees,
@@ -546,7 +540,6 @@ pub struct VoxelInstance {
 pub struct ChunkRenderInfo {
     pub chunk_pos: (i64, i64, i64),
     pub distance: f32,
-    pub lod_level: u8,
 }
 
 impl ChunkRenderInfo {
@@ -562,19 +555,9 @@ impl ChunkRenderInfo {
         let dz = chunk_center[2] - camera_pos[2];
         let distance = (dx * dx + dy * dy + dz * dz).sqrt();
 
-        // Simple LOD: level 0 for <50 units, level 1 for <150, level 2 beyond
-        let lod_level = if distance < 50.0 {
-            0
-        } else if distance < 150.0 {
-            1
-        } else {
-            2
-        };
-
         Self {
             chunk_pos,
             distance,
-            lod_level,
         }
     }
 }
