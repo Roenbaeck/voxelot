@@ -135,7 +135,7 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     var accumulated_light = vec3<f32>(0.0);
     
     for (var slice = 0u; slice < ssao.slice_count; slice = slice + 1u) {
-        let phi = (PI / slice_count) * (f32(slice) + noise);
+        let phi = (2.0 * PI / slice_count) * (f32(slice) + noise);
         let slice_dir = vec2<f32>(cos(phi), sin(phi));
         
         // Project normal onto slice plane
