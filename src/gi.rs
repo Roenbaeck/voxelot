@@ -28,6 +28,7 @@ pub struct GiSystem {
     pub grid_origin: IVec3, // In chunks (chunk_coord)
     pub grid_dims: IVec3,   // Dimensions in chunks
     pub force_update: bool,
+    pub light_sources: Vec<(Vec3, Vec3)>,
 }
 
 impl GiSystem {
@@ -38,6 +39,37 @@ impl GiSystem {
             grid_origin: IVec3::new(0, 0, 0),
             grid_dims: dims,
             force_update: true,
+            light_sources: Vec::new(),
+        }
+    }
+
+    fn scan_lights(&mut self, world: &World, palette: &Palette, min: IVec3, max: IVec3) {
+        for z in min.z..max.z {
+            for y in min.y..max.y {
+                for x in min.x..max.x {
+                    let origin = WorldPos::new(x as i64 * 16, y as i64 * 16, z as i64 * 16);
+
+                    if let Some(chunk) = world.get_leaf_chunk_at_origin(origin) {
+                        if chunk.emissive_power > 0.0 {
+                            for idx in chunk.presence.iter() {
+                                let (lx, ly, lz) = Chunk::unflatten(idx);
+                                let rank = chunk.presence.rank(idx) as usize;
+                                if let Some(Voxel::Solid(v_type)) = chunk.voxels.get(rank - 1) {
+                                    let (e_color, e_strength) = palette.emissive(*v_type as u32);
+                                    if e_strength > 0.0 {
+                                        let pos = Vec3::new(
+                                            (origin.x + lx as i64) as f32 + 0.5,
+                                            (origin.y + ly as i64) as f32 + 0.5,
+                                            (origin.z + lz as i64) as f32 + 0.5,
+                                        );
+                                        self.light_sources.push((pos, Vec3::from(e_color) * e_strength));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -58,42 +90,55 @@ impl GiSystem {
         let force_update = self.force_update;
         self.force_update = false;
 
-        // 2. Identify emissive chunks in the vicinity
-        let mut light_sources = Vec::new();
-        // Expand scan range to catch lights just outside the probe grid
-        // Max light radius is 64.0, which is 4 chunks.
-        let scan_padding = 4; 
+        // 2. Update light sources incrementally
+        let padding = 4;
+        let scan_min = new_origin - IVec3::splat(padding);
+        let scan_max = new_origin + self.grid_dims + IVec3::splat(padding);
+
+        // Remove lights outside new range
+        let min_pos = scan_min.as_vec3() * 16.0;
+        let max_pos = scan_max.as_vec3() * 16.0;
         
-        for z in -scan_padding..(self.grid_dims.z + scan_padding) {
-            for y in -scan_padding..(self.grid_dims.y + scan_padding) {
-                for x in -scan_padding..(self.grid_dims.x + scan_padding) {
-                    let cx = new_origin.x + x;
-                    let cy = new_origin.y + y;
-                    let cz = new_origin.z + z;
+        self.light_sources.retain(|(pos, _)| {
+            pos.x >= min_pos.x && pos.x < max_pos.x &&
+            pos.y >= min_pos.y && pos.y < max_pos.y &&
+            pos.z >= min_pos.z && pos.z < max_pos.z
+        });
 
-                    let origin = WorldPos::new(cx as i64 * 16, cy as i64 * 16, cz as i64 * 16);
-
-                    if let Some(chunk) = world.get_leaf_chunk_at_origin(origin) {
-                        if chunk.emissive_power > 0.0 {
-                            // Iterate voxels to find emissive ones
-                            for idx in chunk.presence.iter() {
-                                let (lx, ly, lz) = Chunk::unflatten(idx);
-                                let rank = chunk.presence.rank(idx) as usize;
-                                if let Some(Voxel::Solid(v_type)) = chunk.voxels.get(rank - 1) {
-                                    let (e_color, e_strength) = palette.emissive(*v_type as u32);
-                                    if e_strength > 0.0 {
-                                        let pos = Vec3::new(
-                                            (origin.x + lx as i64) as f32 + 0.5,
-                                            (origin.y + ly as i64) as f32 + 0.5,
-                                            (origin.z + lz as i64) as f32 + 0.5,
-                                        );
-                                        light_sources.push((pos, Vec3::from(e_color) * e_strength));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+        if force_update {
+            self.light_sources.clear();
+            self.scan_lights(world, palette, scan_min, scan_max);
+        } else {
+            let old_origin = self.grid_origin;
+            let old_scan_min = old_origin - IVec3::splat(padding);
+            let old_scan_max = old_origin + self.grid_dims + IVec3::splat(padding);
+            
+            let x_range = if shift.x > 0 { old_scan_max.x..scan_max.x } else { scan_min.x..old_scan_min.x };
+            let y_range = if shift.y > 0 { old_scan_max.y..scan_max.y } else { scan_min.y..old_scan_min.y };
+            let z_range = if shift.z > 0 { old_scan_max.z..scan_max.z } else { scan_min.z..old_scan_min.z };
+            
+            if !x_range.is_empty() {
+                self.scan_lights(world, palette, 
+                    IVec3::new(x_range.start, scan_min.y, scan_min.z),
+                    IVec3::new(x_range.end, scan_max.y, scan_max.z));
+            }
+            
+            let intersect_x_start = scan_min.x.max(old_scan_min.x);
+            let intersect_x_end = scan_max.x.min(old_scan_max.x);
+            
+            if !y_range.is_empty() && intersect_x_start < intersect_x_end {
+                self.scan_lights(world, palette,
+                    IVec3::new(intersect_x_start, y_range.start, scan_min.z),
+                    IVec3::new(intersect_x_end, y_range.end, scan_max.z));
+            }
+            
+            let intersect_y_start = scan_min.y.max(old_scan_min.y);
+            let intersect_y_end = scan_max.y.min(old_scan_max.y);
+            
+            if !z_range.is_empty() && intersect_x_start < intersect_x_end && intersect_y_start < intersect_y_end {
+                self.scan_lights(world, palette,
+                    IVec3::new(intersect_x_start, intersect_y_start, z_range.start),
+                    IVec3::new(intersect_x_end, intersect_y_end, z_range.end));
             }
         }
 
@@ -132,6 +177,8 @@ impl GiSystem {
         }
 
         // Compute new probes in parallel
+        let light_sources = &self.light_sources;
+
         let computed_data: Vec<(usize, GiProbe)> = probes_to_compute
             .par_iter()
             .map(|&(idx, px, py, pz)| {
@@ -146,11 +193,28 @@ impl GiSystem {
                     (cz as f32 * 16.0) + 8.0,
                 );
 
+                // Check if probe is inside a solid voxel
+                let wp = WorldPos::new(probe_pos.x.floor() as i64, probe_pos.y.floor() as i64, probe_pos.z.floor() as i64);
+                let chunk_origin = WorldPos::new(wp.x & !15, wp.y & !15, wp.z & !15);
+                let mut is_buried = false;
+                if let Some(chunk) = world.get_leaf_chunk_at_origin(chunk_origin) {
+                     let lx = (wp.x & 15) as u8;
+                     let ly = (wp.y & 15) as u8;
+                     let lz = (wp.z & 15) as u8;
+                     if chunk.contains(lx, ly, lz) {
+                         is_buried = true;
+                     }
+                }
+
+                if is_buried {
+                    return (idx, GiProbe::default());
+                }
+
                 let mut probe = GiProbe::default();
                 probe.position = [probe_pos.x, probe_pos.y, probe_pos.z, 1.0];
                 probe.light_data = [[0.0; 4]; 6];
 
-                for (light_pos, light_color) in &light_sources {
+                for (light_pos, light_color) in light_sources {
                     let dir = *light_pos - probe_pos;
                     let dist_sq = dir.length_squared();
                     
