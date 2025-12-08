@@ -341,6 +341,11 @@ struct SsaoUniformsRaw {
     _pad0: f32,
     _pad1: f32,
     inverse_projection: [[f32; 4]; 4],
+    inverse_view: [[f32; 4]; 4],
+    grid_origin: [i32; 3],
+    _pad2: i32,
+    grid_dims: [i32; 3],
+    _pad3: i32,
 }
 
 #[repr(C)]
@@ -844,6 +849,8 @@ struct App {
 
     world: World,
     palette: Palette,
+    gi_system: voxelot::gi::GiSystem,
+    gi_probe_buffer: Option<wgpu::Buffer>,
     camera_controller: CameraController,
     pending_chunk_meshes: VecDeque<(i64, i64, i64)>,
     pending_chunk_set: FxHashSet<(i64, i64, i64)>,
@@ -1513,6 +1520,10 @@ impl App {
             tmp_chunk_emitters: Vec::with_capacity(64),
             vb_data_tmp: Vec::with_capacity(8192),
 
+            // Expanded grid to 32x16x32 chunks (512x256x512 blocks) to cover more view area
+            gi_system: voxelot::gi::GiSystem::new(glam::IVec3::new(32, 16, 32)),
+            gi_probe_buffer: None,
+
             camera_controller: CameraController::new(initial_camera, &cfg.rendering),
             pending_chunk_meshes: VecDeque::new(),
             pending_chunk_set: FxHashSet::default(),
@@ -1875,6 +1886,12 @@ impl App {
         ]);
         let corrected_projection = OPENGL_TO_WGPU_MATRIX * projection;
         let inv_proj = corrected_projection.inverse();
+        let view = Mat4::look_to_rh(
+            Vec3::from(self.camera_controller.camera.position),
+            Vec3::from(self.camera_controller.camera.forward),
+            Vec3::from(self.camera_controller.camera.up),
+        );
+        let inv_view = view.inverse();
         SsaoUniformsRaw {
             sample_count: self.ssao_settings.sample_count as u32,
             slice_count: self.ssao_settings.slice_count as u32,
@@ -1885,6 +1902,11 @@ impl App {
             _pad0: 0.0,
             _pad1: 0.0,
             inverse_projection: inv_proj.to_cols_array_2d(),
+            inverse_view: inv_view.to_cols_array_2d(),
+            grid_origin: self.gi_system.grid_origin.into(),
+            _pad2: 0,
+            grid_dims: self.gi_system.grid_dims.into(),
+            _pad3: 0,
         }
     }
 
@@ -3028,7 +3050,7 @@ impl App {
             Some(uniform_buffer),
             Some(shadow_view),
             Some(shadow_sampler),
-            Some(light_probe_buffer),
+            Some(gi_probe_buffer),
             Some(palette_buffer),
         ) = (
             self.device.as_ref(),
@@ -3036,7 +3058,7 @@ impl App {
             self.uniform_buffer.as_ref(),
             self.shadow_view.as_ref(),
             self.shadow_sampler.as_ref(),
-            self.light_probe_buffer.as_ref(),
+            self.gi_probe_buffer.as_ref(),
             self.palette_buffer.as_ref(),
         )
         else {
@@ -3061,7 +3083,7 @@ impl App {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: light_probe_buffer.as_entire_binding(),
+                    resource: gi_probe_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -3307,10 +3329,11 @@ impl App {
             }
 
             // SSAO bind group uses uniform 0, offscreen depth (1), and post sampler (2)
-            if let (Some(ssao_ubo), Some(depth_view), Some(psampler)) = (
+            if let (Some(ssao_ubo), Some(depth_view), Some(psampler), Some(gi_probe_buf)) = (
                 self.ssilvb_uniform_buffer.as_ref(),
                 self.offscreen_depth_view.as_ref(),
                 self.post_sampler.as_ref(),
+                self.gi_probe_buffer.as_ref(),
             ) {
                 self.ssilvb_bind_group =
                     Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3331,9 +3354,7 @@ impl App {
                             },
                             wgpu::BindGroupEntry {
                                 binding: 3,
-                                resource: wgpu::BindingResource::TextureView(
-                                    self.emissive_view.as_ref().unwrap(),
-                                ),
+                                resource: gi_probe_buf.as_entire_binding(),
                             },
                         ],
                     }));
@@ -5663,10 +5684,10 @@ impl App {
                     wgpu::BindGroupLayoutEntry {
                         binding: 3,
                         visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
                         count: None,
                     },
@@ -6004,28 +6025,12 @@ impl App {
             &mut self.gpu_buffer_bytes,
         );
 
-        // Create light probe buffer (start with capacity for 64 probes)
-        let light_probe_capacity = 64;
-        let empty_probes = vec![
-            LightProbe {
-                position: [0.0; 3],
-                _pad0: 0.0,
-                color_power: [0.0; 4],
-            };
-            light_probe_capacity
-        ];
-        let light_probe_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Light Probe Buffer"),
-            contents: bytemuck::cast_slice(&empty_probes),
+        // Create GI probe buffer
+        let gi_probe_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("GI Probe Buffer"),
+            contents: bytemuck::cast_slice(&self.gi_system.probes),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
-        // Track light probe buffer bytes
-        let probes_size = (light_probe_capacity * std::mem::size_of::<LightProbe>()) as u64;
-        App::replace_buffer_bytes_static(
-            &mut self.light_probe_buffer_bytes,
-            probes_size,
-            &mut self.gpu_buffer_bytes,
-        );
 
         let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Shadow Sampler"),
@@ -6492,8 +6497,7 @@ impl App {
         self.uniform_buffer = Some(uniform_buffer);
         self.palette_buffer = Some(palette_buffer);
 
-        self.light_probe_buffer = Some(light_probe_buffer);
-        self.light_probe_capacity = light_probe_capacity;
+        self.gi_probe_buffer = Some(gi_probe_buffer);
         self.main_bind_group_layout = Some(main_bind_group_layout);
         self.shadow_bind_group_layout = Some(shadow_bind_group_layout);
         self.shadow_sampler = Some(shadow_sampler);
@@ -6624,6 +6628,14 @@ impl App {
         }
 
         self.camera_controller.update(dt);
+
+        // Update GI probes
+        self.gi_system.update(&self.world, &self.palette, glam::Vec3::from(self.camera_controller.camera.position));
+        
+        // Upload probes to GPU
+        if let Some(buffer) = &self.gi_probe_buffer {
+             queue.write_buffer(buffer, 0, bytemuck::cast_slice(&self.gi_system.probes));
+        }
 
         // Reset accumulator for GPU buffer item counting this frame
         self.gpu_buffer_items_frame = 0;

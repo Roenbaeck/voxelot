@@ -1,4 +1,5 @@
 use crate::lib_hierarchical::{Chunk, Voxel, World, WorldPos};
+use crate::palette::Palette;
 use bytemuck::{Pod, Zeroable};
 use glam::{IVec3, Vec3};
 use rayon::prelude::*;
@@ -26,6 +27,7 @@ pub struct GiSystem {
     pub probes: Vec<GiProbe>,
     pub grid_origin: IVec3, // In chunks (chunk_coord)
     pub grid_dims: IVec3,   // Dimensions in chunks
+    pub force_update: bool,
 }
 
 impl GiSystem {
@@ -35,34 +37,36 @@ impl GiSystem {
             probes: vec![GiProbe::default(); count],
             grid_origin: IVec3::new(0, 0, 0),
             grid_dims: dims,
+            force_update: true,
         }
     }
 
     /// Update probes based on camera position and world state
-    pub fn update(&mut self, world: &World, camera_pos: Vec3) {
+    pub fn update(&mut self, world: &World, palette: &Palette, camera_pos: Vec3) {
         // 1. Determine new grid origin (centered on camera, snapped to chunk size)
         let chunk_size = 16.0;
         let cam_chunk = (camera_pos / chunk_size).floor().as_ivec3();
         let half_dims = self.grid_dims / 2;
         let new_origin = cam_chunk - half_dims;
 
-        self.grid_origin = new_origin;
+        let shift = new_origin - self.grid_origin;
+
+        if shift == IVec3::ZERO && !self.force_update {
+            return;
+        }
+        
+        let force_update = self.force_update;
+        self.force_update = false;
 
         // 2. Identify emissive chunks in the vicinity
-        // For performance, we'll scan the world hierarchy or just iterate expected positions
-        // Since Random Access is valid, let's just iterate our grid for now to find "Local" emissives.
-        // A better approach would be to maintain a list of emissive chunks in World, but that requires World changes.
-        // Let's assume we can scan the relevant area.
-
-        // Collect potential light sources (mid-points of emissive chunks)
-        // Format: (Position, Color, Intensity)
         let mut light_sources = Vec::new();
-
-        let sub_scan_dims = self.grid_dims; // Scan same area as probes for now
-
-        for z in 0..sub_scan_dims.z {
-            for y in 0..sub_scan_dims.y {
-                for x in 0..sub_scan_dims.x {
+        // Expand scan range to catch lights just outside the probe grid
+        // Max light radius is 64.0, which is 4 chunks.
+        let scan_padding = 4; 
+        
+        for z in -scan_padding..(self.grid_dims.z + scan_padding) {
+            for y in -scan_padding..(self.grid_dims.y + scan_padding) {
+                for x in -scan_padding..(self.grid_dims.x + scan_padding) {
                     let cx = new_origin.x + x;
                     let cy = new_origin.y + y;
                     let cz = new_origin.z + z;
@@ -71,125 +75,167 @@ impl GiSystem {
 
                     if let Some(chunk) = world.get_leaf_chunk_at_origin(origin) {
                         if chunk.emissive_power > 0.0 {
-                            // Use center of chunk as light source for "rough" GI
-                            let center = Vec3::new(
-                                (cx as f32 * 16.0) + 8.0,
-                                (cy as f32 * 16.0) + 8.0,
-                                (cz as f32 * 16.0) + 8.0,
-                            );
-                            let color = Vec3::from(chunk.emissive_sum); // This is Sum(Color * Strength)
-                                                                        // Normalize by voxel count to get average radiance?
-                                                                        // emissive_sum in Chunk is accumulated (color * strength).
-                                                                        // If we treat the whole chunk as a point light, Total Power ~ emissive_sum.
-                                                                        // We shouldn't divide by count if we want total energy.
-
-                            light_sources.push((center, color));
+                            // Iterate voxels to find emissive ones
+                            for idx in chunk.presence.iter() {
+                                let (lx, ly, lz) = Chunk::unflatten(idx);
+                                let rank = chunk.presence.rank(idx) as usize;
+                                if let Some(Voxel::Solid(v_type)) = chunk.voxels.get(rank - 1) {
+                                    let (e_color, e_strength) = palette.emissive(*v_type as u32);
+                                    if e_strength > 0.0 {
+                                        let pos = Vec3::new(
+                                            (origin.x + lx as i64) as f32 + 0.5,
+                                            (origin.y + ly as i64) as f32 + 0.5,
+                                            (origin.z + lz as i64) as f32 + 0.5,
+                                        );
+                                        light_sources.push((pos, Vec3::from(e_color) * e_strength));
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
         }
 
-        // 3. Update probes in parallel
-        // For shift/scroll we could preserve data, but for now simple rebuild
+        // 3. Update probes with scrolling
         let dims = self.grid_dims;
-        let origin = self.grid_origin;
+        let count = (dims.x * dims.y * dims.z) as usize;
+        let mut new_probes = vec![GiProbe::default(); count];
+        let mut probes_to_compute = Vec::new();
 
-        self.probes
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(i, probe)| {
-                // Reconstruct 3D index
-                let tmp_yz = i as i32 / dims.x;
-                let lx = i as i32 % dims.x;
-                let ly = tmp_yz % dims.y;
-                let lz = tmp_yz / dims.y;
+        for z in 0..dims.z {
+            for y in 0..dims.y {
+                for x in 0..dims.x {
+                    let new_idx = (x + y * dims.x + z * dims.x * dims.y) as usize;
+                    
+                    // Calculate old coordinates
+                    let old_x = x + shift.x;
+                    let old_y = y + shift.y;
+                    let old_z = z + shift.z;
 
-                let cx = origin.x + lx;
-                let cy = origin.y + ly;
-                let cz = origin.z + lz;
+                    let mut reused = false;
+                    if !force_update &&
+                       old_x >= 0 && old_x < dims.x &&
+                       old_y >= 0 && old_y < dims.y &&
+                       old_z >= 0 && old_z < dims.z {
+                        
+                        let old_idx = (old_x + old_y * dims.x + old_z * dims.x * dims.y) as usize;
+                        new_probes[new_idx] = self.probes[old_idx];
+                        reused = true;
+                    }
 
-                let center_pos = Vec3::new(
+                    if !reused {
+                        probes_to_compute.push((new_idx, x, y, z));
+                    }
+                }
+            }
+        }
+
+        // Compute new probes in parallel
+        let computed_data: Vec<(usize, GiProbe)> = probes_to_compute
+            .par_iter()
+            .map(|&(idx, px, py, pz)| {
+                let cx = new_origin.x + px;
+                let cy = new_origin.y + py;
+                let cz = new_origin.z + pz;
+
+                // Probe is at center of chunk
+                let probe_pos = Vec3::new(
                     (cx as f32 * 16.0) + 8.0,
                     (cy as f32 * 16.0) + 8.0,
                     (cz as f32 * 16.0) + 8.0,
                 );
 
-                // Update position
-                probe.position = [center_pos.x, center_pos.y, center_pos.z, 1.0];
-
-                // Clear light data
+                let mut probe = GiProbe::default();
+                probe.position = [probe_pos.x, probe_pos.y, probe_pos.z, 1.0];
                 probe.light_data = [[0.0; 4]; 6];
 
-                // Accumulate light
-                for (light_pos, light_energy) in &light_sources {
-                    let delta = *light_pos - center_pos;
-                    let dist_sq = delta.length_squared();
+                for (light_pos, light_color) in &light_sources {
+                    let dir = *light_pos - probe_pos;
+                    let dist_sq = dir.length_squared();
+                    
+                    // Max radius check (e.g., 64 units = 4 chunks)
+                    if dist_sq > 0.001 && dist_sq < 64.0 * 64.0 {
+                        // Check occlusion for each face individually
+                        // Instead of checking from the center of the chunk (which might be occluded),
+                        // we check from the center of each face that is facing the light.
+                        let faces = [
+                            (Vec3::X, 0), (Vec3::NEG_X, 1),
+                            (Vec3::Y, 2), (Vec3::NEG_Y, 3),
+                            (Vec3::Z, 4), (Vec3::NEG_Z, 5),
+                        ];
 
-                    // Max range check (e.g. 100 meters = ~6 chunks)
-                    if dist_sq > 200.0 * 200.0 || dist_sq < 1.0 {
-                        continue;
-                    }
+                        for (face_normal, face_idx) in faces {
+                            // Calculate the center point of this face
+                            let face_pos = probe_pos + face_normal * 8.0;
+                            
+                            // Recalculate direction and distance from the face center
+                            let face_to_light = *light_pos - face_pos;
+                            let face_dist_sq = face_to_light.length_squared();
+                            let face_dist = face_dist_sq.sqrt();
+                            let face_dir_norm = face_to_light / face_dist;
 
-                    let dist = dist_sq.sqrt();
-                    let dir = delta / dist;
-
-                    // Occlusion Raycast
-                    // Simple heuristic: check midpoint or a few steps
-                    // Full voxel traversal is too slow here (probes * lights).
-                    // Let's check 3 steps: 25%, 50%, 75%
-                    if !is_visible_heuristic(world, center_pos, *light_pos, dist) {
-                        continue;
-                    }
-
-                    // Attenuation (Inverse Square)
-                    let attenuation = 1.0 / (1.0 + dist_sq * 0.05); // Tweak factor
-
-                    let incoming = *light_energy * attenuation * 0.5; // Scale down a bit
-
-                    // Project onto 6 faces (Ambient Cube / Valve basis)
-                    // Normals: +X, -X, +Y, -Y, +Z, -Z
-                    let normals = [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z];
-
-                    for f in 0..6 {
-                        let cos_theta = dir.dot(normals[f]).max(0.0);
-                        if cos_theta > 0.0 {
-                            let contrib = incoming * cos_theta;
-                            probe.light_data[f][0] += contrib.x;
-                            probe.light_data[f][1] += contrib.y;
-                            probe.light_data[f][2] += contrib.z;
+                            // Check if light is in front of the face
+                            let dot = face_normal.dot(face_dir_norm).max(0.0);
+                            
+                            if dot > 0.0 {
+                                // Trace from the face center towards the light
+                                // Reduce distance slightly to avoid hitting the light source voxel itself
+                                let trace_dist = (face_dist - 1.0).max(0.0);
+                                
+                                if trace_dist > 0.0 && !trace_ray(world, face_pos, face_dir_norm, trace_dist) {
+                                    // Inverse square falloff (using distance from face)
+                                    let contribution = *light_color * dot / (1.0 + face_dist_sq);
+                                    
+                                    probe.light_data[face_idx][0] += contribution.x;
+                                    probe.light_data[face_idx][1] += contribution.y;
+                                    probe.light_data[face_idx][2] += contribution.z;
+                                }
+                            }
                         }
                     }
                 }
-            });
+                (idx, probe)
+            })
+            .collect();
+
+        // Apply computed probes
+        for (idx, probe) in computed_data {
+            new_probes[idx] = probe;
+        }
+
+        self.probes = new_probes;
+        self.grid_origin = new_origin;
     }
 }
 
-/// Very coarse visibility check
-fn is_visible_heuristic(world: &World, p0: Vec3, p1: Vec3, dist: f32) -> bool {
-    let steps = (dist / 16.0).ceil() as u32; // check every chunk
-    if steps <= 1 {
-        return true;
-    }
+fn trace_ray(world: &World, start: Vec3, dir: Vec3, max_dist: f32) -> bool {
+    let step_size = 0.5; // Check every half voxel unit for better accuracy
+    let steps = (max_dist / step_size).ceil() as usize;
+    let mut pos = start;
+    
+    // Offset start slightly to avoid self-occlusion
+    pos += dir * 0.1;
 
-    let dir = (p1 - p0) / dist;
+    for _ in 0..steps {
+        pos += dir * step_size;
+        if (pos - start).length_squared() > max_dist * max_dist {
+            break;
+        }
 
-    // Check occupancy at intervals
-    for i in 1..steps {
-        let t = i as f32 * 16.0;
-        let p = p0 + dir * t;
-        let wp = WorldPos::new(p.x as i64, p.y as i64, p.z as i64);
-
-        // Fast check: get leaf chunk, see if solid ratio is high?
-        // Or check specific voxel?
-        // Let's just check if there is a chunk there that isn't empty.
-        // But we want to allow light through empty space.
-
-        // Check if point is inside a solid voxel?
-        // world.get(wp) returns Some(type) if solid.
-        if world.get(wp).is_some() {
-            return false;
+        let wp = WorldPos::new(pos.x.floor() as i64, pos.y.floor() as i64, pos.z.floor() as i64);
+        
+        let chunk_origin = WorldPos::new(wp.x & !15, wp.y & !15, wp.z & !15);
+        
+        if let Some(chunk) = world.get_leaf_chunk_at_origin(chunk_origin) {
+             let lx = (wp.x & 15) as u8;
+             let ly = (wp.y & 15) as u8;
+             let lz = (wp.z & 15) as u8;
+             
+             if chunk.contains(lx, ly, lz) {
+                 return true;
+             }
         }
     }
-    true
+    false
 }

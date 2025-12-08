@@ -5,13 +5,25 @@ struct SsaoUniforms {
     hit_thickness: f32,
     screen_width: f32,
     screen_height: f32,
+    _pad0: f32,
+    _pad1: f32,
     inverse_projection: mat4x4<f32>,
+    inverse_view: mat4x4<f32>,
+    grid_origin: vec3<i32>,
+    _pad2: i32,
+    grid_dims: vec3<i32>,
+    _pad3: i32,
+};
+
+struct GiProbe {
+    position: vec4<f32>,
+    light_data: array<vec4<f32>, 6>,
 };
 
 @group(0) @binding(0) var<uniform> ssao: SsaoUniforms;
 @group(0) @binding(1) var depth_tex: texture_depth_2d;
 @group(0) @binding(2) var post_sampler: sampler;
-@group(0) @binding(3) var emissive_tex: texture_2d<f32>;
+@group(0) @binding(3) var<storage, read> gi_probes: array<GiProbe>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -110,6 +122,85 @@ fn count_bits(value: u32) -> u32 {
     return (((v + (v >> 4u)) & 0x0F0F0F0Fu) * 0x01010101u) >> 24u;
 }
 
+fn get_probe_irradiance(probe_idx: u32, normal: vec3<f32>) -> vec3<f32> {
+    let probe = gi_probes[probe_idx];
+    
+    let w_x = normal.x * normal.x;
+    let w_y = normal.y * normal.y;
+    let w_z = normal.z * normal.z;
+    
+    let idx_x = select(1u, 0u, normal.x > 0.0);
+    let idx_y = select(3u, 2u, normal.y > 0.0);
+    let idx_z = select(5u, 4u, normal.z > 0.0);
+    
+    return probe.light_data[idx_x].rgb * w_x + 
+           probe.light_data[idx_y].rgb * w_y + 
+           probe.light_data[idx_z].rgb * w_z;
+}
+
+fn sample_grid_irradiance(world_pos: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
+    // Apply normal bias to avoid sampling inside walls
+    // Push the sample point 0.5 units along the normal (half a block)
+    let biased_pos = world_pos + normal * 0.5;
+
+    // Convert world pos to grid coords
+    // Grid origin is in chunks (16 units)
+    // Probe is at center of chunk (+8.0)
+    // grid_coord = (biased_pos - (grid_origin * 16.0 + 8.0)) / 16.0
+    //            = biased_pos / 16.0 - grid_origin - 0.5
+    
+    let grid_coord = biased_pos / 16.0 - vec3<f32>(ssao.grid_origin) - 0.5;
+    
+    let base = floor(grid_coord);
+    let frac = grid_coord - base;
+    
+    let dims = ssao.grid_dims;
+    
+    var total_irradiance = vec3<f32>(0.0);
+    var total_weight = 0.0;
+    
+    // Trilinear interpolation
+    for (var z = 0; z < 2; z = z + 1) {
+        for (var y = 0; y < 2; y = y + 1) {
+            for (var x = 0; x < 2; x = x + 1) {
+                let offset = vec3<f32>(f32(x), f32(y), f32(z));
+                let coord = vec3<i32>(base + offset);
+                
+                // Check bounds
+                if (coord.x >= 0 && coord.x < dims.x &&
+                    coord.y >= 0 && coord.y < dims.y &&
+                    coord.z >= 0 && coord.z < dims.z) {
+                    
+                    let idx = u32(coord.x + coord.y * dims.x + coord.z * dims.x * dims.y);
+                    let weight = (select(1.0 - frac.x, frac.x, x == 1) *
+                                  select(1.0 - frac.y, frac.y, y == 1) *
+                                  select(1.0 - frac.z, frac.z, z == 1));
+                                  
+                    total_irradiance += get_probe_irradiance(idx, normal) * weight;
+                    total_weight += weight;
+                }
+            }
+        }
+    }
+    
+    // Calculate distance to edge of grid for smooth fading
+    // grid_coord is in chunk units (0..dims)
+    // We fade out over the last 2 chunks (32 units) to avoid popping
+    let dist_to_edge = min(
+        min(grid_coord.x, f32(dims.x) - grid_coord.x),
+        min(min(grid_coord.y, f32(dims.y) - grid_coord.y),
+            min(grid_coord.z, f32(dims.z) - grid_coord.z))
+    );
+    
+    let fade = smoothstep(0.0, 2.0, dist_to_edge);
+
+    if (total_weight > 0.0) {
+        return (total_irradiance / total_weight) * fade;
+    } else {
+        return vec3<f32>(0.0);
+    }
+}
+
 @fragment
 fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let depth = textureSample(depth_tex, post_sampler, uv);
@@ -120,6 +211,14 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let view_pos = reconstruct_position(uv, depth);
     let normal = compute_normal_from_depth(uv);
     let view_vec = normalize(-view_pos); // View vector pointing to camera (0,0,0) in view space
+
+    // Reconstruct world position
+    let world_pos_4 = ssao.inverse_view * vec4<f32>(view_pos, 1.0);
+    let world_pos = world_pos_4.xyz / world_pos_4.w;
+    
+    // Reconstruct world normal
+    // inverse_view is view-to-world. Normal is direction, so w=0.
+    let world_normal = normalize((ssao.inverse_view * vec4<f32>(normal, 0.0)).xyz);
 
     let screen_size = vec2<f32>(ssao.screen_width, ssao.screen_height);
     let frag_coord = uv * screen_size;
@@ -132,84 +231,40 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let radius = ssao.sample_radius;
     
     var visibility = 0.0;
-    var accumulated_light = vec3<f32>(0.0);
     
     for (var slice = 0u; slice < ssao.slice_count; slice = slice + 1u) {
         let phi = (2.0 * PI / slice_count) * (f32(slice) + noise);
         let slice_dir = vec2<f32>(cos(phi), sin(phi));
         
-        // Project normal onto slice plane
-        // Actually, let's follow the reference logic more closely for the slice construction
-        
-        // Reference uses search in 2D screen space along the slice direction
-        // UV Y is down, View Space Y is up. So we must flip Y for the search direction in UV space.
         let search_dir = vec2<f32>(slice_dir.x, -slice_dir.y);
-        
-        // Calculate tangent angle of the surface in the slice plane
-        // We need to project the view-space normal onto the slice plane defined by view_vec and search_dir
-        // But simpler GTAO/SSILVB often just marches in screen space.
-        
-        // Let's use the reference's horizon search
-        
-        // Construct slice plane basis
-        // We are working in View Space mostly.
-        // Slice direction in view space (approximate)
         let slice_dir_vs = vec3<f32>(slice_dir, 0.0);
-        
-        // Compute projected normal on the slice plane
         let plane_n = normalize(cross(slice_dir_vs, view_vec));
         let proj_n = normal - plane_n * dot(normal, plane_n);
         let proj_n_len = length(proj_n);
         
         var cos_n = 0.0;
-        var sin_n = 1.0;
         var n_angle = 0.0;
 
         if (proj_n_len > 0.001) {
             let pn = proj_n / proj_n_len;
-            cos_n = dot(pn, view_vec); // cos of angle between normal and view vector
-            // Calculate sign of angle
+            cos_n = dot(pn, view_vec);
             let t = cross(plane_n, pn);
             let sgn = select(1.0, -1.0, dot(view_vec, t) < 0.0);
             n_angle = sgn * fast_acos(cos_n);
         }
         
-        // Horizon search
         var occlusion_bits = 0u;
         
-        // Two directions: -1 and 1
         for (var side = 0u; side < 2u; side = side + 1u) {
             let direction = select(-1.0, 1.0, side == 0u);
             let ray_dir = search_dir * direction;
-            
-            // Logarithmic stepping
             let step_factor = pow(radius, 1.0 / sample_count);
-            // Reference uses view space radius but steps in screen space.
-            // Let's map radius to screen space approximately.
-            // Screen space radius ~= radius / view_z * projection_scale
-            // For simplicity, let's treat radius as world/view units and project.
-            
-            // Approximate screen radius at this depth
-            // This is a simplification.
-            let proj_scale = ssao.inverse_projection[1][1] * ssao.screen_height; // Approx
+            let proj_scale = ssao.inverse_projection[1][1] * ssao.screen_height;
             let screen_radius = (radius * proj_scale) / -view_pos.z;
-            
-            // If screen radius is too small, skip
-            // if (screen_radius < 2.0) { continue; } // Removed culling to allow distant lights
-            
             let step_ratio = pow(screen_radius, 1.0 / sample_count);
-            var current_step = 1.0; // Start at 1 pixel offset
-            
-            // Jitter starting position
-            // current_step *= pow(step_ratio, noise); 
-            // Actually reference does: t = pow(s, rnd); where s is step factor.
-            
+            var current_step = 1.0;
             current_step = pow(step_ratio, select(noise, 1.0 - noise, side == 1u));
             
-            // Start at tangent angle (Normal Angle - 90 degrees)
-            var last_horizon_angle = n_angle - HALF_PI - 0.05; 
-
-            // Hardcoded loop limit increase for better long-range sampling
             for (var s = 0u; s < 64u; s = s + 1u) {
                 if (s >= ssao.sample_count) { break; } 
 
@@ -226,63 +281,27 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
                 let dist = sqrt(dist_sq);
                 let dist_vec = delta / dist;
                 
-                // Horizon angle calculation:
-                // - For occlusion bitmask: use direction-relative signed angle (old method)
-                // - For indirect lighting: use monotonic elevation angle (new GTAO method)
                 let horizon_cos = dot(dist_vec, view_vec);
-                
-                // Direction-relative angle for occlusion (preserves left/right distinction)
                 let horizon_angle_rel = fast_acos(horizon_cos) * direction;
                 
-                // Monotonic elevation for indirect lighting (0=Up, -PI/2=Flat, -PI=Down)
-                let horizon_angle_mono = -fast_acos(horizon_cos);
-                
-                // Thickness heuristic for occlusion bitmask
                 let back_horizon_cos = dot(normalize(delta - view_vec * ssao.hit_thickness), view_vec);
                 let back_horizon_angle = fast_acos(back_horizon_cos) * direction;
                 
-                // Occlusion bitmask using direction-relative angles
                 let h1 = clamp((horizon_angle_rel + n_angle) / PI + 0.5, 0.0, 1.0);
                 let h2 = clamp((back_horizon_angle + n_angle) / PI + 0.5, 0.0, 1.0);
                 
                 let min_h = min(h1, h2);
                 let max_h = max(h1, h2);
                 
-                // Bitmask
-                // 32 bits represent [0, 1] range
                 let start_bit = u32(min_h * 32.0);
                 let end_bit = u32(max_h * 32.0);
                 
-                // Create mask for range [start_bit, end_bit]
-                // Be careful with shifts > 31
                 if (start_bit < 32u) {
                     let count = min(end_bit - start_bit, 32u - start_bit);
                     if (count > 0u) {
                         let mask = (0xFFFFFFFFu >> (32u - count)) << start_bit;
                         occlusion_bits = occlusion_bits | mask;
                     }
-                }
-
-                // Indirect Lighting Accumulation (using monotonic elevation)
-                // If this sample is "above" the previous horizon, it contributes light
-                if (horizon_angle_mono > last_horizon_angle) {
-                    let visible_angle = horizon_angle_mono - last_horizon_angle;
-                    
-                    // Sample emissive texture
-                    let emissive_sample = textureSampleLevel(emissive_tex, post_sampler, sample_uv, 0);
-                    let emissive_color = emissive_sample.rgb;
-                    let emissive_strength = emissive_sample.a; // Assuming alpha contains strength or similar
-
-                    if (length(emissive_color) > 0.0) {
-                        // Inverse square falloff + solid angle approximation
-                        // visible_angle is the angular size of the visible segment
-                        // We also attenuate by distance to avoid over-contribution from far sources
-                        let attenuation = 1.0 / (1.0 + dist_sq * 0.005); // Reduced attenuation for farther spread
-                        
-                        accumulated_light += emissive_color * visible_angle * attenuation * 1.0; // No boost
-                    }
-                    
-                    last_horizon_angle = horizon_angle_mono;
                 }
             }
         }
@@ -292,10 +311,10 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     }
     
     visibility /= slice_count;
-    accumulated_light /= slice_count;
+    visibility = pow(visibility, 2.0);
     
-    // Apply strength/contrast
-    visibility = pow(visibility, 2.0); // Ad-hoc contrast
+    // Sample GI from probes
+    let indirect_light = sample_grid_irradiance(world_pos, world_normal);
     
-    return vec4<f32>(accumulated_light, visibility);
+    return vec4<f32>(indirect_light, visibility);
 }

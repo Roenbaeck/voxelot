@@ -33,7 +33,10 @@ Since voxels in the world aren't likely to change rapidly, we could keep a persi
 
 Do you think this could work? I'm not sure whether we'd need to calculate occlusion more often than we do now, or if we could get away with only doing it for the light probes. It may be too "rough" to be useful, but perhaps it could be balanced with the suff we're already calculating for AO and shadow mapping somehow? Note that AO looks great, so I don't want to touch that part of the SSILVB shader.
 
+This should give us a a probe within each visible chunk, with pre-baked illumation values, that can quickly get picked up by the shader. Those pre-baked values cannot change based on camera.
+
 What do you think?
+See documnet LIGHT_PROBE_GI.md for an implentation plan, of which some is already in place.
 
 
 
