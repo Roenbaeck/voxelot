@@ -6,12 +6,21 @@ struct SsaoUniforms {
     screen_width: f32,
     screen_height: f32,
     inverse_projection: mat4x4<f32>,
+    grid_origin: vec3<f32>,
+    grid_dims: vec3<f32>,
+    inverse_view: mat4x4<f32>,
+};
+
+struct GiProbe {
+    position: vec4<f32>,
+    light_data: array<vec4<f32>, 6>,
 };
 
 @group(0) @binding(0) var<uniform> ssao: SsaoUniforms;
 @group(0) @binding(1) var depth_tex: texture_depth_2d;
 @group(0) @binding(2) var post_sampler: sampler;
 @group(0) @binding(3) var emissive_tex: texture_2d<f32>;
+@group(0) @binding(4) var<storage, read> gi_probes: array<GiProbe>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -97,6 +106,70 @@ fn ign(uv: vec2<f32>) -> f32 {
     return fract(52.9829189 * fract(dot(uv, vec2<f32>(0.06711056, 0.00583715))));
 }
 
+fn get_probe_index(coords: vec3<f32>, dims: vec3<u32>) -> u32 {
+    return u32(coords.x) + u32(coords.y) * dims.x + u32(coords.z) * dims.x * dims.y;
+}
+
+fn sample_gi_probe(world_pos: vec3<f32>, world_normal: vec3<f32>) -> vec3<f32> {
+    // Calculate probe coordinates
+    let probe_pos = (world_pos - ssao.grid_origin) / 16.0;
+    let probe_coords = floor(probe_pos);
+    let frac_coords = fract(probe_pos);
+    
+    // Clamp to grid bounds
+    let clamped_coords = clamp(probe_coords, vec3<f32>(0.0), ssao.grid_dims - vec3<f32>(1.0));
+    let clamped_coords_next = clamp(probe_coords + vec3<f32>(1.0), vec3<f32>(0.0), ssao.grid_dims - vec3<f32>(1.0));
+    
+    // Calculate linear indices for 8 neighboring probes
+    let dims = vec3<u32>(ssao.grid_dims);
+    
+    let idx000 = get_probe_index(vec3<f32>(clamped_coords.x, clamped_coords.y, clamped_coords.z), dims);
+    let idx100 = get_probe_index(vec3<f32>(clamped_coords_next.x, clamped_coords.y, clamped_coords.z), dims);
+    let idx010 = get_probe_index(vec3<f32>(clamped_coords.x, clamped_coords_next.y, clamped_coords.z), dims);
+    let idx110 = get_probe_index(vec3<f32>(clamped_coords_next.x, clamped_coords_next.y, clamped_coords.z), dims);
+    let idx001 = get_probe_index(vec3<f32>(clamped_coords.x, clamped_coords.y, clamped_coords_next.z), dims);
+    let idx101 = get_probe_index(vec3<f32>(clamped_coords_next.x, clamped_coords.y, clamped_coords_next.z), dims);
+    let idx011 = get_probe_index(vec3<f32>(clamped_coords.x, clamped_coords_next.y, clamped_coords_next.z), dims);
+    let idx111 = get_probe_index(vec3<f32>(clamped_coords_next.x, clamped_coords_next.y, clamped_coords_next.z), dims);
+    
+    // Select face based on normal direction
+    // Faces: 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z
+    let abs_normal = abs(world_normal);
+    var face_index = 0u;
+    var max_dot = abs_normal.x;
+    
+    if (abs_normal.y > max_dot) {
+        max_dot = abs_normal.y;
+        face_index = select(2u, 3u, world_normal.y < 0.0);
+    } else if (abs_normal.z > max_dot) {
+        max_dot = abs_normal.z;
+        face_index = select(4u, 5u, world_normal.z < 0.0);
+    } else {
+        face_index = select(0u, 1u, world_normal.x < 0.0);
+    }
+    
+    // Sample from each neighboring probe and trilinear interpolate
+    let c000 = gi_probes[idx000].light_data[face_index].rgb;
+    let c100 = gi_probes[idx100].light_data[face_index].rgb;
+    let c010 = gi_probes[idx010].light_data[face_index].rgb;
+    let c110 = gi_probes[idx110].light_data[face_index].rgb;
+    let c001 = gi_probes[idx001].light_data[face_index].rgb;
+    let c101 = gi_probes[idx101].light_data[face_index].rgb;
+    let c011 = gi_probes[idx011].light_data[face_index].rgb;
+    let c111 = gi_probes[idx111].light_data[face_index].rgb;
+    
+    // Trilinear interpolation
+    let c00 = mix(c000, c100, frac_coords.x);
+    let c01 = mix(c001, c101, frac_coords.x);
+    let c10 = mix(c010, c110, frac_coords.x);
+    let c11 = mix(c011, c111, frac_coords.x);
+    
+    let c0 = mix(c00, c10, frac_coords.y);
+    let c1 = mix(c01, c11, frac_coords.y);
+    
+    return mix(c0, c1, frac_coords.z);
+}
+
 fn fast_acos(x: f32) -> f32 {
     let out_val = -0.156583 * abs(x) + HALF_PI;
     let res = out_val * sqrt(1.0 - abs(x));
@@ -118,8 +191,12 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     }
 
     let view_pos = reconstruct_position(uv, depth);
+    let world_pos = (ssao.inverse_view * vec4<f32>(view_pos, 1.0)).xyz;
     let normal = compute_normal_from_depth(uv);
     let view_vec = normalize(-view_pos); // View vector pointing to camera (0,0,0) in view space
+
+    // Sample GI from probes
+    let gi_light = sample_gi_probe(world_pos, normal);
 
     let screen_size = vec2<f32>(ssao.screen_width, ssao.screen_height);
     let frag_coord = uv * screen_size;
@@ -132,7 +209,7 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let radius = ssao.sample_radius;
     
     var visibility = 0.0;
-    var accumulated_light = vec3<f32>(0.0);
+    var accumulated_light = gi_light; // Use GI instead of screen-space accumulation
     
     for (var slice = 0u; slice < ssao.slice_count; slice = slice + 1u) {
         let phi = (2.0 * PI / slice_count) * (f32(slice) + noise);
@@ -206,9 +283,6 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
             
             current_step = pow(step_ratio, select(noise, 1.0 - noise, side == 1u));
             
-            // Start at tangent angle (Normal Angle - 90 degrees)
-            var last_horizon_angle = n_angle - HALF_PI - 0.05; 
-
             // Hardcoded loop limit increase for better long-range sampling
             for (var s = 0u; s < 64u; s = s + 1u) {
                 if (s >= ssao.sample_count) { break; } 
@@ -262,28 +336,6 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
                         occlusion_bits = occlusion_bits | mask;
                     }
                 }
-
-                // Indirect Lighting Accumulation (using monotonic elevation)
-                // If this sample is "above" the previous horizon, it contributes light
-                if (horizon_angle_mono > last_horizon_angle) {
-                    let visible_angle = horizon_angle_mono - last_horizon_angle;
-                    
-                    // Sample emissive texture
-                    let emissive_sample = textureSampleLevel(emissive_tex, post_sampler, sample_uv, 0);
-                    let emissive_color = emissive_sample.rgb;
-                    let emissive_strength = emissive_sample.a; // Assuming alpha contains strength or similar
-
-                    if (length(emissive_color) > 0.0) {
-                        // Inverse square falloff + solid angle approximation
-                        // visible_angle is the angular size of the visible segment
-                        // We also attenuate by distance to avoid over-contribution from far sources
-                        let attenuation = 1.0 / (1.0 + dist_sq * 0.005); // Reduced attenuation for farther spread
-                        
-                        accumulated_light += emissive_color * visible_angle * attenuation * 1.0; // No boost
-                    }
-                    
-                    last_horizon_angle = horizon_angle_mono;
-                }
             }
         }
         
@@ -292,7 +344,8 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     }
     
     visibility /= slice_count;
-    accumulated_light /= slice_count;
+    // Don't divide accumulated_light by slice_count since it's already the GI probe value
+    // accumulated_light /= slice_count;
     
     // Apply strength/contrast
     visibility = pow(visibility, 2.0); // Ad-hoc contrast

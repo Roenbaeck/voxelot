@@ -1,4 +1,4 @@
-use crate::lib_hierarchical::{Chunk, Voxel, World, WorldPos};
+use crate::lib_hierarchical::{World, WorldPos};
 use bytemuck::{Pod, Zeroable};
 use glam::{IVec3, Vec3};
 use rayon::prelude::*;
