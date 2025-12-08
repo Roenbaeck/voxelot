@@ -30,7 +30,6 @@ use voxelot::{
     bbox_local_to_world, cull_visible_voxels_parallel, Camera, Chunk, ChunkMesh, CullStats,
     Palette, RenderConfig, VoxelInstance, World, WorldPos,
 };
-use voxelot::gi::GiSystem;
 
 macro_rules! viewer_debug {
     ($($arg:tt)*) => {
@@ -339,13 +338,9 @@ struct SsaoUniformsRaw {
     hit_thickness: f32,
     screen_width: f32,
     screen_height: f32,
-    _pad0: [f32; 2], // pad to 32 for mat4
+    _pad0: f32,
+    _pad1: f32,
     inverse_projection: [[f32; 4]; 4],
-    grid_origin: [f32; 3],
-    _pad1: f32, // pad vec3 to 16
-    grid_dims: [f32; 3],
-    _pad2: f32, // pad vec3 to 16
-    inverse_view: [[f32; 4]; 4],
 }
 
 #[repr(C)]
@@ -849,7 +844,6 @@ struct App {
 
     world: World,
     palette: Palette,
-    gi_system: GiSystem,
     camera_controller: CameraController,
     pending_chunk_meshes: VecDeque<(i64, i64, i64)>,
     pending_chunk_set: FxHashSet<(i64, i64, i64)>,
@@ -901,8 +895,6 @@ struct App {
     skybox_tint_strength: f32,
     light_probe_buffer: Option<wgpu::Buffer>,
     light_probe_capacity: usize,
-    gi_probe_buffer: Option<wgpu::Buffer>,
-    gi_probe_capacity: usize,
 
     // LOD state
     lod_distance: f32,
@@ -1484,7 +1476,6 @@ impl App {
             cull_params_buffer: None,
             world,
             palette,
-            gi_system: GiSystem::new(glam::IVec3::new(8, 8, 8)), // 8x8x8 grid of probes
             mesh_job_tx,
             mesh_result_rx,
             mesh_worker_count,
@@ -1546,8 +1537,6 @@ impl App {
             skybox_tint_strength: cfg.atmosphere.skybox_tint_strength,
             light_probe_buffer: None,
             light_probe_capacity: 0,
-            gi_probe_buffer: None,
-            gi_probe_capacity: 0,
             lod_distance: cfg.rendering.chunk_lod_distance,
             water_level: cfg.world.water_level,
             water_visibility: cfg.world.water_visibility,
@@ -1886,11 +1875,6 @@ impl App {
         ]);
         let corrected_projection = OPENGL_TO_WGPU_MATRIX * projection;
         let inv_proj = corrected_projection.inverse();
-        let cam_pos = glam::Vec3::from(self.camera_controller.camera.position);
-        let cam_forward = glam::Vec3::from(self.camera_controller.camera.forward);
-        let cam_up = glam::Vec3::from(self.camera_controller.camera.up);
-        let view = glam::Mat4::look_to_rh(cam_pos, cam_forward, cam_up);
-        let inv_view = view.inverse();
         SsaoUniformsRaw {
             sample_count: self.ssao_settings.sample_count as u32,
             slice_count: self.ssao_settings.slice_count as u32,
@@ -1898,13 +1882,9 @@ impl App {
             hit_thickness: self.ssao_settings.thickness,
             screen_width: src_width as f32,
             screen_height: src_height as f32,
-            _pad0: [0.0; 2],
-            inverse_projection: inv_proj.to_cols_array_2d(),
-            grid_origin: self.gi_system.grid_origin.as_vec3().to_array(),
+            _pad0: 0.0,
             _pad1: 0.0,
-            grid_dims: self.gi_system.grid_dims.as_vec3().to_array(),
-            _pad2: 0.0,
-            inverse_view: inv_view.to_cols_array_2d(),
+            inverse_projection: inv_proj.to_cols_array_2d(),
         }
     }
 
@@ -3354,10 +3334,6 @@ impl App {
                                 resource: wgpu::BindingResource::TextureView(
                                     self.emissive_view.as_ref().unwrap(),
                                 ),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 4,
-                                resource: self.gi_probe_buffer.as_ref().unwrap().as_entire_binding(),
                             },
                         ],
                     }));
@@ -5664,7 +5640,7 @@ impl App {
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
-                            min_binding_size: Some(std::num::NonZeroU64::new(std::mem::size_of::<SsaoUniformsRaw>() as u64).unwrap()),
+                            min_binding_size: None,
                         },
                         count: None,
                     },
@@ -5691,16 +5667,6 @@ impl App {
                             sample_type: wgpu::TextureSampleType::Float { filterable: true },
                             view_dimension: wgpu::TextureViewDimension::D2,
                             multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 4,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
                         },
                         count: None,
                     },
@@ -6058,22 +6024,6 @@ impl App {
         App::replace_buffer_bytes_static(
             &mut self.light_probe_buffer_bytes,
             probes_size,
-            &mut self.gpu_buffer_bytes,
-        );
-
-        // Create GI probe buffer
-        let gi_probe_capacity = (self.gi_system.grid_dims.x * self.gi_system.grid_dims.y * self.gi_system.grid_dims.z) as usize;
-        let empty_gi_probes = vec![voxelot::gi::GiProbe::default(); gi_probe_capacity];
-        let gi_probe_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("GI Probe Buffer"),
-            contents: bytemuck::cast_slice(&empty_gi_probes),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
-        // Track GI probe buffer bytes
-        let gi_probes_size = (gi_probe_capacity * std::mem::size_of::<voxelot::gi::GiProbe>()) as u64;
-        App::replace_buffer_bytes_static(
-            &mut self.uniform_buffer_bytes, // reusing this for now, maybe add separate field
-            gi_probes_size,
             &mut self.gpu_buffer_bytes,
         );
 
@@ -6544,8 +6494,6 @@ impl App {
 
         self.light_probe_buffer = Some(light_probe_buffer);
         self.light_probe_capacity = light_probe_capacity;
-        self.gi_probe_buffer = Some(gi_probe_buffer);
-        self.gi_probe_capacity = gi_probe_capacity;
         self.main_bind_group_layout = Some(main_bind_group_layout);
         self.shadow_bind_group_layout = Some(shadow_bind_group_layout);
         self.shadow_sampler = Some(shadow_sampler);
@@ -6676,14 +6624,6 @@ impl App {
         }
 
         self.camera_controller.update(dt);
-
-        // Update GI probes
-        self.gi_system.update(&self.world, glam::Vec3::from(self.camera_controller.camera.position));
-
-        // Upload GI probes to GPU
-        if let Some(gi_buffer) = self.gi_probe_buffer.as_ref() {
-            queue.write_buffer(gi_buffer, 0, bytemuck::cast_slice(&self.gi_system.probes));
-        }
 
         // Reset accumulator for GPU buffer item counting this frame
         self.gpu_buffer_items_frame = 0;
