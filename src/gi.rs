@@ -253,8 +253,10 @@ impl GiSystem {
                                 for (light_pos, light_color) in lights {
                                     let dir = *light_pos - probe_pos;
                                     let dist_sq = dir.length_squared();
+                                    let max_dist = 32.0; // Reduced to 2 chunks to ensure no pop-in
+                                    let max_dist_sq = max_dist * max_dist;
                                     
-                                    if dist_sq > 0.001 && dist_sq < 64.0 * 64.0 {
+                                    if dist_sq > 0.001 && dist_sq < max_dist_sq {
                                         let faces = [
                                             (Vec3::X, 0), (Vec3::NEG_X, 1),
                                             (Vec3::Y, 2), (Vec3::NEG_Y, 3),
@@ -274,7 +276,10 @@ impl GiSystem {
                                                 let trace_dist = (face_dist - 1.0).max(0.0);
                                                 
                                                 if trace_dist > 0.0 && !trace_ray(world, face_pos, face_dir_norm, trace_dist) {
-                                                    let contribution = *light_color * dot / (1.0 + face_dist_sq);
+                                                    // Smooth falloff to 0 at max_dist
+                                                    let window = (1.0 - face_dist_sq / max_dist_sq).max(0.0);
+                                                    let window = window * window; // Quadratic falloff for smoother transition
+                                                    let contribution = (*light_color * dot / (1.0 + face_dist_sq)) * window;
                                                     
                                                     probe.light_data[face_idx][0] += contribution.x;
                                                     probe.light_data[face_idx][1] += contribution.y;
