@@ -67,6 +67,8 @@ pub struct AtmosphereConfig {
     pub fog_density: f32,
     #[serde(default = "default_time_of_day")]
     pub time_of_day: f32,
+    #[serde(default = "default_time_paused")]
+    pub time_paused: bool,
     #[serde(default = "default_night_skybox_brightness")]
     pub night_skybox_brightness: f32,
     #[serde(default = "default_horizon_fade_up")]
@@ -296,6 +298,10 @@ fn default_fog_density() -> f32 {
 
 fn default_time_of_day() -> f32 {
     0.5
+}
+
+fn default_time_paused() -> bool {
+    false
 }
 
 fn default_night_skybox_brightness() -> f32 {
@@ -542,6 +548,7 @@ impl Default for AtmosphereConfig {
         Self {
             fog_density: default_fog_density(),
             time_of_day: default_time_of_day(),
+            time_paused: default_time_paused(),
             night_skybox_brightness: default_night_skybox_brightness(),
             horizon_fade_up: default_horizon_fade_up(),
             horizon_fade_down: default_horizon_fade_down(),

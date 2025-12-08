@@ -1536,7 +1536,7 @@ impl App {
             mouse_pressed: false,
             last_mouse_pos: None,
             time_of_day: cfg.atmosphere.time_of_day,
-            time_paused: false,
+            time_paused: cfg.atmosphere.time_paused,
             fog_density: cfg.atmosphere.fog_density,
             night_skybox_brightness: cfg.atmosphere.night_skybox_brightness,
             horizon_fade_up: cfg.atmosphere.horizon_fade_up,
