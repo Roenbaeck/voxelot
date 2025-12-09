@@ -69,3 +69,16 @@ The new system will:
 -   **Occlusion**: Build a wall between the light and the block. Verify the light disappears.
 -   **Range**: Move far away. Verify the light is still visible (unlike Screen-Space GI).
 -   **Performance**: Check frame rate and CPU usage.
+
+
+# EXPECTED IMPLEMENTATION
+1. Every leaf chunk (that contains voxels) is a probe. 
+2. For each such chunk we calculate light contribution from emissive voxels within "reach" from the center of each face of the chunk. We only look outward from the face. Voxels behind the face cannot contribute.
+3. If the face is fully occluded light contribution is 0 and we can continue early.
+4. If the ray between an emissive voxel and the probing point is occluded, that voxel will not contribute to the accumulated light for the probe. 
+5. We will have a had coded maximum distance to emissive voxels, beyond which they will not contribute. 
+6. The farher away an emissive voxel is, the less its light contribution will be. 
+7. For performance, we keep all emissive voxels in a lookup. Ideally some smart data structure that can give us all voxels within a certain sphere from where we are, and that is less than O(n). Perhaps the `ball-tree` crate.
+8. Since emissive voxels are mostly static, all probe calculations are cached, and only updated if emissive voxels within distance are added or removed.
+9. When a surface is drawn, we apply the light contribution from the surface probe in the chunk containing the surface and for the same face direction. 
+
