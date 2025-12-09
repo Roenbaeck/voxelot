@@ -209,13 +209,16 @@ impl GiSystem {
                 probe.position = [center_pos.x, center_pos.y, center_pos.z, 1.0];
                 
                 let normals = [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z];
+                // Invert offsets to look "inward" from the opposite face.
+                // This ensures that for the +X bin (surfaces facing +X), we sample at the -X boundary (where those surfaces are),
+                // and look towards +X (seeing internal lights and far neighbors).
                 let face_offsets = [
-                    Vec3::new(7.0, 0.0, 0.0),  // +X (Reduced from 8.0 to avoid boundary issues)
-                    Vec3::new(-7.0, 0.0, 0.0), // -X
-                    Vec3::new(0.0, 7.0, 0.0),  // +Y
-                    Vec3::new(0.0, -7.0, 0.0), // -Y
-                    Vec3::new(0.0, 0.0, 7.0),  // +Z
-                    Vec3::new(0.0, 0.0, -7.0), // -Z
+                    Vec3::new(-7.0, 0.0, 0.0), // For +X bin, sample at -X
+                    Vec3::new(7.0, 0.0, 0.0),  // For -X bin, sample at +X
+                    Vec3::new(0.0, -7.0, 0.0), // For +Y bin, sample at -Y
+                    Vec3::new(0.0, 7.0, 0.0),  // For -Y bin, sample at +Y
+                    Vec3::new(0.0, 0.0, -7.0), // For +Z bin, sample at -Z
+                    Vec3::new(0.0, 0.0, 7.0),  // For -Z bin, sample at +Z
                 ];
 
                 for f in 0..6 {
