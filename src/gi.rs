@@ -1,9 +1,9 @@
-use crate::lib_hierarchical::{Chunk, Voxel, World, WorldPos};
+use crate::lib_hierarchical::{World, WorldPos};
 use crate::palette::Palette;
 use bytemuck::{Pod, Zeroable};
 use glam::{IVec3, Vec3};
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
+use std::collections::{HashMap, HashSet};
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -28,9 +28,11 @@ pub struct GiSystem {
     pub probes: Vec<GiProbe>,
     pub grid_origin: IVec3, // In chunks (chunk_coord)
     pub grid_dims: IVec3,   // Dimensions in chunks
-    pub force_update: bool,
-    pub light_sources: FxHashMap<IVec3, Vec<(Vec3, Vec3)>>,
-    pub update_cursor: usize,
+
+    // Caches
+    probe_cache: HashMap<IVec3, GiProbe>,
+    // Chunk coordinate -> List of emissive voxels (position, intensity)
+    light_cache: HashMap<IVec3, Vec<(Vec3, Vec3)>>,
 }
 
 impl GiSystem {
@@ -40,42 +42,8 @@ impl GiSystem {
             probes: vec![GiProbe::default(); count],
             grid_origin: IVec3::new(0, 0, 0),
             grid_dims: dims,
-            force_update: true,
-            light_sources: FxHashMap::default(),
-            update_cursor: 0,
-        }
-    }
-
-    fn scan_lights(&mut self, world: &World, palette: &Palette, min: IVec3, max: IVec3) {
-        for z in min.z..max.z {
-            for y in min.y..max.y {
-                for x in min.x..max.x {
-                    let origin = WorldPos::new(x as i64 * 16, y as i64 * 16, z as i64 * 16);
-
-                    if let Some(chunk) = world.get_leaf_chunk_at_origin(origin) {
-                        if chunk.emissive_power > 0.0 {
-                            let chunk_pos = IVec3::new(x, y, z);
-                            let lights = self.light_sources.entry(chunk_pos).or_default();
-                            
-                            for idx in chunk.presence.iter() {
-                                let (lx, ly, lz) = Chunk::unflatten(idx);
-                                let rank = chunk.presence.rank(idx) as usize;
-                                if let Some(Voxel::Solid(v_type)) = chunk.voxels.get(rank - 1) {
-                                    let (e_color, e_strength) = palette.emissive(*v_type as u32);
-                                    if e_strength > 0.0 {
-                                        let pos = Vec3::new(
-                                            (origin.x + lx as i64) as f32 + 0.5,
-                                            (origin.y + ly as i64) as f32 + 0.5,
-                                            (origin.z + lz as i64) as f32 + 0.5,
-                                        );
-                                        lights.push((pos, Vec3::from(e_color) * e_strength));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            probe_cache: HashMap::new(),
+            light_cache: HashMap::new(),
         }
     }
 
@@ -87,203 +55,75 @@ impl GiSystem {
         let half_dims = self.grid_dims / 2;
         let new_origin = cam_chunk - half_dims;
 
-        let shift = new_origin - self.grid_origin;
+        self.grid_origin = new_origin;
 
-        let force_update = self.force_update;
-        self.force_update = false;
+        // Define the active grid area
+        // let grid_min = new_origin;
+        // let grid_max = new_origin + self.grid_dims;
 
-        // 2. Update light sources incrementally
-        let padding = 4;
-        let scan_min = new_origin - IVec3::splat(padding);
-        let scan_max = new_origin + self.grid_dims + IVec3::splat(padding);
-
-        // Remove lights outside new range
-        self.light_sources.retain(|chunk_pos, _| {
-            chunk_pos.x >= scan_min.x && chunk_pos.x < scan_max.x &&
-            chunk_pos.y >= scan_min.y && chunk_pos.y < scan_max.y &&
-            chunk_pos.z >= scan_min.z && chunk_pos.z < scan_max.z
-        });
-
-        if force_update {
-            self.light_sources.clear();
-            self.scan_lights(world, palette, scan_min, scan_max);
-        } else if shift != IVec3::ZERO {
-            let old_origin = self.grid_origin;
-            let old_scan_min = old_origin - IVec3::splat(padding);
-            let old_scan_max = old_origin + self.grid_dims + IVec3::splat(padding);
-            
-            let x_range = if shift.x > 0 { old_scan_max.x..scan_max.x } else { scan_min.x..old_scan_min.x };
-            let y_range = if shift.y > 0 { old_scan_max.y..scan_max.y } else { scan_min.y..old_scan_min.y };
-            let z_range = if shift.z > 0 { old_scan_max.z..scan_max.z } else { scan_min.z..old_scan_min.z };
-            
-            if !x_range.is_empty() {
-                self.scan_lights(world, palette, 
-                    IVec3::new(x_range.start, scan_min.y, scan_min.z),
-                    IVec3::new(x_range.end, scan_max.y, scan_max.z));
-            }
-            
-            let intersect_x_start = scan_min.x.max(old_scan_min.x);
-            let intersect_x_end = scan_max.x.min(old_scan_max.x);
-            
-            if !y_range.is_empty() && intersect_x_start < intersect_x_end {
-                self.scan_lights(world, palette,
-                    IVec3::new(intersect_x_start, y_range.start, scan_min.z),
-                    IVec3::new(intersect_x_end, y_range.end, scan_max.z));
-            }
-            
-            let intersect_y_start = scan_min.y.max(old_scan_min.y);
-            let intersect_y_end = scan_max.y.min(old_scan_max.y);
-            
-            if !z_range.is_empty() && intersect_x_start < intersect_x_end && intersect_y_start < intersect_y_end {
-                self.scan_lights(world, palette,
-                    IVec3::new(intersect_x_start, intersect_y_start, z_range.start),
-                    IVec3::new(intersect_x_end, intersect_y_end, z_range.end));
-            }
-        }
-
-        // 3. Update probes with scrolling
-        let dims = self.grid_dims;
-        let count = (dims.x * dims.y * dims.z) as usize;
-        let mut new_probes = vec![GiProbe::default(); count];
-        let mut probes_to_compute = Vec::new();
-
-        for z in 0..dims.z {
-            for y in 0..dims.y {
-                for x in 0..dims.x {
-                    let new_idx = (x + y * dims.x + z * dims.x * dims.y) as usize;
-                    
-                    // Calculate old coordinates
-                    let old_x = x + shift.x;
-                    let old_y = y + shift.y;
-                    let old_z = z + shift.z;
-
-                    let mut reused = false;
-                    if !force_update &&
-                       old_x >= 0 && old_x < dims.x &&
-                       old_y >= 0 && old_y < dims.y &&
-                       old_z >= 0 && old_z < dims.z {
-                        
-                        let old_idx = (old_x + old_y * dims.x + old_z * dims.x * dims.y) as usize;
-                        new_probes[new_idx] = self.probes[old_idx];
-                        reused = true;
-                    }
-
-                    if !reused {
-                        probes_to_compute.push((new_idx, x, y, z, true));
+        // 2. Identify missing probes in the active area
+        let mut missing_probes = Vec::new();
+        for z in 0..self.grid_dims.z {
+            for y in 0..self.grid_dims.y {
+                for x in 0..self.grid_dims.x {
+                    let coord = new_origin + IVec3::new(x, y, z);
+                    if !self.probe_cache.contains_key(&coord) {
+                        missing_probes.push(coord);
                     }
                 }
             }
         }
 
-        // 4. Add refresh probes (Round Robin)
-        let refresh_budget = 64;
-        let mut added = 0;
-        let mut attempts = 0;
+        // If no probes are missing, we just need to update the flat buffer and return.
+        // However, we should also check if we need to load lights for new areas.
+        // For simplicity, we drive light loading by probe requirements.
         
-        while added < refresh_budget && attempts < count {
-            self.update_cursor = (self.update_cursor + 1) % count;
-            let idx = self.update_cursor;
-            attempts += 1;
+        if !missing_probes.is_empty() {
+            // 3. Identify required light chunks for the missing probes
+            // We need lights from neighbors. Let's say radius is 4 chunks.
+            let light_radius = 4;
+            let mut required_light_chunks = HashSet::new();
             
-            let z = (idx as i32) / (dims.x * dims.y);
-            let rem = (idx as i32) % (dims.x * dims.y);
-            let y = rem / dims.x;
-            let x = rem % dims.x;
-            
-            let old_x = x + shift.x;
-            let old_y = y + shift.y;
-            let old_z = z + shift.z;
-            
-            let is_reused = !force_update &&
-                       old_x >= 0 && old_x < dims.x &&
-                       old_y >= 0 && old_y < dims.y &&
-                       old_z >= 0 && old_z < dims.z;
-                       
-            if is_reused {
-                probes_to_compute.push((idx, x, y, z, false));
-                added += 1;
+            for probe_coord in &missing_probes {
+                for z in -light_radius..=light_radius {
+                    for y in -light_radius..=light_radius {
+                        for x in -light_radius..=light_radius {
+                            let light_coord = *probe_coord + IVec3::new(x, y, z);
+                            if !self.light_cache.contains_key(&light_coord) {
+                                required_light_chunks.insert(light_coord);
+                            }
+                        }
+                    }
+                }
             }
-        }
 
-        // Compute new probes in parallel
-        let light_sources = &self.light_sources;
+            // 4. Compute missing light chunks in parallel
+            let new_lights: Vec<(IVec3, Vec<(Vec3, Vec3)>)> = required_light_chunks
+                .into_par_iter()
+                .map(|chunk_coord| {
+                    let mut lights = Vec::new();
+                    let origin = WorldPos::new(
+                        chunk_coord.x as i64 * 16,
+                        chunk_coord.y as i64 * 16,
+                        chunk_coord.z as i64 * 16,
+                    );
 
-        let computed_data: Vec<(usize, GiProbe)> = probes_to_compute
-            .par_iter()
-            .map(|&(idx, px, py, pz, _is_new)| {
-                let cx = new_origin.x + px;
-                let cy = new_origin.y + py;
-                let cz = new_origin.z + pz;
-                let probe_chunk = IVec3::new(cx, cy, cz);
-
-                // Probe is at center of chunk
-                let probe_pos = Vec3::new(
-                    (cx as f32 * 16.0) + 8.0,
-                    (cy as f32 * 16.0) + 8.0,
-                    (cz as f32 * 16.0) + 8.0,
-                );
-
-                // Check if probe is inside a solid voxel
-                let wp = WorldPos::new(probe_pos.x.floor() as i64, probe_pos.y.floor() as i64, probe_pos.z.floor() as i64);
-                let chunk_origin = WorldPos::new(wp.x & !15, wp.y & !15, wp.z & !15);
-                let mut is_buried = false;
-                if let Some(chunk) = world.get_leaf_chunk_at_origin(chunk_origin) {
-                     let lx = (wp.x & 15) as u8;
-                     let ly = (wp.y & 15) as u8;
-                     let lz = (wp.z & 15) as u8;
-                     if chunk.contains(lx, ly, lz) {
-                         is_buried = true;
-                     }
-                }
-
-                if is_buried {
-                    return (idx, GiProbe::default());
-                }
-
-                let mut probe = GiProbe::default();
-                probe.position = [probe_pos.x, probe_pos.y, probe_pos.z, 1.0];
-                probe.light_data = [[0.0; 4]; 6];
-
-                let radius = 2;
-                for dz in -radius..=radius {
-                    for dy in -radius..=radius {
-                        for dx in -radius..=radius {
-                            let key = probe_chunk + IVec3::new(dx, dy, dz);
-                            if let Some(lights) = light_sources.get(&key) {
-                                for (light_pos, light_color) in lights {
-                                    let dir = *light_pos - probe_pos;
-                                    let dist_sq = dir.length_squared();
-                                    let max_dist = 32.0; // Reduced to 2 chunks to ensure no pop-in
-                                    let max_dist_sq = max_dist * max_dist;
-                                    
-                                    if dist_sq > 0.001 && dist_sq < max_dist_sq {
-                                        let faces = [
-                                            (Vec3::X, 0), (Vec3::NEG_X, 1),
-                                            (Vec3::Y, 2), (Vec3::NEG_Y, 3),
-                                            (Vec3::Z, 4), (Vec3::NEG_Z, 5),
-                                        ];
-
-                                        for (face_normal, face_idx) in faces {
-                                            let face_pos = probe_pos + face_normal * 8.0;
-                                            let face_to_light = *light_pos - face_pos;
-                                            let face_dist_sq = face_to_light.length_squared();
-                                            let face_dist = face_dist_sq.sqrt();
-                                            let face_dir_norm = face_to_light / face_dist;
-
-                                            let dot = face_normal.dot(face_dir_norm).max(0.0);
-                                            
-                                            if dot > 0.0 {
-                                                let trace_dist = (face_dist - 1.0).max(0.0);
-                                                
-                                                if trace_dist > 0.0 && !trace_ray(world, face_pos, face_dir_norm, trace_dist) {
-                                                    // Smooth falloff to 0 at max_dist
-                                                    let window = (1.0 - face_dist_sq / max_dist_sq).max(0.0);
-                                                    let window = window * window; // Quadratic falloff for smoother transition
-                                                    let contribution = (*light_color * dot / (1.0 + face_dist_sq)) * window;
-                                                    
-                                                    probe.light_data[face_idx][0] += contribution.x;
-                                                    probe.light_data[face_idx][1] += contribution.y;
-                                                    probe.light_data[face_idx][2] += contribution.z;
+                    if let Some(chunk) = world.get_leaf_chunk_at_origin(origin) {
+                        if chunk.emissive_power > 0.0 {
+                            for lz in 0..16 {
+                                for ly in 0..16 {
+                                    for lx in 0..16 {
+                                        if chunk.contains(lx, ly, lz) {
+                                            if let Some(vtype) = chunk.get_type(lx, ly, lz) {
+                                                let (color, intensity) = palette.emissive(vtype as u32);
+                                                if intensity > 0.0 {
+                                                    let emission = Vec3::from(color) * intensity * 10.0;
+                                                    let voxel_pos = Vec3::new(
+                                                        (chunk_coord.x as f32 * 16.0) + lx as f32 + 0.5,
+                                                        (chunk_coord.y as f32 * 16.0) + ly as f32 + 0.5,
+                                                        (chunk_coord.z as f32 * 16.0) + lz as f32 + 0.5,
+                                                    );
+                                                    lights.push((voxel_pos, emission));
                                                 }
                                             }
                                         }
@@ -292,59 +132,217 @@ impl GiSystem {
                             }
                         }
                     }
-                }
-                (idx, probe)
-            })
-            .collect();
+                    (chunk_coord, lights)
+                })
+                .collect();
 
-        // Apply computed probes
-        for (idx, probe) in computed_data {
-            if new_probes[idx].position[3] != 0.0 {
-                // Blend
-                let alpha = 0.1;
-                for i in 0..6 {
-                    for j in 0..3 {
-                        new_probes[idx].light_data[i][j] = 
-                            new_probes[idx].light_data[i][j] * (1.0 - alpha) + probe.light_data[i][j] * alpha;
+            // Update light cache
+            for (coord, lights) in new_lights {
+                self.light_cache.insert(coord, lights);
+            }
+
+            // 5. Compute missing probes in parallel
+            // We need to pass a read-only view of the light cache or clone relevant parts.
+            // Since HashMap isn't Sync for random access during par_iter without RwLock,
+            // and we don't want to lock per probe, we can:
+            // A) Collect all relevant lights for each probe (lots of copying)
+            // B) Use a thread-safe map (e.g. DashMap) - but I can't add dependencies easily.
+            // C) Just collect the lights needed for the *batch* of missing probes?
+            // D) Since we are in a mutable method, we can't share `self` immutably with par_iter.
+            
+            // Let's go with A for now, but optimized:
+            // We can flatten the relevant lights into a spatial structure or just pass the map if we use a standard iterator?
+            // No, standard iterator is single threaded.
+            // We want parallel.
+            
+            // Workaround: Extract the relevant subset of light_cache into a `Arc<HashMap>` or similar?
+            // Or just collect all lights in the active area into a flat Vec?
+            // If the active area is small, a flat Vec of all lights might be faster than hash lookups anyway.
+            
+            // Let's collect ALL lights in the grid+radius area into a flat list for the calculation.
+            // This is O(TotalLights), but TotalLights in the active area might be manageable.
+            // If we have 10k lights, it's fine.
+            
+            // Optimization: Spatial hashing is better.
+            // Let's just use the `light_cache` but we need to access it from threads.
+            // We can wrap `light_cache` in a RwLock or just clone the keys/values we need?
+            // Cloning `Vec<(Vec3, Vec3)>` is cheap if they are small.
+            
+            // Let's try this:
+            // 1. Collect all `(IVec3, Vec<(Vec3, Vec3)>)` pairs that are relevant for the missing probes.
+            //    Actually, we can just collect *all* lights in the extended grid area.
+            //    It's a bit wasteful but safe.
+            
+            // Better: Just iterate missing probes, and for each, gather lights from `light_cache` (single threaded)
+            // THEN compute the expensive raycasts in parallel.
+            
+            // Step 5a: Prepare jobs
+            let jobs: Vec<(IVec3, Vec<(Vec3, Vec3)>)> = missing_probes.iter().map(|&probe_coord| {
+                let mut lights = Vec::new();
+                for z in -light_radius..=light_radius {
+                    for y in -light_radius..=light_radius {
+                        for x in -light_radius..=light_radius {
+                            let light_coord = probe_coord + IVec3::new(x, y, z);
+                            if let Some(chunk_lights) = self.light_cache.get(&light_coord) {
+                                lights.extend_from_slice(chunk_lights);
+                            }
+                        }
                     }
                 }
-            } else {
-                new_probes[idx] = probe;
+                (probe_coord, lights)
+            }).collect();
+
+            // Step 5b: Execute jobs in parallel
+            let new_probes: Vec<(IVec3, GiProbe)> = jobs.into_par_iter().map(|(probe_coord, lights)| {
+                let mut probe = GiProbe::default();
+                
+                let cx = probe_coord.x;
+                let cy = probe_coord.y;
+                let cz = probe_coord.z;
+
+                let center_pos = Vec3::new(
+                    (cx as f32 * 16.0) + 8.0,
+                    (cy as f32 * 16.0) + 8.0,
+                    (cz as f32 * 16.0) + 8.0,
+                );
+                
+                probe.position = [center_pos.x, center_pos.y, center_pos.z, 1.0];
+                
+                let normals = [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z];
+                let face_offsets = [
+                    Vec3::new(7.0, 0.0, 0.0),  // +X (Reduced from 8.0 to avoid boundary issues)
+                    Vec3::new(-7.0, 0.0, 0.0), // -X
+                    Vec3::new(0.0, 7.0, 0.0),  // +Y
+                    Vec3::new(0.0, -7.0, 0.0), // -Y
+                    Vec3::new(0.0, 0.0, 7.0),  // +Z
+                    Vec3::new(0.0, 0.0, -7.0), // -Z
+                ];
+
+                for f in 0..6 {
+                    let face_normal = normals[f];
+                    let face_center = center_pos + face_offsets[f];
+                    
+                    // Check if face center is buried
+                    let face_wp = WorldPos::new(
+                        face_center.x.floor() as i64,
+                        face_center.y.floor() as i64,
+                        face_center.z.floor() as i64
+                    );
+                    // Note: We need `world` access here. `world` is &World, which is Sync.
+                    if world.get(face_wp).is_some() {
+                        continue;
+                    }
+
+                    for (light_pos, light_energy) in &lights {
+                        let delta = *light_pos - face_center;
+                        if delta.dot(face_normal) <= 0.0 { continue; }
+
+                        let dist_sq = delta.length_squared();
+                        if dist_sq > 64.0 * 64.0 || dist_sq < 0.01 { continue; }
+
+                        let dist = dist_sq.sqrt();
+                        let dir = delta / dist;
+                        let cos_theta = dir.dot(face_normal);
+                        
+                        if !is_visible_dda(world, face_center, *light_pos) {
+                            continue;
+                        }
+
+                        let attenuation = 1.0 / (1.0 + dist_sq * 0.1); 
+                        let contrib = *light_energy * attenuation * cos_theta;
+                        
+                        probe.light_data[f][0] += contrib.x;
+                        probe.light_data[f][1] += contrib.y;
+                        probe.light_data[f][2] += contrib.z;
+                    }
+                }
+                (probe_coord, probe)
+            }).collect();
+
+            // Update probe cache
+            for (coord, probe) in new_probes {
+                self.probe_cache.insert(coord, probe);
             }
         }
 
-        self.probes = new_probes;
-        self.grid_origin = new_origin;
+        // 6. Fill the flat buffer for GPU
+        // We iterate the grid dimensions and fetch from cache
+        // This is fast enough to do on main thread
+        let dims = self.grid_dims;
+        let origin = self.grid_origin;
+        
+        // Resize if needed (shouldn't be if dims constant)
+        let total_probes = (dims.x * dims.y * dims.z) as usize;
+        if self.probes.len() != total_probes {
+            self.probes.resize(total_probes, GiProbe::default());
+        }
+
+        // Sequential copy
+        for z in 0..dims.z {
+            for y in 0..dims.y {
+                for x in 0..dims.x {
+                    let coord = origin + IVec3::new(x, y, z);
+                    let idx = (x + y * dims.x + z * dims.x * dims.y) as usize;
+                    if let Some(p) = self.probe_cache.get(&coord) {
+                        self.probes[idx] = *p;
+                    } else {
+                        // Should not happen if logic above is correct
+                        self.probes[idx] = GiProbe::default();
+                    }
+                }
+            }
+        }
+        
+        // 7. Prune caches (Optional, to keep memory usage bounded)
+        // Remove chunks that are far away
+        // let prune_dist = 10; // chunks
+        // let center = new_origin + half_dims;
+        
+        // This might be slow if map is huge. Do it occasionally?
+        // For now, let's skip or do a simple check.
+        // self.probe_cache.retain(|k, _| (*k - center).abs().max_element() < prune_dist);
+        // self.light_cache.retain(|k, _| (*k - center).abs().max_element() < prune_dist + 4);
     }
 }
 
-fn trace_ray(world: &World, start: Vec3, dir: Vec3, max_dist: f32) -> bool {
-    let step_size = 1.0; // Check every voxel unit for better performance
-    let steps = (max_dist / step_size).ceil() as usize;
-    let mut pos = start;
+/// Robust Voxel Traversal (DDA)
+/// Returns true if the ray from p0 to p1 is clear of obstacles.
+fn is_visible_dda(world: &World, p0: Vec3, p1: Vec3) -> bool {
+    let d = p1 - p0;
+    let len = d.length();
+    if len < 0.001 {
+        return true;
+    }
+    let dir = d / len;
+
+    // Ray start (nudge slightly to avoid self-intersection)
+    let start = p0 + dir * 0.01;
     
-    // Offset start slightly to avoid self-occlusion
-    pos += dir * 0.1;
+    // Ray end: Stop 0.6 units before the light center to avoid hitting the light voxel itself
+    // (Light voxel is 1x1x1, center at 0.5, so 0.6 ensures we are outside)
+    let end = p1 - dir * 0.6;
+    
+    let dist = (end - start).length();
+    // If dist is negative (start is past end), it means we are inside the light voxel or very close.
+    // In that case, we are visible.
+    if (end - start).dot(dir) <= 0.0 {
+        return true;
+    }
 
-    for _ in 0..steps {
-        pos += dir * step_size;
-        if (pos - start).length_squared() > max_dist * max_dist {
-            break;
-        }
+    // Simple stepping for now (DDA is tricky to get perfect with floats/hierarchical)
+    // Step size = 0.5 units ensures we don't miss 1x1x1 voxels easily
+    let step_size = 0.5;
+    let steps = (dist / step_size).ceil() as u32;
 
-        let wp = WorldPos::new(pos.x.floor() as i64, pos.y.floor() as i64, pos.z.floor() as i64);
-        
-        let chunk_origin = WorldPos::new(wp.x & !15, wp.y & !15, wp.z & !15);
-        
-        if let Some(chunk) = world.get_leaf_chunk_at_origin(chunk_origin) {
-             let lx = (wp.x & 15) as u8;
-             let ly = (wp.y & 15) as u8;
-             let lz = (wp.z & 15) as u8;
-             
-             if chunk.contains(lx, ly, lz) {
-                 return true;
-             }
+    for i in 0..steps {
+        let t = i as f32 * step_size;
+        let p = start + dir * t;
+        let wp = WorldPos::new(p.x.floor() as i64, p.y.floor() as i64, p.z.floor() as i64);
+
+        if world.get(wp).is_some() {
+            return false;
         }
     }
-    false
+    
+    true
 }

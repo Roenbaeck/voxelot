@@ -82,3 +82,9 @@ The new system will:
 8. Since emissive voxels are mostly static, all probe calculations are cached, and only updated if emissive voxels within distance are added or removed.
 9. When a surface is drawn, we apply the light contribution from the surface probe in the chunk containing the surface and for the same face direction. 
 
+---
+We made an implementation for GI, and it has some issues. Both with "dark patches" that remain unlit and with performance. I believe both are because we have deviated from the expected implementation. 
+
+I added a section at the end of LIGHT_PROBE_GI.md with what I would have expected. Can you check the current implementation and see where we differ. Since what is being lit up right now looks good, I want to keep as much as possible of the existing code, but adapted so we follow the expected implementation, unless you see a very good reason to deviate. 
+
+Please first check where we stand with respect to the expected implementation and provide feedback before we go along with code changes. 
