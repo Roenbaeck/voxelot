@@ -313,8 +313,8 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     visibility /= slice_count;
     visibility = pow(visibility, 2.0);
     
-    // Sample GI from probes
-    let indirect_light = sample_grid_irradiance(world_pos, world_normal);
+    // Sample GI from probes (TODO: fix hard coded 0.01)
+    let indirect_light = sample_grid_irradiance(world_pos, world_normal) * 0.01;
     
     return vec4<f32>(indirect_light, visibility);
 }
