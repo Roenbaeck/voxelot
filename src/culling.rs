@@ -92,7 +92,7 @@ impl VisibilityCache {
         }
 
         // Recalculate visible voxels using parallel culling
-        let (instances, _stats) = cull_visible_voxels_parallel(world, camera);
+        let (instances, _stats, _visible_chunks) = cull_visible_voxels_parallel(world, camera);
 
         // Update cache - organize by chunk
         self.cache.clear();
@@ -601,6 +601,7 @@ fn collect_voxels_recursive(
     camera: &Camera,
     result: &mut Vec<VoxelInstance>,
     stats: &mut CullStats,
+    visible_chunks: &mut Vec<glam::IVec3>,
 ) {
     // 1. Compute Intersection AABB between Frustum AABB and Chunk AABB
     let chunk_min = [
@@ -693,6 +694,7 @@ fn collect_voxels_recursive(
             camera,
             result,
             stats,
+            visible_chunks,
         );
     } else {
         // Masked iteration using precomputed masks
@@ -741,6 +743,7 @@ fn collect_voxels_recursive(
             camera,
             result,
             stats,
+            visible_chunks,
         );
     }
 }
@@ -753,6 +756,7 @@ fn process_voxels<I>(
     camera: &Camera,
     result: &mut Vec<VoxelInstance>,
     stats: &mut CullStats,
+    visible_chunks: &mut Vec<glam::IVec3>,
 ) where
     I: Iterator<Item = u32>,
 {
@@ -886,6 +890,7 @@ fn process_voxels<I>(
                             camera,
                             result,
                             stats,
+                            visible_chunks,
                         );
                     } else if sub_chunk.voxel_count > 0 {
                         // Final check before adding leaf chunk
@@ -906,6 +911,14 @@ fn process_voxels<I>(
                                 is_leaf_chunk: true,
                             });
                             stats.chunks_visible += 1;
+                            
+                            // Track visible leaf chunk position for GI system
+                            let chunk_coord = glam::IVec3::new(
+                                (world_x / 16) as i32,
+                                (world_y / 16) as i32,
+                                (world_z / 16) as i32,
+                            );
+                            visible_chunks.push(chunk_coord);
                         } else {
                             stats.frustum_aabb_culled += 1;
                         }
@@ -939,6 +952,7 @@ pub fn cull_visible_voxels(world: &World, camera: &Camera) -> Vec<VoxelInstance>
     let scale = 16i64.pow(world.hierarchy_depth() as u32 - 1);
 
     let mut stats = CullStats::default();
+    let mut visible_chunks = Vec::new();
     collect_voxels_recursive(
         world.root(),
         [0, 0, 0], // World starts at origin
@@ -946,6 +960,7 @@ pub fn cull_visible_voxels(world: &World, camera: &Camera) -> Vec<VoxelInstance>
         camera,
         &mut instances,
         &mut stats,
+        &mut visible_chunks,
     );
 
     instances
@@ -970,14 +985,15 @@ pub fn cull_visible_voxels_with_occlusion(world: &World, camera: &Camera) -> Vec
     let scale = 16i64.pow(world.hierarchy_depth() as u32 - 1);
 
     let mut stats = CullStats::default();
-    collect_voxels_recursive(world.root(), [0, 0, 0], scale, camera, &mut instances, &mut stats);
+    let mut visible_chunks = Vec::new();
+    collect_voxels_recursive(world.root(), [0, 0, 0], scale, camera, &mut instances, &mut stats, &mut visible_chunks);
 
     instances
 }
 
 /// Parallel culling - for hierarchical world, parallelize at top level of root chunk
 /// Returns visible voxel instances and culling statistics
-pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> (Vec<VoxelInstance>, CullStats) {
+pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> (Vec<VoxelInstance>, CullStats, Vec<glam::IVec3>) {
     use rayon::prelude::*;
 
     // For hierarchical world, we can parallelize by processing top-level cells
@@ -987,7 +1003,7 @@ pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> (Vec<Voxe
 
     // Frustum cull the entire world first
     if !camera.frustum_cull_aabb(min, max) {
-        return (Vec::new(), CullStats::default());
+        return (Vec::new(), CullStats::default(), Vec::new());
     }
 
     // Collect top-level positions that have voxels
@@ -996,8 +1012,8 @@ pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> (Vec<Voxe
 
     let top_level_cells: Vec<_> = root.positions().map(|(x, y, z)| (x, y, z)).collect();
 
-    // Process each top-level cell in parallel, collecting both instances and stats
-    let results: Vec<(Vec<VoxelInstance>, CullStats)> = top_level_cells
+    // Process each top-level cell in parallel, collecting instances, stats, and visible chunk positions
+    let results: Vec<(Vec<VoxelInstance>, CullStats, Vec<glam::IVec3>)> = top_level_cells
         .par_iter()
         .filter_map(|&(x, y, z)| {
             // Get the voxel at this position
@@ -1021,10 +1037,11 @@ pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> (Vec<Voxe
 
             if !camera.frustum_cull_aabb(cell_min, cell_max) {
                 cell_stats.frustum_aabb_culled += 1;
-                return Some((Vec::new(), cell_stats));
+                return Some((Vec::new(), cell_stats, Vec::new()));
             }
 
             let mut cell_instances = Vec::new();
+            let mut visible_chunks = Vec::new();
 
             match voxel {
                 Voxel::Solid(vtype) => {
@@ -1055,6 +1072,7 @@ pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> (Vec<Voxe
                             camera,
                             &mut cell_instances,
                             &mut cell_stats,
+                            &mut visible_chunks,
                         );
                     } else {
                         // Bottom-level chunk: near = individual voxels, far = averaged block
@@ -1098,6 +1116,14 @@ pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> (Vec<Voxe
                                     is_leaf_chunk: true,
                                 });
                                 cell_stats.chunks_visible += 1;
+                                
+                                // Track visible leaf chunk position for GI system
+                                let chunk_coord = glam::IVec3::new(
+                                    (world_x / 16) as i32,
+                                    (world_y / 16) as i32,
+                                    (world_z / 16) as i32,
+                                );
+                                visible_chunks.push(chunk_coord);
                             } else {
                                 cell_stats.empty_chunk_culled += 1;
                             }
@@ -1106,19 +1132,21 @@ pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> (Vec<Voxe
                 }
             }
 
-            Some((cell_instances, cell_stats))
+            Some((cell_instances, cell_stats, visible_chunks))
         })
         .collect();
 
     // Merge all results
     let mut all_instances = Vec::new();
     let mut total_stats = CullStats::default();
-    for (instances, stats) in results {
+    let mut all_visible_chunks = Vec::new();
+    for (instances, stats, chunks) in results {
         all_instances.extend(instances);
         total_stats.merge(&stats);
+        all_visible_chunks.extend(chunks);
     }
 
-    (all_instances, total_stats)
+    (all_instances, total_stats, all_visible_chunks)
 }
 
 /// Get visible top-level cells as chunk render info

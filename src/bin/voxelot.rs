@@ -320,6 +320,14 @@ struct SsaoSettings {
     _bias: f32,
 }
 
+struct GiSettings {
+    enabled: bool,
+    indirect_scale: f32,
+    fade_distance: f32,
+    fade_range: f32,
+    grid_dims: glam::IVec3,
+}
+
 #[derive(Copy, Clone, Debug)]
 struct SSRSettings {
     max_steps: u32,
@@ -338,9 +346,18 @@ struct SsaoUniformsRaw {
     hit_thickness: f32,
     screen_width: f32,
     screen_height: f32,
+    gi_indirect_scale: f32,
+    gi_fade_distance: f32,
+    gi_fade_range: f32,
     _pad0: f32,
     _pad1: f32,
+    _pad2: f32,
     inverse_projection: [[f32; 4]; 4],
+    inverse_view: [[f32; 4]; 4],
+    grid_origin: [i32; 3],
+    _pad3: i32,
+    grid_dims: [i32; 3],
+    _pad4: i32,
 }
 
 #[repr(C)]
@@ -842,8 +859,15 @@ struct App {
     cull_params_buffer: Option<wgpu::Buffer>,
     hzb_params_buffer: Option<wgpu::Buffer>,
 
-    world: World,
-    palette: Palette,
+    world: Arc<World>,
+    palette: Arc<Palette>,
+    // Async GI system: worker thread communicates via channels (like mesh workers)
+    gi_request_tx: Sender<voxelot::gi::GiUpdateRequest>,
+    gi_result_rx: Receiver<voxelot::gi::GiUpdateResult>,
+    gi_probes: Arc<Vec<voxelot::gi::GiProbe>>,
+    gi_grid_origin: glam::IVec3,
+    gi_grid_dims: glam::IVec3,
+    gi_probe_buffer: Option<wgpu::Buffer>,
     camera_controller: CameraController,
     pending_chunk_meshes: VecDeque<(i64, i64, i64)>,
     pending_chunk_set: FxHashSet<(i64, i64, i64)>,
@@ -1021,6 +1045,7 @@ struct App {
     bloom_settings: BloomSettings,
     bloom_enabled: bool,
     ssao_settings: SsaoSettings,
+    gi_settings: GiSettings,
     shadow_map_size: u32,
     shadow_darkness: f32,
     shadow_backface_scale: f32,
@@ -1142,18 +1167,18 @@ impl App {
         let cfg = voxelot::Config::load_or_default(config_path);
 
         let mut initial_camera;
-        let mut world;
+        let world;
 
         if cfg!(feature = "test-block-world") {
             // Create test world (depth 3 = 4,096 units)
-            world = World::new(3);
+            let mut temp_world = World::new(3);
             initial_camera = [50.0, 15.0, 65.0];
             viewer_debug!("Creating test block: 3x5x7 voxels at (50, 10, 50)");
             let mut count = 0;
             for x in 0..3 {
                 for y in 0..5 {
                     for z in 0..7 {
-                        world.set(WorldPos::new(50 + x, 10 + y, 50 + z), 2);
+                        temp_world.set(WorldPos::new(50 + x, 10 + y, 50 + z), 2);
                         count += 1;
                     }
                 }
@@ -1163,7 +1188,7 @@ impl App {
             if cfg!(feature = "viewer-debug") {
                 viewer_debug!("Verifying voxels for test block:");
                 for (x, y, z) in [(50, 10, 50), (51, 11, 51), (52, 14, 56)] {
-                    if let Some(vtype) = world.get(WorldPos::new(x, y, z)) {
+                    if let Some(vtype) = temp_world.get(WorldPos::new(x, y, z)) {
                         viewer_debug!("  ({},{},{}) = type {}", x, y, z, vtype);
                     } else {
                         viewer_debug!("  ({},{},{}) = NONE!", x, y, z);
@@ -1172,7 +1197,7 @@ impl App {
 
                 let test_pos = WorldPos::new(50, 10, 50);
                 viewer_debug!("Checking world structure around test block...");
-                if let Some(vtype) = world.get(test_pos) {
+                if let Some(vtype) = temp_world.get(test_pos) {
                     viewer_debug!(
                         "  Voxel at ({},{},{}) = type {}",
                         test_pos.x,
@@ -1181,7 +1206,7 @@ impl App {
                         vtype
                     );
                 }
-                if let Some(depth) = world.depth_at(test_pos) {
+                if let Some(depth) = temp_world.depth_at(test_pos) {
                     viewer_debug!(
                         "  Depth at this position: {} (0 = Solid, 1+ = Chunk with N levels below)",
                         depth
@@ -1195,19 +1220,35 @@ impl App {
                     chunk_origin.y,
                     chunk_origin.z
                 );
-                if let Some(chunk) = world.get_leaf_chunk_at_origin(chunk_origin) {
+                if let Some(chunk) = temp_world.get_leaf_chunk_at_origin(chunk_origin) {
                     viewer_debug!("  ✓ Found leaf chunk with {} voxels", chunk.iter().count());
                 } else {
                     viewer_debug!("  ✗ Leaf chunk not found");
                 }
             }
+            
+            // Load palette and do LOD updates BEFORE wrapping in Arc
+            println!("Loading palette from {}...", cfg.world.palette);
+            let temp_palette = Palette::load(&cfg.world.palette);
+            
+            println!("Updating LOD metadata...");
+            let lod_start = Instant::now();
+            temp_world.update_all_lod_metadata(&temp_palette);
+            println!("LOD metadata updated (took {:.3}s)", lod_start.elapsed().as_secs_f32());
+
+            println!("Generating hierarchy shells...");
+            let shell_start = Instant::now();
+            temp_world.generate_all_hierarchy_shells();
+            println!("Hierarchy shells generated (took {:.3}s)", shell_start.elapsed().as_secs_f32());
+            
+            world = Arc::new(temp_world);
         } else {
             initial_camera = cfg.world.camera_position;
 
             println!("Loading voxel data from {}...", cfg.world.file);
             // Load hierarchical chunk format (.vhc) from configured path — loader accepts legacy .oct for compatibility
             let load_start = Instant::now();
-            world = voxelot::load_world_file(std::path::Path::new(&cfg.world.file)).unwrap_or_else(
+            let mut temp_world = voxelot::load_world_file(std::path::Path::new(&cfg.world.file)).unwrap_or_else(
                 |e| {
                     eprintln!(
                         "ERROR: Failed to load world file '{}': {}",
@@ -1221,9 +1262,26 @@ impl App {
             println!(
                 "Loaded world from {} (depth {}) (took {:.3}s)",
                 cfg.world.file,
-                world.hierarchy_depth(),
+                temp_world.hierarchy_depth(),
                 load_elapsed.as_secs_f32()
             );
+            
+            // Load palette BEFORE wrapping world in Arc (needed for LOD metadata)
+            println!("Loading palette from {}...", cfg.world.palette);
+            let temp_palette = Palette::load(&cfg.world.palette);
+            
+            // Update LOD metadata and generate hierarchy shells BEFORE wrapping in Arc
+            println!("Updating LOD metadata...");
+            let lod_start = Instant::now();
+            temp_world.update_all_lod_metadata(&temp_palette);
+            println!("LOD metadata updated (took {:.3}s)", lod_start.elapsed().as_secs_f32());
+
+            println!("Generating hierarchy shells...");
+            let shell_start = Instant::now();
+            temp_world.generate_all_hierarchy_shells();
+            println!("Hierarchy shells generated (took {:.3}s)", shell_start.elapsed().as_secs_f32());
+            
+            world = Arc::new(temp_world);
         }
 
         // Failsafe: Ensure camera spawns above terrain
@@ -1292,8 +1350,8 @@ impl App {
 
         println!("World created with voxels");
 
-        println!("Loading palette from {}...", cfg.world.palette);
-        let palette = Palette::load(&cfg.world.palette);
+        // Palette is already Arc-wrapped in both branches above
+        let palette = Arc::new(Palette::load(&cfg.world.palette));
 
         let (mesh_job_tx, mesh_job_rx) = unbounded::<MeshJob>();
         let (mesh_result_tx, mesh_result_rx) = unbounded::<MeshResult>();
@@ -1353,26 +1411,17 @@ impl App {
         drop(mesh_result_tx);
         drop(mesh_job_rx);
 
+        // Spawn GI worker thread (similar to mesh workers)
+        println!("Spawning GI worker thread...");
+        let gi_grid_dims = glam::IVec3::from_array(cfg.effects.gi.grid_dims);
+        let (gi_request_tx, gi_result_rx) = voxelot::gi::spawn_gi_worker(
+            world.clone(),
+            palette.clone(),
+            gi_grid_dims,
+        );
+
         let mesh_upload_baseline = cfg.performance.mesh_upload_baseline;
         let mesh_upload_max = (mesh_worker_count * 4).max(mesh_upload_baseline * 2);
-
-        println!("Updating LOD metadata...");
-        let lod_start = Instant::now();
-        world.update_all_lod_metadata(&palette);
-        let lod_elapsed = lod_start.elapsed();
-        println!(
-            "LOD metadata updated (took {:.3}s)",
-            lod_elapsed.as_secs_f32()
-        );
-
-        println!("Generating hierarchy shells...");
-        let shell_start = Instant::now();
-        world.generate_all_hierarchy_shells();
-        let shell_elapsed = shell_start.elapsed();
-        println!(
-            "Hierarchy shells generated (took {:.3}s)",
-            shell_elapsed.as_secs_f32()
-        );
 
         println!("\n=== Controls ===");
         println!("Movement: WASD + Q/E (down/up)");
@@ -1513,6 +1562,19 @@ impl App {
             tmp_chunk_emitters: Vec::with_capacity(64),
             vb_data_tmp: Vec::with_capacity(8192),
 
+            // Spawn async GI worker (like mesh workers)
+            gi_request_tx,
+            gi_result_rx,
+            gi_probes: Arc::new(vec![
+                voxelot::gi::GiProbe::default();
+                (cfg.effects.gi.grid_dims[0] * 
+                 cfg.effects.gi.grid_dims[1] * 
+                 cfg.effects.gi.grid_dims[2]) as usize
+            ]),
+            gi_grid_origin: glam::IVec3::ZERO,
+            gi_grid_dims: glam::IVec3::from_array(cfg.effects.gi.grid_dims),
+            gi_probe_buffer: None,
+
             camera_controller: CameraController::new(initial_camera, &cfg.rendering),
             pending_chunk_meshes: VecDeque::new(),
             pending_chunk_set: FxHashSet::default(),
@@ -1525,7 +1587,7 @@ impl App {
             mouse_pressed: false,
             last_mouse_pos: None,
             time_of_day: cfg.atmosphere.time_of_day,
-            time_paused: false,
+            time_paused: cfg.atmosphere.time_paused,
             fog_density: cfg.atmosphere.fog_density,
             night_skybox_brightness: cfg.atmosphere.night_skybox_brightness,
             horizon_fade_up: cfg.atmosphere.horizon_fade_up,
@@ -1658,6 +1720,13 @@ impl App {
                 blur_enabled: cfg.effects.ssao.blur_enabled,
                 blur_radius: cfg.effects.ssao.blur_radius,
                 _bias: 0.01,
+            },
+            gi_settings: GiSettings {
+                enabled: cfg.effects.gi.enabled,
+                indirect_scale: cfg.effects.gi.indirect_scale,
+                fade_distance: cfg.effects.gi.fade_distance,
+                fade_range: cfg.effects.gi.fade_range,
+                grid_dims: glam::IVec3::from_array(cfg.effects.gi.grid_dims),
             },
             ssr_settings: SSRSettings {
                 max_steps: cfg.effects.ssr.max_steps,
@@ -1875,6 +1944,12 @@ impl App {
         ]);
         let corrected_projection = OPENGL_TO_WGPU_MATRIX * projection;
         let inv_proj = corrected_projection.inverse();
+        let view = Mat4::look_to_rh(
+            Vec3::from(self.camera_controller.camera.position),
+            Vec3::from(self.camera_controller.camera.forward),
+            Vec3::from(self.camera_controller.camera.up),
+        );
+        let inv_view = view.inverse();
         SsaoUniformsRaw {
             sample_count: self.ssao_settings.sample_count as u32,
             slice_count: self.ssao_settings.slice_count as u32,
@@ -1882,9 +1957,18 @@ impl App {
             hit_thickness: self.ssao_settings.thickness,
             screen_width: src_width as f32,
             screen_height: src_height as f32,
+            gi_indirect_scale: self.gi_settings.indirect_scale,
+            gi_fade_distance: self.gi_settings.fade_distance,
+            gi_fade_range: self.gi_settings.fade_range,
             _pad0: 0.0,
             _pad1: 0.0,
+            _pad2: 0.0,
             inverse_projection: inv_proj.to_cols_array_2d(),
+            inverse_view: inv_view.to_cols_array_2d(),
+            grid_origin: self.gi_grid_origin.into(),
+            _pad3: 0,
+            grid_dims: self.gi_grid_dims.into(),
+            _pad4: 0,
         }
     }
 
@@ -3028,7 +3112,7 @@ impl App {
             Some(uniform_buffer),
             Some(shadow_view),
             Some(shadow_sampler),
-            Some(light_probe_buffer),
+            Some(gi_probe_buffer),
             Some(palette_buffer),
         ) = (
             self.device.as_ref(),
@@ -3036,7 +3120,7 @@ impl App {
             self.uniform_buffer.as_ref(),
             self.shadow_view.as_ref(),
             self.shadow_sampler.as_ref(),
-            self.light_probe_buffer.as_ref(),
+            self.gi_probe_buffer.as_ref(),
             self.palette_buffer.as_ref(),
         )
         else {
@@ -3061,7 +3145,7 @@ impl App {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: light_probe_buffer.as_entire_binding(),
+                    resource: gi_probe_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -3307,10 +3391,11 @@ impl App {
             }
 
             // SSAO bind group uses uniform 0, offscreen depth (1), and post sampler (2)
-            if let (Some(ssao_ubo), Some(depth_view), Some(psampler)) = (
+            if let (Some(ssao_ubo), Some(depth_view), Some(psampler), Some(gi_probe_buf)) = (
                 self.ssilvb_uniform_buffer.as_ref(),
                 self.offscreen_depth_view.as_ref(),
                 self.post_sampler.as_ref(),
+                self.gi_probe_buffer.as_ref(),
             ) {
                 self.ssilvb_bind_group =
                     Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3331,9 +3416,7 @@ impl App {
                             },
                             wgpu::BindGroupEntry {
                                 binding: 3,
-                                resource: wgpu::BindingResource::TextureView(
-                                    self.emissive_view.as_ref().unwrap(),
-                                ),
+                                resource: gi_probe_buf.as_entire_binding(),
                             },
                         ],
                     }));
@@ -5663,10 +5746,10 @@ impl App {
                     wgpu::BindGroupLayoutEntry {
                         binding: 3,
                         visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
                         count: None,
                     },
@@ -6004,28 +6087,12 @@ impl App {
             &mut self.gpu_buffer_bytes,
         );
 
-        // Create light probe buffer (start with capacity for 64 probes)
-        let light_probe_capacity = 64;
-        let empty_probes = vec![
-            LightProbe {
-                position: [0.0; 3],
-                _pad0: 0.0,
-                color_power: [0.0; 4],
-            };
-            light_probe_capacity
-        ];
-        let light_probe_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Light Probe Buffer"),
-            contents: bytemuck::cast_slice(&empty_probes),
+        // Create GI probe buffer
+        let gi_probe_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("GI Probe Buffer"),
+            contents: bytemuck::cast_slice(&self.gi_probes),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
-        // Track light probe buffer bytes
-        let probes_size = (light_probe_capacity * std::mem::size_of::<LightProbe>()) as u64;
-        App::replace_buffer_bytes_static(
-            &mut self.light_probe_buffer_bytes,
-            probes_size,
-            &mut self.gpu_buffer_bytes,
-        );
 
         let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Shadow Sampler"),
@@ -6492,8 +6559,7 @@ impl App {
         self.uniform_buffer = Some(uniform_buffer);
         self.palette_buffer = Some(palette_buffer);
 
-        self.light_probe_buffer = Some(light_probe_buffer);
-        self.light_probe_capacity = light_probe_capacity;
+        self.gi_probe_buffer = Some(gi_probe_buffer);
         self.main_bind_group_layout = Some(main_bind_group_layout);
         self.shadow_bind_group_layout = Some(shadow_bind_group_layout);
         self.shadow_sampler = Some(shadow_sampler);
@@ -6534,7 +6600,7 @@ impl App {
         // everything before the first render pass. This primes the mesh worker queue
         // with only visible chunks and gives accurate cull_stats / visible counts.
         {
-            let (all_visible, stats) =
+            let (all_visible, stats, _visible_chunks) =
                 cull_visible_voxels_parallel(&self.world, &self.camera_controller.camera);
             self.cull_stats = stats;
 
@@ -6625,15 +6691,33 @@ impl App {
 
         self.camera_controller.update(dt);
 
+        // Check for GI results (non-blocking, like mesh result polling)
+        if let Ok(result) = self.gi_result_rx.try_recv() {
+            self.gi_probes = result.probes; // Arc clone is cheap
+            self.gi_grid_origin = result.grid_origin;
+            
+            // Upload new probes to GPU
+            if let Some(buffer) = &self.gi_probe_buffer {
+                queue.write_buffer(buffer, 0, bytemuck::cast_slice(&*self.gi_probes));
+            }
+        }
+
         // Reset accumulator for GPU buffer item counting this frame
         self.gpu_buffer_items_frame = 0;
 
         // Gather candidate voxels for GPU culling using CPU hierarchy traversal
         let cull_start = Instant::now();
-        let (all_visible, cull_stats) =
+        let (all_visible, cull_stats, visible_chunks) =
             cull_visible_voxels_parallel(&self.world, &self.camera_controller.camera);
         self.cull_stats = cull_stats;
         let cull_time = cull_start.elapsed();
+        
+        // Send async GI update request with visible chunks (non-blocking, after culling)
+        let camera_pos = glam::Vec3::from(self.camera_controller.camera.position);
+        let _ = self.gi_request_tx.send(voxelot::gi::GiUpdateRequest { 
+            camera_pos,
+            visible_chunks,
+        });
 
         // CPU cull: filter out chunks that are completely below water visibility threshold
         // Any chunk whose max y-value is below (water_level - water_visibility) is invisible
@@ -7432,7 +7516,9 @@ impl App {
 
         let max_inflight = self.max_inflight_jobs();
         let schedule_start = std::time::Instant::now();
-        while self.mesh_jobs_in_flight < max_inflight {
+        let mut jobs_scheduled_this_frame = 0;
+        let max_jobs_per_frame = 8; // Throttle mesh job creation to prevent stuttering
+        while self.mesh_jobs_in_flight < max_inflight && jobs_scheduled_this_frame < max_jobs_per_frame {
             // Backpressure: don't schedule more worker jobs if the ready result queue is already
             // large. This avoids generating more meshes than we can upload and prevents a
             // runaway backlog that keeps workers busy indefinitely.
@@ -7522,7 +7608,7 @@ impl App {
 
             match self
                 .world
-                .get_leaf_chunk_at_origin(WorldPos::new(key.0, key.1, key.2))
+                .get_leaf_chunk_arc_at_origin(WorldPos::new(key.0, key.1, key.2))
             {
                 Some(chunk) => {
                     // Snapshot neighbor chunks so AO can be computed across chunk bounds.
@@ -7536,18 +7622,17 @@ impl App {
                                 let nz = key.2 + (dz << 4);
                                 if let Some(nc) = self
                                     .world
-                                    .get_leaf_chunk_at_origin(WorldPos::new(nx, ny, nz))
+                                    .get_leaf_chunk_arc_at_origin(WorldPos::new(nx, ny, nz))
                                 {
                                     let nk = (nx, ny, nz);
-                                    // Reuse an Arc snapshot if available; otherwise clone and cache
+                                    // Reuse cached Arc or cache the new one
                                     let arc_neigh = if let Some(existing) =
                                         self.mesh_chunk_arc_cache.get(&nk)
                                     {
                                         existing.clone()
                                     } else {
-                                        let a = Arc::new(nc.clone());
-                                        self.mesh_chunk_arc_cache.insert(nk, a.clone());
-                                        a
+                                        self.mesh_chunk_arc_cache.insert(nk, nc.clone());
+                                        nc
                                     };
                                     neighbors.insert((dx as i8, dy as i8, dz as i8), arc_neigh);
                                 }
@@ -7560,9 +7645,8 @@ impl App {
                     let chunk_arc = if let Some(existing) = self.mesh_chunk_arc_cache.get(&key) {
                         existing.clone()
                     } else {
-                        let a = Arc::new(chunk.clone());
-                        self.mesh_chunk_arc_cache.insert(key, a.clone());
-                        a
+                        self.mesh_chunk_arc_cache.insert(key, chunk.clone());
+                        chunk
                     };
 
                     if self
@@ -7576,6 +7660,7 @@ impl App {
                         .is_ok()
                     {
                         self.mesh_jobs_in_flight += 1;
+                        jobs_scheduled_this_frame += 1;
                     } else {
                         self.pending_chunk_meshes.push_front(key);
                         self.pending_chunk_set.remove(&key);

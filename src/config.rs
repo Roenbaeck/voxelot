@@ -67,6 +67,8 @@ pub struct AtmosphereConfig {
     pub fog_density: f32,
     #[serde(default = "default_time_of_day")]
     pub time_of_day: f32,
+    #[serde(default = "default_time_paused")]
+    pub time_paused: bool,
     #[serde(default = "default_night_skybox_brightness")]
     pub night_skybox_brightness: f32,
     #[serde(default = "default_horizon_fade_up")]
@@ -93,6 +95,8 @@ pub struct EffectsConfig {
     pub bloom: BloomConfig,
     #[serde(default)]
     pub ssao: SsaoConfig,
+    #[serde(default)]
+    pub gi: GiConfig,
     #[serde(default)]
     pub ssr: SsrConfig,
 }
@@ -149,6 +153,20 @@ pub struct SsaoConfig {
     pub blur_enabled: bool,
     #[serde(default = "default_ssao_blur_radius")]
     pub blur_radius: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GiConfig {
+    #[serde(default = "default_gi_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_gi_indirect_scale")]
+    pub indirect_scale: f32,
+    #[serde(default = "default_gi_fade_distance")]
+    pub fade_distance: f32,
+    #[serde(default = "default_gi_fade_range")]
+    pub fade_range: f32,
+    #[serde(default = "default_gi_grid_dims")]
+    pub grid_dims: [i32; 3],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -298,6 +316,10 @@ fn default_time_of_day() -> f32 {
     0.5
 }
 
+fn default_time_paused() -> bool {
+    false
+}
+
 fn default_night_skybox_brightness() -> f32 {
     0.02
 }
@@ -426,6 +448,26 @@ fn default_ssao_blur_radius() -> f32 {
     2.0
 }
 
+fn default_gi_enabled() -> bool {
+    true
+}
+
+fn default_gi_indirect_scale() -> f32 {
+    0.003
+}
+
+fn default_gi_fade_distance() -> f32 {
+    400.0
+}
+
+fn default_gi_fade_range() -> f32 {
+    100.0
+}
+
+fn default_gi_grid_dims() -> [i32; 3] {
+    [32, 16, 32]
+}
+
 fn default_shadow_map_size() -> u32 {
     4096
 }
@@ -542,6 +584,7 @@ impl Default for AtmosphereConfig {
         Self {
             fog_density: default_fog_density(),
             time_of_day: default_time_of_day(),
+            time_paused: default_time_paused(),
             night_skybox_brightness: default_night_skybox_brightness(),
             horizon_fade_up: default_horizon_fade_up(),
             horizon_fade_down: default_horizon_fade_down(),
@@ -604,6 +647,7 @@ impl Default for EffectsConfig {
             depth_of_field: DepthOfFieldConfig::default(),
             bloom: BloomConfig::default(),
             ssao: SsaoConfig::default(),
+            gi: GiConfig::default(),
             ssr: SsrConfig::default(),
         }
     }
@@ -620,6 +664,18 @@ impl Default for SsaoConfig {
             strength: default_ssao_strength(),
             blur_enabled: default_ssao_blur_enabled(),
             blur_radius: default_ssao_blur_radius(),
+        }
+    }
+}
+
+impl Default for GiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_gi_enabled(),
+            indirect_scale: default_gi_indirect_scale(),
+            fade_distance: default_gi_fade_distance(),
+            fade_range: default_gi_fade_range(),
+            grid_dims: default_gi_grid_dims(),
         }
     }
 }

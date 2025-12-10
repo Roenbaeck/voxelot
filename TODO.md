@@ -26,6 +26,21 @@
 - 🛑 Sliders instead of buttons to change settings.
 - 🛑 Can all of our code be compiled as wasm?
 
+
+I want to redo GI. It's not working well. Can we instead leverage it using some CPU cycles? The idea is to add a light probe in the center of each leaf chunk (that contains 16x16x16 voxels). For the proble we calculate an average light contribution per face direction, by tracing rays from all emissive voxels nearby enough to have a meaningful contribution, and that aren't fully occluded by other leaf chunks. This way we should be able to quickly calculate the GI for each light probe, and store it in a buffer that can be sampled by the shader. 
+
+Since voxels in the world aren't likely to change rapidly, we could keep a persistent "probe map" of the world, and only update it when the world changes. This would be much faster than calculating GI for every chunk every frame.
+
+Do you think this could work? I'm not sure whether we'd need to calculate occlusion more often than we do now, or if we could get away with only doing it for the light probes. It may be too "rough" to be useful, but perhaps it could be balanced with the suff we're already calculating for AO and shadow mapping somehow? Note that AO looks great, so I don't want to touch that part of the SSILVB shader.
+
+This should give us a a probe within each visible chunk, with pre-baked illumation values, that can quickly get picked up by the shader. Those pre-baked values cannot change based on camera.
+
+What do you think?
+See documnet LIGHT_PROBE_GI.md for an implentation plan, of which some is already in place.
+
+
+
+
 ---
 Generate a large world for stress testing:
 ```
