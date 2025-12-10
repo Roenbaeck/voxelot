@@ -67,6 +67,8 @@ strength = 1.0
 blur_enabled = true
 blur_radius = 2.0
 gi_indirect_scale = 0.003
+gi_fade_distance = 400.0
+gi_fade_range = 100.0
 
 [effects.ssr]
 enabled = true

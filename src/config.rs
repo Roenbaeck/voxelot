@@ -153,6 +153,10 @@ pub struct SsaoConfig {
     pub blur_radius: f32,
     #[serde(default = "default_ssao_gi_indirect_scale")]
     pub gi_indirect_scale: f32,
+    #[serde(default = "default_ssao_gi_fade_distance")]
+    pub gi_fade_distance: f32,
+    #[serde(default = "default_ssao_gi_fade_range")]
+    pub gi_fade_range: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -438,6 +442,14 @@ fn default_ssao_gi_indirect_scale() -> f32 {
     0.003
 }
 
+fn default_ssao_gi_fade_distance() -> f32 {
+    400.0
+}
+
+fn default_ssao_gi_fade_range() -> f32 {
+    100.0
+}
+
 fn default_shadow_map_size() -> u32 {
     4096
 }
@@ -634,6 +646,8 @@ impl Default for SsaoConfig {
             blur_enabled: default_ssao_blur_enabled(),
             blur_radius: default_ssao_blur_radius(),
             gi_indirect_scale: default_ssao_gi_indirect_scale(),
+            gi_fade_distance: default_ssao_gi_fade_distance(),
+            gi_fade_range: default_ssao_gi_fade_range(),
         }
     }
 }

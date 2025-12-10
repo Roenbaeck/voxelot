@@ -318,6 +318,8 @@ struct SsaoSettings {
     blur_enabled: bool,
     blur_radius: f32,
     gi_indirect_scale: f32,
+    gi_fade_distance: f32,
+    gi_fade_range: f32,
     _bias: f32,
 }
 
@@ -340,13 +342,17 @@ struct SsaoUniformsRaw {
     screen_width: f32,
     screen_height: f32,
     gi_indirect_scale: f32,
+    gi_fade_distance: f32,
+    gi_fade_range: f32,
     _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
     inverse_projection: [[f32; 4]; 4],
     inverse_view: [[f32; 4]; 4],
     grid_origin: [i32; 3],
-    _pad2: i32,
-    grid_dims: [i32; 3],
     _pad3: i32,
+    grid_dims: [i32; 3],
+    _pad4: i32,
 }
 
 #[repr(C)]
@@ -1703,6 +1709,8 @@ impl App {
                 blur_enabled: cfg.effects.ssao.blur_enabled,
                 blur_radius: cfg.effects.ssao.blur_radius,
                 gi_indirect_scale: cfg.effects.ssao.gi_indirect_scale,
+                gi_fade_distance: cfg.effects.ssao.gi_fade_distance,
+                gi_fade_range: cfg.effects.ssao.gi_fade_range,
                 _bias: 0.01,
             },
             ssr_settings: SSRSettings {
@@ -1935,13 +1943,17 @@ impl App {
             screen_width: src_width as f32,
             screen_height: src_height as f32,
             gi_indirect_scale: self.ssao_settings.gi_indirect_scale,
+            gi_fade_distance: self.ssao_settings.gi_fade_distance,
+            gi_fade_range: self.ssao_settings.gi_fade_range,
             _pad0: 0.0,
+            _pad1: 0.0,
+            _pad2: 0.0,
             inverse_projection: inv_proj.to_cols_array_2d(),
             inverse_view: inv_view.to_cols_array_2d(),
             grid_origin: self.gi_grid_origin.into(),
-            _pad2: 0,
-            grid_dims: self.gi_grid_dims.into(),
             _pad3: 0,
+            grid_dims: self.gi_grid_dims.into(),
+            _pad4: 0,
         }
     }
 

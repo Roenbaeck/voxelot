@@ -6,13 +6,17 @@ struct SsaoUniforms {
     screen_width: f32,
     screen_height: f32,
     gi_indirect_scale: f32,
+    gi_fade_distance: f32,
+    gi_fade_range: f32,
     _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
     inverse_projection: mat4x4<f32>,
     inverse_view: mat4x4<f32>,
     grid_origin: vec3<i32>,
-    _pad2: i32,
-    grid_dims: vec3<i32>,
     _pad3: i32,
+    grid_dims: vec3<i32>,
+    _pad4: i32,
 };
 
 struct GiProbe {
@@ -138,7 +142,7 @@ fn get_probe_irradiance(probe_idx: u32, normal: vec3<f32>) -> vec3<f32> {
            probe.light_data[idx_z].rgb * w_z;
 }
 
-fn sample_grid_irradiance(world_pos: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
+fn sample_grid_irradiance(world_pos: vec3<f32>, normal: vec3<f32>, camera_pos: vec3<f32>) -> vec3<f32> {
     // Apply normal bias to avoid sampling inside walls
     // Push the sample point 0.5 units along the normal (half a block)
     let biased_pos = world_pos + normal * 0.5;
@@ -193,9 +197,18 @@ fn sample_grid_irradiance(world_pos: vec3<f32>, normal: vec3<f32>) -> vec3<f32> 
     );
     
     let fade = smoothstep(0.0, 2.0, dist_to_edge);
+    
+    // Distance-based fade to prevent popping when entering lit areas
+    // Fade GI to zero as we approach the fade distance
+    let dist_to_camera = length(world_pos - camera_pos);
+    let fade_start = ssao.gi_fade_distance - ssao.gi_fade_range;
+    let distance_fade = 1.0 - smoothstep(fade_start, ssao.gi_fade_distance, dist_to_camera);
+    
+    // Combine both fades
+    let total_fade = fade * distance_fade;
 
     if (total_weight > 0.0) {
-        return (total_irradiance / total_weight) * fade;
+        return (total_irradiance / total_weight) * total_fade;
     } else {
         return vec3<f32>(0.0);
     }
@@ -313,9 +326,12 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     visibility /= slice_count;
     visibility = pow(visibility, 2.0);
     
+    // Extract camera position from inverse view matrix (translation component)
+    let camera_pos = ssao.inverse_view[3].xyz;
+    
     // Sample GI from probes
     // Scale factor is configurable (gi_indirect_scale in config.toml)
-    let indirect_light = sample_grid_irradiance(world_pos, world_normal) * ssao.gi_indirect_scale;
+    let indirect_light = sample_grid_irradiance(world_pos, world_normal, camera_pos) * ssao.gi_indirect_scale;
     
     return vec4<f32>(indirect_light, visibility);
 }
