@@ -10,6 +10,7 @@ use crossbeam_channel::{Sender, Receiver};
 /// Request to update GI probes
 pub struct GiUpdateRequest {
     pub camera_pos: Vec3,
+    pub visible_chunks: Vec<IVec3>,
 }
 
 /// Result from async GI update
@@ -78,8 +79,8 @@ impl GiSystem {
         }
     }
 
-    /// Update probes based on camera position and world state
-    pub fn update(&mut self, world: &World, palette: &Palette, camera_pos: Vec3) {
+    /// Update probes based on camera position and visible chunks from culling
+    pub fn update(&mut self, world: &World, palette: &Palette, camera_pos: Vec3, visible_chunks: &[IVec3]) {
         // 1. Determine new grid origin (centered on camera, snapped to chunk size)
         let chunk_size = 16.0;
         let cam_chunk = (camera_pos / chunk_size).floor().as_ivec3();
@@ -88,17 +89,21 @@ impl GiSystem {
 
         self.grid_origin = new_origin;
 
-        // 2. Identify missing probes in the active area
-        // Only do full scan if grid origin changed, otherwise reuse existing list
+        // 2. Identify missing probes from the VISIBLE chunks (frustum culled)
+        // Only scan if grid origin changed, otherwise reuse existing list
         if new_origin != self.last_grid_origin {
             self.missing_probes.clear();
-            for z in 0..self.grid_dims.z {
-                for y in 0..self.grid_dims.y {
-                    for x in 0..self.grid_dims.x {
-                        let coord = new_origin + IVec3::new(x, y, z);
-                        if !self.probe_cache.contains_key(&coord) {
-                            self.missing_probes.push(coord);
-                        }
+            
+            // Only check visible chunks, not entire grid cube
+            for &chunk_coord in visible_chunks {
+                // Check if chunk is within our grid bounds
+                let relative = chunk_coord - new_origin;
+                if relative.x >= 0 && relative.x < self.grid_dims.x
+                    && relative.y >= 0 && relative.y < self.grid_dims.y
+                    && relative.z >= 0 && relative.z < self.grid_dims.z
+                {
+                    if !self.probe_cache.contains_key(&chunk_coord) {
+                        self.missing_probes.push(chunk_coord);
                     }
                 }
             }
@@ -413,7 +418,7 @@ pub fn spawn_gi_worker(
         
         while let Ok(request) = request_rx.recv() {
             // Update GI system - world is already Arc, no lock needed (World is Sync)
-            gi_system.update(&world, &palette, request.camera_pos);
+            gi_system.update(&world, &palette, request.camera_pos, &request.visible_chunks);
             
             // Send result back to main thread (Arc clone is cheap)
             let result = GiUpdateResult {

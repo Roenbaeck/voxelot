@@ -6600,7 +6600,7 @@ impl App {
         // everything before the first render pass. This primes the mesh worker queue
         // with only visible chunks and gives accurate cull_stats / visible counts.
         {
-            let (all_visible, stats) =
+            let (all_visible, stats, _visible_chunks) =
                 cull_visible_voxels_parallel(&self.world, &self.camera_controller.camera);
             self.cull_stats = stats;
 
@@ -6691,10 +6691,6 @@ impl App {
 
         self.camera_controller.update(dt);
 
-        // Send async GI update request (non-blocking, like mesh job submission)
-        let camera_pos = glam::Vec3::from(self.camera_controller.camera.position);
-        let _ = self.gi_request_tx.send(voxelot::gi::GiUpdateRequest { camera_pos });
-        
         // Check for GI results (non-blocking, like mesh result polling)
         if let Ok(result) = self.gi_result_rx.try_recv() {
             self.gi_probes = result.probes; // Arc clone is cheap
@@ -6711,10 +6707,17 @@ impl App {
 
         // Gather candidate voxels for GPU culling using CPU hierarchy traversal
         let cull_start = Instant::now();
-        let (all_visible, cull_stats) =
+        let (all_visible, cull_stats, visible_chunks) =
             cull_visible_voxels_parallel(&self.world, &self.camera_controller.camera);
         self.cull_stats = cull_stats;
         let cull_time = cull_start.elapsed();
+        
+        // Send async GI update request with visible chunks (non-blocking, after culling)
+        let camera_pos = glam::Vec3::from(self.camera_controller.camera.position);
+        let _ = self.gi_request_tx.send(voxelot::gi::GiUpdateRequest { 
+            camera_pos,
+            visible_chunks,
+        });
 
         // CPU cull: filter out chunks that are completely below water visibility threshold
         // Any chunk whose max y-value is below (water_level - water_visibility) is invisible

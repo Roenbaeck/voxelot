@@ -288,7 +288,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let (visible_instances, _cull_stats) = cull_visible_voxels_parallel(&world, &camera);
+    let (visible_instances, _cull_stats, _visible_chunks) = cull_visible_voxels_parallel(&world, &camera);
     println!(
         "Visible instances: {} (scales {:?})",
         visible_instances.len(),
