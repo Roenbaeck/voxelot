@@ -66,6 +66,7 @@ thickness = 0.5
 strength = 1.0
 blur_enabled = true
 blur_radius = 2.0
+gi_indirect_scale = 0.003
 
 [effects.ssr]
 enabled = true

@@ -5,8 +5,8 @@ struct SsaoUniforms {
     hit_thickness: f32,
     screen_width: f32,
     screen_height: f32,
+    gi_indirect_scale: f32,
     _pad0: f32,
-    _pad1: f32,
     inverse_projection: mat4x4<f32>,
     inverse_view: mat4x4<f32>,
     grid_origin: vec3<i32>,
@@ -314,8 +314,8 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     visibility = pow(visibility, 2.0);
     
     // Sample GI from probes
-    // Factor reduced because GI is no longer darkened by AO (correct order now)
-    let indirect_light = sample_grid_irradiance(world_pos, world_normal) * 0.003;
+    // Scale factor is configurable (gi_indirect_scale in config.toml)
+    let indirect_light = sample_grid_irradiance(world_pos, world_normal) * ssao.gi_indirect_scale;
     
     return vec4<f32>(indirect_light, visibility);
 }

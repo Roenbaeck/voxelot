@@ -317,6 +317,7 @@ struct SsaoSettings {
     strength: f32,
     blur_enabled: bool,
     blur_radius: f32,
+    gi_indirect_scale: f32,
     _bias: f32,
 }
 
@@ -338,8 +339,8 @@ struct SsaoUniformsRaw {
     hit_thickness: f32,
     screen_width: f32,
     screen_height: f32,
+    gi_indirect_scale: f32,
     _pad0: f32,
-    _pad1: f32,
     inverse_projection: [[f32; 4]; 4],
     inverse_view: [[f32; 4]; 4],
     grid_origin: [i32; 3],
@@ -1701,6 +1702,7 @@ impl App {
                 strength: cfg.effects.ssao.strength,
                 blur_enabled: cfg.effects.ssao.blur_enabled,
                 blur_radius: cfg.effects.ssao.blur_radius,
+                gi_indirect_scale: cfg.effects.ssao.gi_indirect_scale,
                 _bias: 0.01,
             },
             ssr_settings: SSRSettings {
@@ -1932,8 +1934,8 @@ impl App {
             hit_thickness: self.ssao_settings.thickness,
             screen_width: src_width as f32,
             screen_height: src_height as f32,
+            gi_indirect_scale: self.ssao_settings.gi_indirect_scale,
             _pad0: 0.0,
-            _pad1: 0.0,
             inverse_projection: inv_proj.to_cols_array_2d(),
             inverse_view: inv_view.to_cols_array_2d(),
             grid_origin: self.gi_grid_origin.into(),
