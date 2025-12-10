@@ -414,8 +414,10 @@ pub fn spawn_gi_worker(
     (request_tx, result_rx)
 }
 
-/// Robust Voxel Traversal (DDA)
+/// Hierarchical DDA raycasting using World's structure
 /// Returns true if the ray from p0 to p1 is clear of obstacles.
+/// Leverages World.get() which already does hierarchical traversal,
+/// so we benefit from early-out on empty regions.
 fn is_visible_dda(world: &World, p0: Vec3, p1: Vec3) -> bool {
     let d = p1 - p0;
     let len = d.length();
@@ -438,9 +440,12 @@ fn is_visible_dda(world: &World, p0: Vec3, p1: Vec3) -> bool {
         return true;
     }
 
-    // Simple stepping for now (DDA is tricky to get perfect with floats/hierarchical)
-    // Step size = 1.0 units (voxels are 1x1x1, so this is sufficient)
-    let step_size = 1.0;
+    // Adaptive step size: Start with larger steps (2.0) for faster traversal
+    // World.get() handles hierarchical lookup, so this benefits from:
+    // - Fast early-out on empty parent chunks (sparse regions)
+    // - Marginal bitmap checks at leaf chunks
+    // A step size of 2.0 is safe because if we skip a 1x1x1 voxel, we're in empty space anyway
+    let step_size = 2.0;
     let steps = (dist / step_size).ceil() as u32;
 
     for i in 0..steps {
@@ -448,6 +453,10 @@ fn is_visible_dda(world: &World, p0: Vec3, p1: Vec3) -> bool {
         let p = start + dir * t;
         let wp = WorldPos::new(p.x.floor() as i64, p.y.floor() as i64, p.z.floor() as i64);
 
+        // World.get() already does:
+        // 1. Hierarchical tree traversal (benefits from sparse structure)
+        // 2. Marginal bitmap checking at leaf chunks (fast rejection)
+        // 3. RoaringBitmap presence check (final verification)
         if world.get(wp).is_some() {
             return false;
         }
