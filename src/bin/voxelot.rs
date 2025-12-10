@@ -852,7 +852,7 @@ struct App {
     // Async GI system: worker thread communicates via channels (like mesh workers)
     gi_request_tx: Sender<voxelot::gi::GiUpdateRequest>,
     gi_result_rx: Receiver<voxelot::gi::GiUpdateResult>,
-    gi_probes: Vec<voxelot::gi::GiProbe>,
+    gi_probes: Arc<Vec<voxelot::gi::GiProbe>>,
     gi_grid_origin: glam::IVec3,
     gi_grid_dims: glam::IVec3,
     gi_probe_buffer: Option<wgpu::Buffer>,
@@ -1552,7 +1552,7 @@ impl App {
             // Spawn async GI worker (like mesh workers)
             gi_request_tx,
             gi_result_rx,
-            gi_probes: vec![voxelot::gi::GiProbe::default(); (32 * 16 * 32) as usize],
+            gi_probes: Arc::new(vec![voxelot::gi::GiProbe::default(); (32 * 16 * 32) as usize]),
             gi_grid_origin: glam::IVec3::ZERO,
             gi_grid_dims: glam::IVec3::new(32, 16, 32),
             gi_probe_buffer: None,
@@ -6668,12 +6668,12 @@ impl App {
         
         // Check for GI results (non-blocking, like mesh result polling)
         if let Ok(result) = self.gi_result_rx.try_recv() {
-            self.gi_probes = result.probes;
+            self.gi_probes = result.probes; // Arc clone is cheap
             self.gi_grid_origin = result.grid_origin;
             
             // Upload new probes to GPU
             if let Some(buffer) = &self.gi_probe_buffer {
-                queue.write_buffer(buffer, 0, bytemuck::cast_slice(&self.gi_probes));
+                queue.write_buffer(buffer, 0, bytemuck::cast_slice(&*self.gi_probes));
             }
         }
 

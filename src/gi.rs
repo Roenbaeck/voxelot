@@ -14,7 +14,7 @@ pub struct GiUpdateRequest {
 
 /// Result from async GI update
 pub struct GiUpdateResult {
-    pub probes: Vec<GiProbe>,
+    pub probes: Arc<Vec<GiProbe>>,
     pub grid_origin: IVec3,
 }
 
@@ -105,8 +105,9 @@ impl GiSystem {
         // For simplicity, we drive light loading by probe requirements.
         
         if !missing_probes.is_empty() {
-            // Throttle: only process up to 8 probes per update to prevent frame drops
-            let probes_to_process: Vec<IVec3> = missing_probes.iter().take(8).cloned().collect();
+            // Throttle: only process up to 64 probes per update to prevent frame drops
+            // Since GI runs async on background thread, this won't impact frame rate
+            let probes_to_process: Vec<IVec3> = missing_probes.iter().take(64).cloned().collect();
             
             // 3. Identify required light chunks for the missing probes
             // We need lights from neighbors. Let's say radius is 4 chunks.
@@ -239,24 +240,30 @@ impl GiSystem {
             // Better: Just iterate missing probes, and for each, gather lights from `light_cache` (single threaded)
             // THEN compute the expensive raycasts in parallel.
             
-            // Step 5a: Prepare jobs (throttled to probes_to_process)
-            let jobs: Vec<(IVec3, Vec<(Vec3, Vec3)>)> = probes_to_process.iter().map(|&probe_coord| {
-                let mut lights = Vec::new();
+            // Step 5a: Build flat light list once for all probes (optimization)
+            // Instead of doing 729 HashMap lookups per probe, collect all lights in radius once
+            let mut all_lights = Vec::new();
+            let mut light_chunks_processed = HashSet::new();
+            for probe_coord in &probes_to_process {
                 for z in -light_radius..=light_radius {
                     for y in -light_radius..=light_radius {
                         for x in -light_radius..=light_radius {
-                            let light_coord = probe_coord + IVec3::new(x, y, z);
-                            if let Some(chunk_lights) = self.light_cache.get(&light_coord) {
-                                lights.extend_from_slice(chunk_lights);
+                            let light_coord = *probe_coord + IVec3::new(x, y, z);
+                            if light_chunks_processed.insert(light_coord) {
+                                if let Some(chunk_lights) = self.light_cache.get(&light_coord) {
+                                    all_lights.extend_from_slice(chunk_lights);
+                                }
                             }
                         }
                     }
                 }
-                (probe_coord, lights)
-            }).collect();
+            }
+            
+            // Step 5b: Prepare jobs with shared light list
+            let jobs: Vec<IVec3> = probes_to_process;
 
-            // Step 5b: Execute jobs in parallel
-            let new_probes: Vec<(IVec3, GiProbe)> = jobs.into_par_iter().map(|(probe_coord, lights)| {
+            // Step 5c: Execute jobs in parallel with shared light list
+            let new_probes: Vec<(IVec3, GiProbe)> = jobs.into_par_iter().map(|probe_coord| {
                 let mut probe = GiProbe::default();
                 
                 let cx = probe_coord.x;
@@ -299,7 +306,7 @@ impl GiSystem {
                         continue;
                     }
 
-                    for (light_pos, light_energy) in &lights {
+                    for (light_pos, light_energy) in &all_lights {
                         let delta = *light_pos - face_center;
                         if delta.dot(face_normal) <= 0.0 { continue; }
 
@@ -390,9 +397,9 @@ pub fn spawn_gi_worker(
             // Update GI system - world is already Arc, no lock needed (World is Sync)
             gi_system.update(&world, &palette, request.camera_pos);
             
-            // Send result back to main thread
+            // Send result back to main thread (Arc clone is cheap)
             let result = GiUpdateResult {
-                probes: gi_system.probes.clone(),
+                probes: Arc::new(gi_system.probes.clone()),
                 grid_origin: gi_system.grid_origin,
             };
             
@@ -432,8 +439,8 @@ fn is_visible_dda(world: &World, p0: Vec3, p1: Vec3) -> bool {
     }
 
     // Simple stepping for now (DDA is tricky to get perfect with floats/hierarchical)
-    // Step size = 0.5 units ensures we don't miss 1x1x1 voxels easily
-    let step_size = 0.5;
+    // Step size = 1.0 units (voxels are 1x1x1, so this is sufficient)
+    let step_size = 1.0;
     let steps = (dist / step_size).ceil() as u32;
 
     for i in 0..steps {
