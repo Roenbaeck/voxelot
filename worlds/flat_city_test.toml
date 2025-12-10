@@ -20,7 +20,7 @@ window_height = 720
 
 [atmosphere]
 fog_density = 0.00019999995
-time_of_day = 0.01233201
+time_of_day = 0.16953534
 time_paused = true
 night_skybox_brightness = 0.02
 horizon_fade_up = 0.05
