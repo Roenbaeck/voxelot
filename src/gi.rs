@@ -58,6 +58,9 @@ pub struct GiSystem {
     // Separate index: chunk coordinate -> emissive voxels in that chunk
     // This avoids O(16³) scans when building light_cache
     emissive_index: HashMap<IVec3, Vec<EmissiveVoxel>>,
+    // Track missing probes incrementally to avoid full grid scan every update
+    missing_probes: Vec<IVec3>,
+    last_grid_origin: IVec3,
 }
 
 impl GiSystem {
@@ -70,6 +73,8 @@ impl GiSystem {
             probe_cache: HashMap::new(),
             light_cache: HashMap::new(),
             emissive_index: HashMap::new(),
+            missing_probes: Vec::new(),
+            last_grid_origin: IVec3::new(i32::MAX, i32::MAX, i32::MAX), // Force initial scan
         }
     }
 
@@ -83,42 +88,44 @@ impl GiSystem {
 
         self.grid_origin = new_origin;
 
-        // Define the active grid area
-        // let grid_min = new_origin;
-        // let grid_max = new_origin + self.grid_dims;
-
         // 2. Identify missing probes in the active area
-        let mut missing_probes = Vec::new();
-        for z in 0..self.grid_dims.z {
-            for y in 0..self.grid_dims.y {
-                for x in 0..self.grid_dims.x {
-                    let coord = new_origin + IVec3::new(x, y, z);
-                    if !self.probe_cache.contains_key(&coord) {
-                        missing_probes.push(coord);
+        // Only do full scan if grid origin changed, otherwise reuse existing list
+        if new_origin != self.last_grid_origin {
+            self.missing_probes.clear();
+            for z in 0..self.grid_dims.z {
+                for y in 0..self.grid_dims.y {
+                    for x in 0..self.grid_dims.x {
+                        let coord = new_origin + IVec3::new(x, y, z);
+                        if !self.probe_cache.contains_key(&coord) {
+                            self.missing_probes.push(coord);
+                        }
                     }
                 }
             }
+            
+            // Sort missing probes by distance to camera (prioritize nearest)
+            // This matches the mesh worker priority system
+            self.missing_probes.sort_by(|a, b| {
+                // Calculate distance from camera chunk to probe chunk
+                let da = (*a - cam_chunk).as_vec3().length_squared();
+                let db = (*b - cam_chunk).as_vec3().length_squared();
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            
+            self.last_grid_origin = new_origin;
         }
 
         // If no probes are missing, we just need to update the flat buffer and return.
         // However, we should also check if we need to load lights for new areas.
         // For simplicity, we drive light loading by probe requirements.
         
-        if !missing_probes.is_empty() {
-            // Sort missing probes by distance to camera (prioritize nearest)
-            // This matches the mesh worker priority system
-            let cam_chunk = cam_chunk;
-            missing_probes.sort_by(|a, b| {
-                // Calculate distance from camera chunk to probe chunk
-                // Probe is at center of chunk (+8.0 units)
-                let da = (*a - cam_chunk).as_vec3().length_squared();
-                let db = (*b - cam_chunk).as_vec3().length_squared();
-                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-            });
-            
+        if !self.missing_probes.is_empty() {
             // Throttle: only process up to 64 probes per update to prevent frame drops
             // Since GI runs async on background thread, this won't impact frame rate
-            let probes_to_process: Vec<IVec3> = missing_probes.iter().take(64).cloned().collect();
+            let probes_to_process: Vec<IVec3> = self.missing_probes.iter().take(64).cloned().collect();
+            
+            // Remove processed probes from missing list
+            self.missing_probes.drain(0..probes_to_process.len().min(self.missing_probes.len()));
             
             // 3. Identify required light chunks for the missing probes
             // We need lights from neighbors. Let's say radius is 4 chunks.
