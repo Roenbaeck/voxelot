@@ -4,6 +4,19 @@ use bytemuck::{Pod, Zeroable};
 use glam::{IVec3, Vec3};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use crossbeam_channel::{Sender, Receiver};
+
+/// Request to update GI probes
+pub struct GiUpdateRequest {
+    pub camera_pos: Vec3,
+}
+
+/// Result from async GI update
+pub struct GiUpdateResult {
+    pub probes: Vec<GiProbe>,
+    pub grid_origin: IVec3,
+}
 
 /// Compact representation of an emissive voxel within a chunk
 #[derive(Copy, Clone, Debug)]
@@ -353,6 +366,42 @@ impl GiSystem {
         // self.probe_cache.retain(|k, _| (*k - center).abs().max_element() < prune_dist);
         // self.light_cache.retain(|k, _| (*k - center).abs().max_element() < prune_dist + 4);
     }
+}
+
+/// Spawn a background worker thread for async GI probe updates
+/// Returns (request_sender, result_receiver)
+pub fn spawn_gi_worker(
+    world: Arc<World>,
+    palette: Arc<Palette>,
+    grid_dims: IVec3,
+) -> (Sender<GiUpdateRequest>, Receiver<GiUpdateResult>) {
+    let (request_tx, request_rx) = crossbeam_channel::unbounded::<GiUpdateRequest>();
+    let (result_tx, result_rx) = crossbeam_channel::unbounded::<GiUpdateResult>();
+
+    std::thread::Builder::new()
+        .name("gi-worker".to_string())
+        .spawn(move || {
+        let mut gi_system = GiSystem::new(grid_dims);
+        
+        while let Ok(request) = request_rx.recv() {
+            // Update GI system - world is already Arc, no lock needed (World is Sync)
+            gi_system.update(&world, &palette, request.camera_pos);
+            
+            // Send result back to main thread
+            let result = GiUpdateResult {
+                probes: gi_system.probes.clone(),
+                grid_origin: gi_system.grid_origin,
+            };
+            
+            // If send fails, main thread has dropped the receiver (shutdown)
+            if result_tx.send(result).is_err() {
+                break;
+            }
+        }
+    })
+    .expect("failed to spawn GI worker");
+
+    (request_tx, result_rx)
 }
 
 /// Robust Voxel Traversal (DDA)

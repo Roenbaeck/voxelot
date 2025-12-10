@@ -847,9 +847,14 @@ struct App {
     cull_params_buffer: Option<wgpu::Buffer>,
     hzb_params_buffer: Option<wgpu::Buffer>,
 
-    world: World,
-    palette: Palette,
-    gi_system: voxelot::gi::GiSystem,
+    world: Arc<World>,
+    palette: Arc<Palette>,
+    // Async GI system: worker thread communicates via channels (like mesh workers)
+    gi_request_tx: Sender<voxelot::gi::GiUpdateRequest>,
+    gi_result_rx: Receiver<voxelot::gi::GiUpdateResult>,
+    gi_probes: Vec<voxelot::gi::GiProbe>,
+    gi_grid_origin: glam::IVec3,
+    gi_grid_dims: glam::IVec3,
     gi_probe_buffer: Option<wgpu::Buffer>,
     camera_controller: CameraController,
     pending_chunk_meshes: VecDeque<(i64, i64, i64)>,
@@ -1149,18 +1154,18 @@ impl App {
         let cfg = voxelot::Config::load_or_default(config_path);
 
         let mut initial_camera;
-        let mut world;
+        let world;
 
         if cfg!(feature = "test-block-world") {
             // Create test world (depth 3 = 4,096 units)
-            world = World::new(3);
+            let mut temp_world = World::new(3);
             initial_camera = [50.0, 15.0, 65.0];
             viewer_debug!("Creating test block: 3x5x7 voxels at (50, 10, 50)");
             let mut count = 0;
             for x in 0..3 {
                 for y in 0..5 {
                     for z in 0..7 {
-                        world.set(WorldPos::new(50 + x, 10 + y, 50 + z), 2);
+                        temp_world.set(WorldPos::new(50 + x, 10 + y, 50 + z), 2);
                         count += 1;
                     }
                 }
@@ -1170,7 +1175,7 @@ impl App {
             if cfg!(feature = "viewer-debug") {
                 viewer_debug!("Verifying voxels for test block:");
                 for (x, y, z) in [(50, 10, 50), (51, 11, 51), (52, 14, 56)] {
-                    if let Some(vtype) = world.get(WorldPos::new(x, y, z)) {
+                    if let Some(vtype) = temp_world.get(WorldPos::new(x, y, z)) {
                         viewer_debug!("  ({},{},{}) = type {}", x, y, z, vtype);
                     } else {
                         viewer_debug!("  ({},{},{}) = NONE!", x, y, z);
@@ -1179,7 +1184,7 @@ impl App {
 
                 let test_pos = WorldPos::new(50, 10, 50);
                 viewer_debug!("Checking world structure around test block...");
-                if let Some(vtype) = world.get(test_pos) {
+                if let Some(vtype) = temp_world.get(test_pos) {
                     viewer_debug!(
                         "  Voxel at ({},{},{}) = type {}",
                         test_pos.x,
@@ -1188,7 +1193,7 @@ impl App {
                         vtype
                     );
                 }
-                if let Some(depth) = world.depth_at(test_pos) {
+                if let Some(depth) = temp_world.depth_at(test_pos) {
                     viewer_debug!(
                         "  Depth at this position: {} (0 = Solid, 1+ = Chunk with N levels below)",
                         depth
@@ -1202,19 +1207,35 @@ impl App {
                     chunk_origin.y,
                     chunk_origin.z
                 );
-                if let Some(chunk) = world.get_leaf_chunk_at_origin(chunk_origin) {
+                if let Some(chunk) = temp_world.get_leaf_chunk_at_origin(chunk_origin) {
                     viewer_debug!("  ✓ Found leaf chunk with {} voxels", chunk.iter().count());
                 } else {
                     viewer_debug!("  ✗ Leaf chunk not found");
                 }
             }
+            
+            // Load palette and do LOD updates BEFORE wrapping in Arc
+            println!("Loading palette from {}...", cfg.world.palette);
+            let temp_palette = Palette::load(&cfg.world.palette);
+            
+            println!("Updating LOD metadata...");
+            let lod_start = Instant::now();
+            temp_world.update_all_lod_metadata(&temp_palette);
+            println!("LOD metadata updated (took {:.3}s)", lod_start.elapsed().as_secs_f32());
+
+            println!("Generating hierarchy shells...");
+            let shell_start = Instant::now();
+            temp_world.generate_all_hierarchy_shells();
+            println!("Hierarchy shells generated (took {:.3}s)", shell_start.elapsed().as_secs_f32());
+            
+            world = Arc::new(temp_world);
         } else {
             initial_camera = cfg.world.camera_position;
 
             println!("Loading voxel data from {}...", cfg.world.file);
             // Load hierarchical chunk format (.vhc) from configured path — loader accepts legacy .oct for compatibility
             let load_start = Instant::now();
-            world = voxelot::load_world_file(std::path::Path::new(&cfg.world.file)).unwrap_or_else(
+            let mut temp_world = voxelot::load_world_file(std::path::Path::new(&cfg.world.file)).unwrap_or_else(
                 |e| {
                     eprintln!(
                         "ERROR: Failed to load world file '{}': {}",
@@ -1228,9 +1249,26 @@ impl App {
             println!(
                 "Loaded world from {} (depth {}) (took {:.3}s)",
                 cfg.world.file,
-                world.hierarchy_depth(),
+                temp_world.hierarchy_depth(),
                 load_elapsed.as_secs_f32()
             );
+            
+            // Load palette BEFORE wrapping world in Arc (needed for LOD metadata)
+            println!("Loading palette from {}...", cfg.world.palette);
+            let temp_palette = Palette::load(&cfg.world.palette);
+            
+            // Update LOD metadata and generate hierarchy shells BEFORE wrapping in Arc
+            println!("Updating LOD metadata...");
+            let lod_start = Instant::now();
+            temp_world.update_all_lod_metadata(&temp_palette);
+            println!("LOD metadata updated (took {:.3}s)", lod_start.elapsed().as_secs_f32());
+
+            println!("Generating hierarchy shells...");
+            let shell_start = Instant::now();
+            temp_world.generate_all_hierarchy_shells();
+            println!("Hierarchy shells generated (took {:.3}s)", shell_start.elapsed().as_secs_f32());
+            
+            world = Arc::new(temp_world);
         }
 
         // Failsafe: Ensure camera spawns above terrain
@@ -1299,8 +1337,8 @@ impl App {
 
         println!("World created with voxels");
 
-        println!("Loading palette from {}...", cfg.world.palette);
-        let palette = Palette::load(&cfg.world.palette);
+        // Palette is already Arc-wrapped in both branches above
+        let palette = Arc::new(Palette::load(&cfg.world.palette));
 
         let (mesh_job_tx, mesh_job_rx) = unbounded::<MeshJob>();
         let (mesh_result_tx, mesh_result_rx) = unbounded::<MeshResult>();
@@ -1360,26 +1398,17 @@ impl App {
         drop(mesh_result_tx);
         drop(mesh_job_rx);
 
+        // Spawn GI worker thread (similar to mesh workers)
+        println!("Spawning GI worker thread...");
+        let gi_grid_dims = glam::IVec3::new(32, 16, 32);
+        let (gi_request_tx, gi_result_rx) = voxelot::gi::spawn_gi_worker(
+            world.clone(),
+            palette.clone(),
+            gi_grid_dims,
+        );
+
         let mesh_upload_baseline = cfg.performance.mesh_upload_baseline;
         let mesh_upload_max = (mesh_worker_count * 4).max(mesh_upload_baseline * 2);
-
-        println!("Updating LOD metadata...");
-        let lod_start = Instant::now();
-        world.update_all_lod_metadata(&palette);
-        let lod_elapsed = lod_start.elapsed();
-        println!(
-            "LOD metadata updated (took {:.3}s)",
-            lod_elapsed.as_secs_f32()
-        );
-
-        println!("Generating hierarchy shells...");
-        let shell_start = Instant::now();
-        world.generate_all_hierarchy_shells();
-        let shell_elapsed = shell_start.elapsed();
-        println!(
-            "Hierarchy shells generated (took {:.3}s)",
-            shell_elapsed.as_secs_f32()
-        );
 
         println!("\n=== Controls ===");
         println!("Movement: WASD + Q/E (down/up)");
@@ -1520,8 +1549,12 @@ impl App {
             tmp_chunk_emitters: Vec::with_capacity(64),
             vb_data_tmp: Vec::with_capacity(8192),
 
-            // Expanded grid to 32x16x32 chunks (512x256x512 blocks) to cover more view area
-            gi_system: voxelot::gi::GiSystem::new(glam::IVec3::new(32, 16, 32)),
+            // Spawn async GI worker (like mesh workers)
+            gi_request_tx,
+            gi_result_rx,
+            gi_probes: vec![voxelot::gi::GiProbe::default(); (32 * 16 * 32) as usize],
+            gi_grid_origin: glam::IVec3::ZERO,
+            gi_grid_dims: glam::IVec3::new(32, 16, 32),
             gi_probe_buffer: None,
 
             camera_controller: CameraController::new(initial_camera, &cfg.rendering),
@@ -1903,9 +1936,9 @@ impl App {
             _pad1: 0.0,
             inverse_projection: inv_proj.to_cols_array_2d(),
             inverse_view: inv_view.to_cols_array_2d(),
-            grid_origin: self.gi_system.grid_origin.into(),
+            grid_origin: self.gi_grid_origin.into(),
             _pad2: 0,
-            grid_dims: self.gi_system.grid_dims.into(),
+            grid_dims: self.gi_grid_dims.into(),
             _pad3: 0,
         }
     }
@@ -6028,7 +6061,7 @@ impl App {
         // Create GI probe buffer
         let gi_probe_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("GI Probe Buffer"),
-            contents: bytemuck::cast_slice(&self.gi_system.probes),
+            contents: bytemuck::cast_slice(&self.gi_probes),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -6629,12 +6662,19 @@ impl App {
 
         self.camera_controller.update(dt);
 
-        // Update GI probes
-        self.gi_system.update(&self.world, &self.palette, glam::Vec3::from(self.camera_controller.camera.position));
+        // Send async GI update request (non-blocking, like mesh job submission)
+        let camera_pos = glam::Vec3::from(self.camera_controller.camera.position);
+        let _ = self.gi_request_tx.send(voxelot::gi::GiUpdateRequest { camera_pos });
         
-        // Upload probes to GPU
-        if let Some(buffer) = &self.gi_probe_buffer {
-             queue.write_buffer(buffer, 0, bytemuck::cast_slice(&self.gi_system.probes));
+        // Check for GI results (non-blocking, like mesh result polling)
+        if let Ok(result) = self.gi_result_rx.try_recv() {
+            self.gi_probes = result.probes;
+            self.gi_grid_origin = result.grid_origin;
+            
+            // Upload new probes to GPU
+            if let Some(buffer) = &self.gi_probe_buffer {
+                queue.write_buffer(buffer, 0, bytemuck::cast_slice(&self.gi_probes));
+            }
         }
 
         // Reset accumulator for GPU buffer item counting this frame
