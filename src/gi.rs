@@ -5,6 +5,15 @@ use glam::{IVec3, Vec3};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 
+/// Compact representation of an emissive voxel within a chunk
+#[derive(Copy, Clone, Debug)]
+struct EmissiveVoxel {
+    /// Local position within chunk (0..15)
+    local_pos: [u8; 3],
+    /// Pre-multiplied emission (color * intensity * 10.0)
+    emission: Vec3,
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct GiProbe {
@@ -33,6 +42,9 @@ pub struct GiSystem {
     probe_cache: HashMap<IVec3, GiProbe>,
     // Chunk coordinate -> List of emissive voxels (position, intensity)
     light_cache: HashMap<IVec3, Vec<(Vec3, Vec3)>>,
+    // Separate index: chunk coordinate -> emissive voxels in that chunk
+    // This avoids O(16³) scans when building light_cache
+    emissive_index: HashMap<IVec3, Vec<EmissiveVoxel>>,
 }
 
 impl GiSystem {
@@ -44,6 +56,7 @@ impl GiSystem {
             grid_dims: dims,
             probe_cache: HashMap::new(),
             light_cache: HashMap::new(),
+            emissive_index: HashMap::new(),
         }
     }
 
@@ -97,42 +110,76 @@ impl GiSystem {
                 }
             }
 
-            // 4. Compute missing light chunks in parallel
-            let new_lights: Vec<(IVec3, Vec<(Vec3, Vec3)>)> = required_light_chunks
-                .into_par_iter()
-                .map(|chunk_coord| {
-                    let mut lights = Vec::new();
+            // 4. Build emissive index for new chunks (in parallel)
+            // This replaces the O(16³) voxel scan with O(E) where E = # emissive voxels
+            let new_emissive_data: Vec<(IVec3, Vec<EmissiveVoxel>)> = required_light_chunks
+                .par_iter()
+                .filter_map(|&chunk_coord| {
                     let origin = WorldPos::new(
                         chunk_coord.x as i64 * 16,
                         chunk_coord.y as i64 * 16,
                         chunk_coord.z as i64 * 16,
                     );
 
-                    if let Some(chunk) = world.get_leaf_chunk_at_origin(origin) {
-                        if chunk.emissive_power > 0.0 {
-                            for lz in 0..16 {
-                                for ly in 0..16 {
-                                    for lx in 0..16 {
-                                        if chunk.contains(lx, ly, lz) {
-                                            if let Some(vtype) = chunk.get_type(lx, ly, lz) {
-                                                let (color, intensity) = palette.emissive(vtype as u32);
-                                                if intensity > 0.0 {
-                                                    let emission = Vec3::from(color) * intensity * 10.0;
-                                                    let voxel_pos = Vec3::new(
-                                                        (chunk_coord.x as f32 * 16.0) + lx as f32 + 0.5,
-                                                        (chunk_coord.y as f32 * 16.0) + ly as f32 + 0.5,
-                                                        (chunk_coord.z as f32 * 16.0) + lz as f32 + 0.5,
-                                                    );
-                                                    lights.push((voxel_pos, emission));
-                                                }
-                                            }
+                    let chunk = world.get_leaf_chunk_at_origin(origin)?;
+                    if chunk.emissive_power <= 0.0 {
+                        return None;
+                    }
+
+                    let mut emissives = Vec::new();
+                    for lz in 0..16u8 {
+                        for ly in 0..16u8 {
+                            for lx in 0..16u8 {
+                                if chunk.contains(lx, ly, lz) {
+                                    if let Some(vtype) = chunk.get_type(lx, ly, lz) {
+                                        let (color, intensity) = palette.emissive(vtype as u32);
+                                        if intensity > 0.0 {
+                                            let emission = Vec3::from(color) * intensity * 10.0;
+                                            emissives.push(EmissiveVoxel {
+                                                local_pos: [lx, ly, lz],
+                                                emission,
+                                            });
                                         }
                                     }
                                 }
                             }
                         }
                     }
-                    (chunk_coord, lights)
+
+                    if emissives.is_empty() {
+                        None
+                    } else {
+                        Some((chunk_coord, emissives))
+                    }
+                })
+                .collect();
+
+            // Update emissive index
+            for (coord, emissives) in new_emissive_data {
+                self.emissive_index.insert(coord, emissives);
+            }
+
+            // 4b. Build light_cache from emissive_index (fast, no voxel scanning)
+            let new_lights: Vec<(IVec3, Vec<(Vec3, Vec3)>)> = required_light_chunks
+                .into_iter()
+                .filter_map(|chunk_coord| {
+                    let emissives = self.emissive_index.get(&chunk_coord)?;
+                    if emissives.is_empty() {
+                        return None;
+                    }
+
+                    let lights: Vec<(Vec3, Vec3)> = emissives
+                        .iter()
+                        .map(|ev| {
+                            let voxel_pos = Vec3::new(
+                                (chunk_coord.x as f32 * 16.0) + ev.local_pos[0] as f32 + 0.5,
+                                (chunk_coord.y as f32 * 16.0) + ev.local_pos[1] as f32 + 0.5,
+                                (chunk_coord.z as f32 * 16.0) + ev.local_pos[2] as f32 + 0.5,
+                            );
+                            (voxel_pos, ev.emission)
+                        })
+                        .collect();
+                    Some((chunk_coord, lights))
                 })
                 .collect();
 
