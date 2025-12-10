@@ -73,9 +73,9 @@ indirect_scale = 0.003
 fade_distance = 400.0
 fade_range = 100.0
 grid_dims = [
-    50,
-    20,
-    50,
+    42,
+    17,
+    42,
 ]
 
 [effects.ssr]

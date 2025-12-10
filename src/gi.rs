@@ -105,6 +105,17 @@ impl GiSystem {
         // For simplicity, we drive light loading by probe requirements.
         
         if !missing_probes.is_empty() {
+            // Sort missing probes by distance to camera (prioritize nearest)
+            // This matches the mesh worker priority system
+            let cam_chunk = cam_chunk;
+            missing_probes.sort_by(|a, b| {
+                // Calculate distance from camera chunk to probe chunk
+                // Probe is at center of chunk (+8.0 units)
+                let da = (*a - cam_chunk).as_vec3().length_squared();
+                let db = (*b - cam_chunk).as_vec3().length_squared();
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            
             // Throttle: only process up to 64 probes per update to prevent frame drops
             // Since GI runs async on background thread, this won't impact frame rate
             let probes_to_process: Vec<IVec3> = missing_probes.iter().take(64).cloned().collect();
