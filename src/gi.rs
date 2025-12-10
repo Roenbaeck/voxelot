@@ -105,12 +105,15 @@ impl GiSystem {
         // For simplicity, we drive light loading by probe requirements.
         
         if !missing_probes.is_empty() {
+            // Throttle: only process up to 8 probes per update to prevent frame drops
+            let probes_to_process: Vec<IVec3> = missing_probes.iter().take(8).cloned().collect();
+            
             // 3. Identify required light chunks for the missing probes
             // We need lights from neighbors. Let's say radius is 4 chunks.
             let light_radius = 4;
             let mut required_light_chunks = HashSet::new();
             
-            for probe_coord in &missing_probes {
+            for probe_coord in &probes_to_process {
                 for z in -light_radius..=light_radius {
                     for y in -light_radius..=light_radius {
                         for x in -light_radius..=light_radius {
@@ -236,8 +239,8 @@ impl GiSystem {
             // Better: Just iterate missing probes, and for each, gather lights from `light_cache` (single threaded)
             // THEN compute the expensive raycasts in parallel.
             
-            // Step 5a: Prepare jobs
-            let jobs: Vec<(IVec3, Vec<(Vec3, Vec3)>)> = missing_probes.iter().map(|&probe_coord| {
+            // Step 5a: Prepare jobs (throttled to probes_to_process)
+            let jobs: Vec<(IVec3, Vec<(Vec3, Vec3)>)> = probes_to_process.iter().map(|&probe_coord| {
                 let mut lights = Vec::new();
                 for z in -light_radius..=light_radius {
                     for y in -light_radius..=light_radius {

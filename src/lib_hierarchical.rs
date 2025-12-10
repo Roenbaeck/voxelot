@@ -963,6 +963,29 @@ impl World {
         }
     }
 
+    /// Get the Arc<Chunk> at the given origin position (avoids cloning the chunk)
+    pub fn get_leaf_chunk_arc_at_origin(&self, origin: WorldPos) -> Option<Arc<Chunk>> {
+        // Ensure alignment (optional safety)
+        if (origin.x & 15) != 0 || (origin.y & 15) != 0 || (origin.z & 15) != 0 {
+            return None;
+        }
+
+        if self.hierarchy_depth == 1 {
+            // Special case: root is the leaf chunk - clone the Arc
+            return Some(self.root.clone());
+        }
+
+        let path = self.position_to_path(origin).ok()?;
+        // Navigate to the parent of the leaf chunk level (depth-2)
+        let parent = self.navigate_to(&path, self.hierarchy_depth as usize - 2)?;
+        // The leaf chunk is at position path[depth-2] in that parent
+        let &(x, y, z) = &path[self.hierarchy_depth as usize - 2];
+        match parent.get(x, y, z)? {
+            Voxel::Chunk(c) => Some(c.clone()), // Clone the Arc, not the Chunk!
+            _ => None,
+        }
+    }
+
     /// Subdivide a 16×16×16 region into a chunk structure
     /// This collects all existing voxels in the region and organizes them into a chunk
     /// If the parent position doesn't exist yet, it will be created

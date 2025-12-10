@@ -7484,7 +7484,9 @@ impl App {
 
         let max_inflight = self.max_inflight_jobs();
         let schedule_start = std::time::Instant::now();
-        while self.mesh_jobs_in_flight < max_inflight {
+        let mut jobs_scheduled_this_frame = 0;
+        let max_jobs_per_frame = 8; // Throttle mesh job creation to prevent stuttering
+        while self.mesh_jobs_in_flight < max_inflight && jobs_scheduled_this_frame < max_jobs_per_frame {
             // Backpressure: don't schedule more worker jobs if the ready result queue is already
             // large. This avoids generating more meshes than we can upload and prevents a
             // runaway backlog that keeps workers busy indefinitely.
@@ -7574,7 +7576,7 @@ impl App {
 
             match self
                 .world
-                .get_leaf_chunk_at_origin(WorldPos::new(key.0, key.1, key.2))
+                .get_leaf_chunk_arc_at_origin(WorldPos::new(key.0, key.1, key.2))
             {
                 Some(chunk) => {
                     // Snapshot neighbor chunks so AO can be computed across chunk bounds.
@@ -7588,18 +7590,17 @@ impl App {
                                 let nz = key.2 + (dz << 4);
                                 if let Some(nc) = self
                                     .world
-                                    .get_leaf_chunk_at_origin(WorldPos::new(nx, ny, nz))
+                                    .get_leaf_chunk_arc_at_origin(WorldPos::new(nx, ny, nz))
                                 {
                                     let nk = (nx, ny, nz);
-                                    // Reuse an Arc snapshot if available; otherwise clone and cache
+                                    // Reuse cached Arc or cache the new one
                                     let arc_neigh = if let Some(existing) =
                                         self.mesh_chunk_arc_cache.get(&nk)
                                     {
                                         existing.clone()
                                     } else {
-                                        let a = Arc::new(nc.clone());
-                                        self.mesh_chunk_arc_cache.insert(nk, a.clone());
-                                        a
+                                        self.mesh_chunk_arc_cache.insert(nk, nc.clone());
+                                        nc
                                     };
                                     neighbors.insert((dx as i8, dy as i8, dz as i8), arc_neigh);
                                 }
@@ -7612,9 +7613,8 @@ impl App {
                     let chunk_arc = if let Some(existing) = self.mesh_chunk_arc_cache.get(&key) {
                         existing.clone()
                     } else {
-                        let a = Arc::new(chunk.clone());
-                        self.mesh_chunk_arc_cache.insert(key, a.clone());
-                        a
+                        self.mesh_chunk_arc_cache.insert(key, chunk.clone());
+                        chunk
                     };
 
                     if self
@@ -7628,6 +7628,7 @@ impl App {
                         .is_ok()
                     {
                         self.mesh_jobs_in_flight += 1;
+                        jobs_scheduled_this_frame += 1;
                     } else {
                         self.pending_chunk_meshes.push_front(key);
                         self.pending_chunk_set.remove(&key);
