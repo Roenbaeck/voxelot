@@ -133,9 +133,9 @@ fn get_probe_irradiance(probe_idx: u32, normal: vec3<f32>) -> vec3<f32> {
     let w_y = normal.y * normal.y;
     let w_z = normal.z * normal.z;
     
-    let idx_x = select(1u, 0u, normal.x > 0.0);
-    let idx_y = select(3u, 2u, normal.y > 0.0);
-    let idx_z = select(5u, 4u, normal.z > 0.0);
+    let idx_x = select(0u, 1u, normal.x > 0.0);
+    let idx_y = select(2u, 3u, normal.y > 0.0);
+    let idx_z = select(4u, 5u, normal.z > 0.0);
     
     return probe.light_data[idx_x].rgb * w_x + 
            probe.light_data[idx_y].rgb * w_y + 
@@ -143,9 +143,8 @@ fn get_probe_irradiance(probe_idx: u32, normal: vec3<f32>) -> vec3<f32> {
 }
 
 fn sample_grid_irradiance(world_pos: vec3<f32>, normal: vec3<f32>, camera_pos: vec3<f32>) -> vec3<f32> {
-    // Apply normal bias to avoid sampling inside walls
-    // Push the sample point 0.5 units along the normal (half a block)
-    let biased_pos = world_pos + normal * 0.5;
+    // Bias position against normal to sample from same probe but opposite bin
+    let biased_pos = world_pos - normal * 0.5;
 
     // Convert world pos to grid coords
     // Grid origin is in chunks (16 units)
