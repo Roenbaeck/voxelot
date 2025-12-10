@@ -317,10 +317,15 @@ struct SsaoSettings {
     strength: f32,
     blur_enabled: bool,
     blur_radius: f32,
-    gi_indirect_scale: f32,
-    gi_fade_distance: f32,
-    gi_fade_range: f32,
     _bias: f32,
+}
+
+struct GiSettings {
+    enabled: bool,
+    indirect_scale: f32,
+    fade_distance: f32,
+    fade_range: f32,
+    grid_dims: glam::IVec3,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -1040,6 +1045,7 @@ struct App {
     bloom_settings: BloomSettings,
     bloom_enabled: bool,
     ssao_settings: SsaoSettings,
+    gi_settings: GiSettings,
     shadow_map_size: u32,
     shadow_darkness: f32,
     shadow_backface_scale: f32,
@@ -1407,7 +1413,7 @@ impl App {
 
         // Spawn GI worker thread (similar to mesh workers)
         println!("Spawning GI worker thread...");
-        let gi_grid_dims = glam::IVec3::new(32, 16, 32);
+        let gi_grid_dims = glam::IVec3::from_array(cfg.effects.gi.grid_dims);
         let (gi_request_tx, gi_result_rx) = voxelot::gi::spawn_gi_worker(
             world.clone(),
             palette.clone(),
@@ -1559,9 +1565,14 @@ impl App {
             // Spawn async GI worker (like mesh workers)
             gi_request_tx,
             gi_result_rx,
-            gi_probes: Arc::new(vec![voxelot::gi::GiProbe::default(); (32 * 16 * 32) as usize]),
+            gi_probes: Arc::new(vec![
+                voxelot::gi::GiProbe::default();
+                (cfg.effects.gi.grid_dims[0] * 
+                 cfg.effects.gi.grid_dims[1] * 
+                 cfg.effects.gi.grid_dims[2]) as usize
+            ]),
             gi_grid_origin: glam::IVec3::ZERO,
-            gi_grid_dims: glam::IVec3::new(32, 16, 32),
+            gi_grid_dims: glam::IVec3::from_array(cfg.effects.gi.grid_dims),
             gi_probe_buffer: None,
 
             camera_controller: CameraController::new(initial_camera, &cfg.rendering),
@@ -1708,10 +1719,14 @@ impl App {
                 strength: cfg.effects.ssao.strength,
                 blur_enabled: cfg.effects.ssao.blur_enabled,
                 blur_radius: cfg.effects.ssao.blur_radius,
-                gi_indirect_scale: cfg.effects.ssao.gi_indirect_scale,
-                gi_fade_distance: cfg.effects.ssao.gi_fade_distance,
-                gi_fade_range: cfg.effects.ssao.gi_fade_range,
                 _bias: 0.01,
+            },
+            gi_settings: GiSettings {
+                enabled: cfg.effects.gi.enabled,
+                indirect_scale: cfg.effects.gi.indirect_scale,
+                fade_distance: cfg.effects.gi.fade_distance,
+                fade_range: cfg.effects.gi.fade_range,
+                grid_dims: glam::IVec3::from_array(cfg.effects.gi.grid_dims),
             },
             ssr_settings: SSRSettings {
                 max_steps: cfg.effects.ssr.max_steps,
@@ -1942,9 +1957,9 @@ impl App {
             hit_thickness: self.ssao_settings.thickness,
             screen_width: src_width as f32,
             screen_height: src_height as f32,
-            gi_indirect_scale: self.ssao_settings.gi_indirect_scale,
-            gi_fade_distance: self.ssao_settings.gi_fade_distance,
-            gi_fade_range: self.ssao_settings.gi_fade_range,
+            gi_indirect_scale: self.gi_settings.indirect_scale,
+            gi_fade_distance: self.gi_settings.fade_distance,
+            gi_fade_range: self.gi_settings.fade_range,
             _pad0: 0.0,
             _pad1: 0.0,
             _pad2: 0.0,

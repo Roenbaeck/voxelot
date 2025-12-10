@@ -66,9 +66,13 @@ thickness = 0.5
 strength = 1.0
 blur_enabled = true
 blur_radius = 2.0
-gi_indirect_scale = 0.003
-gi_fade_distance = 400.0
-gi_fade_range = 100.0
+
+[effects.gi]
+enabled = true
+indirect_scale = 0.003
+fade_distance = 400.0
+fade_range = 100.0
+grid_dims = [32, 16, 32]
 
 [effects.ssr]
 enabled = true
