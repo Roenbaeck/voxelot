@@ -1,3 +1,5 @@
+![Voxelot viewer screenshot](voxelot.gif)
+
 # voxelot
 
 A high-performance sparse voxel engine using hierarchical chunks with Roaring Bitmaps. See [YouTube](https://www.youtube.com/watch?v=18E_aCRf2BY) for visuals. Theoretical framework is of human origin, but almost all code is AI-generated. The exception being when AI got completely stuck, usually on some trivial thing like an unclosed bracket. It is an experiment to see if a whole game can be created from scratch using AI-assisted coding, where the AI is assisted by experienced programmers. 
@@ -5,8 +7,6 @@ A high-performance sparse voxel engine using hierarchical chunks with Roaring Bi
 Initial code by Claude Sonnet 4.5, GPT-5.1 and Gemini 2.5 Pro, then the bulk by Raptor Mini (occasionally unstuck by Grok Code Fast), and lately optimizations by Gemini 3.0 Pro and Claude Opus 4.5. For currently being a "free" model within GitHub Copilot, Raptor Mini is surprisingly capable, and I've only occasionally had to turn to what we believe are more capable models. 
 
 AI can still run wild and mess up large portions of the code base. If you experiment like this, git commit often. Reverting is your friend.
-
-![Voxelot viewer screenshot](voxelot.gif)
 
 ## Key Features
 
