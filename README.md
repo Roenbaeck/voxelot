@@ -1,4 +1,4 @@
-![Voxelot viewer screenshot](voxelot.gif)
+![Voxelot viewer screenshot](voxelot.webp)
 
 # voxelot
 
