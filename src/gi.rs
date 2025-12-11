@@ -90,24 +90,31 @@ impl GiSystem {
         self.grid_origin = new_origin;
 
         // 2. Identify missing probes from the VISIBLE chunks (frustum culled)
-        // Only scan if grid origin changed, otherwise reuse existing list
-        if new_origin != self.last_grid_origin {
+        // Check for missing probes whenever grid moves OR when we have new visible chunks
+        let grid_moved = new_origin != self.last_grid_origin;
+        
+        if grid_moved {
             self.missing_probes.clear();
-            
-            // Only check visible chunks, not entire grid cube
-            for &chunk_coord in visible_chunks {
-                // Check if chunk is within our grid bounds
-                let relative = chunk_coord - new_origin;
-                if relative.x >= 0 && relative.x < self.grid_dims.x
-                    && relative.y >= 0 && relative.y < self.grid_dims.y
-                    && relative.z >= 0 && relative.z < self.grid_dims.z
-                {
-                    if !self.probe_cache.contains_key(&chunk_coord) {
+        }
+        
+        // Always check visible chunks for missing probes (handles rotation case)
+        for &chunk_coord in visible_chunks {
+            // Check if chunk is within our grid bounds
+            let relative = chunk_coord - new_origin;
+            if relative.x >= 0 && relative.x < self.grid_dims.x
+                && relative.y >= 0 && relative.y < self.grid_dims.y
+                && relative.z >= 0 && relative.z < self.grid_dims.z
+            {
+                if !self.probe_cache.contains_key(&chunk_coord) {
+                    // Only add if not already in the list
+                    if !self.missing_probes.contains(&chunk_coord) {
                         self.missing_probes.push(chunk_coord);
                     }
                 }
             }
-            
+        }
+        
+        if grid_moved {
             // Sort missing probes by distance to camera (prioritize nearest)
             // This matches the mesh worker priority system
             self.missing_probes.sort_by(|a, b| {
@@ -340,7 +347,19 @@ impl GiSystem {
                         let dir = delta / dist;
                         let cos_theta = dir.dot(face_normal);
                         
-                        if !is_visible_dda(world, face_center, *light_pos) {
+                        // Use hierarchical line_of_sight instead of DDA
+                        let start_pos = WorldPos::new(
+                            face_center.x.floor() as i64,
+                            face_center.y.floor() as i64,
+                            face_center.z.floor() as i64,
+                        );
+                        let end_pos = WorldPos::new(
+                            light_pos.x.floor() as i64,
+                            light_pos.y.floor() as i64,
+                            light_pos.z.floor() as i64,
+                        );
+                        
+                        if !world.line_of_sight(start_pos, end_pos) {
                             continue;
                         }
 
@@ -435,55 +454,4 @@ pub fn spawn_gi_worker(
     .expect("failed to spawn GI worker");
 
     (request_tx, result_rx)
-}
-
-/// Hierarchical DDA raycasting using World's structure
-/// Returns true if the ray from p0 to p1 is clear of obstacles.
-/// Leverages World.get() which already does hierarchical traversal,
-/// so we benefit from early-out on empty regions.
-fn is_visible_dda(world: &World, p0: Vec3, p1: Vec3) -> bool {
-    let d = p1 - p0;
-    let len = d.length();
-    if len < 0.001 {
-        return true;
-    }
-    let dir = d / len;
-
-    // Ray start (nudge slightly to avoid self-intersection)
-    let start = p0 + dir * 0.01;
-    
-    // Ray end: Stop 0.6 units before the light center to avoid hitting the light voxel itself
-    // (Light voxel is 1x1x1, center at 0.5, so 0.6 ensures we are outside)
-    let end = p1 - dir * 0.6;
-    
-    let dist = (end - start).length();
-    // If dist is negative (start is past end), it means we are inside the light voxel or very close.
-    // In that case, we are visible.
-    if (end - start).dot(dir) <= 0.0 {
-        return true;
-    }
-
-    // Adaptive step size: Start with larger steps (2.0) for faster traversal
-    // World.get() handles hierarchical lookup, so this benefits from:
-    // - Fast early-out on empty parent chunks (sparse regions)
-    // - Marginal bitmap checks at leaf chunks
-    // A step size of 2.0 is safe because if we skip a 1x1x1 voxel, we're in empty space anyway
-    let step_size = 2.0;
-    let steps = (dist / step_size).ceil() as u32;
-
-    for i in 0..steps {
-        let t = i as f32 * step_size;
-        let p = start + dir * t;
-        let wp = WorldPos::new(p.x.floor() as i64, p.y.floor() as i64, p.z.floor() as i64);
-
-        // World.get() already does:
-        // 1. Hierarchical tree traversal (benefits from sparse structure)
-        // 2. Marginal bitmap checking at leaf chunks (fast rejection)
-        // 3. RoaringBitmap presence check (final verification)
-        if world.get(wp).is_some() {
-            return false;
-        }
-    }
-    
-    true
 }

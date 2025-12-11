@@ -10,9 +10,15 @@
 
 use croaring::Bitmap;
 use rustc_hash::FxHashMap as HashMap;
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use crate::palette::Palette;
+
+// Thread-local bitmap for ray marching to avoid allocations
+thread_local! {
+    static RAY_BITMAP: RefCell<Bitmap> = RefCell::new(Bitmap::new());
+}
 
 /// Convert a local chunk bounding box (bbox in 0..15 coordinates) to world-space position and
 /// world-space size using the supplied scale for the current voxel.
@@ -1149,6 +1155,221 @@ impl World {
         // Get the leaf position
         let &(x, y, z) = path.last()?;
         parent.get_type(x, y, z)
+    }
+
+    /// Check line of sight between two world positions using hierarchical bitmap intersection
+    /// Returns true if there's a clear line of sight (no voxels blocking)
+    pub fn line_of_sight(&self, start: WorldPos, end: WorldPos) -> bool {
+        // Early check: if start == end, we have line of sight
+        if start == end {
+            return true;
+        }
+
+        // Use thread-local bitmap to avoid allocations
+        RAY_BITMAP.with(|bitmap_cell| {
+            let mut bitmap = bitmap_cell.borrow_mut();
+            bitmap.clear();
+
+            // Start hierarchical traversal from root
+            self.line_of_sight_recursive(
+                &self.root,
+                start,
+                end,
+                WorldPos::new(0, 0, 0), // Root origin
+                self.hierarchy_depth,
+                &mut bitmap,
+            )
+        })
+    }
+
+    /// Recursive helper for line_of_sight using hierarchical bitmap intersection
+    fn line_of_sight_recursive(
+        &self,
+        chunk: &Chunk,
+        start: WorldPos,
+        end: WorldPos,
+        chunk_origin: WorldPos,
+        depth: u8,
+        bitmap: &mut Bitmap,
+    ) -> bool {
+        // Calculate the size of voxels at this level
+        let voxel_size = 16i64.pow((depth - 1) as u32);
+
+        // Compute which voxels in this chunk the ray passes through
+        bitmap.clear();
+        self.rasterize_ray_in_chunk(start, end, chunk_origin, voxel_size, bitmap);
+
+        // Fast check: if ray doesn't pass through any voxels in chunk's presence bitmap
+        if !bitmap.intersect(&chunk.presence) {
+            return true; // Clear line of sight through this chunk
+        }
+
+        // Ray intersects with occupied voxels - need to check deeper
+        // If we're at leaf level, we have an obstruction
+        if depth == 1 {
+            return false; // Hit a solid voxel
+        }
+
+        // Not at leaf level - descend into sub-chunks that the ray intersects
+        // Only check the voxels where bitmap AND presence overlap
+        let intersection = bitmap.and(&chunk.presence);
+
+        for idx in intersection.iter() {
+            let (x, y, z) = Chunk::unflatten(idx);
+            
+            // Get the sub-chunk at this position
+            let rank = chunk.presence.rank(idx) as usize;
+            if let Some(Voxel::Chunk(sub_chunk)) = chunk.voxels.get(rank - 1) {
+                // Calculate origin of this sub-chunk
+                let sub_origin = WorldPos::new(
+                    chunk_origin.x + (x as i64 * voxel_size),
+                    chunk_origin.y + (y as i64 * voxel_size),
+                    chunk_origin.z + (z as i64 * voxel_size),
+                );
+
+                // Recursively check this sub-chunk
+                if !self.line_of_sight_recursive(sub_chunk, start, end, sub_origin, depth - 1, bitmap) {
+                    return false; // Found obstruction
+                }
+            } else {
+                // It's a solid voxel at a non-leaf level - obstruction
+                return false;
+            }
+        }
+
+        // No obstructions found
+        true
+    }
+
+    /// Rasterize a ray into a bitmap of which voxels (0-15 in each axis) it passes through
+    /// Uses a 3D DDA algorithm
+    fn rasterize_ray_in_chunk(
+        &self,
+        start: WorldPos,
+        end: WorldPos,
+        chunk_origin: WorldPos,
+        voxel_size: i64,
+        bitmap: &mut Bitmap,
+    ) {
+        // Convert world positions to chunk-local coordinates (in voxel units 0-15)
+        let start_local = [
+            ((start.x - chunk_origin.x) as f64 / voxel_size as f64),
+            ((start.y - chunk_origin.y) as f64 / voxel_size as f64),
+            ((start.z - chunk_origin.z) as f64 / voxel_size as f64),
+        ];
+        
+        let end_local = [
+            ((end.x - chunk_origin.x) as f64 / voxel_size as f64),
+            ((end.y - chunk_origin.y) as f64 / voxel_size as f64),
+            ((end.z - chunk_origin.z) as f64 / voxel_size as f64),
+        ];
+
+        // DDA ray traversal
+        let delta = [
+            end_local[0] - start_local[0],
+            end_local[1] - start_local[1],
+            end_local[2] - start_local[2],
+        ];
+
+        let length = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+        if length < 0.001 {
+            // Ray is too short, just add start voxel if in bounds
+            let x = start_local[0].floor() as i32;
+            let y = start_local[1].floor() as i32;
+            let z = start_local[2].floor() as i32;
+            if x >= 0 && x < 16 && y >= 0 && y < 16 && z >= 0 && z < 16 {
+                bitmap.add(Chunk::flat_index(x as u8, y as u8, z as u8));
+            }
+            return;
+        }
+
+        // Normalized direction
+        let dir = [delta[0] / length, delta[1] / length, delta[2] / length];
+
+        // Step sizes for each axis
+        let step_x = if dir[0].abs() > 0.0001 { 1.0 / dir[0].abs() } else { f64::MAX };
+        let step_y = if dir[1].abs() > 0.0001 { 1.0 / dir[1].abs() } else { f64::MAX };
+        let step_z = if dir[2].abs() > 0.0001 { 1.0 / dir[2].abs() } else { f64::MAX };
+
+        // Current voxel
+        let mut vx = start_local[0].floor() as i32;
+        let mut vy = start_local[1].floor() as i32;
+        let mut vz = start_local[2].floor() as i32;
+
+        // Initial t-values to next voxel boundaries
+        let mut t_max_x = if dir[0] > 0.0 {
+            ((vx + 1) as f64 - start_local[0]) / dir[0]
+        } else if dir[0] < 0.0 {
+            (vx as f64 - start_local[0]) / dir[0]
+        } else {
+            f64::MAX
+        };
+
+        let mut t_max_y = if dir[1] > 0.0 {
+            ((vy + 1) as f64 - start_local[1]) / dir[1]
+        } else if dir[1] < 0.0 {
+            (vy as f64 - start_local[1]) / dir[1]
+        } else {
+            f64::MAX
+        };
+
+        let mut t_max_z = if dir[2] > 0.0 {
+            ((vz + 1) as f64 - start_local[2]) / dir[2]
+        } else if dir[2] < 0.0 {
+            (vz as f64 - start_local[2]) / dir[2]
+        } else {
+            f64::MAX
+        };
+
+        // Step directions
+        let step_dir_x = if dir[0] > 0.0 { 1 } else { -1 };
+        let step_dir_y = if dir[1] > 0.0 { 1 } else { -1 };
+        let step_dir_z = if dir[2] > 0.0 { 1 } else { -1 };
+
+        // Traverse the ray
+        let max_steps = 48; // Max voxels to check (covers diagonal + some margin)
+        for _ in 0..max_steps {
+            // Add current voxel if in bounds
+            if vx >= 0 && vx < 16 && vy >= 0 && vy < 16 && vz >= 0 && vz < 16 {
+                bitmap.add(Chunk::flat_index(vx as u8, vy as u8, vz as u8));
+            }
+
+            // Check if we've passed the end point
+            let current = [vx as f64 + 0.5, vy as f64 + 0.5, vz as f64 + 0.5];
+            let to_end = [
+                end_local[0] - current[0],
+                end_local[1] - current[1],
+                end_local[2] - current[2],
+            ];
+            let dist_sq = to_end[0] * to_end[0] + to_end[1] * to_end[1] + to_end[2] * to_end[2];
+            if dist_sq < 0.5 {
+                break; // Reached end
+            }
+
+            // Step to next voxel boundary
+            if t_max_x < t_max_y {
+                if t_max_x < t_max_z {
+                    vx += step_dir_x;
+                    t_max_x += step_x;
+                } else {
+                    vz += step_dir_z;
+                    t_max_z += step_z;
+                }
+            } else {
+                if t_max_y < t_max_z {
+                    vy += step_dir_y;
+                    t_max_y += step_y;
+                } else {
+                    vz += step_dir_z;
+                    t_max_z += step_z;
+                }
+            }
+
+            // Safety: exit if we've gone too far outside the chunk
+            if vx < -2 || vx > 17 || vy < -2 || vy > 17 || vz < -2 || vz > 17 {
+                break;
+            }
+        }
     }
 
     /// Set a solid voxel at world position

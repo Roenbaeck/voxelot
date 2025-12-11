@@ -6,7 +6,7 @@ Initial code by Claude Sonnet 4.5, GPT-5.1 and Gemini 2.5 Pro, then the bulk by 
 
 AI can still run wild and mess up large portions of the code base. If you experiment like this, git commit often. Reverting is your friend.
 
-![Voxelot viewer screenshot](voxelot.png)
+![Voxelot viewer screenshot](voxelot.gif)
 
 ## Key Features
 
