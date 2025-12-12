@@ -73,10 +73,9 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let saturated = vec3<f32>(luma, luma, luma) + balance * composite.saturation_boost;
 
     // Note: direct emissive is already included in 'base' (added in DoF CoC pass)
-    // Apply AO to direct light (base + bloom), then add GI after
-    // GI already has visibility from raytracing, so AO shouldn't darken it
-    var color = (saturated + bloom * composite.bloom_strength) * ao;
-    color = color + indirect_light * composite.indirect_light_scale; // Add GI after AO
+    // Apply AO to all lighting (direct + bloom + GI)
+    // AO represents how much ambient light reaches a surface, affecting both direct and indirect
+    var color = (saturated + bloom * composite.bloom_strength + indirect_light * composite.indirect_light_scale) * ao;
     color = color * composite.exposure;
     color = max(color, vec3<f32>(0.0));
 
