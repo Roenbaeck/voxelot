@@ -7,6 +7,8 @@
 //! - LOD support
 //! - Instanced rendering
 
+#![cfg_attr(target_os = "macos", allow(unexpected_cfgs))]
+
 use clap::Parser;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use glam::{Mat4, Vec3};
@@ -21,6 +23,9 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
     window::{Fullscreen, Window, WindowAttributes},
 };
+
+#[cfg(target_os = "macos")]
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
@@ -290,7 +295,7 @@ struct CompositeUniforms {
     ssao_strength: f32,
     ssr_debug: f32,
     indirect_light_scale: f32, // Modulates emissive bounce light by ambient darkness (0=day, 1=night)
-    _padding1: f32,
+    hdr_highlight_compression: f32,
     _padding2: f32,
 }
 
@@ -756,6 +761,8 @@ struct App {
     config: Option<wgpu::SurfaceConfiguration>,
     // Persisted user config containing unified TOML settings (render_scale, window size, etc.)
     user_config: voxelot::Config,
+    /// True when HDR presentation is active (platform + config + swapchain format support).
+    hdr_active: bool,
     render_pipeline: Option<wgpu::RenderPipeline>,
     mesh_pipeline: Option<wgpu::RenderPipeline>,
     shadow_pipeline: Option<wgpu::RenderPipeline>,
@@ -1448,6 +1455,7 @@ impl App {
             queue: None,
             config: None,
             user_config: cfg.clone(),
+            hdr_active: false,
             render_pipeline: None,
             mesh_pipeline: None,
             shadow_pipeline: None,
@@ -2000,6 +2008,12 @@ impl App {
             0.5 + 0.5 * smoothstep(0.80, 1.0, t)
         };
 
+        let hdr_exposure_boost = if self.hdr_active {
+            self.user_config.rendering.macos_hdr_exposure_boost
+        } else {
+            1.0
+        };
+
         CompositeUniforms {
             bloom_strength: if self.bloom_enabled && self.bloom_settings.kawase_enabled {
                 self.bloom_settings.bloom_strength
@@ -2007,13 +2021,13 @@ impl App {
                 0.0
             },
             saturation_boost: self.bloom_settings.saturation_boost,
-            exposure: self.bloom_settings.exposure,
+            exposure: self.bloom_settings.exposure * hdr_exposure_boost,
             ssao_enabled: if self.ssao_enabled { 1.0 } else { 0.0 },
             ssao_debug: if self.ssao_debug { 1.0 } else { 0.0 },
             ssao_strength: self.ssao_settings.strength,
             ssr_debug: if self.ssr_debug { 1.0 } else { 0.0 },
             indirect_light_scale,
-            _padding1: 0.0,
+            hdr_highlight_compression: if self.hdr_active { 1.0 } else { 0.0 },
             _padding2: 0.0,
         }
     }
@@ -4966,6 +4980,82 @@ impl App {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[allow(unexpected_cfgs)]
+    unsafe fn configure_macos_hdr_layer(
+        window: &Window,
+        enable_hdr: bool,
+        colorspace: voxelot::config::MacosHdrColorspace,
+    ) {
+        use libc::c_void;
+        use objc::{msg_send, sel, sel_impl};
+        use objc::runtime::{Object, BOOL, NO, YES};
+
+        // CoreGraphics color space helpers (no extra crates).
+        #[link(name = "CoreGraphics", kind = "framework")]
+        extern "C" {
+            static kCGColorSpaceExtendedLinearDisplayP3: *const c_void;
+            static kCGColorSpaceExtendedLinearSRGB: *const c_void;
+            fn CGColorSpaceCreateWithName(name: *const c_void) -> *mut c_void;
+            fn CGColorSpaceRelease(space: *mut c_void);
+        }
+
+        let ns_view_ptr = match window.window_handle().ok().map(|h| h.as_raw()) {
+            Some(RawWindowHandle::AppKit(handle)) => handle.ns_view.as_ptr(),
+            _ => return,
+        };
+
+        let ns_view = ns_view_ptr as *mut Object;
+        if ns_view.is_null() {
+            return;
+        }
+
+        // Ensure the view is layer-backed.
+        let wants_layer: BOOL = msg_send![ns_view, wantsLayer];
+        if wants_layer == NO {
+            let _: () = msg_send![ns_view, setWantsLayer: YES];
+        }
+
+        // Fetch the backing layer. wgpu uses a CAMetalLayer-backed view on macOS.
+        let layer: *mut Object = msg_send![ns_view, layer];
+        if layer.is_null() {
+            return;
+        }
+
+        if enable_hdr {
+            // Enable Extended Dynamic Range if supported.
+            let supports_edr: BOOL =
+                msg_send![layer, respondsToSelector: sel!(setWantsExtendedDynamicRangeContent:)];
+            if supports_edr != NO {
+                let _: () = msg_send![layer, setWantsExtendedDynamicRangeContent: YES];
+            }
+
+            // Prefer an extended linear wide-gamut color space when supported.
+            let supports_colorspace: BOOL =
+                msg_send![layer, respondsToSelector: sel!(setColorspace:)];
+            if supports_colorspace != NO {
+                // IMPORTANT: Our renderer outputs linear RGB values assuming sRGB primaries.
+                // Advertising Display P3 without converting the output will shift hues (e.g. sun tint).
+                // Default to extended-linear sRGB unless the user opts into Display P3.
+                let want_p3 = matches!(
+                    colorspace,
+                    voxelot::config::MacosHdrColorspace::ExtendedLinearDisplayP3
+                );
+                let cs_name = if want_p3 {
+                    kCGColorSpaceExtendedLinearDisplayP3
+                } else {
+                    kCGColorSpaceExtendedLinearSRGB
+                };
+
+                let cs = CGColorSpaceCreateWithName(cs_name);
+                if !cs.is_null() {
+                    let _: () = msg_send![layer, setColorspace: cs];
+                    CGColorSpaceRelease(cs);
+                }
+            }
+        }
+    }
+
     async fn init_wgpu(&mut self, window: Arc<Window>) {
         let size = window.inner_size();
         let scale = window.scale_factor() as f32;
@@ -5008,12 +5098,53 @@ impl App {
 
         // Configure surface
         let surface_caps = surface.get_capabilities(&adapter);
-        let surface_format = surface_caps
-            .formats
-            .iter()
-            .find(|f| f.is_srgb())
-            .copied()
-            .unwrap_or(surface_caps.formats[0]);
+        let surface_format = {
+            #[cfg(target_os = "macos")]
+            {
+                // Allow forcing SDR for easy A/B comparison.
+                let want_hdr = self.user_config.rendering.macos_hdr;
+                if want_hdr && surface_caps.formats.contains(&wgpu::TextureFormat::Rgba16Float) {
+                    wgpu::TextureFormat::Rgba16Float
+                } else {
+                    surface_caps
+                        .formats
+                        .iter()
+                        .find(|f| f.is_srgb())
+                        .copied()
+                        .unwrap_or(surface_caps.formats[0])
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                surface_caps
+                    .formats
+                    .iter()
+                    .find(|f| f.is_srgb())
+                    .copied()
+                    .unwrap_or(surface_caps.formats[0])
+            }
+        };
+
+        self.hdr_active = cfg!(target_os = "macos")
+            && self.user_config.rendering.macos_hdr
+            && surface_format == wgpu::TextureFormat::Rgba16Float;
+
+        viewer_debug!(
+            "Surface formats: {:?} => selected {:?}",
+            surface_caps.formats,
+            surface_format
+        );
+
+        // macOS HDR/EDR is controlled by the underlying CAMetalLayer.
+        // Configure it after choosing the swapchain format (HDR requires a float surface).
+        #[cfg(target_os = "macos")]
+        unsafe {
+            Self::configure_macos_hdr_layer(
+                window.as_ref(),
+                self.hdr_active,
+                self.user_config.rendering.macos_hdr_colorspace,
+            );
+        }
 
         // Prefer low-latency present modes when available. `Mailbox` is ideal
         // (low latency + no tearing) but not available on all platforms/drivers.

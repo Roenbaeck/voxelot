@@ -8,9 +8,23 @@ struct CompositeUniforms {
     ssao_strength: f32,
     ssr_debug: f32,
     indirect_light_scale: f32, // Modulates emissive bounce light by ambient darkness (0=day, 1=night)
-    _pad1: f32,
+    hdr_highlight_compression: f32,
     _pad2: f32,
 };
+
+fn compress_highlights_hdr(color: vec3<f32>) -> vec3<f32> {
+    // Preserve values in [0..1] and apply a soft shoulder above 1.0.
+    // This keeps HDR headroom (values can still exceed 1.0) while preventing
+    // extreme highlights from turning into a veiling-glare look.
+    let x = max(color, vec3<f32>(0.0));
+    let base = min(x, vec3<f32>(1.0));
+    let hi = max(x - vec3<f32>(1.0), vec3<f32>(0.0));
+    // Soft-shoulder highlights without crushing them.
+    // With max_hi = 16, output can still reach ~17 in extreme cases (base + max_hi).
+    let max_hi = vec3<f32>(16.0);
+    let hi_comp = (hi * max_hi) / (max_hi + hi);
+    return base + hi_comp;
+}
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -78,6 +92,10 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     var color = (saturated + bloom * composite.bloom_strength + indirect_light * composite.indirect_light_scale) * ao;
     color = color * composite.exposure;
     color = max(color, vec3<f32>(0.0));
+
+    if (composite.hdr_highlight_compression > 0.5) {
+        color = compress_highlights_hdr(color);
+    }
 
     return vec4<f32>(color, 1.0);
 }

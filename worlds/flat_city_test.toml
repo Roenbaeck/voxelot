@@ -17,10 +17,13 @@ far_plane = 7000.0
 camera_speed_multiplier = 5.9604645
 window_width = 1280
 window_height = 720
+macos_hdr = true
+macos_hdr_exposure_boost = 1.0
+macos_hdr_colorspace = "extended_linear_srgb"
 
 [atmosphere]
 fog_density = 0.00019999995
-time_of_day = 0.0
+time_of_day = 0.45210788
 time_paused = true
 night_skybox_brightness = 0.02
 horizon_fade_up = 0.05

@@ -4,6 +4,15 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MacosHdrColorspace {
+    /// Extended linear sRGB (matches typical linear rendering pipelines).
+    ExtendedLinearSrgb,
+    /// Extended linear Display P3 (wide gamut; requires rendering pipeline to be in P3 to avoid hue shifts).
+    ExtendedLinearDisplayP3,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -51,6 +60,21 @@ pub struct RenderingConfig {
     pub window_width: u32,
     #[serde(default = "default_window_height")]
     pub window_height: u32,
+
+    /// Enable HDR presentation on macOS (EDR + extended linear Display P3) when supported.
+    /// If disabled, the viewer will prefer an sRGB swapchain format.
+    #[serde(default = "default_macos_hdr")]
+    pub macos_hdr: bool,
+
+    /// Multiplier applied to final exposure when macOS HDR presentation is active.
+    /// Useful because HDR presentation may look perceptually darker than SDR.
+    #[serde(default = "default_macos_hdr_exposure_boost")]
+    pub macos_hdr_exposure_boost: f32,
+
+    /// Which colorspace the macOS CAMetalLayer should advertise when HDR is active.
+    /// If your renderer outputs linear sRGB values, prefer `extended_linear_srgb` to avoid hue shifts.
+    #[serde(default = "default_macos_hdr_colorspace")]
+    pub macos_hdr_colorspace: MacosHdrColorspace,
 }
 
 fn default_window_width() -> u32 {
@@ -59,6 +83,18 @@ fn default_window_width() -> u32 {
 
 fn default_window_height() -> u32 {
     720
+}
+
+fn default_macos_hdr() -> bool {
+    true
+}
+
+fn default_macos_hdr_exposure_boost() -> f32 {
+    1.0
+}
+
+fn default_macos_hdr_colorspace() -> MacosHdrColorspace {
+    MacosHdrColorspace::ExtendedLinearSrgb
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -575,6 +611,9 @@ impl Default for RenderingConfig {
             camera_speed_multiplier: default_camera_speed(),
             window_width: default_window_width(),
             window_height: default_window_height(),
+            macos_hdr: default_macos_hdr(),
+            macos_hdr_exposure_boost: default_macos_hdr_exposure_boost(),
+            macos_hdr_colorspace: default_macos_hdr_colorspace(),
         }
     }
 }
