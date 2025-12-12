@@ -295,7 +295,7 @@ struct CompositeUniforms {
     ssao_strength: f32,
     ssr_debug: f32,
     indirect_light_scale: f32, // Modulates emissive bounce light by ambient darkness (0=day, 1=night)
-    _padding1: f32,
+    hdr_highlight_compression: f32,
     _padding2: f32,
 }
 
@@ -761,6 +761,8 @@ struct App {
     config: Option<wgpu::SurfaceConfiguration>,
     // Persisted user config containing unified TOML settings (render_scale, window size, etc.)
     user_config: voxelot::Config,
+    /// True when HDR presentation is active (platform + config + swapchain format support).
+    hdr_active: bool,
     render_pipeline: Option<wgpu::RenderPipeline>,
     mesh_pipeline: Option<wgpu::RenderPipeline>,
     shadow_pipeline: Option<wgpu::RenderPipeline>,
@@ -1453,6 +1455,7 @@ impl App {
             queue: None,
             config: None,
             user_config: cfg.clone(),
+            hdr_active: false,
             render_pipeline: None,
             mesh_pipeline: None,
             shadow_pipeline: None,
@@ -2005,6 +2008,12 @@ impl App {
             0.5 + 0.5 * smoothstep(0.80, 1.0, t)
         };
 
+        let hdr_exposure_boost = if self.hdr_active {
+            self.user_config.rendering.macos_hdr_exposure_boost
+        } else {
+            1.0
+        };
+
         CompositeUniforms {
             bloom_strength: if self.bloom_enabled && self.bloom_settings.kawase_enabled {
                 self.bloom_settings.bloom_strength
@@ -2012,13 +2021,13 @@ impl App {
                 0.0
             },
             saturation_boost: self.bloom_settings.saturation_boost,
-            exposure: self.bloom_settings.exposure,
+            exposure: self.bloom_settings.exposure * hdr_exposure_boost,
             ssao_enabled: if self.ssao_enabled { 1.0 } else { 0.0 },
             ssao_debug: if self.ssao_debug { 1.0 } else { 0.0 },
             ssao_strength: self.ssao_settings.strength,
             ssr_debug: if self.ssr_debug { 1.0 } else { 0.0 },
             indirect_light_scale,
-            _padding1: 0.0,
+            hdr_highlight_compression: if self.hdr_active { 1.0 } else { 0.0 },
             _padding2: 0.0,
         }
     }
@@ -4973,7 +4982,11 @@ impl App {
 
     #[cfg(target_os = "macos")]
     #[allow(unexpected_cfgs)]
-    unsafe fn configure_macos_hdr_layer(window: &Window, enable_hdr: bool) {
+    unsafe fn configure_macos_hdr_layer(
+        window: &Window,
+        enable_hdr: bool,
+        colorspace: voxelot::config::MacosHdrColorspace,
+    ) {
         use libc::c_void;
         use objc::{msg_send, sel, sel_impl};
         use objc::runtime::{Object, BOOL, NO, YES};
@@ -4982,6 +4995,7 @@ impl App {
         #[link(name = "CoreGraphics", kind = "framework")]
         extern "C" {
             static kCGColorSpaceExtendedLinearDisplayP3: *const c_void;
+            static kCGColorSpaceExtendedLinearSRGB: *const c_void;
             fn CGColorSpaceCreateWithName(name: *const c_void) -> *mut c_void;
             fn CGColorSpaceRelease(space: *mut c_void);
         }
@@ -5020,7 +5034,20 @@ impl App {
             let supports_colorspace: BOOL =
                 msg_send![layer, respondsToSelector: sel!(setColorspace:)];
             if supports_colorspace != NO {
-                let cs = CGColorSpaceCreateWithName(kCGColorSpaceExtendedLinearDisplayP3);
+                // IMPORTANT: Our renderer outputs linear RGB values assuming sRGB primaries.
+                // Advertising Display P3 without converting the output will shift hues (e.g. sun tint).
+                // Default to extended-linear sRGB unless the user opts into Display P3.
+                let want_p3 = matches!(
+                    colorspace,
+                    voxelot::config::MacosHdrColorspace::ExtendedLinearDisplayP3
+                );
+                let cs_name = if want_p3 {
+                    kCGColorSpaceExtendedLinearDisplayP3
+                } else {
+                    kCGColorSpaceExtendedLinearSRGB
+                };
+
+                let cs = CGColorSpaceCreateWithName(cs_name);
                 if !cs.is_null() {
                     let _: () = msg_send![layer, setColorspace: cs];
                     CGColorSpaceRelease(cs);
@@ -5074,16 +5101,18 @@ impl App {
         let surface_format = {
             #[cfg(target_os = "macos")]
             {
-                // Prefer an HDR-capable swapchain format when the platform exposes one.
-                // Otherwise preserve the existing sRGB preference.
-                let preferred = [
-                    wgpu::TextureFormat::Rgba16Float,
-                    wgpu::TextureFormat::Bgra8UnormSrgb,
-                ];
-                preferred
-                    .into_iter()
-                    .find(|f| surface_caps.formats.contains(f))
-                    .unwrap_or(surface_caps.formats[0])
+                // Allow forcing SDR for easy A/B comparison.
+                let want_hdr = self.user_config.rendering.macos_hdr;
+                if want_hdr && surface_caps.formats.contains(&wgpu::TextureFormat::Rgba16Float) {
+                    wgpu::TextureFormat::Rgba16Float
+                } else {
+                    surface_caps
+                        .formats
+                        .iter()
+                        .find(|f| f.is_srgb())
+                        .copied()
+                        .unwrap_or(surface_caps.formats[0])
+                }
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -5095,6 +5124,10 @@ impl App {
                     .unwrap_or(surface_caps.formats[0])
             }
         };
+
+        self.hdr_active = cfg!(target_os = "macos")
+            && self.user_config.rendering.macos_hdr
+            && surface_format == wgpu::TextureFormat::Rgba16Float;
 
         viewer_debug!(
             "Surface formats: {:?} => selected {:?}",
@@ -5108,7 +5141,8 @@ impl App {
         unsafe {
             Self::configure_macos_hdr_layer(
                 window.as_ref(),
-                surface_format == wgpu::TextureFormat::Rgba16Float,
+                self.hdr_active,
+                self.user_config.rendering.macos_hdr_colorspace,
             );
         }
 

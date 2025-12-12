@@ -86,6 +86,24 @@ Each entry shows the default value (as found in `src/config.rs`), a short descri
   - Used: `src/bin/voxelot.rs` (Window creation / resume), saves and updates runtime.
   - Effect of change: Sets the initial window size.
 
+- `rendering.macos_hdr` (bool)
+  - Default: `true`
+  - Description: Enables HDR presentation on macOS (EDR + extended linear Display P3) when supported.
+  - Used: `src/bin/voxelot.rs` (swapchain format selection + CAMetalLayer configuration)
+  - Effect of change: Set to `false` to force SDR output on macOS for A/B comparison.
+
+- `rendering.macos_hdr_exposure_boost` (float)
+  - Default: `1.0`
+  - Description: Multiplies the final exposure only when HDR presentation is active on macOS.
+  - Used: `src/bin/voxelot.rs` (final composite uniforms)
+  - Effect of change: Increase (e.g., `1.2`–`1.6`) if HDR output looks perceptually too dim.
+
+- `rendering.macos_hdr_colorspace` (string)
+  - Default: `"extended_linear_srgb"`
+  - Description: Sets the colorspace that the macOS Metal layer advertises when HDR is active.
+  - Used: `src/bin/voxelot.rs` (CAMetalLayer colorspace)
+  - Effect of change: Use `"extended_linear_srgb"` to keep hues consistent with a linear-sRGB renderer. Use `"extended_linear_display_p3"` only if you also convert your output to Display P3.
+
 ---
 
 ## Atmosphere
