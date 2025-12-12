@@ -7,6 +7,8 @@
 //! - LOD support
 //! - Instanced rendering
 
+#![cfg_attr(target_os = "macos", allow(unexpected_cfgs))]
+
 use clap::Parser;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use glam::{Mat4, Vec3};
@@ -21,6 +23,9 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
     window::{Fullscreen, Window, WindowAttributes},
 };
+
+#[cfg(target_os = "macos")]
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
@@ -4966,6 +4971,64 @@ impl App {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[allow(unexpected_cfgs)]
+    unsafe fn configure_macos_hdr_layer(window: &Window, enable_hdr: bool) {
+        use libc::c_void;
+        use objc::{msg_send, sel, sel_impl};
+        use objc::runtime::{Object, BOOL, NO, YES};
+
+        // CoreGraphics color space helpers (no extra crates).
+        #[link(name = "CoreGraphics", kind = "framework")]
+        extern "C" {
+            static kCGColorSpaceExtendedLinearDisplayP3: *const c_void;
+            fn CGColorSpaceCreateWithName(name: *const c_void) -> *mut c_void;
+            fn CGColorSpaceRelease(space: *mut c_void);
+        }
+
+        let ns_view_ptr = match window.window_handle().ok().map(|h| h.as_raw()) {
+            Some(RawWindowHandle::AppKit(handle)) => handle.ns_view.as_ptr(),
+            _ => return,
+        };
+
+        let ns_view = ns_view_ptr as *mut Object;
+        if ns_view.is_null() {
+            return;
+        }
+
+        // Ensure the view is layer-backed.
+        let wants_layer: BOOL = msg_send![ns_view, wantsLayer];
+        if wants_layer == NO {
+            let _: () = msg_send![ns_view, setWantsLayer: YES];
+        }
+
+        // Fetch the backing layer. wgpu uses a CAMetalLayer-backed view on macOS.
+        let layer: *mut Object = msg_send![ns_view, layer];
+        if layer.is_null() {
+            return;
+        }
+
+        if enable_hdr {
+            // Enable Extended Dynamic Range if supported.
+            let supports_edr: BOOL =
+                msg_send![layer, respondsToSelector: sel!(setWantsExtendedDynamicRangeContent:)];
+            if supports_edr != NO {
+                let _: () = msg_send![layer, setWantsExtendedDynamicRangeContent: YES];
+            }
+
+            // Prefer an extended linear wide-gamut color space when supported.
+            let supports_colorspace: BOOL =
+                msg_send![layer, respondsToSelector: sel!(setColorspace:)];
+            if supports_colorspace != NO {
+                let cs = CGColorSpaceCreateWithName(kCGColorSpaceExtendedLinearDisplayP3);
+                if !cs.is_null() {
+                    let _: () = msg_send![layer, setColorspace: cs];
+                    CGColorSpaceRelease(cs);
+                }
+            }
+        }
+    }
+
     async fn init_wgpu(&mut self, window: Arc<Window>) {
         let size = window.inner_size();
         let scale = window.scale_factor() as f32;
@@ -5008,12 +5071,46 @@ impl App {
 
         // Configure surface
         let surface_caps = surface.get_capabilities(&adapter);
-        let surface_format = surface_caps
-            .formats
-            .iter()
-            .find(|f| f.is_srgb())
-            .copied()
-            .unwrap_or(surface_caps.formats[0]);
+        let surface_format = {
+            #[cfg(target_os = "macos")]
+            {
+                // Prefer an HDR-capable swapchain format when the platform exposes one.
+                // Otherwise preserve the existing sRGB preference.
+                let preferred = [
+                    wgpu::TextureFormat::Rgba16Float,
+                    wgpu::TextureFormat::Bgra8UnormSrgb,
+                ];
+                preferred
+                    .into_iter()
+                    .find(|f| surface_caps.formats.contains(f))
+                    .unwrap_or(surface_caps.formats[0])
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                surface_caps
+                    .formats
+                    .iter()
+                    .find(|f| f.is_srgb())
+                    .copied()
+                    .unwrap_or(surface_caps.formats[0])
+            }
+        };
+
+        viewer_debug!(
+            "Surface formats: {:?} => selected {:?}",
+            surface_caps.formats,
+            surface_format
+        );
+
+        // macOS HDR/EDR is controlled by the underlying CAMetalLayer.
+        // Configure it after choosing the swapchain format (HDR requires a float surface).
+        #[cfg(target_os = "macos")]
+        unsafe {
+            Self::configure_macos_hdr_layer(
+                window.as_ref(),
+                surface_format == wgpu::TextureFormat::Rgba16Float,
+            );
+        }
 
         // Prefer low-latency present modes when available. `Mailbox` is ideal
         // (low latency + no tearing) but not available on all platforms/drivers.
