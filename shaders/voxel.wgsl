@@ -274,43 +274,37 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
         // Calculate fade factor: 0 at surface, 1 at max visibility depth
         let underwater_fade = smoothstep(0.0, water_vis, underwater_depth);
         
-        // Multi-frequency noise for organic water-like diffusion
-        // Layer multiple noise octaves to create softer, more natural underwater appearance
-        let noise_pos1 = input.world_pos * 7.3 + vec3<f32>(relative_pos.x * 0.1, relative_pos.y * 0.1, relative_pos.z * 0.1);
-        let noise_pos2 = input.world_pos * 3.7 + vec3<f32>(relative_pos.x * 0.05, relative_pos.y * 0.05, relative_pos.z * 0.05);
-        let noise_pos3 = input.world_pos * 13.9 + vec3<f32>(relative_pos.x * 0.15, relative_pos.y * 0.15, relative_pos.z * 0.15);
-        
-        let hash1 = fract(sin(dot(floor(noise_pos1), vec3<f32>(127.1, 311.7, 74.7))) * 43758.5453);
-        let hash2 = fract(sin(dot(floor(noise_pos2), vec3<f32>(269.5, 183.3, 421.9))) * 43758.5453);
-        let hash3 = fract(sin(dot(floor(noise_pos3), vec3<f32>(419.2, 371.9, 168.4))) * 43758.5453);
-        
-        // Use primary hash for dithering, but modulate the fade threshold with secondary noise
-        // This adds organic variation without biasing the statistical distribution
-        let detail_variation = (hash2 - 0.5) * 0.15 + (hash3 - 0.5) * 0.08; // Range: ~[-0.115, +0.115]
-        let modulated_fade = underwater_fade + detail_variation;
-        
-        // Use dithering to discard pixels as they get deeper
-        if (modulated_fade > hash1) {
-            discard;
-        }
-        
         // Alpha fade using Beer-Lambert exponential decay (how light behaves in water)
         // exp(-k*d) where k controls absorption rate, d is depth
-        // At depth = water_vis, we want alpha to be near 0
-        // exp(-3) ≈ 0.05, so k = 3/water_vis gives ~5% visibility at max depth
-        let absorption_coefficient = 3.0 / water_vis;
+        // Very aggressive absorption to limit visibility depth
+        let absorption_coefficient = 12.0 / max(water_vis, 1.0);
         underwater_alpha = exp(-absorption_coefficient * underwater_depth);
         
-        // Also tint remaining pixels toward a darker blue-green for underwater atmosphere
-        let water_tint = vec3<f32>(0.1, 0.3, 0.4);
-        brightened = mix(brightened, water_tint * ambient, underwater_fade * 0.7);
+        // Force objects beyond half visibility to be nearly invisible
+        if (underwater_depth > water_vis * 0.5) {
+            underwater_alpha = underwater_alpha * 0.1;
+        }
+        
+        // Darken based on depth to simulate light absorption
+        let depth_darkness = exp(-3.5 * underwater_depth / max(water_vis, 1.0));
+        brightened = brightened * depth_darkness;
+        
+        // Fade to water color (deep water color) as objects get deeper
+        // This works even without alpha blending by making objects blend into water
+        let deep_water_color = vec3<f32>(0.02, 0.12, 0.20) * ambient;
+        // More aggressive fade curve - objects become water color quickly
+        let color_fade = pow(underwater_fade, 0.6); // Power < 1 makes fade faster
+        brightened = mix(brightened, deep_water_color, color_fade);
     }
     
     // Add gradual alpha fading for smoother transitions
     // Alpha fades 60-95% while dithering operates 80-95% on semi-transparent fragments
     let alpha_fade_start = uniforms.lod_distance * 0.60;
     let alpha_fade_end = uniforms.lod_distance * 0.95;
-    let alpha = (1.0 - smoothstep(alpha_fade_start, alpha_fade_end, distance)) * underwater_alpha;
+    let lod_alpha = 1.0 - smoothstep(alpha_fade_start, alpha_fade_end, distance);
+    
+    // Apply both LOD fade and underwater fade (multiplicative)
+    let alpha = lod_alpha * underwater_alpha;
 
     var out: FragmentOutput;
     out.color = vec4<f32>(brightened, alpha);
@@ -458,40 +452,37 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
         // Calculate fade factor: 0 at surface, 1 at max visibility depth
         let underwater_fade_mesh = smoothstep(0.0, water_vis_mesh, underwater_depth_mesh);
         
-        // Multi-frequency noise for organic water-like diffusion
-        // Layer multiple noise octaves to create softer, more natural underwater appearance
-        let noise_pos1_mesh = input.world_pos * 7.3 + vec3<f32>(relative_pos.x * 0.1, relative_pos.y * 0.1, relative_pos.z * 0.1);
-        let noise_pos2_mesh = input.world_pos * 3.7 + vec3<f32>(relative_pos.x * 0.05, relative_pos.y * 0.05, relative_pos.z * 0.05);
-        let noise_pos3_mesh = input.world_pos * 13.9 + vec3<f32>(relative_pos.x * 0.15, relative_pos.y * 0.15, relative_pos.z * 0.15);
-        
-        let hash1_mesh = fract(sin(dot(floor(noise_pos1_mesh), vec3<f32>(127.1, 311.7, 74.7))) * 43758.5453);
-        let hash2_mesh = fract(sin(dot(floor(noise_pos2_mesh), vec3<f32>(269.5, 183.3, 421.9))) * 43758.5453);
-        let hash3_mesh = fract(sin(dot(floor(noise_pos3_mesh), vec3<f32>(419.2, 371.9, 168.4))) * 43758.5453);
-        
-        // Use primary hash for dithering, but modulate the fade threshold with secondary noise
-        // This adds organic variation without biasing the statistical distribution
-        let detail_variation_mesh = (hash2_mesh - 0.5) * 0.15 + (hash3_mesh - 0.5) * 0.08; // Range: ~[-0.115, +0.115]
-        let modulated_fade_mesh = underwater_fade_mesh + detail_variation_mesh;
-        
-        // Use dithering to discard pixels as they get deeper
-        if (modulated_fade_mesh > hash1_mesh) {
-            discard;
-        }
-        
         // Alpha fade using Beer-Lambert exponential decay (how light behaves in water)
-        let absorption_coefficient_mesh = 3.0 / water_vis_mesh;
+        // exp(-k*d) where k controls absorption rate, d is depth
+        // Very aggressive absorption to limit visibility depth
+        let absorption_coefficient_mesh = 12.0 / max(water_vis_mesh, 1.0);
         underwater_alpha_mesh = exp(-absorption_coefficient_mesh * underwater_depth_mesh);
         
-        // Also tint remaining pixels toward a darker blue-green for underwater atmosphere
-        let water_tint_mesh = vec3<f32>(0.1, 0.3, 0.4);
-        brightened = mix(brightened, water_tint_mesh * ambient, underwater_fade_mesh * 0.7);
+        // Force objects beyond half visibility to be nearly invisible
+        if (underwater_depth_mesh > water_vis_mesh * 0.5) {
+            underwater_alpha_mesh = underwater_alpha_mesh * 0.1;
+        }
+        
+        // Darken based on depth to simulate light absorption
+        let depth_darkness_mesh = exp(-3.5 * underwater_depth_mesh / max(water_vis_mesh, 1.0));
+        brightened = brightened * depth_darkness_mesh;
+        
+        // Fade to water color (deep water color) as objects get deeper
+        // This works even without alpha blending by making objects blend into water
+        let deep_water_color_mesh = vec3<f32>(0.02, 0.12, 0.20) * ambient;
+        // More aggressive fade curve - objects become water color quickly
+        let color_fade_mesh = pow(underwater_fade_mesh, 0.6); // Power < 1 makes fade faster
+        brightened = mix(brightened, deep_water_color_mesh, color_fade_mesh);
     }
     
     // Add gradual alpha fading for smoother transitions
     // Alpha fades 60-95% while dithering operates 80-95% on semi-transparent fragments
     let alpha_fade_start = uniforms.lod_distance * 0.60;
     let alpha_fade_end = uniforms.lod_distance * 0.95;
-    let alpha = (1.0 - smoothstep(alpha_fade_start, alpha_fade_end, distance)) * underwater_alpha_mesh;
+    let lod_alpha_mesh = 1.0 - smoothstep(alpha_fade_start, alpha_fade_end, distance);
+    
+    // Apply both LOD fade and underwater fade (multiplicative)
+    let alpha = lod_alpha_mesh * underwater_alpha_mesh;
     
     var out: FragmentOutput;
     out.color = vec4<f32>(brightened, alpha);

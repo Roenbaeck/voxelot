@@ -8,8 +8,8 @@ struct SsaoUniforms {
     gi_indirect_scale: f32,
     gi_fade_distance: f32,
     gi_fade_range: f32,
-    _pad0: f32,
-    _pad1: f32,
+    water_level: f32,
+    water_visibility: f32,
     _pad2: f32,
     inverse_projection: mat4x4<f32>,
     inverse_view: mat4x4<f32>,
@@ -330,7 +330,21 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     
     // Sample GI from probes
     // Scale factor is configurable (gi_indirect_scale in config.toml)
-    let indirect_light = sample_grid_irradiance(world_pos, world_normal, camera_pos) * ssao.gi_indirect_scale;
+    var indirect_light = sample_grid_irradiance(world_pos, world_normal, camera_pos) * ssao.gi_indirect_scale;
+    
+    // Fade AO and GI for underwater surfaces to prevent them being visible through water
+    let underwater_depth = ssao.water_level - world_pos.y;
+    if (underwater_depth > 0.0 && ssao.water_visibility > 0.0) {
+        // Aggressive fade: at max visibility depth, AO becomes 1.0 (no occlusion) and GI becomes 0
+        let fade_factor = clamp(underwater_depth / ssao.water_visibility, 0.0, 1.0);
+        let fade_curve = pow(fade_factor, 0.5); // Faster fade
+        
+        // Fade AO to 1.0 (no darkening) underwater
+        visibility = mix(visibility, 1.0, fade_curve);
+        
+        // Fade GI to zero underwater
+        indirect_light = indirect_light * (1.0 - fade_curve);
+    }
     
     return vec4<f32>(indirect_light, visibility);
 }
