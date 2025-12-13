@@ -1128,6 +1128,10 @@ struct App {
     gpu_timing_accum_gpu_cull_ms: f64,
     gpu_timing_accum_ssr_ms: f64,
     gpu_timing_accum_water_ms: f64,
+    gpu_timing_accum_dof_ms: f64,
+    gpu_timing_accum_kawase_ms: f64,
+    gpu_timing_accum_bloom_ms: f64,
+    gpu_timing_accum_post_ms: f64,
     gpu_timing_accum_frames: u32,
     gpu_timing_print_interval_frames: u32,
 }
@@ -1645,6 +1649,10 @@ impl App {
             gpu_timing_accum_gpu_cull_ms: 0.0,
             gpu_timing_accum_ssr_ms: 0.0,
             gpu_timing_accum_water_ms: 0.0,
+            gpu_timing_accum_dof_ms: 0.0,
+            gpu_timing_accum_kawase_ms: 0.0,
+            gpu_timing_accum_bloom_ms: 0.0,
+            gpu_timing_accum_post_ms: 0.0,
             gpu_timing_accum_frames: 0,
             gpu_timing_print_interval_frames: 120,
             dof_coc_pipeline: None,
@@ -4869,8 +4877,8 @@ impl App {
                 // Resolve the full set at end of frame and copy into staging readback buffer
                 if !self.query_readback_in_flight {
                     log::debug!("performing resolve+copy into readback buffer");
-                    encoder.resolve_query_set(qs, 0..12, resolve_buf, 0);
-                    let total_bytes = (12u64) * 8u64;
+                    encoder.resolve_query_set(qs, 0..20, resolve_buf, 0);
+                    let total_bytes = (20u64) * 8u64;
                     encoder.copy_buffer_to_buffer(resolve_buf, 0, readback_buf, 0, total_bytes);
                 } else {
                     log::debug!("skipping resolve+copy: previous readback still in flight");
@@ -9233,6 +9241,11 @@ impl App {
                 let blur_strength = self.dof_settings.blur_strength;
                 let gpu_uniforms = self.pack_dof_uniforms(blur_strength);
                 queue.write_buffer(dof_buffer, 0, bytemuck::cast_slice(&gpu_uniforms));
+                let post_ts = self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
+                    query_set: qs,
+                    beginning_of_pass_write_index: Some(4),
+                    end_of_pass_write_index: None,
+                });
                 let mut post_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("DoF CoC Copy Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -9245,7 +9258,7 @@ impl App {
                         depth_slice: None,
                     })],
                     depth_stencil_attachment: None,
-                    timestamp_writes: None,
+                    timestamp_writes: post_ts,
                     occlusion_query_set: None,
                 });
                 post_pass.set_pipeline(dof_coc_pipeline);
@@ -9313,7 +9326,7 @@ impl App {
                                     depth_slice: None,
                                 })],
                                 depth_stencil_attachment: None,
-                                timestamp_writes: None,
+                                timestamp_writes: if level == 0 { self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites { query_set: qs, beginning_of_pass_write_index: Some(14), end_of_pass_write_index: None }) } else { None },
                                 occlusion_query_set: None,
                             });
                             pass.set_pipeline(kawase_down_pipeline);
@@ -9372,7 +9385,7 @@ impl App {
                                         depth_slice: None,
                                     })],
                                     depth_stencil_attachment: None,
-                                    timestamp_writes: None,
+                                    timestamp_writes: if level_rev == 0 { self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites { query_set: qs, beginning_of_pass_write_index: None, end_of_pass_write_index: Some(15) }) } else { None },
                                     occlusion_query_set: None,
                                 });
                             up_pass.set_pipeline(kawase_up_pipeline);
@@ -9398,6 +9411,11 @@ impl App {
                 self.dof_combine_bind_group.as_ref(),
                 self.post_color_view.as_ref(),
             ) {
+                let combine_ts = self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
+                    query_set: qs,
+                    beginning_of_pass_write_index: None,
+                    end_of_pass_write_index: Some(5),
+                });
                 let mut combine_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("DoF Combine Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -9410,7 +9428,7 @@ impl App {
                         depth_slice: None,
                     })],
                     depth_stencil_attachment: None,
-                    timestamp_writes: None,
+                    timestamp_writes: combine_ts,
                     occlusion_query_set: None,
                 });
                 combine_pass.set_pipeline(dof_combine_pipeline);
@@ -9587,7 +9605,7 @@ impl App {
                                     depth_slice: None,
                                 })],
                                 depth_stencil_attachment: None,
-                                timestamp_writes: None,
+                                timestamp_writes: if level == 0 || level == (iterations - 1) { self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites { query_set: qs, beginning_of_pass_write_index: if level == 0 { Some(16) } else { None }, end_of_pass_write_index: if level == (iterations - 1) { Some(17) } else { None } }) } else { None },
                                 occlusion_query_set: None,
                             });
                             pass.set_pipeline(kawase_down_pipeline);
@@ -9670,6 +9688,11 @@ impl App {
             self.composite_pipeline.as_ref(),
             self.composite_bind_group.as_ref(),
         ) {
+            let composite_ts = self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
+                query_set: qs,
+                beginning_of_pass_write_index: Some(18),
+                end_of_pass_write_index: Some(19),
+            });
             let mut composite_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Composite Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -9682,7 +9705,7 @@ impl App {
                     depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: composite_ts,
                 occlusion_query_set: None,
             });
             composite_pass.set_pipeline(composite_pipeline);
@@ -10003,14 +10026,12 @@ impl App {
         #[cfg(feature = "gpu-profiling")]
         {
             if let Some(readback_buf) = self.query_readback_buffer.as_ref() {
-                let slice = readback_buf.slice(..((12 * 8) as u64));
+                let slice = readback_buf.slice(..((20 * 8) as u64));
                 if !self.query_readback_in_flight {
                         if let Some(tx) = &self.query_readback_notifier_tx {
-                        log::debug!("requesting readback map_async for frame={} (non-blocking)", self.frame_count);
+                        // Requesting readback for this frame (map_async non-blocking)
                         let tx = tx.clone();
-                        let map_frame = self.frame_count;
                         slice.map_async(wgpu::MapMode::Read, move |_res| {
-                            log::debug!("map_async completion callback fired for frame={}", map_frame);
                             tx.send(()).ok();
                         });
                         self.query_readback_in_flight = true;
@@ -10021,63 +10042,89 @@ impl App {
                 // Try non-blocking check for readback notification and process mapped data if ready
                 if let Some(rx) = &self.query_readback_notifier_rx {
                     if let Ok(()) = rx.try_recv() {
-                        log::debug!("readback notifier received for frame={} (processing mapped buffer)", self.frame_count);
+                        // readback notifier received; processing mapped buffer now
                         let data = slice.get_mapped_range();
-                        let mut stamps: Vec<u64> = Vec::with_capacity(12);
-                        for i in 0..12 {
+                        let mut stamps: Vec<u64> = Vec::with_capacity(20);
+                        for i in 0..20 {
                             let start = (i * 8) as usize;
                             let mut b = [0u8; 8];
                             b.copy_from_slice(&data[start..start + 8]);
                             stamps.push(u64::from_le_bytes(b));
                         }
+                        // Raw stamp values intentionally omitted from normal logs
                         drop(data);
                         readback_buf.unmap();
                         self.query_readback_in_flight = false;
 
                         let period_ns = self.timestamp_period_ns;
                         let gpu_ms = |idx_start: usize, idx_end: usize| -> f64 {
-                            let delta = (stamps[idx_end] - stamps[idx_start]) as f64;
+                            let s = stamps[idx_start];
+                            let e = stamps[idx_end];
+                            if s == 0 || e == 0 || e <= s {
+                                return 0.0;
+                            }
+                            let delta = (e - s) as f64;
                             (delta * period_ns) / 1_000_000.0
                         };
 
                         let scene_ms = gpu_ms(0, 1);
                         let hzb_copy_ms = gpu_ms(2, 3);
+                        let dof_ms = gpu_ms(4, 5);
                         let gpu_cull_ms = gpu_ms(6, 7);
                         let ssr_ms = gpu_ms(8, 9);
                         let water_ms = gpu_ms(10, 11);
+                        let kawase_ms = gpu_ms(14, 15);
+                        let bloom_ms = gpu_ms(16, 17);
+                        let post_ms = gpu_ms(18, 19);
 
                         // Accumulate GPU timings; averaging is printed periodically
                         self.gpu_timing_accum_scene_ms += scene_ms;
                         self.gpu_timing_accum_hzb_copy_ms += hzb_copy_ms;
+                        self.gpu_timing_accum_dof_ms += dof_ms;
                         self.gpu_timing_accum_gpu_cull_ms += gpu_cull_ms;
                         self.gpu_timing_accum_ssr_ms += ssr_ms;
                         self.gpu_timing_accum_water_ms += water_ms;
+                        self.gpu_timing_accum_kawase_ms += kawase_ms;
+                        self.gpu_timing_accum_bloom_ms += bloom_ms;
+                        self.gpu_timing_accum_post_ms += post_ms;
                         self.gpu_timing_accum_frames = self.gpu_timing_accum_frames.saturating_add(1);
 
                         if self.gpu_timing_accum_frames >= self.gpu_timing_print_interval_frames {
                             let frames = self.gpu_timing_accum_frames as f64;
                             let avg_scene = self.gpu_timing_accum_scene_ms / frames;
                             let avg_hzb_copy = self.gpu_timing_accum_hzb_copy_ms / frames;
+                            let avg_dof = self.gpu_timing_accum_dof_ms / frames;
                             let avg_gpu_cull = self.gpu_timing_accum_gpu_cull_ms / frames;
                             let avg_ssr = self.gpu_timing_accum_ssr_ms / frames;
                             let avg_water = self.gpu_timing_accum_water_ms / frames;
+                            let avg_kawase = self.gpu_timing_accum_kawase_ms / frames;
+                            let avg_bloom = self.gpu_timing_accum_bloom_ms / frames;
+                            let avg_post = self.gpu_timing_accum_post_ms / frames;
 
                             log::info!(
-                                "GPU avg timings over {} frames - scene: {:.3}ms, hzb_copy: {:.3}ms, gpu_cull: {:.3}ms, ssr: {:.3}ms, water: {:.3}ms",
+                                "GPU avg timings over {} frames - scene: {:.3}ms, hzb_copy: {:.3}ms, dof: {:.3}ms, gpu_cull: {:.3}ms, ssr: {:.3}ms, water: {:.3}ms, kawase: {:.3}ms, bloom: {:.3}ms, post: {:.3}ms",
                                 self.gpu_timing_accum_frames,
                                 avg_scene,
                                 avg_hzb_copy,
+                                avg_dof,
                                 avg_gpu_cull,
                                 avg_ssr,
-                                avg_water
+                                avg_water,
+                                avg_kawase,
+                                avg_bloom,
+                                avg_post
                             );
 
                             // reset accumulators
                             self.gpu_timing_accum_scene_ms = 0.0;
                             self.gpu_timing_accum_hzb_copy_ms = 0.0;
+                            self.gpu_timing_accum_dof_ms = 0.0;
                             self.gpu_timing_accum_gpu_cull_ms = 0.0;
                             self.gpu_timing_accum_ssr_ms = 0.0;
                             self.gpu_timing_accum_water_ms = 0.0;
+                            self.gpu_timing_accum_kawase_ms = 0.0;
+                            self.gpu_timing_accum_bloom_ms = 0.0;
+                            self.gpu_timing_accum_post_ms = 0.0;
                             self.gpu_timing_accum_frames = 0;
                         }
                     }
