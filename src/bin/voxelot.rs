@@ -831,6 +831,8 @@ struct App {
     mesh_chunk_arc_cache: FxHashMap<(i64, i64, i64), Arc<Chunk>>,
     /// Count of mesh jobs executed per second by worker threads (reset on FPS print)
     mesh_jobs_executed: Arc<AtomicUsize>,
+    // Nanoseconds per GPU timestamp tick (adapter info)
+    timestamp_period_ns: f64,
 
     // Mega-buffer infrastructure
     mega_vertex_buffer: Option<wgpu::Buffer>,
@@ -1112,6 +1114,22 @@ struct App {
     emissive_texture_bytes: u64,
     // Path to loaded config file (user provided or default)
     config_path: String,
+    // Profiling helper (CPU scopes). No-op if compiled without `profiling` feature.
+    profiler: std::sync::Arc<voxelot::profiling::Profiler>,
+    // Optional query set for GPU timestamps + resolve buffer (only enabled when config + adapter supports it)
+    query_set: Option<wgpu::QuerySet>,
+    query_resolve_buffer: Option<wgpu::Buffer>,
+    query_readback_buffer: Option<wgpu::Buffer>,
+    query_readback_notifier_tx: Option<crossbeam_channel::Sender<()>>,
+    query_readback_notifier_rx: Option<crossbeam_channel::Receiver<()>>,
+    query_readback_in_flight: bool,
+    gpu_timing_accum_scene_ms: f64,
+    gpu_timing_accum_hzb_copy_ms: f64,
+    gpu_timing_accum_gpu_cull_ms: f64,
+    gpu_timing_accum_ssr_ms: f64,
+    gpu_timing_accum_water_ms: f64,
+    gpu_timing_accum_frames: u32,
+    gpu_timing_print_interval_frames: u32,
 }
 
 impl App {
@@ -1614,6 +1632,21 @@ impl App {
             emissive_view: None,
             emissive_texture_bytes: 0,
             config_path: config_path.to_string(),
+            profiler: voxelot::profiling::Profiler::new(),
+            timestamp_period_ns: 0.0,
+            query_set: None,
+            query_resolve_buffer: None,
+            query_readback_buffer: None,
+            query_readback_notifier_tx: None,
+            query_readback_notifier_rx: None,
+            query_readback_in_flight: false,
+            gpu_timing_accum_scene_ms: 0.0,
+            gpu_timing_accum_hzb_copy_ms: 0.0,
+            gpu_timing_accum_gpu_cull_ms: 0.0,
+            gpu_timing_accum_ssr_ms: 0.0,
+            gpu_timing_accum_water_ms: 0.0,
+            gpu_timing_accum_frames: 0,
+            gpu_timing_print_interval_frames: 120,
             dof_coc_pipeline: None,
             dof_bind_group_layout: None,
             dof_bind_group: None,
@@ -4756,10 +4789,16 @@ impl App {
                     };
                     queue.write_buffer(params_buf, 0, bytemuck::bytes_of(&params));
 
+                    let ts_writes = self.query_set.as_ref().map(|qs| wgpu::ComputePassTimestampWrites {
+                        query_set: qs,
+                        beginning_of_pass_write_index: Some(2),
+                        end_of_pass_write_index: Some(3),
+                    });
+
                     let mut hzb_copy_pass =
                         encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                             label: Some("HZB Copy Pass"),
-                            timestamp_writes: None,
+                            timestamp_writes: ts_writes,
                         });
                     hzb_copy_pass.set_pipeline(copy_pipeline);
                     hzb_copy_pass.set_bind_group(0, copy_bg, &[]);
@@ -4798,9 +4837,14 @@ impl App {
             }
         }
 
-        let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                let ts_writes = self.query_set.as_ref().map(|qs| wgpu::ComputePassTimestampWrites {
+                    query_set: qs,
+                    beginning_of_pass_write_index: Some(6),
+                    end_of_pass_write_index: Some(7),
+                });
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("GPU Cull Pass"),
-            timestamp_writes: None,
+            timestamp_writes: ts_writes,
         });
         compute_pass.set_pipeline(cull_pipeline);
         compute_pass.set_bind_group(0, cull_bind_group, &[]);
@@ -4813,6 +4857,24 @@ impl App {
         if self.pending_recreate_offscreen {
             self.pending_recreate_offscreen = false;
             self.recreate_offscreen_targets();
+        }
+        // All GPU timestamp queries are resolved at end-of-frame; per-pass resolves removed to avoid alignment constraints.
+        #[cfg(feature = "gpu-profiling")]
+        {
+            if let (Some(qs), Some(resolve_buf), Some(readback_buf)) = (
+                self.query_set.as_ref(),
+                self.query_resolve_buffer.as_ref(),
+                self.query_readback_buffer.as_ref(),
+            ) {
+                // Resolve the full set at end of frame and copy into staging readback buffer
+                if !self.query_readback_in_flight {
+                    encoder.resolve_query_set(qs, 0..12, resolve_buf, 0);
+                    let total_bytes = (12u64) * 8u64;
+                    encoder.copy_buffer_to_buffer(resolve_buf, 0, readback_buf, 0, total_bytes);
+                } else {
+                    log::debug!("skipping resolve+copy: previous readback still in flight");
+                }
+            }
         }
         queue.submit(std::iter::once(encoder.finish()));
     }
@@ -5084,10 +5146,18 @@ impl App {
         limits.max_buffer_size = 1_073_741_824; // 1 GB (up from 256 MB default)
         limits.max_storage_buffer_binding_size = 536_870_912; // 512 MB (up from 128 MB default)
 
+        let mut req_features = wgpu::Features::FLOAT32_FILTERABLE;
+        #[cfg(feature = "gpu-profiling")]
+        {
+            if adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+                req_features |= wgpu::Features::TIMESTAMP_QUERY;
+            }
+        }
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Main Device"),
-                required_features: wgpu::Features::FLOAT32_FILTERABLE,
+                required_features: req_features,
                 required_limits: limits,
                 memory_hints: wgpu::MemoryHints::Performance,
                 experimental_features: Default::default(),
@@ -5095,6 +5165,44 @@ impl App {
             })
             .await
             .unwrap();
+
+        // Capture timestamp period (nanoseconds per timestamp tick) from queue
+        self.timestamp_period_ns = queue.get_timestamp_period() as f64;
+
+        // Create a query set and resolve buffer if GPU profiling is requested and supported
+        #[cfg(feature = "gpu-profiling")]
+        {
+            if device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            // Reserve up to 64 timestamps; adjust as needed
+            let query_count: u32 = 64;
+            let qs = device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("Timestamp QuerySet"),
+                ty: wgpu::QueryType::Timestamp,
+                count: query_count,
+            });
+            // Buffer to resolve query results into (8 bytes per query) - GPU-only buffer
+            let query_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Query Resolve Buffer"),
+                size: (query_count as u64) * 8u64,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            // Staging buffer for reading back resolved queries (MAP_READ + COPY_DST)
+            let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Query Readback Buffer"),
+                size: (query_count as u64) * 8u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            // Create an unbounded notifier for mapping completion events
+            let (tx, rx) = crossbeam_channel::unbounded();
+            self.query_set = Some(qs);
+            self.query_resolve_buffer = Some(query_buffer);
+            self.query_readback_buffer = Some(readback_buffer);
+            self.query_readback_notifier_tx = Some(tx);
+            self.query_readback_notifier_rx = Some(rx);
+            }
+        }
 
         // Configure surface
         let surface_caps = surface.get_capabilities(&adapter);
@@ -6798,14 +6906,19 @@ impl App {
     }
 
     fn render(&mut self) {
+        log::debug!("render() enter frame={}, frame_index={}", self.frame_count, self.frame_index);
         let device = self.device.as_ref().unwrap().clone();
         let queue = self.queue.as_ref().unwrap().clone();
         let config = self.config.as_ref().unwrap().clone();
+
+        let _frame_scope = self.profiler.scope("frame");
+        log::debug!("render: entered profiler frame scope for frame={}", self.frame_count);
 
         // Update camera
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
+        log::debug!("render: camera updated dt={}", dt);
         self.elapsed_time += dt;
         self.frame_index = self.frame_index.wrapping_add(1);
 
@@ -6837,6 +6950,7 @@ impl App {
         self.gpu_buffer_items_frame = 0;
 
         // Gather candidate voxels for GPU culling using CPU hierarchy traversal
+        let _cull_scope = self.profiler.scope("cull_cpu");
         let cull_start = Instant::now();
         let (all_visible, cull_stats, visible_chunks) =
             cull_visible_voxels_parallel(&self.world, &self.camera_controller.camera);
@@ -8817,6 +8931,12 @@ impl App {
             .expect("offscreen depth view missing");
 
         {
+            let rp_ts = self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
+                query_set: qs,
+                beginning_of_pass_write_index: Some(0),
+                end_of_pass_write_index: Some(1),
+            });
+
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Scene Pass"),
                 color_attachments: &[
@@ -8852,7 +8972,7 @@ impl App {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: rp_ts,
                 occlusion_query_set: None,
             });
 
@@ -8868,6 +8988,7 @@ impl App {
             }
 
             // Draw meshed chunks first
+            let _scene_scope = self.profiler.scope("scene_render_cpu");
             if let Some(mesh_indirect) = &self.mesh_indirect_buffer {
                 render_pass.set_pipeline(self.mesh_pipeline.as_ref().unwrap());
                 render_pass.set_bind_group(0, self.bind_group.as_ref().unwrap(), &[]);
@@ -8968,12 +9089,18 @@ impl App {
         }
 
         // SSR Pass (if enabled) -> writes SSR texture
+        let _ssr_scope = self.profiler.scope("ssr_cpu");
         if self.ssr_settings.enabled {
             if let (Some(pipeline), Some(bind_group), Some(ssr_view)) = (
                 self.ssr_pipeline.as_ref(),
                 self.ssr_bind_group.as_ref(),
                 self.ssr_texture_view.as_ref(),
             ) {
+                let ssr_ts = self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
+                    query_set: qs,
+                    beginning_of_pass_write_index: Some(8),
+                    end_of_pass_write_index: Some(9),
+                });
                 let mut ssr_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("SSR Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -8986,7 +9113,7 @@ impl App {
                         depth_slice: None,
                     })],
                     depth_stencil_attachment: None,
-                    timestamp_writes: None,
+                    timestamp_writes: ssr_ts,
                     occlusion_query_set: None,
                 });
                 ssr_pass.set_pipeline(pipeline);
@@ -9024,7 +9151,14 @@ impl App {
         }
 
         // Water Pass (Transparent, reads depth buffer)
+        let _water_scope = self.profiler.scope("water_cpu");
         {
+            let water_ts = self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
+                query_set: qs,
+                beginning_of_pass_write_index: Some(10),
+                end_of_pass_write_index: Some(11),
+            });
+
             let mut water_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Water Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -9037,7 +9171,7 @@ impl App {
                     depth_slice: None,
                 })],
                 depth_stencil_attachment: None, // No depth attachment, we sample it manually
-                timestamp_writes: None,
+                timestamp_writes: water_ts,
                 occlusion_query_set: None,
             });
 
@@ -9850,11 +9984,96 @@ impl App {
         }
 
         queue.submit(std::iter::once(encoder.finish()));
+        log::debug!("submitted frame {} to GPU queue", self.frame_count);
         output.present();
+        log::debug!("presented output for frame {}", self.frame_count);
+
+        #[cfg(feature = "gpu-profiling")]
+        {
+            if let Some(readback_buf) = self.query_readback_buffer.as_ref() {
+                let slice = readback_buf.slice(..((12 * 8) as u64));
+                if !self.query_readback_in_flight {
+                    if let Some(tx) = &self.query_readback_notifier_tx {
+                        log::debug!("requesting readback map_async for frame={} (non-blocking)", self.frame_count);
+                        let tx = tx.clone();
+                        slice.map_async(wgpu::MapMode::Read, move |_res| { tx.send(()).ok(); });
+                        self.query_readback_in_flight = true;
+                    }
+                }
+                // Do not block waiting on GPU; mapping will be processed asynchronously.
+                // Removed on_submitted_work_done + blocking wait to avoid UI stalls.
+                // Try non-blocking check for readback notification and process mapped data if ready
+                if let Some(rx) = &self.query_readback_notifier_rx {
+                    if let Ok(()) = rx.try_recv() {
+                        let data = slice.get_mapped_range();
+                        let mut stamps: Vec<u64> = Vec::with_capacity(12);
+                        for i in 0..12 {
+                            let start = (i * 8) as usize;
+                            let mut b = [0u8; 8];
+                            b.copy_from_slice(&data[start..start + 8]);
+                            stamps.push(u64::from_le_bytes(b));
+                        }
+                        drop(data);
+                        readback_buf.unmap();
+                        self.query_readback_in_flight = false;
+
+                        let period_ns = self.timestamp_period_ns;
+                        let gpu_ms = |idx_start: usize, idx_end: usize| -> f64 {
+                            let delta = (stamps[idx_end] - stamps[idx_start]) as f64;
+                            (delta * period_ns) / 1_000_000.0
+                        };
+
+                        let scene_ms = gpu_ms(0, 1);
+                        let hzb_copy_ms = gpu_ms(2, 3);
+                        let gpu_cull_ms = gpu_ms(6, 7);
+                        let ssr_ms = gpu_ms(8, 9);
+                        let water_ms = gpu_ms(10, 11);
+
+                        // Accumulate GPU timings; averaging is printed periodically
+                        self.gpu_timing_accum_scene_ms += scene_ms;
+                        self.gpu_timing_accum_hzb_copy_ms += hzb_copy_ms;
+                        self.gpu_timing_accum_gpu_cull_ms += gpu_cull_ms;
+                        self.gpu_timing_accum_ssr_ms += ssr_ms;
+                        self.gpu_timing_accum_water_ms += water_ms;
+                        self.gpu_timing_accum_frames = self.gpu_timing_accum_frames.saturating_add(1);
+
+                        if self.gpu_timing_accum_frames >= self.gpu_timing_print_interval_frames {
+                            let frames = self.gpu_timing_accum_frames as f64;
+                            let avg_scene = self.gpu_timing_accum_scene_ms / frames;
+                            let avg_hzb_copy = self.gpu_timing_accum_hzb_copy_ms / frames;
+                            let avg_gpu_cull = self.gpu_timing_accum_gpu_cull_ms / frames;
+                            let avg_ssr = self.gpu_timing_accum_ssr_ms / frames;
+                            let avg_water = self.gpu_timing_accum_water_ms / frames;
+
+                            log::info!(
+                                "GPU avg timings over {} frames - scene: {:.3}ms, hzb_copy: {:.3}ms, gpu_cull: {:.3}ms, ssr: {:.3}ms, water: {:.3}ms",
+                                self.gpu_timing_accum_frames,
+                                avg_scene,
+                                avg_hzb_copy,
+                                avg_gpu_cull,
+                                avg_ssr,
+                                avg_water
+                            );
+
+                            // reset accumulators
+                            self.gpu_timing_accum_scene_ms = 0.0;
+                            self.gpu_timing_accum_hzb_copy_ms = 0.0;
+                            self.gpu_timing_accum_gpu_cull_ms = 0.0;
+                            self.gpu_timing_accum_ssr_ms = 0.0;
+                            self.gpu_timing_accum_water_ms = 0.0;
+                            self.gpu_timing_accum_frames = 0;
+                        }
+                    }
+                }
+            }
+        }
 
         // Stats
         self.frame_count += 1;
-        if now.duration_since(self.last_fps_print).as_secs() >= 1 {
+        if self.frame_count % 240 == 0 {
+            self.profiler.print_summary();
+        }
+        if self.frame_count >= (self.gpu_timing_print_interval_frames as u64) {
             let total_visible = visible.len();
             let mesh_cache_mib = self.mesh_cache_bytes as f64 / (1024.0 * 1024.0);
             let mesh_budget_mib = self.mesh_cache_byte_budget() as f64 / (1024.0 * 1024.0);
