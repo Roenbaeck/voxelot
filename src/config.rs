@@ -296,7 +296,7 @@ pub struct PerformanceConfig {
     /// Maximum number of GPU instances (chunks + fallback voxels). Limits memory usage.
     #[serde(default = "default_max_gpu_instances")]
     pub max_gpu_instances: usize,
-    // Profiling is controlled at compile-time via Cargo features (`profiling` & `gpu-profiling`).
+    // Profiling is controlled at compile-time via Cargo features (`cpu-profiling` & `gpu-profiling`).
 }
 
 

@@ -558,10 +558,10 @@ impl CameraController {
 
     fn new(position: [f32; 3], render_cfg: &voxelot::config::RenderingConfig) -> Self {
         let rc = RenderConfig::from_rendering(render_cfg);
-        println!("Loaded rendering config (TOML):");
-        println!("  LOD render distance: {}", rc.lod_render_distance);
-        println!("  Far plane: {}", rc.far_plane);
-        println!("  FOV: {}°", rc.fov_degrees);
+        log::info!("Loaded rendering config (TOML):");
+        log::info!("  LOD render distance: {}", rc.lod_render_distance);
+        log::info!("  Far plane: {}", rc.far_plane);
+        log::info!("  FOV: {}°", rc.fov_degrees);
 
         let mut this = Self {
             camera: Camera::with_config(position, [0.0, 0.0, -1.0], [0.0, 1.0, 0.0], rc),
@@ -600,22 +600,22 @@ impl CameraController {
             KeyCode::Minus if pressed => {
                 self.speed_multiplier =
                     (self.speed_multiplier * 0.8).max(Self::MIN_SPEED_MULTIPLIER);
-                println!("Camera speed multiplier: {:.2}", self.speed_multiplier);
+                log::info!("Camera speed multiplier: {:.2}", self.speed_multiplier);
             }
             KeyCode::Equal if pressed => {
                 self.speed_multiplier =
                     (self.speed_multiplier * 1.25).min(Self::MAX_SPEED_MULTIPLIER);
-                println!("Camera speed multiplier: {:.2}", self.speed_multiplier);
+                log::info!("Camera speed multiplier: {:.2}", self.speed_multiplier);
             }
             KeyCode::Digit0 if pressed => {
                 self.speed_multiplier = 1.0;
-                println!("Camera speed multiplier reset to 1.00");
+                log::info!("Camera speed multiplier reset to 1.00");
             }
             // Runtime config adjustments (only on key press, not release)
             KeyCode::PageDown if pressed => {
                 self.camera.config.lod_render_distance =
                     (self.camera.config.lod_render_distance - 50.0).max(50.0);
-                println!(
+                log::info!(
                     "LOD render distance: {:.0}",
                     self.camera.config.lod_render_distance
                 );
@@ -623,7 +623,7 @@ impl CameraController {
             KeyCode::PageUp if pressed => {
                 self.camera.config.lod_render_distance =
                     (self.camera.config.lod_render_distance + 50.0).min(2000.0);
-                println!(
+                log::info!(
                     "LOD render distance: {:.0}",
                     self.camera.config.lod_render_distance
                 );
@@ -632,13 +632,13 @@ impl CameraController {
                 self.camera.config.far_plane = (self.camera.config.far_plane - 500.0).max(1000.0);
                 self.camera.far = self.camera.config.far_plane;
                 self.update_camera_vectors(); // Recalculate frustum
-                println!("Far plane: {:.0}", self.camera.config.far_plane);
+                log::info!("Far plane: {:.0}", self.camera.config.far_plane);
             }
             KeyCode::KeyC if pressed => {
                 self.camera.config.far_plane = (self.camera.config.far_plane + 500.0).min(20000.0);
                 self.camera.far = self.camera.config.far_plane;
                 self.update_camera_vectors(); // Recalculate frustum
-                println!("Far plane: {:.0}", self.camera.config.far_plane);
+                log::info!("Far plane: {:.0}", self.camera.config.far_plane);
             }
             _ => {}
         }
@@ -1114,7 +1114,7 @@ struct App {
     emissive_texture_bytes: u64,
     // Path to loaded config file (user provided or default)
     config_path: String,
-    // Profiling helper (CPU scopes). No-op if compiled without `profiling` feature.
+    // Profiling helper (CPU scopes). No-op if compiled without `cpu-profiling` feature.
     profiler: std::sync::Arc<voxelot::profiling::Profiler>,
     // Optional query set for GPU timestamps + resolve buffer (only enabled when config + adapter supports it)
     query_set: Option<wgpu::QuerySet>,
@@ -1257,24 +1257,24 @@ impl App {
             }
             
             // Load palette and do LOD updates BEFORE wrapping in Arc
-            println!("Loading palette from {}...", cfg.world.palette);
+            log::info!("Loading palette from {}...", cfg.world.palette);
             let temp_palette = Palette::load(&cfg.world.palette);
             
-            println!("Updating LOD metadata...");
+            log::info!("Updating LOD metadata...");
             let lod_start = Instant::now();
             temp_world.update_all_lod_metadata(&temp_palette);
-            println!("LOD metadata updated (took {:.3}s)", lod_start.elapsed().as_secs_f32());
+            log::info!("LOD metadata updated (took {:.3}s)", lod_start.elapsed().as_secs_f32());
 
-            println!("Generating hierarchy shells...");
+            log::info!("Generating hierarchy shells...");
             let shell_start = Instant::now();
             temp_world.generate_all_hierarchy_shells();
-            println!("Hierarchy shells generated (took {:.3}s)", shell_start.elapsed().as_secs_f32());
+            log::info!("Hierarchy shells generated (took {:.3}s)", shell_start.elapsed().as_secs_f32());
             
             world = Arc::new(temp_world);
         } else {
             initial_camera = cfg.world.camera_position;
 
-            println!("Loading voxel data from {}...", cfg.world.file);
+            log::info!("Loading voxel data from {}...", cfg.world.file);
             // Load hierarchical chunk format (.vhc) from configured path — loader accepts legacy .oct for compatibility
             let load_start = Instant::now();
             let mut temp_world = voxelot::load_world_file(std::path::Path::new(&cfg.world.file)).unwrap_or_else(
@@ -1288,27 +1288,30 @@ impl App {
                 },
             );
             let load_elapsed = load_start.elapsed();
-            println!(
-                "Loaded world from {} (depth {}) (took {:.3}s)",
-                cfg.world.file,
-                temp_world.hierarchy_depth(),
-                load_elapsed.as_secs_f32()
-            );
+            #[cfg(feature = "cpu-profiling")]
+            {
+                log::info!(
+                    "Loaded world from {} (depth {}) (took {:.3}s)",
+                    cfg.world.file,
+                    temp_world.hierarchy_depth(),
+                    load_elapsed.as_secs_f32()
+                );
+            }
             
             // Load palette BEFORE wrapping world in Arc (needed for LOD metadata)
-            println!("Loading palette from {}...", cfg.world.palette);
+            log::info!("Loading palette from {}...", cfg.world.palette);
             let temp_palette = Palette::load(&cfg.world.palette);
             
             // Update LOD metadata and generate hierarchy shells BEFORE wrapping in Arc
-            println!("Updating LOD metadata...");
+            log::info!("Updating LOD metadata...");
             let lod_start = Instant::now();
             temp_world.update_all_lod_metadata(&temp_palette);
-            println!("LOD metadata updated (took {:.3}s)", lod_start.elapsed().as_secs_f32());
+            log::info!("LOD metadata updated (took {:.3}s)", lod_start.elapsed().as_secs_f32());
 
-            println!("Generating hierarchy shells...");
+            log::info!("Generating hierarchy shells...");
             let shell_start = Instant::now();
             temp_world.generate_all_hierarchy_shells();
-            println!("Hierarchy shells generated (took {:.3}s)", shell_start.elapsed().as_secs_f32());
+            log::info!("Hierarchy shells generated (took {:.3}s)", shell_start.elapsed().as_secs_f32());
             
             world = Arc::new(temp_world);
         }
@@ -1340,7 +1343,7 @@ impl App {
         if let Some(solid_y) = highest_solid_y {
             let safe_y = (solid_y + 10) as f32;
             if cam_pos[1] <= solid_y as f32 {
-                println!(
+                log::info!(
                     "Camera was at y={:.1} (inside/below terrain at y={}), moved to y={:.1}",
                     start_y, solid_y, safe_y
                 );
@@ -1369,7 +1372,7 @@ impl App {
                 }
             }
             if corrected {
-                println!(
+                log::info!(
                     "Camera was inside terrain at y={:.1}, moved to y={:.1}",
                     start_y, cam_pos[1]
                 );
@@ -1377,7 +1380,7 @@ impl App {
             }
         }
 
-        println!("World created with voxels");
+        log::info!("World created with voxels");
 
         // Palette is already Arc-wrapped in both branches above
         let palette = Arc::new(Palette::load(&cfg.world.palette));
@@ -1441,7 +1444,7 @@ impl App {
         drop(mesh_job_rx);
 
         // Spawn GI worker thread (similar to mesh workers)
-        println!("Spawning GI worker thread...");
+        log::info!("Spawning GI worker thread...");
         let gi_grid_dims = glam::IVec3::from_array(cfg.effects.gi.grid_dims);
         let (gi_request_tx, gi_result_rx) = voxelot::gi::spawn_gi_worker(
             world.clone(),
@@ -1452,23 +1455,23 @@ impl App {
         let mesh_upload_baseline = cfg.performance.mesh_upload_baseline;
         let mesh_upload_max = (mesh_worker_count * 4).max(mesh_upload_baseline * 2);
 
-        println!("\n=== Controls ===");
-        println!("Movement: WASD + Q/E (down/up)");
-        println!("Look: Right Mouse + drag");
-        println!("Rotate: Arrow Keys (Left/Right yaw, Up/Down pitch)");
-        println!("Camera Speed: -/+ (decrease/increase multiplier), 0 reset");
-        println!("Camera LOD Distance: R/T (decrease/increase)");
-        println!("Draw Distance: Z/C (decrease/increase)");
-        println!("Chunk LOD Distance: K/L (decrease/increase)");
-        println!("Time of Day: T (cycle through day/night)");
-        println!("Fog Density: F/G (decrease/increase)");
-        println!("Depth of Field: / (toggle), , and . adjust focus");
-        println!("Kawase DoF: X (toggle), U/I (offset -/+), O/P (iterations -/+)");
-        println!("Bloom: B (toggle)");
-        println!("HZB: J (toggle)");
-        println!("Fullscreen: F11 (toggle)");
-        println!("Quit: ESC");
-        println!("================\n");
+        log::info!("\n=== Controls ===");
+        log::info!("Movement: WASD + Q/E (down/up)");
+        log::info!("Look: Right Mouse + drag");
+        log::info!("Rotate: Arrow Keys (Left/Right yaw, Up/Down pitch)");
+        log::info!("Camera Speed: -/+ (decrease/increase multiplier), 0 reset");
+        log::info!("Camera LOD Distance: R/T (decrease/increase)");
+        log::info!("Draw Distance: Z/C (decrease/increase)");
+        log::info!("Chunk LOD Distance: K/L (decrease/increase)");
+        log::info!("Time of Day: T (cycle through day/night)");
+        log::info!("Fog Density: F/G (decrease/increase)");
+        log::info!("Depth of Field: / (toggle), , and . adjust focus");
+        log::info!("Kawase DoF: X (toggle), U/I (offset -/+), O/P (iterations -/+)");
+        log::info!("Bloom: B (toggle)");
+        log::info!("HZB: J (toggle)");
+        log::info!("Fullscreen: F11 (toggle)");
+        log::info!("Quit: ESC");
+        log::info!("================\n");
 
         Self {
             window: None,
@@ -1915,7 +1918,7 @@ impl App {
             if let Err(e) = full_cfg.save(&self.config_path) {
                 eprintln!("Failed to save unified config: {}", e);
             } else {
-                println!("Saved unified TOML config to {}", self.config_path);
+                log::info!("Saved unified TOML config to {}", self.config_path);
             }
         } else {
             eprintln!("Warning: could not load existing TOML config for update; creating default.");
@@ -2092,7 +2095,7 @@ impl App {
                 } else {
                     "Dusk→Midnight"
                 };
-                println!(
+                log::info!(
                     "Time {} at {:.3} ({})",
                     if self.time_paused {
                         "paused"
@@ -2106,16 +2109,16 @@ impl App {
             KeyCode::KeyF => {
                 // Decrease fog density (smaller step)
                 self.fog_density = (self.fog_density - 0.00005).max(0.0);
-                println!("Fog density: {:.6}", self.fog_density);
+                log::info!("Fog density: {:.6}", self.fog_density);
             }
             KeyCode::KeyG => {
                 // Increase fog density (smaller step)
                 self.fog_density = (self.fog_density + 0.00005).min(0.01);
-                println!("Fog density: {:.6}", self.fog_density);
+                log::info!("Fog density: {:.6}", self.fog_density);
             }
             KeyCode::KeyB => {
                 self.bloom_enabled = !self.bloom_enabled;
-                println!(
+                log::info!(
                     "Bloom {}",
                     if self.bloom_enabled {
                         "enabled"
@@ -2126,7 +2129,7 @@ impl App {
             }
             KeyCode::KeyN => {
                 self.ssao_enabled = !self.ssao_enabled;
-                println!(
+                log::info!(
                     "SSAO {}",
                     if self.ssao_enabled {
                         "enabled"
@@ -2140,17 +2143,17 @@ impl App {
                 if self.ssao_settings.sample_count > 1 {
                     self.ssao_settings.sample_count =
                         self.ssao_settings.sample_count.saturating_sub(1);
-                    println!("SSAO sample_count: {}", self.ssao_settings.sample_count);
+                    log::info!("SSAO sample_count: {}", self.ssao_settings.sample_count);
                 }
             }
             KeyCode::F2 => {
                 // increase SSILVB sample count
                 self.ssao_settings.sample_count = (self.ssao_settings.sample_count + 1).min(32);
-                println!("SSAO sample_count: {}", self.ssao_settings.sample_count);
+                log::info!("SSAO sample_count: {}", self.ssao_settings.sample_count);
             }
             KeyCode::F5 => {
                 self.gui_visible = !self.gui_visible;
-                println!(
+                log::info!(
                     "GUI overlay: {}",
                     if self.gui_visible { "ON" } else { "OFF" }
                 );
@@ -2158,16 +2161,16 @@ impl App {
             KeyCode::F3 => {
                 // decrease sampling radius
                 self.ssao_settings.radius = (self.ssao_settings.radius - 1.0).max(0.0);
-                println!("SSAO radius: {}", self.ssao_settings.radius);
+                log::info!("SSAO radius: {}", self.ssao_settings.radius);
             }
             KeyCode::F4 => {
                 // increase sampling radius
                 self.ssao_settings.radius += 1.0;
-                println!("SSAO radius: {}", self.ssao_settings.radius);
+                log::info!("SSAO radius: {}", self.ssao_settings.radius);
             }
             KeyCode::KeyH => {
                 self.ssao_debug = !self.ssao_debug;
-                println!(
+                log::info!(
                     "SSAO debug {}",
                     if self.ssao_debug {
                         "enabled"
@@ -2184,18 +2187,18 @@ impl App {
                 // Decrease LOD distance (more detail at distance)
                 self.lod_distance = (self.lod_distance - 100.0).max(100.0);
                 self.camera_controller.camera.config.lod_render_distance = self.lod_distance;
-                println!("LOD distance: {:.0} units", self.lod_distance);
+                log::info!("LOD distance: {:.0} units", self.lod_distance);
             }
             KeyCode::KeyL => {
                 // Increase LOD distance (less detail at distance)
                 self.lod_distance = (self.lod_distance + 100.0).min(5000.0);
                 self.camera_controller.camera.config.lod_render_distance = self.lod_distance;
-                println!("LOD distance: {:.0} units", self.lod_distance);
+                log::info!("LOD distance: {:.0} units", self.lod_distance);
             }
             KeyCode::Comma => {
                 self.dof_settings.focal_distance =
                     (self.dof_settings.focal_distance - 10.0).max(10.0);
-                println!(
+                log::info!(
                     "DoF focal distance: {:.1}",
                     self.dof_settings.focal_distance
                 );
@@ -2203,30 +2206,30 @@ impl App {
             KeyCode::Period => {
                 self.dof_settings.focal_distance =
                     (self.dof_settings.focal_distance + 10.0).min(5000.0);
-                println!(
+                log::info!(
                     "DoF focal distance: {:.1}",
                     self.dof_settings.focal_distance
                 );
             }
             KeyCode::BracketLeft => {
                 self.dof_settings.focal_range = (self.dof_settings.focal_range - 5.0).max(5.0);
-                println!("DoF focal range: {:.1}", self.dof_settings.focal_range);
+                log::info!("DoF focal range: {:.1}", self.dof_settings.focal_range);
             }
             KeyCode::BracketRight => {
                 self.dof_settings.focal_range = (self.dof_settings.focal_range + 5.0).min(500.0);
-                println!("DoF focal range: {:.1}", self.dof_settings.focal_range);
+                log::info!("DoF focal range: {:.1}", self.dof_settings.focal_range);
             }
             KeyCode::Semicolon => {
                 self.dof_settings.blur_strength = (self.dof_settings.blur_strength - 0.1).max(0.0);
-                println!("DoF blur strength: {:.2}", self.dof_settings.blur_strength);
+                log::info!("DoF blur strength: {:.2}", self.dof_settings.blur_strength);
             }
             KeyCode::Quote => {
                 self.dof_settings.blur_strength = (self.dof_settings.blur_strength + 0.1).min(2.5);
-                println!("DoF blur strength: {:.2}", self.dof_settings.blur_strength);
+                log::info!("DoF blur strength: {:.2}", self.dof_settings.blur_strength);
             }
             KeyCode::Slash => {
                 self.dof_enabled = !self.dof_enabled;
-                println!(
+                log::info!(
                     "DoF {}",
                     if self.dof_enabled {
                         "enabled"
@@ -2237,7 +2240,7 @@ impl App {
             }
             KeyCode::KeyX => {
                 self.dof_settings.kawase_enabled = !self.dof_settings.kawase_enabled;
-                println!(
+                log::info!(
                     "Kawase {}",
                     if self.dof_settings.kawase_enabled {
                         "enabled"
@@ -2252,7 +2255,7 @@ impl App {
             }
             KeyCode::KeyJ => {
                 self.hzb_enabled = !self.hzb_enabled;
-                println!(
+                log::info!(
                     "HZB {}",
                     if self.hzb_enabled {
                         "enabled"
@@ -2265,30 +2268,30 @@ impl App {
             KeyCode::KeyU => {
                 self.dof_settings.kawase_offset =
                     (self.dof_settings.kawase_offset - 0.25).max(0.25);
-                println!("Kawase offset: {:.2}", self.dof_settings.kawase_offset);
+                log::info!("Kawase offset: {:.2}", self.dof_settings.kawase_offset);
                 self.update_kawase_bind_groups();
             }
             KeyCode::KeyI => {
                 self.dof_settings.kawase_offset =
                     (self.dof_settings.kawase_offset + 0.25).min(10.0);
-                println!("Kawase offset: {:.2}", self.dof_settings.kawase_offset);
+                log::info!("Kawase offset: {:.2}", self.dof_settings.kawase_offset);
                 self.update_kawase_bind_groups();
             }
             KeyCode::KeyO => {
                 self.dof_settings.kawase_iterations =
                     (self.dof_settings.kawase_iterations.saturating_sub(1)).max(1);
-                println!("Kawase iterations: {}", self.dof_settings.kawase_iterations);
+                log::info!("Kawase iterations: {}", self.dof_settings.kawase_iterations);
                 self.update_kawase_bind_groups();
             }
             KeyCode::KeyP => {
                 self.dof_settings.kawase_iterations =
                     (self.dof_settings.kawase_iterations + 1).min(6);
-                println!("Kawase iterations: {}", self.dof_settings.kawase_iterations);
+                log::info!("Kawase iterations: {}", self.dof_settings.kawase_iterations);
                 self.update_kawase_bind_groups();
             }
             KeyCode::KeyR => {
                 self.ssr_settings.enabled = !self.ssr_settings.enabled;
-                println!(
+                log::info!(
                     "SSR: {}",
                     if self.ssr_settings.enabled {
                         "ENABLED"
@@ -2299,26 +2302,26 @@ impl App {
             }
             KeyCode::KeyV => {
                 self.ssr_debug = !self.ssr_debug;
-                println!("SSR DEBUG overlay: {}", self.ssr_debug);
+                log::info!("SSR DEBUG overlay: {}", self.ssr_debug);
             }
             KeyCode::KeyY => {
                 self.water_level = (self.water_level - 5.0).max(0.0);
-                println!("Water level: {:.1}", self.water_level);
+                log::info!("Water level: {:.1}", self.water_level);
             }
             KeyCode::KeyM => {
                 self.water_level = (self.water_level + 5.0).min(1000.0);
-                println!("Water level: {:.1}", self.water_level);
+                log::info!("Water level: {:.1}", self.water_level);
             }
             KeyCode::F11 => {
                 if let Some(window) = &self.window {
                     if self.is_fullscreen {
                         window.set_fullscreen(None);
                         self.is_fullscreen = false;
-                        println!("Switched to windowed mode");
+                        log::info!("Switched to windowed mode");
                     } else {
                         window.set_fullscreen(Some(Fullscreen::Borderless(None)));
                         self.is_fullscreen = true;
-                        println!("Switched to borderless fullscreen");
+                        log::info!("Switched to borderless fullscreen");
                     }
                 }
             }
@@ -6916,8 +6919,8 @@ impl App {
         }
 
         viewer_debug!("DEBUG: mesh_pipeline created successfully");
-        println!("wgpu initialized");
-        println!(
+        log::info!("wgpu initialized");
+        log::info!(
             "DoF Kawase enabled: {} (kawase_iterations={}, kawase_offset={})",
             self.dof_settings.kawase_enabled,
             self.dof_settings.kawase_iterations,
@@ -8149,7 +8152,7 @@ impl App {
         }
 
         if chunks_not_found > 0 && self.frame_count == 0 {
-            println!(
+            log::warn!(
                 "Warning: {} out of {} potential chunks not found (OSM voxels are not in subdivided chunks)",
                 chunks_not_found,
                 leaf_chunks.len()
@@ -10179,66 +10182,72 @@ impl App {
             let mesh_idle = self.pending_chunk_meshes.is_empty()
                 && self.ready_chunk_meshes.is_empty()
                 && jobs_in_flight == 0;
-            println!(
-                "FPS: {}, Visible items: {}, Leaf chunks: {}, Meshed chunks: {}, Pending: {}, PendingSet: {}, Ready: {}, InFlight: {}, Fallback: {}, Mesh cache: {:.1}/{:.1} MiB, Process (RSS/VM): {:.1}/{:.1} MiB, Tracked: {:.1} MiB, GPU reserved: {:.1} MiB, Cull: {:.2}ms, Group: {:.2}ms, Mesh: {:.2}ms, Instances: {:.2}ms, Draws: {}, GPU items: {}, Jobs/sec: {}, EmptyMeshes: {}, VReuse: {}, IReuse: {}, VPool: {}, IPool: {}, MeshIdle: {}, DoF Kawase: {} (iter={}, off={:.2}), MeshUp: {:.2}ms parts:(leaf:{:.2} sched:{:.2} sort:{:.2} res:{:.2} jobc:{:.2} jobn:{:.2}) vbld:{:.2} v:{:.2} i:{:.2} ins:{:.2} emit:{:.2} processed:{} limit:{}",
-                self.frame_count,
-                total_visible,
-                leaf_chunks.len(),
-                draw_mesh_keys.len(),
-                self.pending_chunk_meshes.len(),
-                pending_set_count,
-                ready_count,
-                jobs_in_flight,
-                missing_chunks.len(),
-                mesh_cache_mib,
-                mesh_budget_mib,
-                process_mem_mib,
-                process_vmem_mib,
-                tracked_mem_mib,
-                gpu_reserved_mib,
-                cull_time.as_secs_f64() * 1000.0,
-                grouping_time.as_secs_f64() * 1000.0,
+            #[cfg(feature = "cpu-profiling")]
+            {
+                log::info!(
+                    "FPS: {}, Visible items: {}, Leaf chunks: {}, Meshed chunks: {}, Pending: {}, PendingSet: {}, Ready: {}, InFlight: {}, Fallback: {}, Mesh cache: {:.1}/{:.1} MiB, Process (RSS/VM): {:.1}/{:.1} MiB, Tracked: {:.1} MiB, GPU reserved: {:.1} MiB, Cull: {:.2}ms, Group: {:.2}ms, Mesh: {:.2}ms, Instances: {:.2}ms, Draws: {}, GPU items: {}, Jobs/sec: {}, EmptyMeshes: {}, VReuse: {}, IReuse: {}, VPool: {}, IPool: {}, MeshIdle: {}, DoF Kawase: {} (iter={}, off={:.2}), MeshUp: {:.2}ms parts:(leaf:{:.2} sched:{:.2} sort:{:.2} res:{:.2} jobc:{:.2} jobn:{:.2}) vbld:{:.2} v:{:.2} i:{:.2} ins:{:.2} emit:{:.2} processed:{} limit:{}",
+                    self.frame_count,
+                    total_visible,
+                    leaf_chunks.len(),
+                    draw_mesh_keys.len(),
+                    self.pending_chunk_meshes.len(),
+                    pending_set_count,
+                    ready_count,
+                    jobs_in_flight,
+                    missing_chunks.len(),
+                    mesh_cache_mib,
+                    mesh_budget_mib,
+                    process_mem_mib,
+                    process_vmem_mib,
+                    tracked_mem_mib,
+                    gpu_reserved_mib,
+                    cull_time.as_secs_f64() * 1000.0,
+                    grouping_time.as_secs_f64() * 1000.0,
                     (if mesh_idle { std::time::Duration::from_secs(0) } else { mesh_time }).as_secs_f64() * 1000.0,
-                instance_time.as_secs_f64() * 1000.0,
-                draw_calls,
-                self.gpu_buffer_items_count,
-                jobs_per_sec,
-                self.stat_empty_meshes,
-                self.stat_vertex_buffers_reused,
-                self.stat_index_buffers_reused,
-                mesh_idle,
-                self.vertex_allocator.allocated_count(),
-                self.index_allocator.allocated_count(),
-                if self.dof_settings.kawase_enabled {"enabled"} else {"disabled"}
-                , self.dof_settings.kawase_iterations
-                , self.dof_settings.kawase_offset
-                , mesh_upload_total_time.as_secs_f64() * 1000.0
-                , mesh_leaf_proc_time.as_secs_f64() * 1000.0
-                , mesh_schedule_time.as_secs_f64() * 1000.0
-                , mesh_pending_sort_time.as_secs_f64() * 1000.0
-                , mesh_result_collect_time.as_secs_f64() * 1000.0
-                , mesh_job_creation_time.as_secs_f64() * 1000.0
-                , mesh_job_neighbors_time.as_secs_f64() * 1000.0
-                , mesh_build_vb_time.as_secs_f64() * 1000.0
-                , mesh_upload_vbuf_time.as_secs_f64() * 1000.0
-                , mesh_upload_ibuf_time.as_secs_f64() * 1000.0
-                , mesh_upload_entry_time.as_secs_f64() * 1000.0
-                , mesh_emitters_proc_time.as_secs_f64() * 1000.0
-                , processed_meshes
-                    , frame_mesh_upload_limit
-            );
+                    instance_time.as_secs_f64() * 1000.0,
+                    draw_calls,
+                    self.gpu_buffer_items_count,
+                    jobs_per_sec,
+                    self.stat_empty_meshes,
+                    self.stat_vertex_buffers_reused,
+                    self.stat_index_buffers_reused,
+                    mesh_idle,
+                    self.vertex_allocator.allocated_count(),
+                    self.index_allocator.allocated_count(),
+                    if self.dof_settings.kawase_enabled {"enabled"} else {"disabled"},
+                    self.dof_settings.kawase_iterations,
+                    self.dof_settings.kawase_offset,
+                    mesh_upload_total_time.as_secs_f64() * 1000.0,
+                    mesh_leaf_proc_time.as_secs_f64() * 1000.0,
+                    mesh_schedule_time.as_secs_f64() * 1000.0,
+                    mesh_pending_sort_time.as_secs_f64() * 1000.0,
+                    mesh_result_collect_time.as_secs_f64() * 1000.0,
+                    mesh_job_creation_time.as_secs_f64() * 1000.0,
+                    mesh_job_neighbors_time.as_secs_f64() * 1000.0,
+                    mesh_build_vb_time.as_secs_f64() * 1000.0,
+                    mesh_upload_vbuf_time.as_secs_f64() * 1000.0,
+                    mesh_upload_ibuf_time.as_secs_f64() * 1000.0,
+                    mesh_upload_entry_time.as_secs_f64() * 1000.0,
+                    mesh_emitters_proc_time.as_secs_f64() * 1000.0,
+                    processed_meshes,
+                    frame_mesh_upload_limit
+                );
+            }
             // Print culling statistics grouped by reason
-            println!(
-                "  Cull Stats: examined={}, visible={}, frustum={}, marginal={}, shell={}, empty={}, no_shell={}, depth={}",
-                self.cull_stats.chunks_examined,
-                self.cull_stats.chunks_visible,
-                self.cull_stats.frustum_aabb_culled,
-                self.cull_stats.marginal_bitmap_culled,
-                self.cull_stats.hierarchy_shell_culled,
-                self.cull_stats.empty_chunk_culled,
-                self.cull_stats.no_shell_available,
-                depth_culled_count,
-            );
+            #[cfg(feature = "cpu-profiling")]
+            {
+                log::info!(
+                    "  Cull Stats: examined={}, visible={}, frustum={}, marginal={}, shell={}, empty={}, no_shell={}, depth={}",
+                    self.cull_stats.chunks_examined,
+                    self.cull_stats.chunks_visible,
+                    self.cull_stats.frustum_aabb_culled,
+                    self.cull_stats.marginal_bitmap_culled,
+                    self.cull_stats.hierarchy_shell_culled,
+                    self.cull_stats.empty_chunk_culled,
+                    self.cull_stats.no_shell_available,
+                    depth_culled_count,
+                );
+            }
 
             // Update UI overlay stats
             self.visible_count = total_visible;
@@ -10323,7 +10332,7 @@ impl ApplicationHandler for App {
 
         match event {
             WindowEvent::CloseRequested => {
-                println!("Close requested");
+                log::info!("Close requested");
                 self.save_config();
                 event_loop.exit();
             }
@@ -10424,14 +10433,14 @@ impl ApplicationHandler for App {
 fn main() {
     env_logger::init();
 
-    println!("Hierarchical Voxel Viewer");
-    println!("=========================");
-    println!("Controls:");
-    println!("  WASD - Move");
-    println!("  Space/Shift - Up/Down");
-    println!("  Arrow Keys - Rotate (Left/Right yaw, Up/Down pitch)");
-    println!("  Right Mouse - Look around");
-    println!("  ESC - Quit\n");
+    log::info!("Hierarchical Voxel Viewer");
+    log::info!("=========================");
+    log::info!("Controls:");
+    log::info!("  WASD - Move");
+    log::info!("  Space/Shift - Up/Down");
+    log::info!("  Arrow Keys - Rotate (Left/Right yaw, Up/Down pitch)");
+    log::info!("  Right Mouse - Look around");
+    log::info!("  ESC - Quit\n");
 
     let args = ViewerArgs::parse();
     let config_path = args.config_arg.unwrap_or(args.config);

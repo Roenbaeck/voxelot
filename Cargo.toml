@@ -9,7 +9,7 @@ viewer-debug = []
 mesh-debug = []
 test-block-world = []
 # Optional profiling features
-profiling = []
+cpu-profiling = []
 gpu-profiling = ["wgpu-profiler"]
 
 [dependencies]

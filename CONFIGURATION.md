@@ -348,14 +348,14 @@ Each entry shows the default value (as found in `src/config.rs`), a short descri
   - Effect of change: Risk of GPU memory overflow if set too high; insufficient instances can prematurely limit draw capacity.
 
 ---
-**Profiling:** CPU & GPU profiling flags were removed from `config.toml`. Enable profiling using cargo features only:
-- `profiling` for CPU scope collection
+- **Profiling:** CPU & GPU profiling flags were removed from `config.toml`. Enable profiling using cargo features only:
+- `cpu-profiling` for CPU scope collection
 - `gpu-profiling` for GPU timestamps (and optional `wgpu-profiler` integration)
 
 Example: to enable both CPU and GPU profiling, build and run with:
 
 ```
-cargo run --bin voxelot --release --features "profiling gpu-profiling" -- worlds/flat_city_test.toml
+cargo run --bin voxelot --release --features "cpu-profiling gpu-profiling" -- worlds/flat_city_test.toml
 ```
 ---
 
