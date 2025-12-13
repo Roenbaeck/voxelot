@@ -4868,6 +4868,7 @@ impl App {
             ) {
                 // Resolve the full set at end of frame and copy into staging readback buffer
                 if !self.query_readback_in_flight {
+                    log::debug!("performing resolve+copy into readback buffer");
                     encoder.resolve_query_set(qs, 0..12, resolve_buf, 0);
                     let total_bytes = (12u64) * 8u64;
                     encoder.copy_buffer_to_buffer(resolve_buf, 0, readback_buf, 0, total_bytes);
@@ -5201,7 +5202,18 @@ impl App {
             self.query_readback_buffer = Some(readback_buffer);
             self.query_readback_notifier_tx = Some(tx);
             self.query_readback_notifier_rx = Some(rx);
+            log::info!(
+                "GPU profiling enabled: query_count={} timestamp_period_ns={:.3}ns",
+                query_count,
+                self.timestamp_period_ns
+            );
+            } else {
+                log::info!("GPU profiling requested but adapter lacks TIMESTAMP_QUERY; profiling disabled");
             }
+        }
+        #[cfg(not(feature = "gpu-profiling"))]
+        {
+            log::info!("GPU profiling feature not compiled in; build with --features 'gpu-profiling' to enable");
         }
 
         // Configure surface
@@ -9993,10 +10005,14 @@ impl App {
             if let Some(readback_buf) = self.query_readback_buffer.as_ref() {
                 let slice = readback_buf.slice(..((12 * 8) as u64));
                 if !self.query_readback_in_flight {
-                    if let Some(tx) = &self.query_readback_notifier_tx {
+                        if let Some(tx) = &self.query_readback_notifier_tx {
                         log::debug!("requesting readback map_async for frame={} (non-blocking)", self.frame_count);
                         let tx = tx.clone();
-                        slice.map_async(wgpu::MapMode::Read, move |_res| { tx.send(()).ok(); });
+                        let map_frame = self.frame_count;
+                        slice.map_async(wgpu::MapMode::Read, move |_res| {
+                            log::debug!("map_async completion callback fired for frame={}", map_frame);
+                            tx.send(()).ok();
+                        });
                         self.query_readback_in_flight = true;
                     }
                 }
@@ -10005,6 +10021,7 @@ impl App {
                 // Try non-blocking check for readback notification and process mapped data if ready
                 if let Some(rx) = &self.query_readback_notifier_rx {
                     if let Ok(()) = rx.try_recv() {
+                        log::debug!("readback notifier received for frame={} (processing mapped buffer)", self.frame_count);
                         let data = slice.get_mapped_range();
                         let mut stamps: Vec<u64> = Vec::with_capacity(12);
                         for i in 0..12 {
