@@ -1,5 +1,10 @@
+use std::sync::Arc;
+
+#[cfg(feature = "cpu-profiling")]
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+#[cfg(feature = "cpu-profiling")]
+use std::sync::Mutex;
+#[cfg(feature = "cpu-profiling")]
 use std::time::Instant;
 
 #[cfg(feature = "cpu-profiling")]

@@ -1064,10 +1064,14 @@ struct App {
     _mesh_buffer_pool_max_entries: usize,
 
     // egui UI state
+    #[cfg(feature = "overlay")]
     egui_ctx: Option<egui::Context>,
+    #[cfg(feature = "overlay")]
     egui_winit: Option<egui_winit::State>,
+    #[cfg(feature = "overlay")]
     egui_renderer: Option<egui_wgpu::Renderer>,
     last_fps: u32,
+    fps_ema: f32,
 
     // Culling statistics
     cull_stats: CullStats,
@@ -1434,7 +1438,10 @@ impl App {
                             break;
                         }
                         // Account for this processed mesh job
-                        jobs_executed.fetch_add(1, Ordering::Relaxed);
+                        #[cfg(feature = "perf-counters")]
+                        {
+                            jobs_executed.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 })
                 .expect("failed to spawn mesh worker");
@@ -1534,10 +1541,14 @@ impl App {
             multi_mesh_args_tmp: Vec::with_capacity(4096),
             multi_env_args_tmp: Vec::with_capacity(4096),
 
+            #[cfg(feature = "overlay")]
             egui_ctx: None,
+            #[cfg(feature = "overlay")]
             egui_winit: None,
+            #[cfg(feature = "overlay")]
             egui_renderer: None,
             last_fps: 0,
+            fps_ema: 0.0,
             cull_stats: CullStats::default(),
             mesh_chunk_arc_cache: FxHashMap::default(),
             // empty_mesh buffers removed; placeholders use offsets into mega buffers
@@ -4749,7 +4760,10 @@ impl App {
         );
 
         // Count the mesh we added to the mega buffers as a single GPU item
-        self.gpu_buffer_items_frame = self.gpu_buffer_items_frame.saturating_add(1);
+        #[cfg(feature = "perf-counters")]
+        {
+            self.gpu_buffer_items_frame = self.gpu_buffer_items_frame.saturating_add(1);
+        }
 
         Ok((vertex_offset, index_offset))
     }
@@ -5006,9 +5020,12 @@ impl App {
             if !self.multi_mesh_args_tmp.is_empty() {
                 queue.write_buffer(buffer, 0, bytemuck::cast_slice(&self.multi_mesh_args_tmp));
                 // Count number of mesh indirect entries uploaded
-                self.gpu_buffer_items_frame = self
-                    .gpu_buffer_items_frame
-                    .saturating_add(self.multi_mesh_args_tmp.len());
+                #[cfg(feature = "perf-counters")]
+                {
+                    self.gpu_buffer_items_frame = self
+                        .gpu_buffer_items_frame
+                        .saturating_add(self.multi_mesh_args_tmp.len());
+                }
             } else {
                 // zero-length doesn't matter, but clear first 4 bytes
                 let zero: [u8; 4] = [0; 4];
@@ -5031,9 +5048,12 @@ impl App {
             if !self.multi_env_args_tmp.is_empty() {
                 queue.write_buffer(buffer, 0, bytemuck::cast_slice(&self.multi_env_args_tmp));
                 // Count number of envelope indirect entries uploaded
-                self.gpu_buffer_items_frame = self
-                    .gpu_buffer_items_frame
-                    .saturating_add(self.multi_env_args_tmp.len());
+                #[cfg(feature = "perf-counters")]
+                {
+                    self.gpu_buffer_items_frame = self
+                        .gpu_buffer_items_frame
+                        .saturating_add(self.multi_env_args_tmp.len());
+                }
             } else {
                 let zero: [u8; 4] = [0; 4];
                 queue.write_buffer(buffer, 0, &zero);
@@ -6826,31 +6846,34 @@ impl App {
         self.shadow_bind_group_layout = Some(shadow_bind_group_layout);
         self.shadow_sampler = Some(shadow_sampler);
 
-        // Initialize egui
-        let egui_ctx = egui::Context::default();
-        let egui_winit = egui_winit::State::new(
-            egui_ctx.clone(),
-            egui::ViewportId::ROOT,
-            self.window.as_ref().unwrap(),
-            Some(self.window.as_ref().unwrap().scale_factor() as f32),
-            None, // theme
-            Some(
-                self.device
-                    .as_ref()
-                    .unwrap()
-                    .limits()
-                    .max_texture_dimension_2d as usize,
-            ),
-        );
-        let egui_renderer = egui_wgpu::Renderer::new(
-            self.device.as_ref().unwrap(),
-            self.config.as_ref().unwrap().format,
-            egui_wgpu::RendererOptions::default(),
-        );
+        #[cfg(feature = "overlay")]
+        {
+            // Initialize egui
+            let egui_ctx = egui::Context::default();
+            let egui_winit = egui_winit::State::new(
+                egui_ctx.clone(),
+                egui::ViewportId::ROOT,
+                self.window.as_ref().unwrap(),
+                Some(self.window.as_ref().unwrap().scale_factor() as f32),
+                None, // theme
+                Some(
+                    self.device
+                        .as_ref()
+                        .unwrap()
+                        .limits()
+                        .max_texture_dimension_2d as usize,
+                ),
+            );
+            let egui_renderer = egui_wgpu::Renderer::new(
+                self.device.as_ref().unwrap(),
+                self.config.as_ref().unwrap().format,
+                egui_wgpu::RendererOptions::default(),
+            );
 
-        self.egui_ctx = Some(egui_ctx);
-        self.egui_winit = Some(egui_winit);
-        self.egui_renderer = Some(egui_renderer);
+            self.egui_ctx = Some(egui_ctx);
+            self.egui_winit = Some(egui_winit);
+            self.egui_renderer = Some(egui_renderer);
+        }
         self.cube_vertex_buffer = Some(cube_vertex_buffer);
 
         self.update_shadow_bind_group();
@@ -6946,6 +6969,14 @@ impl App {
         self.frame_index = self.frame_index.wrapping_add(1);
 
         let fps = if dt > 0.0 { 1.0 / dt } else { f32::INFINITY };
+        // Exponential moving average for FPS (cheap, always enabled)
+        const FPS_ALPHA: f32 = 0.10;
+        if self.fps_ema <= 0.0 {
+            self.fps_ema = fps;
+        } else {
+            self.fps_ema = self.fps_ema * (1.0 - FPS_ALPHA) + fps * FPS_ALPHA;
+        }
+        self.last_fps = self.fps_ema.round() as u32;
         self.adjust_mesh_upload_budget(dt, fps);
 
         // Auto-advance time of day: full cycle in 120 seconds (60s sun, 60s moon)
@@ -6970,7 +7001,10 @@ impl App {
         }
 
         // Reset accumulator for GPU buffer item counting this frame
-        self.gpu_buffer_items_frame = 0;
+        #[cfg(feature = "perf-counters")]
+        {
+            self.gpu_buffer_items_frame = 0;
+        }
 
         // Gather candidate voxels for GPU culling using CPU hierarchy traversal
         let _cull_scope = self.profiler.scope("cull_cpu");
@@ -7318,8 +7352,11 @@ impl App {
                     bytemuck::cast_slice(&self.gpu_inputs[0..items_to_write]),
                 );
                 // Count the number of instance entries uploaded to the GPU input buffer
-                self.gpu_buffer_items_frame =
-                    self.gpu_buffer_items_frame.saturating_add(items_to_write);
+                #[cfg(feature = "perf-counters")]
+                {
+                    self.gpu_buffer_items_frame =
+                        self.gpu_buffer_items_frame.saturating_add(items_to_write);
+                }
             }
 
             // Upload Mesh Indirect Args
@@ -7500,9 +7537,12 @@ impl App {
                     bytemuck::cast_slice(&self.envelope_indirect_args_tmp),
                 );
                 // Count the number of indirect draw entries uploaded for envelopes
-                self.gpu_buffer_items_frame = self
-                    .gpu_buffer_items_frame
-                    .saturating_add(self.envelope_indirect_args_tmp.len());
+                #[cfg(feature = "perf-counters")]
+                {
+                    self.gpu_buffer_items_frame = self
+                        .gpu_buffer_items_frame
+                        .saturating_add(self.envelope_indirect_args_tmp.len());
+                }
                 // Mark entries as used so eviction won't free them during this frame
                 for v in visible.iter() {
                     if !v.is_leaf_chunk {
@@ -7538,8 +7578,11 @@ impl App {
                             bytemuck::cast_slice(&self.cpu_prepopulated_instances[..write_count]),
                         );
                         // Count the CPU-prepopulated instances written into the fallback instance buffer
-                        self.gpu_buffer_items_frame =
-                            self.gpu_buffer_items_frame.saturating_add(write_count);
+                        #[cfg(feature = "perf-counters")]
+                        {
+                            self.gpu_buffer_items_frame =
+                                self.gpu_buffer_items_frame.saturating_add(write_count);
+                        }
                     }
                 }
             }
@@ -9719,6 +9762,7 @@ impl App {
         }
 
         // Egui rendering
+        #[cfg(feature = "overlay")]
         if self.gui_visible {
             if let (Some(egui_ctx), Some(egui_winit), Some(window)) =
                 (&self.egui_ctx, &mut self.egui_winit, &self.window)
@@ -10175,18 +10219,34 @@ impl App {
             let gpu_reserved_bytes = self.gpu_buffer_bytes.saturating_add(self.gpu_texture_bytes);
             let gpu_reserved_mib = gpu_reserved_bytes as f64 / (1024.0 * 1024.0);
             let ready_count = self.ready_chunk_meshes.len();
-            self.last_fps = self.frame_count as u32;
+            // Compute average FPS across the elapsed interval and store in last_fps for UI
+            let elapsed_fps_seconds = (now - self.last_fps_print).as_secs_f64();
+            let avg_fps = if elapsed_fps_seconds > 0.0 {
+                self.frame_count as f64 / elapsed_fps_seconds
+            } else {
+                0.0
+            };
+            self.last_fps = avg_fps.round() as u32;
             let jobs_in_flight = self.mesh_jobs_in_flight;
             let pending_set_count = self.pending_chunk_set.len();
-            let jobs_per_sec = self.mesh_jobs_executed.swap(0, Ordering::Relaxed);
+            let jobs_per_sec = {
+                #[cfg(feature = "perf-counters")]
+                {
+                    self.mesh_jobs_executed.swap(0, Ordering::Relaxed)
+                }
+                #[cfg(not(feature = "perf-counters"))]
+                {
+                    0
+                }
+            };
             let mesh_idle = self.pending_chunk_meshes.is_empty()
                 && self.ready_chunk_meshes.is_empty()
                 && jobs_in_flight == 0;
             #[cfg(feature = "cpu-profiling")]
             {
                 log::info!(
-                    "FPS: {}, Visible items: {}, Leaf chunks: {}, Meshed chunks: {}, Pending: {}, PendingSet: {}, Ready: {}, InFlight: {}, Fallback: {}, Mesh cache: {:.1}/{:.1} MiB, Process (RSS/VM): {:.1}/{:.1} MiB, Tracked: {:.1} MiB, GPU reserved: {:.1} MiB, Cull: {:.2}ms, Group: {:.2}ms, Mesh: {:.2}ms, Instances: {:.2}ms, Draws: {}, GPU items: {}, Jobs/sec: {}, EmptyMeshes: {}, VReuse: {}, IReuse: {}, VPool: {}, IPool: {}, MeshIdle: {}, DoF Kawase: {} (iter={}, off={:.2}), MeshUp: {:.2}ms parts:(leaf:{:.2} sched:{:.2} sort:{:.2} res:{:.2} jobc:{:.2} jobn:{:.2}) vbld:{:.2} v:{:.2} i:{:.2} ins:{:.2} emit:{:.2} processed:{} limit:{}",
-                    self.frame_count,
+                    "FPS: {:.2}, Visible items: {}, Leaf chunks: {}, Meshed chunks: {}, Pending: {}, PendingSet: {}, Ready: {}, InFlight: {}, Fallback: {}, Mesh cache: {:.1}/{:.1} MiB, Process (RSS/VM): {:.1}/{:.1} MiB, Tracked: {:.1} MiB, GPU reserved: {:.1} MiB, Cull: {:.2}ms, Group: {:.2}ms, Mesh: {:.2}ms, Instances: {:.2}ms, Draws: {}, GPU items: {}, Jobs/sec: {}, EmptyMeshes: {}, VReuse: {}, IReuse: {}, VPool: {}, IPool: {}, MeshIdle: {}, DoF Kawase: {} (iter={}, off={:.2}), MeshUp: {:.2}ms parts:(leaf:{:.2} sched:{:.2} sort:{:.2} res:{:.2} jobc:{:.2} jobn:{:.2}) vbld:{:.2} v:{:.2} i:{:.2} ins:{:.2} emit:{:.2} processed:{} limit:{}",
+                    avg_fps,
                     total_visible,
                     leaf_chunks.len(),
                     draw_mesh_keys.len(),
@@ -10273,7 +10333,14 @@ impl App {
                 * 1000.0;
             self.instance_ms = instance_time.as_secs_f64() * 1000.0;
             self.draw_calls_count = draw_calls;
-            self.gpu_buffer_items_count = self.gpu_buffer_items_frame;
+            #[cfg(feature = "perf-counters")]
+            {
+                self.gpu_buffer_items_count = self.gpu_buffer_items_frame;
+            }
+            #[cfg(not(feature = "perf-counters"))]
+            {
+                self.gpu_buffer_items_count = 0;
+            }
 
             // Update UI overlay stats
             self.visible_count = total_visible;
@@ -10322,6 +10389,7 @@ impl ApplicationHandler for App {
         event: WindowEvent,
     ) {
         // Let egui handle the event first
+        #[cfg(feature = "overlay")]
         if let (Some(egui_winit), Some(window)) = (&mut self.egui_winit, &self.window) {
             let response = egui_winit.on_window_event(window, &event);
             if response.consumed {
