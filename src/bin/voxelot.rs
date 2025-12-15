@@ -2650,7 +2650,8 @@ impl App {
                     App::compute_texture_bytes(config.format, target_width, target_height, 1, 1);
 
                 // SSR texture (also used as scene color copy for water reflections)
-                let ssr_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
+                let (ssr_texture_loc, ssr_texture_view_loc) = if self.user_config.effects.ssr.enabled {
+                    let ssr_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("SSR Texture"),
                     size: wgpu::Extent3d {
                         width: target_width,
@@ -2665,8 +2666,12 @@ impl App {
                         | wgpu::TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
                 });
-                let ssr_texture_view_loc =
-                    ssr_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
+                    let ssr_texture_view_loc =
+                        ssr_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
+                    (Some(ssr_texture_loc), Some(ssr_texture_view_loc))
+                } else {
+                    (None, None)
+                };
 
                 // Scene color copy texture (for water reflections - same format as offscreen)
                 let scene_copy_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
@@ -2762,8 +2767,8 @@ impl App {
         );
         self.offscreen_color_view = Some(color_view);
         self.offscreen_color_texture = Some(color_texture);
-        self.ssr_texture = Some(ssr_texture_loc);
-        self.ssr_texture_view = Some(ssr_texture_view_loc);
+    self.ssr_texture = ssr_texture_loc;
+    self.ssr_texture_view = ssr_texture_view_loc;
         self.scene_copy_texture = Some(scene_copy_texture_loc);
         self.scene_copy_view = Some(scene_copy_view_loc);
         self.emissive_texture = Some(emissive_texture_loc);
@@ -3394,9 +3399,7 @@ impl App {
         let Some(offscreen_view) = self.offscreen_color_view.as_ref() else {
             return;
         };
-        let Some(post_view) = self.post_color_view.as_ref() else {
-            return;
-        };
+        
         let Some(bloom_ping_view) = self.bloom_ping_view.as_ref() else {
             return;
         };
@@ -3591,12 +3594,13 @@ impl App {
             }
         }
 
-        if let (Some(composite_ubo), Some(sampler), Some(ssao_ping_view), Some(ssr_view)) = (
+        if let (Some(composite_ubo), Some(sampler), Some(ssao_ping_view), Some(post_view_ref)) = (
             self.composite_uniform_buffer.as_ref(),
             self.post_sampler.as_ref(),
             self.ssao_ping_view.as_ref(),
-            self.ssr_texture_view.as_ref(),
+            self.post_color_view.as_ref(),
         ) {
+            let ssr_view = self.ssr_texture_view.as_ref().unwrap_or(post_view_ref);
             self.composite_bind_group =
                 Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("Composite Bind Group"),
@@ -3608,7 +3612,7 @@ impl App {
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
-                            resource: wgpu::BindingResource::TextureView(post_view),
+                            resource: wgpu::BindingResource::TextureView(post_view_ref),
                         },
                         wgpu::BindGroupEntry {
                             binding: 2,
@@ -6828,7 +6832,9 @@ impl App {
         // Initialize skybox before moving values into self
         self.init_skybox(&device, &queue, &config, &main_bind_group_layout);
         self.create_water_pipeline(&device, &config, &main_bind_group_layout);
-        self.create_ssr_pipeline(&device);
+        if self.user_config.effects.ssr.enabled {
+            self.create_ssr_pipeline(&device);
+        }
 
         self.surface = Some(surface);
         self.device = Some(device);
