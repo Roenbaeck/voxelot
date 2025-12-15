@@ -296,6 +296,7 @@ pub struct PerformanceConfig {
     /// Maximum number of GPU instances (chunks + fallback voxels). Limits memory usage.
     #[serde(default = "default_max_gpu_instances")]
     pub max_gpu_instances: usize,
+    // Profiling is controlled at compile-time via Cargo features (`cpu-profiling` & `gpu-profiling`).
 }
 
 
@@ -585,6 +586,8 @@ fn default_render_scale() -> f32 {
 fn default_max_gpu_instances() -> usize {
     6_000_000 // ~384MB for VoxelInstanceRaw (64 bytes each)
 }
+
+// Profiling is controlled via cargo features; no runtime defaults.
 
 // default_true was used by DebugConfig, which was removed.
 

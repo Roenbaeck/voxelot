@@ -23,7 +23,7 @@ macos_hdr_colorspace = "extended_linear_srgb"
 
 [atmosphere]
 fog_density = 0.00019999995
-time_of_day = 0.45210788
+time_of_day = 0.5657946
 time_paused = true
 night_skybox_brightness = 0.02
 horizon_fade_up = 0.05
@@ -57,7 +57,7 @@ saturation_boost = 1.5
 exposure = 1.18
 blur_radius = 3.8
 kawase_enabled = true
-kawase_iterations = 4
+kawase_iterations = 2
 kawase_offset = 0.5
 
 [effects.ssao]
@@ -82,7 +82,7 @@ grid_dims = [
 ]
 
 [effects.ssr]
-enabled = true
+enabled = false
 max_steps = 32
 max_binary_steps = 4
 step_size = 0.5
@@ -90,7 +90,7 @@ thickness = 0.5
 
 [shadows]
 map_size = 8192
-darkness = 2.0
+darkness = 3.0
 backface_ambient_scale = 0.25
 pcf_radius = 3.0
 pcf_poisson_samples = 8

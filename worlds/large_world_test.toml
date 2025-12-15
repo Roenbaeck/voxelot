@@ -17,10 +17,14 @@ far_plane = 30000.0
 camera_speed_multiplier = 5.9604645
 window_width = 1280
 window_height = 720
+macos_hdr = false
+macos_hdr_exposure_boost = 1.0
+macos_hdr_colorspace = "extended_linear_srgb"
 
 [atmosphere]
 fog_density = 0.00019999995
-time_of_day = 0.3246
+time_of_day = 0.98307294
+time_paused = false
 night_skybox_brightness = 0.01
 horizon_fade_up = 0.05
 horizon_fade_down = 0.25
@@ -53,7 +57,7 @@ saturation_boost = 1.5
 exposure = 1.18
 blur_radius = 3.8
 kawase_enabled = true
-kawase_iterations = 4
+kawase_iterations = 2
 kawase_offset = 0.5
 
 [effects.ssao]
@@ -65,10 +69,20 @@ thickness = 8.0
 strength = 1.0
 blur_enabled = true
 blur_radius = 1.0
-gi_indirect_scale = 0.003
+
+[effects.gi]
+enabled = true
+indirect_scale = 0.003
+fade_distance = 400.0
+fade_range = 100.0
+grid_dims = [
+    32,
+    16,
+    32,
+]
 
 [effects.ssr]
-enabled = true
+enabled = false
 max_steps = 32
 max_binary_steps = 4
 step_size = 0.5

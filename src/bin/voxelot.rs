@@ -558,10 +558,10 @@ impl CameraController {
 
     fn new(position: [f32; 3], render_cfg: &voxelot::config::RenderingConfig) -> Self {
         let rc = RenderConfig::from_rendering(render_cfg);
-        println!("Loaded rendering config (TOML):");
-        println!("  LOD render distance: {}", rc.lod_render_distance);
-        println!("  Far plane: {}", rc.far_plane);
-        println!("  FOV: {}°", rc.fov_degrees);
+        log::info!("Loaded rendering config (TOML):");
+        log::info!("  LOD render distance: {}", rc.lod_render_distance);
+        log::info!("  Far plane: {}", rc.far_plane);
+        log::info!("  FOV: {}°", rc.fov_degrees);
 
         let mut this = Self {
             camera: Camera::with_config(position, [0.0, 0.0, -1.0], [0.0, 1.0, 0.0], rc),
@@ -600,22 +600,22 @@ impl CameraController {
             KeyCode::Minus if pressed => {
                 self.speed_multiplier =
                     (self.speed_multiplier * 0.8).max(Self::MIN_SPEED_MULTIPLIER);
-                println!("Camera speed multiplier: {:.2}", self.speed_multiplier);
+                log::info!("Camera speed multiplier: {:.2}", self.speed_multiplier);
             }
             KeyCode::Equal if pressed => {
                 self.speed_multiplier =
                     (self.speed_multiplier * 1.25).min(Self::MAX_SPEED_MULTIPLIER);
-                println!("Camera speed multiplier: {:.2}", self.speed_multiplier);
+                log::info!("Camera speed multiplier: {:.2}", self.speed_multiplier);
             }
             KeyCode::Digit0 if pressed => {
                 self.speed_multiplier = 1.0;
-                println!("Camera speed multiplier reset to 1.00");
+                log::info!("Camera speed multiplier reset to 1.00");
             }
             // Runtime config adjustments (only on key press, not release)
             KeyCode::PageDown if pressed => {
                 self.camera.config.lod_render_distance =
                     (self.camera.config.lod_render_distance - 50.0).max(50.0);
-                println!(
+                log::info!(
                     "LOD render distance: {:.0}",
                     self.camera.config.lod_render_distance
                 );
@@ -623,7 +623,7 @@ impl CameraController {
             KeyCode::PageUp if pressed => {
                 self.camera.config.lod_render_distance =
                     (self.camera.config.lod_render_distance + 50.0).min(2000.0);
-                println!(
+                log::info!(
                     "LOD render distance: {:.0}",
                     self.camera.config.lod_render_distance
                 );
@@ -632,13 +632,13 @@ impl CameraController {
                 self.camera.config.far_plane = (self.camera.config.far_plane - 500.0).max(1000.0);
                 self.camera.far = self.camera.config.far_plane;
                 self.update_camera_vectors(); // Recalculate frustum
-                println!("Far plane: {:.0}", self.camera.config.far_plane);
+                log::info!("Far plane: {:.0}", self.camera.config.far_plane);
             }
             KeyCode::KeyC if pressed => {
                 self.camera.config.far_plane = (self.camera.config.far_plane + 500.0).min(20000.0);
                 self.camera.far = self.camera.config.far_plane;
                 self.update_camera_vectors(); // Recalculate frustum
-                println!("Far plane: {:.0}", self.camera.config.far_plane);
+                log::info!("Far plane: {:.0}", self.camera.config.far_plane);
             }
             _ => {}
         }
@@ -831,6 +831,8 @@ struct App {
     mesh_chunk_arc_cache: FxHashMap<(i64, i64, i64), Arc<Chunk>>,
     /// Count of mesh jobs executed per second by worker threads (reset on FPS print)
     mesh_jobs_executed: Arc<AtomicUsize>,
+    // Nanoseconds per GPU timestamp tick (adapter info)
+    timestamp_period_ns: f64,
 
     // Mega-buffer infrastructure
     mega_vertex_buffer: Option<wgpu::Buffer>,
@@ -1062,10 +1064,14 @@ struct App {
     _mesh_buffer_pool_max_entries: usize,
 
     // egui UI state
+    #[cfg(feature = "overlay")]
     egui_ctx: Option<egui::Context>,
+    #[cfg(feature = "overlay")]
     egui_winit: Option<egui_winit::State>,
+    #[cfg(feature = "overlay")]
     egui_renderer: Option<egui_wgpu::Renderer>,
     last_fps: u32,
+    fps_ema: f32,
 
     // Culling statistics
     cull_stats: CullStats,
@@ -1112,6 +1118,26 @@ struct App {
     emissive_texture_bytes: u64,
     // Path to loaded config file (user provided or default)
     config_path: String,
+    // Profiling helper (CPU scopes). No-op if compiled without `cpu-profiling` feature.
+    profiler: std::sync::Arc<voxelot::profiling::Profiler>,
+    // Optional query set for GPU timestamps + resolve buffer (only enabled when config + adapter supports it)
+    query_set: Option<wgpu::QuerySet>,
+    query_resolve_buffer: Option<wgpu::Buffer>,
+    query_readback_buffer: Option<wgpu::Buffer>,
+    query_readback_notifier_tx: Option<crossbeam_channel::Sender<()>>,
+    query_readback_notifier_rx: Option<crossbeam_channel::Receiver<()>>,
+    query_readback_in_flight: bool,
+    gpu_timing_accum_scene_ms: f64,
+    gpu_timing_accum_hzb_copy_ms: f64,
+    gpu_timing_accum_gpu_cull_ms: f64,
+    gpu_timing_accum_ssr_ms: f64,
+    gpu_timing_accum_water_ms: f64,
+    gpu_timing_accum_dof_ms: f64,
+    gpu_timing_accum_kawase_ms: f64,
+    gpu_timing_accum_bloom_ms: f64,
+    gpu_timing_accum_post_ms: f64,
+    gpu_timing_accum_frames: u32,
+    gpu_timing_print_interval_frames: u32,
 }
 
 impl App {
@@ -1235,24 +1261,24 @@ impl App {
             }
             
             // Load palette and do LOD updates BEFORE wrapping in Arc
-            println!("Loading palette from {}...", cfg.world.palette);
+            log::info!("Loading palette from {}...", cfg.world.palette);
             let temp_palette = Palette::load(&cfg.world.palette);
             
-            println!("Updating LOD metadata...");
+            log::info!("Updating LOD metadata...");
             let lod_start = Instant::now();
             temp_world.update_all_lod_metadata(&temp_palette);
-            println!("LOD metadata updated (took {:.3}s)", lod_start.elapsed().as_secs_f32());
+            log::info!("LOD metadata updated (took {:.3}s)", lod_start.elapsed().as_secs_f32());
 
-            println!("Generating hierarchy shells...");
+            log::info!("Generating hierarchy shells...");
             let shell_start = Instant::now();
             temp_world.generate_all_hierarchy_shells();
-            println!("Hierarchy shells generated (took {:.3}s)", shell_start.elapsed().as_secs_f32());
+            log::info!("Hierarchy shells generated (took {:.3}s)", shell_start.elapsed().as_secs_f32());
             
             world = Arc::new(temp_world);
         } else {
             initial_camera = cfg.world.camera_position;
 
-            println!("Loading voxel data from {}...", cfg.world.file);
+            log::info!("Loading voxel data from {}...", cfg.world.file);
             // Load hierarchical chunk format (.vhc) from configured path — loader accepts legacy .oct for compatibility
             let load_start = Instant::now();
             let mut temp_world = voxelot::load_world_file(std::path::Path::new(&cfg.world.file)).unwrap_or_else(
@@ -1266,27 +1292,30 @@ impl App {
                 },
             );
             let load_elapsed = load_start.elapsed();
-            println!(
-                "Loaded world from {} (depth {}) (took {:.3}s)",
-                cfg.world.file,
-                temp_world.hierarchy_depth(),
-                load_elapsed.as_secs_f32()
-            );
+            #[cfg(feature = "cpu-profiling")]
+            {
+                log::info!(
+                    "Loaded world from {} (depth {}) (took {:.3}s)",
+                    cfg.world.file,
+                    temp_world.hierarchy_depth(),
+                    load_elapsed.as_secs_f32()
+                );
+            }
             
             // Load palette BEFORE wrapping world in Arc (needed for LOD metadata)
-            println!("Loading palette from {}...", cfg.world.palette);
+            log::info!("Loading palette from {}...", cfg.world.palette);
             let temp_palette = Palette::load(&cfg.world.palette);
             
             // Update LOD metadata and generate hierarchy shells BEFORE wrapping in Arc
-            println!("Updating LOD metadata...");
+            log::info!("Updating LOD metadata...");
             let lod_start = Instant::now();
             temp_world.update_all_lod_metadata(&temp_palette);
-            println!("LOD metadata updated (took {:.3}s)", lod_start.elapsed().as_secs_f32());
+            log::info!("LOD metadata updated (took {:.3}s)", lod_start.elapsed().as_secs_f32());
 
-            println!("Generating hierarchy shells...");
+            log::info!("Generating hierarchy shells...");
             let shell_start = Instant::now();
             temp_world.generate_all_hierarchy_shells();
-            println!("Hierarchy shells generated (took {:.3}s)", shell_start.elapsed().as_secs_f32());
+            log::info!("Hierarchy shells generated (took {:.3}s)", shell_start.elapsed().as_secs_f32());
             
             world = Arc::new(temp_world);
         }
@@ -1318,7 +1347,7 @@ impl App {
         if let Some(solid_y) = highest_solid_y {
             let safe_y = (solid_y + 10) as f32;
             if cam_pos[1] <= solid_y as f32 {
-                println!(
+                log::info!(
                     "Camera was at y={:.1} (inside/below terrain at y={}), moved to y={:.1}",
                     start_y, solid_y, safe_y
                 );
@@ -1347,7 +1376,7 @@ impl App {
                 }
             }
             if corrected {
-                println!(
+                log::info!(
                     "Camera was inside terrain at y={:.1}, moved to y={:.1}",
                     start_y, cam_pos[1]
                 );
@@ -1355,7 +1384,7 @@ impl App {
             }
         }
 
-        println!("World created with voxels");
+        log::info!("World created with voxels");
 
         // Palette is already Arc-wrapped in both branches above
         let palette = Arc::new(Palette::load(&cfg.world.palette));
@@ -1409,7 +1438,10 @@ impl App {
                             break;
                         }
                         // Account for this processed mesh job
-                        jobs_executed.fetch_add(1, Ordering::Relaxed);
+                        #[cfg(feature = "perf-counters")]
+                        {
+                            jobs_executed.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 })
                 .expect("failed to spawn mesh worker");
@@ -1419,7 +1451,7 @@ impl App {
         drop(mesh_job_rx);
 
         // Spawn GI worker thread (similar to mesh workers)
-        println!("Spawning GI worker thread...");
+        log::info!("Spawning GI worker thread...");
         let gi_grid_dims = glam::IVec3::from_array(cfg.effects.gi.grid_dims);
         let (gi_request_tx, gi_result_rx) = voxelot::gi::spawn_gi_worker(
             world.clone(),
@@ -1430,23 +1462,23 @@ impl App {
         let mesh_upload_baseline = cfg.performance.mesh_upload_baseline;
         let mesh_upload_max = (mesh_worker_count * 4).max(mesh_upload_baseline * 2);
 
-        println!("\n=== Controls ===");
-        println!("Movement: WASD + Q/E (down/up)");
-        println!("Look: Right Mouse + drag");
-        println!("Rotate: Arrow Keys (Left/Right yaw, Up/Down pitch)");
-        println!("Camera Speed: -/+ (decrease/increase multiplier), 0 reset");
-        println!("Camera LOD Distance: R/T (decrease/increase)");
-        println!("Draw Distance: Z/C (decrease/increase)");
-        println!("Chunk LOD Distance: K/L (decrease/increase)");
-        println!("Time of Day: T (cycle through day/night)");
-        println!("Fog Density: F/G (decrease/increase)");
-        println!("Depth of Field: / (toggle), , and . adjust focus");
-        println!("Kawase DoF: X (toggle), U/I (offset -/+), O/P (iterations -/+)");
-        println!("Bloom: B (toggle)");
-        println!("HZB: J (toggle)");
-        println!("Fullscreen: F11 (toggle)");
-        println!("Quit: ESC");
-        println!("================\n");
+        log::info!("\n=== Controls ===");
+        log::info!("Movement: WASD + Q/E (down/up)");
+        log::info!("Look: Right Mouse + drag");
+        log::info!("Rotate: Arrow Keys (Left/Right yaw, Up/Down pitch)");
+        log::info!("Camera Speed: -/+ (decrease/increase multiplier), 0 reset");
+        log::info!("Camera LOD Distance: R/T (decrease/increase)");
+        log::info!("Draw Distance: Z/C (decrease/increase)");
+        log::info!("Chunk LOD Distance: K/L (decrease/increase)");
+        log::info!("Time of Day: T (cycle through day/night)");
+        log::info!("Fog Density: F/G (decrease/increase)");
+        log::info!("Depth of Field: / (toggle), , and . adjust focus");
+        log::info!("Kawase DoF: X (toggle), U/I (offset -/+), O/P (iterations -/+)");
+        log::info!("Bloom: B (toggle)");
+        log::info!("HZB: J (toggle)");
+        log::info!("Fullscreen: F11 (toggle)");
+        log::info!("Quit: ESC");
+        log::info!("================\n");
 
         Self {
             window: None,
@@ -1509,10 +1541,14 @@ impl App {
             multi_mesh_args_tmp: Vec::with_capacity(4096),
             multi_env_args_tmp: Vec::with_capacity(4096),
 
+            #[cfg(feature = "overlay")]
             egui_ctx: None,
+            #[cfg(feature = "overlay")]
             egui_winit: None,
+            #[cfg(feature = "overlay")]
             egui_renderer: None,
             last_fps: 0,
+            fps_ema: 0.0,
             cull_stats: CullStats::default(),
             mesh_chunk_arc_cache: FxHashMap::default(),
             // empty_mesh buffers removed; placeholders use offsets into mega buffers
@@ -1614,6 +1650,25 @@ impl App {
             emissive_view: None,
             emissive_texture_bytes: 0,
             config_path: config_path.to_string(),
+            profiler: voxelot::profiling::Profiler::new(),
+            timestamp_period_ns: 0.0,
+            query_set: None,
+            query_resolve_buffer: None,
+            query_readback_buffer: None,
+            query_readback_notifier_tx: None,
+            query_readback_notifier_rx: None,
+            query_readback_in_flight: false,
+            gpu_timing_accum_scene_ms: 0.0,
+            gpu_timing_accum_hzb_copy_ms: 0.0,
+            gpu_timing_accum_gpu_cull_ms: 0.0,
+            gpu_timing_accum_ssr_ms: 0.0,
+            gpu_timing_accum_water_ms: 0.0,
+            gpu_timing_accum_dof_ms: 0.0,
+            gpu_timing_accum_kawase_ms: 0.0,
+            gpu_timing_accum_bloom_ms: 0.0,
+            gpu_timing_accum_post_ms: 0.0,
+            gpu_timing_accum_frames: 0,
+            gpu_timing_print_interval_frames: 120,
             dof_coc_pipeline: None,
             dof_bind_group_layout: None,
             dof_bind_group: None,
@@ -1874,7 +1929,7 @@ impl App {
             if let Err(e) = full_cfg.save(&self.config_path) {
                 eprintln!("Failed to save unified config: {}", e);
             } else {
-                println!("Saved unified TOML config to {}", self.config_path);
+                log::info!("Saved unified TOML config to {}", self.config_path);
             }
         } else {
             eprintln!("Warning: could not load existing TOML config for update; creating default.");
@@ -2051,7 +2106,7 @@ impl App {
                 } else {
                     "Dusk→Midnight"
                 };
-                println!(
+                log::info!(
                     "Time {} at {:.3} ({})",
                     if self.time_paused {
                         "paused"
@@ -2065,16 +2120,16 @@ impl App {
             KeyCode::KeyF => {
                 // Decrease fog density (smaller step)
                 self.fog_density = (self.fog_density - 0.00005).max(0.0);
-                println!("Fog density: {:.6}", self.fog_density);
+                log::info!("Fog density: {:.6}", self.fog_density);
             }
             KeyCode::KeyG => {
                 // Increase fog density (smaller step)
                 self.fog_density = (self.fog_density + 0.00005).min(0.01);
-                println!("Fog density: {:.6}", self.fog_density);
+                log::info!("Fog density: {:.6}", self.fog_density);
             }
             KeyCode::KeyB => {
                 self.bloom_enabled = !self.bloom_enabled;
-                println!(
+                log::info!(
                     "Bloom {}",
                     if self.bloom_enabled {
                         "enabled"
@@ -2085,7 +2140,7 @@ impl App {
             }
             KeyCode::KeyN => {
                 self.ssao_enabled = !self.ssao_enabled;
-                println!(
+                log::info!(
                     "SSAO {}",
                     if self.ssao_enabled {
                         "enabled"
@@ -2099,17 +2154,17 @@ impl App {
                 if self.ssao_settings.sample_count > 1 {
                     self.ssao_settings.sample_count =
                         self.ssao_settings.sample_count.saturating_sub(1);
-                    println!("SSAO sample_count: {}", self.ssao_settings.sample_count);
+                    log::info!("SSAO sample_count: {}", self.ssao_settings.sample_count);
                 }
             }
             KeyCode::F2 => {
                 // increase SSILVB sample count
                 self.ssao_settings.sample_count = (self.ssao_settings.sample_count + 1).min(32);
-                println!("SSAO sample_count: {}", self.ssao_settings.sample_count);
+                log::info!("SSAO sample_count: {}", self.ssao_settings.sample_count);
             }
             KeyCode::F5 => {
                 self.gui_visible = !self.gui_visible;
-                println!(
+                log::info!(
                     "GUI overlay: {}",
                     if self.gui_visible { "ON" } else { "OFF" }
                 );
@@ -2117,16 +2172,16 @@ impl App {
             KeyCode::F3 => {
                 // decrease sampling radius
                 self.ssao_settings.radius = (self.ssao_settings.radius - 1.0).max(0.0);
-                println!("SSAO radius: {}", self.ssao_settings.radius);
+                log::info!("SSAO radius: {}", self.ssao_settings.radius);
             }
             KeyCode::F4 => {
                 // increase sampling radius
                 self.ssao_settings.radius += 1.0;
-                println!("SSAO radius: {}", self.ssao_settings.radius);
+                log::info!("SSAO radius: {}", self.ssao_settings.radius);
             }
             KeyCode::KeyH => {
                 self.ssao_debug = !self.ssao_debug;
-                println!(
+                log::info!(
                     "SSAO debug {}",
                     if self.ssao_debug {
                         "enabled"
@@ -2143,18 +2198,18 @@ impl App {
                 // Decrease LOD distance (more detail at distance)
                 self.lod_distance = (self.lod_distance - 100.0).max(100.0);
                 self.camera_controller.camera.config.lod_render_distance = self.lod_distance;
-                println!("LOD distance: {:.0} units", self.lod_distance);
+                log::info!("LOD distance: {:.0} units", self.lod_distance);
             }
             KeyCode::KeyL => {
                 // Increase LOD distance (less detail at distance)
                 self.lod_distance = (self.lod_distance + 100.0).min(5000.0);
                 self.camera_controller.camera.config.lod_render_distance = self.lod_distance;
-                println!("LOD distance: {:.0} units", self.lod_distance);
+                log::info!("LOD distance: {:.0} units", self.lod_distance);
             }
             KeyCode::Comma => {
                 self.dof_settings.focal_distance =
                     (self.dof_settings.focal_distance - 10.0).max(10.0);
-                println!(
+                log::info!(
                     "DoF focal distance: {:.1}",
                     self.dof_settings.focal_distance
                 );
@@ -2162,30 +2217,30 @@ impl App {
             KeyCode::Period => {
                 self.dof_settings.focal_distance =
                     (self.dof_settings.focal_distance + 10.0).min(5000.0);
-                println!(
+                log::info!(
                     "DoF focal distance: {:.1}",
                     self.dof_settings.focal_distance
                 );
             }
             KeyCode::BracketLeft => {
                 self.dof_settings.focal_range = (self.dof_settings.focal_range - 5.0).max(5.0);
-                println!("DoF focal range: {:.1}", self.dof_settings.focal_range);
+                log::info!("DoF focal range: {:.1}", self.dof_settings.focal_range);
             }
             KeyCode::BracketRight => {
                 self.dof_settings.focal_range = (self.dof_settings.focal_range + 5.0).min(500.0);
-                println!("DoF focal range: {:.1}", self.dof_settings.focal_range);
+                log::info!("DoF focal range: {:.1}", self.dof_settings.focal_range);
             }
             KeyCode::Semicolon => {
                 self.dof_settings.blur_strength = (self.dof_settings.blur_strength - 0.1).max(0.0);
-                println!("DoF blur strength: {:.2}", self.dof_settings.blur_strength);
+                log::info!("DoF blur strength: {:.2}", self.dof_settings.blur_strength);
             }
             KeyCode::Quote => {
                 self.dof_settings.blur_strength = (self.dof_settings.blur_strength + 0.1).min(2.5);
-                println!("DoF blur strength: {:.2}", self.dof_settings.blur_strength);
+                log::info!("DoF blur strength: {:.2}", self.dof_settings.blur_strength);
             }
             KeyCode::Slash => {
                 self.dof_enabled = !self.dof_enabled;
-                println!(
+                log::info!(
                     "DoF {}",
                     if self.dof_enabled {
                         "enabled"
@@ -2196,7 +2251,7 @@ impl App {
             }
             KeyCode::KeyX => {
                 self.dof_settings.kawase_enabled = !self.dof_settings.kawase_enabled;
-                println!(
+                log::info!(
                     "Kawase {}",
                     if self.dof_settings.kawase_enabled {
                         "enabled"
@@ -2211,7 +2266,7 @@ impl App {
             }
             KeyCode::KeyJ => {
                 self.hzb_enabled = !self.hzb_enabled;
-                println!(
+                log::info!(
                     "HZB {}",
                     if self.hzb_enabled {
                         "enabled"
@@ -2224,30 +2279,30 @@ impl App {
             KeyCode::KeyU => {
                 self.dof_settings.kawase_offset =
                     (self.dof_settings.kawase_offset - 0.25).max(0.25);
-                println!("Kawase offset: {:.2}", self.dof_settings.kawase_offset);
+                log::info!("Kawase offset: {:.2}", self.dof_settings.kawase_offset);
                 self.update_kawase_bind_groups();
             }
             KeyCode::KeyI => {
                 self.dof_settings.kawase_offset =
                     (self.dof_settings.kawase_offset + 0.25).min(10.0);
-                println!("Kawase offset: {:.2}", self.dof_settings.kawase_offset);
+                log::info!("Kawase offset: {:.2}", self.dof_settings.kawase_offset);
                 self.update_kawase_bind_groups();
             }
             KeyCode::KeyO => {
                 self.dof_settings.kawase_iterations =
                     (self.dof_settings.kawase_iterations.saturating_sub(1)).max(1);
-                println!("Kawase iterations: {}", self.dof_settings.kawase_iterations);
+                log::info!("Kawase iterations: {}", self.dof_settings.kawase_iterations);
                 self.update_kawase_bind_groups();
             }
             KeyCode::KeyP => {
                 self.dof_settings.kawase_iterations =
                     (self.dof_settings.kawase_iterations + 1).min(6);
-                println!("Kawase iterations: {}", self.dof_settings.kawase_iterations);
+                log::info!("Kawase iterations: {}", self.dof_settings.kawase_iterations);
                 self.update_kawase_bind_groups();
             }
             KeyCode::KeyR => {
                 self.ssr_settings.enabled = !self.ssr_settings.enabled;
-                println!(
+                log::info!(
                     "SSR: {}",
                     if self.ssr_settings.enabled {
                         "ENABLED"
@@ -2258,26 +2313,26 @@ impl App {
             }
             KeyCode::KeyV => {
                 self.ssr_debug = !self.ssr_debug;
-                println!("SSR DEBUG overlay: {}", self.ssr_debug);
+                log::info!("SSR DEBUG overlay: {}", self.ssr_debug);
             }
             KeyCode::KeyY => {
                 self.water_level = (self.water_level - 5.0).max(0.0);
-                println!("Water level: {:.1}", self.water_level);
+                log::info!("Water level: {:.1}", self.water_level);
             }
             KeyCode::KeyM => {
                 self.water_level = (self.water_level + 5.0).min(1000.0);
-                println!("Water level: {:.1}", self.water_level);
+                log::info!("Water level: {:.1}", self.water_level);
             }
             KeyCode::F11 => {
                 if let Some(window) = &self.window {
                     if self.is_fullscreen {
                         window.set_fullscreen(None);
                         self.is_fullscreen = false;
-                        println!("Switched to windowed mode");
+                        log::info!("Switched to windowed mode");
                     } else {
                         window.set_fullscreen(Some(Fullscreen::Borderless(None)));
                         self.is_fullscreen = true;
-                        println!("Switched to borderless fullscreen");
+                        log::info!("Switched to borderless fullscreen");
                     }
                 }
             }
@@ -2595,7 +2650,8 @@ impl App {
                     App::compute_texture_bytes(config.format, target_width, target_height, 1, 1);
 
                 // SSR texture (also used as scene color copy for water reflections)
-                let ssr_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
+                let (ssr_texture_loc, ssr_texture_view_loc) = if self.user_config.effects.ssr.enabled {
+                    let ssr_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("SSR Texture"),
                     size: wgpu::Extent3d {
                         width: target_width,
@@ -2610,8 +2666,12 @@ impl App {
                         | wgpu::TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
                 });
-                let ssr_texture_view_loc =
-                    ssr_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
+                    let ssr_texture_view_loc =
+                        ssr_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
+                    (Some(ssr_texture_loc), Some(ssr_texture_view_loc))
+                } else {
+                    (None, None)
+                };
 
                 // Scene color copy texture (for water reflections - same format as offscreen)
                 let scene_copy_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
@@ -2707,8 +2767,8 @@ impl App {
         );
         self.offscreen_color_view = Some(color_view);
         self.offscreen_color_texture = Some(color_texture);
-        self.ssr_texture = Some(ssr_texture_loc);
-        self.ssr_texture_view = Some(ssr_texture_view_loc);
+    self.ssr_texture = ssr_texture_loc;
+    self.ssr_texture_view = ssr_texture_view_loc;
         self.scene_copy_texture = Some(scene_copy_texture_loc);
         self.scene_copy_view = Some(scene_copy_view_loc);
         self.emissive_texture = Some(emissive_texture_loc);
@@ -3339,9 +3399,7 @@ impl App {
         let Some(offscreen_view) = self.offscreen_color_view.as_ref() else {
             return;
         };
-        let Some(post_view) = self.post_color_view.as_ref() else {
-            return;
-        };
+        
         let Some(bloom_ping_view) = self.bloom_ping_view.as_ref() else {
             return;
         };
@@ -3536,12 +3594,13 @@ impl App {
             }
         }
 
-        if let (Some(composite_ubo), Some(sampler), Some(ssao_ping_view), Some(ssr_view)) = (
+        if let (Some(composite_ubo), Some(sampler), Some(ssao_ping_view), Some(post_view_ref)) = (
             self.composite_uniform_buffer.as_ref(),
             self.post_sampler.as_ref(),
             self.ssao_ping_view.as_ref(),
-            self.ssr_texture_view.as_ref(),
+            self.post_color_view.as_ref(),
         ) {
+            let ssr_view = self.ssr_texture_view.as_ref().unwrap_or(post_view_ref);
             self.composite_bind_group =
                 Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("Composite Bind Group"),
@@ -3553,7 +3612,7 @@ impl App {
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
-                            resource: wgpu::BindingResource::TextureView(post_view),
+                            resource: wgpu::BindingResource::TextureView(post_view_ref),
                         },
                         wgpu::BindGroupEntry {
                             binding: 2,
@@ -4705,7 +4764,10 @@ impl App {
         );
 
         // Count the mesh we added to the mega buffers as a single GPU item
-        self.gpu_buffer_items_frame = self.gpu_buffer_items_frame.saturating_add(1);
+        #[cfg(feature = "perf-counters")]
+        {
+            self.gpu_buffer_items_frame = self.gpu_buffer_items_frame.saturating_add(1);
+        }
 
         Ok((vertex_offset, index_offset))
     }
@@ -4756,10 +4818,16 @@ impl App {
                     };
                     queue.write_buffer(params_buf, 0, bytemuck::bytes_of(&params));
 
+                    let ts_writes = self.query_set.as_ref().map(|qs| wgpu::ComputePassTimestampWrites {
+                        query_set: qs,
+                        beginning_of_pass_write_index: Some(2),
+                        end_of_pass_write_index: Some(3),
+                    });
+
                     let mut hzb_copy_pass =
                         encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                             label: Some("HZB Copy Pass"),
-                            timestamp_writes: None,
+                            timestamp_writes: ts_writes,
                         });
                     hzb_copy_pass.set_pipeline(copy_pipeline);
                     hzb_copy_pass.set_bind_group(0, copy_bg, &[]);
@@ -4798,9 +4866,14 @@ impl App {
             }
         }
 
-        let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                let ts_writes = self.query_set.as_ref().map(|qs| wgpu::ComputePassTimestampWrites {
+                    query_set: qs,
+                    beginning_of_pass_write_index: Some(6),
+                    end_of_pass_write_index: Some(7),
+                });
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("GPU Cull Pass"),
-            timestamp_writes: None,
+            timestamp_writes: ts_writes,
         });
         compute_pass.set_pipeline(cull_pipeline);
         compute_pass.set_bind_group(0, cull_bind_group, &[]);
@@ -4813,6 +4886,25 @@ impl App {
         if self.pending_recreate_offscreen {
             self.pending_recreate_offscreen = false;
             self.recreate_offscreen_targets();
+        }
+        // All GPU timestamp queries are resolved at end-of-frame; per-pass resolves removed to avoid alignment constraints.
+        #[cfg(feature = "gpu-profiling")]
+        {
+            if let (Some(qs), Some(resolve_buf), Some(readback_buf)) = (
+                self.query_set.as_ref(),
+                self.query_resolve_buffer.as_ref(),
+                self.query_readback_buffer.as_ref(),
+            ) {
+                // Resolve the full set at end of frame and copy into staging readback buffer
+                if !self.query_readback_in_flight {
+                    log::debug!("performing resolve+copy into readback buffer");
+                    encoder.resolve_query_set(qs, 0..20, resolve_buf, 0);
+                    let total_bytes = (20u64) * 8u64;
+                    encoder.copy_buffer_to_buffer(resolve_buf, 0, readback_buf, 0, total_bytes);
+                } else {
+                    log::debug!("skipping resolve+copy: previous readback still in flight");
+                }
+            }
         }
         queue.submit(std::iter::once(encoder.finish()));
     }
@@ -4932,9 +5024,12 @@ impl App {
             if !self.multi_mesh_args_tmp.is_empty() {
                 queue.write_buffer(buffer, 0, bytemuck::cast_slice(&self.multi_mesh_args_tmp));
                 // Count number of mesh indirect entries uploaded
-                self.gpu_buffer_items_frame = self
-                    .gpu_buffer_items_frame
-                    .saturating_add(self.multi_mesh_args_tmp.len());
+                #[cfg(feature = "perf-counters")]
+                {
+                    self.gpu_buffer_items_frame = self
+                        .gpu_buffer_items_frame
+                        .saturating_add(self.multi_mesh_args_tmp.len());
+                }
             } else {
                 // zero-length doesn't matter, but clear first 4 bytes
                 let zero: [u8; 4] = [0; 4];
@@ -4957,9 +5052,12 @@ impl App {
             if !self.multi_env_args_tmp.is_empty() {
                 queue.write_buffer(buffer, 0, bytemuck::cast_slice(&self.multi_env_args_tmp));
                 // Count number of envelope indirect entries uploaded
-                self.gpu_buffer_items_frame = self
-                    .gpu_buffer_items_frame
-                    .saturating_add(self.multi_env_args_tmp.len());
+                #[cfg(feature = "perf-counters")]
+                {
+                    self.gpu_buffer_items_frame = self
+                        .gpu_buffer_items_frame
+                        .saturating_add(self.multi_env_args_tmp.len());
+                }
             } else {
                 let zero: [u8; 4] = [0; 4];
                 queue.write_buffer(buffer, 0, &zero);
@@ -5084,10 +5182,18 @@ impl App {
         limits.max_buffer_size = 1_073_741_824; // 1 GB (up from 256 MB default)
         limits.max_storage_buffer_binding_size = 536_870_912; // 512 MB (up from 128 MB default)
 
+        let mut req_features = wgpu::Features::FLOAT32_FILTERABLE;
+        #[cfg(feature = "gpu-profiling")]
+        {
+            if adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+                req_features |= wgpu::Features::TIMESTAMP_QUERY;
+            }
+        }
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Main Device"),
-                required_features: wgpu::Features::FLOAT32_FILTERABLE,
+                required_features: req_features,
                 required_limits: limits,
                 memory_hints: wgpu::MemoryHints::Performance,
                 experimental_features: Default::default(),
@@ -5095,6 +5201,55 @@ impl App {
             })
             .await
             .unwrap();
+
+        // Capture timestamp period (nanoseconds per timestamp tick) from queue
+        self.timestamp_period_ns = queue.get_timestamp_period() as f64;
+
+        // Create a query set and resolve buffer if GPU profiling is requested and supported
+        #[cfg(feature = "gpu-profiling")]
+        {
+            if device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            // Reserve up to 64 timestamps; adjust as needed
+            let query_count: u32 = 64;
+            let qs = device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("Timestamp QuerySet"),
+                ty: wgpu::QueryType::Timestamp,
+                count: query_count,
+            });
+            // Buffer to resolve query results into (8 bytes per query) - GPU-only buffer
+            let query_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Query Resolve Buffer"),
+                size: (query_count as u64) * 8u64,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            // Staging buffer for reading back resolved queries (MAP_READ + COPY_DST)
+            let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Query Readback Buffer"),
+                size: (query_count as u64) * 8u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            // Create an unbounded notifier for mapping completion events
+            let (tx, rx) = crossbeam_channel::unbounded();
+            self.query_set = Some(qs);
+            self.query_resolve_buffer = Some(query_buffer);
+            self.query_readback_buffer = Some(readback_buffer);
+            self.query_readback_notifier_tx = Some(tx);
+            self.query_readback_notifier_rx = Some(rx);
+            log::info!(
+                "GPU profiling enabled: query_count={} timestamp_period_ns={:.3}ns",
+                query_count,
+                self.timestamp_period_ns
+            );
+            } else {
+                log::info!("GPU profiling requested but adapter lacks TIMESTAMP_QUERY; profiling disabled");
+            }
+        }
+        #[cfg(not(feature = "gpu-profiling"))]
+        {
+            log::info!("GPU profiling feature not compiled in; build with --features 'gpu-profiling' to enable");
+        }
 
         // Configure surface
         let surface_caps = surface.get_capabilities(&adapter);
@@ -6677,7 +6832,9 @@ impl App {
         // Initialize skybox before moving values into self
         self.init_skybox(&device, &queue, &config, &main_bind_group_layout);
         self.create_water_pipeline(&device, &config, &main_bind_group_layout);
-        self.create_ssr_pipeline(&device);
+        if self.user_config.effects.ssr.enabled {
+            self.create_ssr_pipeline(&device);
+        }
 
         self.surface = Some(surface);
         self.device = Some(device);
@@ -6695,31 +6852,34 @@ impl App {
         self.shadow_bind_group_layout = Some(shadow_bind_group_layout);
         self.shadow_sampler = Some(shadow_sampler);
 
-        // Initialize egui
-        let egui_ctx = egui::Context::default();
-        let egui_winit = egui_winit::State::new(
-            egui_ctx.clone(),
-            egui::ViewportId::ROOT,
-            self.window.as_ref().unwrap(),
-            Some(self.window.as_ref().unwrap().scale_factor() as f32),
-            None, // theme
-            Some(
-                self.device
-                    .as_ref()
-                    .unwrap()
-                    .limits()
-                    .max_texture_dimension_2d as usize,
-            ),
-        );
-        let egui_renderer = egui_wgpu::Renderer::new(
-            self.device.as_ref().unwrap(),
-            self.config.as_ref().unwrap().format,
-            egui_wgpu::RendererOptions::default(),
-        );
+        #[cfg(feature = "overlay")]
+        {
+            // Initialize egui
+            let egui_ctx = egui::Context::default();
+            let egui_winit = egui_winit::State::new(
+                egui_ctx.clone(),
+                egui::ViewportId::ROOT,
+                self.window.as_ref().unwrap(),
+                Some(self.window.as_ref().unwrap().scale_factor() as f32),
+                None, // theme
+                Some(
+                    self.device
+                        .as_ref()
+                        .unwrap()
+                        .limits()
+                        .max_texture_dimension_2d as usize,
+                ),
+            );
+            let egui_renderer = egui_wgpu::Renderer::new(
+                self.device.as_ref().unwrap(),
+                self.config.as_ref().unwrap().format,
+                egui_wgpu::RendererOptions::default(),
+            );
 
-        self.egui_ctx = Some(egui_ctx);
-        self.egui_winit = Some(egui_winit);
-        self.egui_renderer = Some(egui_renderer);
+            self.egui_ctx = Some(egui_ctx);
+            self.egui_winit = Some(egui_winit);
+            self.egui_renderer = Some(egui_renderer);
+        }
         self.cube_vertex_buffer = Some(cube_vertex_buffer);
 
         self.update_shadow_bind_group();
@@ -6788,8 +6948,8 @@ impl App {
         }
 
         viewer_debug!("DEBUG: mesh_pipeline created successfully");
-        println!("wgpu initialized");
-        println!(
+        log::info!("wgpu initialized");
+        log::info!(
             "DoF Kawase enabled: {} (kawase_iterations={}, kawase_offset={})",
             self.dof_settings.kawase_enabled,
             self.dof_settings.kawase_iterations,
@@ -6798,18 +6958,31 @@ impl App {
     }
 
     fn render(&mut self) {
+        log::debug!("render() enter frame={}, frame_index={}", self.frame_count, self.frame_index);
         let device = self.device.as_ref().unwrap().clone();
         let queue = self.queue.as_ref().unwrap().clone();
         let config = self.config.as_ref().unwrap().clone();
+
+        let _frame_scope = self.profiler.scope("frame");
+        log::debug!("render: entered profiler frame scope for frame={}", self.frame_count);
 
         // Update camera
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
+        log::debug!("render: camera updated dt={}", dt);
         self.elapsed_time += dt;
         self.frame_index = self.frame_index.wrapping_add(1);
 
         let fps = if dt > 0.0 { 1.0 / dt } else { f32::INFINITY };
+        // Exponential moving average for FPS (cheap, always enabled)
+        const FPS_ALPHA: f32 = 0.10;
+        if self.fps_ema <= 0.0 {
+            self.fps_ema = fps;
+        } else {
+            self.fps_ema = self.fps_ema * (1.0 - FPS_ALPHA) + fps * FPS_ALPHA;
+        }
+        self.last_fps = self.fps_ema.round() as u32;
         self.adjust_mesh_upload_budget(dt, fps);
 
         // Auto-advance time of day: full cycle in 120 seconds (60s sun, 60s moon)
@@ -6834,9 +7007,13 @@ impl App {
         }
 
         // Reset accumulator for GPU buffer item counting this frame
-        self.gpu_buffer_items_frame = 0;
+        #[cfg(feature = "perf-counters")]
+        {
+            self.gpu_buffer_items_frame = 0;
+        }
 
         // Gather candidate voxels for GPU culling using CPU hierarchy traversal
+        let _cull_scope = self.profiler.scope("cull_cpu");
         let cull_start = Instant::now();
         let (all_visible, cull_stats, visible_chunks) =
             cull_visible_voxels_parallel(&self.world, &self.camera_controller.camera);
@@ -7181,8 +7358,11 @@ impl App {
                     bytemuck::cast_slice(&self.gpu_inputs[0..items_to_write]),
                 );
                 // Count the number of instance entries uploaded to the GPU input buffer
-                self.gpu_buffer_items_frame =
-                    self.gpu_buffer_items_frame.saturating_add(items_to_write);
+                #[cfg(feature = "perf-counters")]
+                {
+                    self.gpu_buffer_items_frame =
+                        self.gpu_buffer_items_frame.saturating_add(items_to_write);
+                }
             }
 
             // Upload Mesh Indirect Args
@@ -7363,9 +7543,12 @@ impl App {
                     bytemuck::cast_slice(&self.envelope_indirect_args_tmp),
                 );
                 // Count the number of indirect draw entries uploaded for envelopes
-                self.gpu_buffer_items_frame = self
-                    .gpu_buffer_items_frame
-                    .saturating_add(self.envelope_indirect_args_tmp.len());
+                #[cfg(feature = "perf-counters")]
+                {
+                    self.gpu_buffer_items_frame = self
+                        .gpu_buffer_items_frame
+                        .saturating_add(self.envelope_indirect_args_tmp.len());
+                }
                 // Mark entries as used so eviction won't free them during this frame
                 for v in visible.iter() {
                     if !v.is_leaf_chunk {
@@ -7401,8 +7584,11 @@ impl App {
                             bytemuck::cast_slice(&self.cpu_prepopulated_instances[..write_count]),
                         );
                         // Count the CPU-prepopulated instances written into the fallback instance buffer
-                        self.gpu_buffer_items_frame =
-                            self.gpu_buffer_items_frame.saturating_add(write_count);
+                        #[cfg(feature = "perf-counters")]
+                        {
+                            self.gpu_buffer_items_frame =
+                                self.gpu_buffer_items_frame.saturating_add(write_count);
+                        }
                     }
                 }
             }
@@ -8015,7 +8201,7 @@ impl App {
         }
 
         if chunks_not_found > 0 && self.frame_count == 0 {
-            println!(
+            log::warn!(
                 "Warning: {} out of {} potential chunks not found (OSM voxels are not in subdivided chunks)",
                 chunks_not_found,
                 leaf_chunks.len()
@@ -8817,6 +9003,12 @@ impl App {
             .expect("offscreen depth view missing");
 
         {
+            let rp_ts = self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
+                query_set: qs,
+                beginning_of_pass_write_index: Some(0),
+                end_of_pass_write_index: Some(1),
+            });
+
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Scene Pass"),
                 color_attachments: &[
@@ -8852,7 +9044,7 @@ impl App {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: rp_ts,
                 occlusion_query_set: None,
             });
 
@@ -8868,6 +9060,7 @@ impl App {
             }
 
             // Draw meshed chunks first
+            let _scene_scope = self.profiler.scope("scene_render_cpu");
             if let Some(mesh_indirect) = &self.mesh_indirect_buffer {
                 render_pass.set_pipeline(self.mesh_pipeline.as_ref().unwrap());
                 render_pass.set_bind_group(0, self.bind_group.as_ref().unwrap(), &[]);
@@ -8968,12 +9161,18 @@ impl App {
         }
 
         // SSR Pass (if enabled) -> writes SSR texture
+        let _ssr_scope = self.profiler.scope("ssr_cpu");
         if self.ssr_settings.enabled {
             if let (Some(pipeline), Some(bind_group), Some(ssr_view)) = (
                 self.ssr_pipeline.as_ref(),
                 self.ssr_bind_group.as_ref(),
                 self.ssr_texture_view.as_ref(),
             ) {
+                let ssr_ts = self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
+                    query_set: qs,
+                    beginning_of_pass_write_index: Some(8),
+                    end_of_pass_write_index: Some(9),
+                });
                 let mut ssr_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("SSR Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -8986,7 +9185,7 @@ impl App {
                         depth_slice: None,
                     })],
                     depth_stencil_attachment: None,
-                    timestamp_writes: None,
+                    timestamp_writes: ssr_ts,
                     occlusion_query_set: None,
                 });
                 ssr_pass.set_pipeline(pipeline);
@@ -9024,7 +9223,14 @@ impl App {
         }
 
         // Water Pass (Transparent, reads depth buffer)
+        let _water_scope = self.profiler.scope("water_cpu");
         {
+            let water_ts = self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
+                query_set: qs,
+                beginning_of_pass_write_index: Some(10),
+                end_of_pass_write_index: Some(11),
+            });
+
             let mut water_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Water Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -9037,7 +9243,7 @@ impl App {
                     depth_slice: None,
                 })],
                 depth_stencil_attachment: None, // No depth attachment, we sample it manually
-                timestamp_writes: None,
+                timestamp_writes: water_ts,
                 occlusion_query_set: None,
             });
 
@@ -9087,6 +9293,11 @@ impl App {
                 let blur_strength = self.dof_settings.blur_strength;
                 let gpu_uniforms = self.pack_dof_uniforms(blur_strength);
                 queue.write_buffer(dof_buffer, 0, bytemuck::cast_slice(&gpu_uniforms));
+                let post_ts = self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
+                    query_set: qs,
+                    beginning_of_pass_write_index: Some(4),
+                    end_of_pass_write_index: None,
+                });
                 let mut post_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("DoF CoC Copy Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -9099,7 +9310,7 @@ impl App {
                         depth_slice: None,
                     })],
                     depth_stencil_attachment: None,
-                    timestamp_writes: None,
+                    timestamp_writes: post_ts,
                     occlusion_query_set: None,
                 });
                 post_pass.set_pipeline(dof_coc_pipeline);
@@ -9167,7 +9378,7 @@ impl App {
                                     depth_slice: None,
                                 })],
                                 depth_stencil_attachment: None,
-                                timestamp_writes: None,
+                                timestamp_writes: if level == 0 { self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites { query_set: qs, beginning_of_pass_write_index: Some(14), end_of_pass_write_index: None }) } else { None },
                                 occlusion_query_set: None,
                             });
                             pass.set_pipeline(kawase_down_pipeline);
@@ -9226,7 +9437,7 @@ impl App {
                                         depth_slice: None,
                                     })],
                                     depth_stencil_attachment: None,
-                                    timestamp_writes: None,
+                                    timestamp_writes: if level_rev == 0 { self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites { query_set: qs, beginning_of_pass_write_index: None, end_of_pass_write_index: Some(15) }) } else { None },
                                     occlusion_query_set: None,
                                 });
                             up_pass.set_pipeline(kawase_up_pipeline);
@@ -9252,6 +9463,11 @@ impl App {
                 self.dof_combine_bind_group.as_ref(),
                 self.post_color_view.as_ref(),
             ) {
+                let combine_ts = self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
+                    query_set: qs,
+                    beginning_of_pass_write_index: None,
+                    end_of_pass_write_index: Some(5),
+                });
                 let mut combine_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("DoF Combine Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -9264,7 +9480,7 @@ impl App {
                         depth_slice: None,
                     })],
                     depth_stencil_attachment: None,
-                    timestamp_writes: None,
+                    timestamp_writes: combine_ts,
                     occlusion_query_set: None,
                 });
                 combine_pass.set_pipeline(dof_combine_pipeline);
@@ -9441,7 +9657,7 @@ impl App {
                                     depth_slice: None,
                                 })],
                                 depth_stencil_attachment: None,
-                                timestamp_writes: None,
+                                timestamp_writes: if level == 0 || level == (iterations - 1) { self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites { query_set: qs, beginning_of_pass_write_index: if level == 0 { Some(16) } else { None }, end_of_pass_write_index: if level == (iterations - 1) { Some(17) } else { None } }) } else { None },
                                 occlusion_query_set: None,
                             });
                             pass.set_pipeline(kawase_down_pipeline);
@@ -9524,6 +9740,11 @@ impl App {
             self.composite_pipeline.as_ref(),
             self.composite_bind_group.as_ref(),
         ) {
+            let composite_ts = self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
+                query_set: qs,
+                beginning_of_pass_write_index: Some(18),
+                end_of_pass_write_index: Some(19),
+            });
             let mut composite_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Composite Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -9536,7 +9757,7 @@ impl App {
                     depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: composite_ts,
                 occlusion_query_set: None,
             });
             composite_pass.set_pipeline(composite_pipeline);
@@ -9547,6 +9768,7 @@ impl App {
         }
 
         // Egui rendering
+        #[cfg(feature = "overlay")]
         if self.gui_visible {
             if let (Some(egui_ctx), Some(egui_winit), Some(window)) =
                 (&self.egui_ctx, &mut self.egui_winit, &self.window)
@@ -9850,11 +10072,125 @@ impl App {
         }
 
         queue.submit(std::iter::once(encoder.finish()));
+        log::debug!("submitted frame {} to GPU queue", self.frame_count);
         output.present();
+        log::debug!("presented output for frame {}", self.frame_count);
+
+        #[cfg(feature = "gpu-profiling")]
+        {
+            if let Some(readback_buf) = self.query_readback_buffer.as_ref() {
+                let slice = readback_buf.slice(..((20 * 8) as u64));
+                if !self.query_readback_in_flight {
+                        if let Some(tx) = &self.query_readback_notifier_tx {
+                        // Requesting readback for this frame (map_async non-blocking)
+                        let tx = tx.clone();
+                        slice.map_async(wgpu::MapMode::Read, move |_res| {
+                            tx.send(()).ok();
+                        });
+                        self.query_readback_in_flight = true;
+                    }
+                }
+                // Do not block waiting on GPU; mapping will be processed asynchronously.
+                // Removed on_submitted_work_done + blocking wait to avoid UI stalls.
+                // Try non-blocking check for readback notification and process mapped data if ready
+                if let Some(rx) = &self.query_readback_notifier_rx {
+                    if let Ok(()) = rx.try_recv() {
+                        // readback notifier received; processing mapped buffer now
+                        let data = slice.get_mapped_range();
+                        let mut stamps: Vec<u64> = Vec::with_capacity(20);
+                        for i in 0..20 {
+                            let start = (i * 8) as usize;
+                            let mut b = [0u8; 8];
+                            b.copy_from_slice(&data[start..start + 8]);
+                            stamps.push(u64::from_le_bytes(b));
+                        }
+                        // Raw stamp values intentionally omitted from normal logs
+                        drop(data);
+                        readback_buf.unmap();
+                        self.query_readback_in_flight = false;
+
+                        let period_ns = self.timestamp_period_ns;
+                        let gpu_ms = |idx_start: usize, idx_end: usize| -> f64 {
+                            let s = stamps[idx_start];
+                            let e = stamps[idx_end];
+                            if s == 0 || e == 0 || e <= s {
+                                return 0.0;
+                            }
+                            let delta = (e - s) as f64;
+                            (delta * period_ns) / 1_000_000.0
+                        };
+
+                        let scene_ms = gpu_ms(0, 1);
+                        let hzb_copy_ms = gpu_ms(2, 3);
+                        let dof_ms = gpu_ms(4, 5);
+                        let gpu_cull_ms = gpu_ms(6, 7);
+                        let ssr_ms = gpu_ms(8, 9);
+                        let water_ms = gpu_ms(10, 11);
+                        let kawase_ms = gpu_ms(14, 15);
+                        let bloom_ms = gpu_ms(16, 17);
+                        let post_ms = gpu_ms(18, 19);
+
+                        // Accumulate GPU timings; averaging is printed periodically
+                        self.gpu_timing_accum_scene_ms += scene_ms;
+                        self.gpu_timing_accum_hzb_copy_ms += hzb_copy_ms;
+                        self.gpu_timing_accum_dof_ms += dof_ms;
+                        self.gpu_timing_accum_gpu_cull_ms += gpu_cull_ms;
+                        self.gpu_timing_accum_ssr_ms += ssr_ms;
+                        self.gpu_timing_accum_water_ms += water_ms;
+                        self.gpu_timing_accum_kawase_ms += kawase_ms;
+                        self.gpu_timing_accum_bloom_ms += bloom_ms;
+                        self.gpu_timing_accum_post_ms += post_ms;
+                        self.gpu_timing_accum_frames = self.gpu_timing_accum_frames.saturating_add(1);
+
+                        if self.gpu_timing_accum_frames >= self.gpu_timing_print_interval_frames {
+                            let frames = self.gpu_timing_accum_frames as f64;
+                            let avg_scene = self.gpu_timing_accum_scene_ms / frames;
+                            let avg_hzb_copy = self.gpu_timing_accum_hzb_copy_ms / frames;
+                            let avg_dof = self.gpu_timing_accum_dof_ms / frames;
+                            let avg_gpu_cull = self.gpu_timing_accum_gpu_cull_ms / frames;
+                            let avg_ssr = self.gpu_timing_accum_ssr_ms / frames;
+                            let avg_water = self.gpu_timing_accum_water_ms / frames;
+                            let avg_kawase = self.gpu_timing_accum_kawase_ms / frames;
+                            let avg_bloom = self.gpu_timing_accum_bloom_ms / frames;
+                            let avg_post = self.gpu_timing_accum_post_ms / frames;
+
+                            log::info!(
+                                "GPU avg timings over {} frames - scene: {:.3}ms, hzb_copy: {:.3}ms, dof: {:.3}ms, gpu_cull: {:.3}ms, ssr: {:.3}ms, water: {:.3}ms, kawase: {:.3}ms, bloom: {:.3}ms, post: {:.3}ms",
+                                self.gpu_timing_accum_frames,
+                                avg_scene,
+                                avg_hzb_copy,
+                                avg_dof,
+                                avg_gpu_cull,
+                                avg_ssr,
+                                avg_water,
+                                avg_kawase,
+                                avg_bloom,
+                                avg_post
+                            );
+
+                            // reset accumulators
+                            self.gpu_timing_accum_scene_ms = 0.0;
+                            self.gpu_timing_accum_hzb_copy_ms = 0.0;
+                            self.gpu_timing_accum_dof_ms = 0.0;
+                            self.gpu_timing_accum_gpu_cull_ms = 0.0;
+                            self.gpu_timing_accum_ssr_ms = 0.0;
+                            self.gpu_timing_accum_water_ms = 0.0;
+                            self.gpu_timing_accum_kawase_ms = 0.0;
+                            self.gpu_timing_accum_bloom_ms = 0.0;
+                            self.gpu_timing_accum_post_ms = 0.0;
+                            self.gpu_timing_accum_frames = 0;
+                        }
+                    }
+                }
+            }
+        }
 
         // Stats
         self.frame_count += 1;
-        if now.duration_since(self.last_fps_print).as_secs() >= 1 {
+        if self.frame_count % 240 == 0 {
+            self.profiler.print_summary();
+        }
+        if self.frame_count >= (self.gpu_timing_print_interval_frames as u64) {
             let total_visible = visible.len();
             let mesh_cache_mib = self.mesh_cache_bytes as f64 / (1024.0 * 1024.0);
             let mesh_budget_mib = self.mesh_cache_byte_budget() as f64 / (1024.0 * 1024.0);
@@ -9889,73 +10225,95 @@ impl App {
             let gpu_reserved_bytes = self.gpu_buffer_bytes.saturating_add(self.gpu_texture_bytes);
             let gpu_reserved_mib = gpu_reserved_bytes as f64 / (1024.0 * 1024.0);
             let ready_count = self.ready_chunk_meshes.len();
-            self.last_fps = self.frame_count as u32;
+            // Compute average FPS across the elapsed interval and store in last_fps for UI
+            let elapsed_fps_seconds = (now - self.last_fps_print).as_secs_f64();
+            let avg_fps = if elapsed_fps_seconds > 0.0 {
+                self.frame_count as f64 / elapsed_fps_seconds
+            } else {
+                0.0
+            };
+            self.last_fps = avg_fps.round() as u32;
             let jobs_in_flight = self.mesh_jobs_in_flight;
             let pending_set_count = self.pending_chunk_set.len();
-            let jobs_per_sec = self.mesh_jobs_executed.swap(0, Ordering::Relaxed);
+            let jobs_per_sec = {
+                #[cfg(feature = "perf-counters")]
+                {
+                    self.mesh_jobs_executed.swap(0, Ordering::Relaxed)
+                }
+                #[cfg(not(feature = "perf-counters"))]
+                {
+                    0
+                }
+            };
             let mesh_idle = self.pending_chunk_meshes.is_empty()
                 && self.ready_chunk_meshes.is_empty()
                 && jobs_in_flight == 0;
-            println!(
-                "FPS: {}, Visible items: {}, Leaf chunks: {}, Meshed chunks: {}, Pending: {}, PendingSet: {}, Ready: {}, InFlight: {}, Fallback: {}, Mesh cache: {:.1}/{:.1} MiB, Process (RSS/VM): {:.1}/{:.1} MiB, Tracked: {:.1} MiB, GPU reserved: {:.1} MiB, Cull: {:.2}ms, Group: {:.2}ms, Mesh: {:.2}ms, Instances: {:.2}ms, Draws: {}, GPU items: {}, Jobs/sec: {}, EmptyMeshes: {}, VReuse: {}, IReuse: {}, VPool: {}, IPool: {}, MeshIdle: {}, DoF Kawase: {} (iter={}, off={:.2}), MeshUp: {:.2}ms parts:(leaf:{:.2} sched:{:.2} sort:{:.2} res:{:.2} jobc:{:.2} jobn:{:.2}) vbld:{:.2} v:{:.2} i:{:.2} ins:{:.2} emit:{:.2} processed:{} limit:{}",
-                self.frame_count,
-                total_visible,
-                leaf_chunks.len(),
-                draw_mesh_keys.len(),
-                self.pending_chunk_meshes.len(),
-                pending_set_count,
-                ready_count,
-                jobs_in_flight,
-                missing_chunks.len(),
-                mesh_cache_mib,
-                mesh_budget_mib,
-                process_mem_mib,
-                process_vmem_mib,
-                tracked_mem_mib,
-                gpu_reserved_mib,
-                cull_time.as_secs_f64() * 1000.0,
-                grouping_time.as_secs_f64() * 1000.0,
+            #[cfg(feature = "cpu-profiling")]
+            {
+                log::info!(
+                    "FPS: {:.2}, Visible items: {}, Leaf chunks: {}, Meshed chunks: {}, Pending: {}, PendingSet: {}, Ready: {}, InFlight: {}, Fallback: {}, Mesh cache: {:.1}/{:.1} MiB, Process (RSS/VM): {:.1}/{:.1} MiB, Tracked: {:.1} MiB, GPU reserved: {:.1} MiB, Cull: {:.2}ms, Group: {:.2}ms, Mesh: {:.2}ms, Instances: {:.2}ms, Draws: {}, GPU items: {}, Jobs/sec: {}, EmptyMeshes: {}, VReuse: {}, IReuse: {}, VPool: {}, IPool: {}, MeshIdle: {}, DoF Kawase: {} (iter={}, off={:.2}), MeshUp: {:.2}ms parts:(leaf:{:.2} sched:{:.2} sort:{:.2} res:{:.2} jobc:{:.2} jobn:{:.2}) vbld:{:.2} v:{:.2} i:{:.2} ins:{:.2} emit:{:.2} processed:{} limit:{}",
+                    avg_fps,
+                    total_visible,
+                    leaf_chunks.len(),
+                    draw_mesh_keys.len(),
+                    self.pending_chunk_meshes.len(),
+                    pending_set_count,
+                    ready_count,
+                    jobs_in_flight,
+                    missing_chunks.len(),
+                    mesh_cache_mib,
+                    mesh_budget_mib,
+                    process_mem_mib,
+                    process_vmem_mib,
+                    tracked_mem_mib,
+                    gpu_reserved_mib,
+                    cull_time.as_secs_f64() * 1000.0,
+                    grouping_time.as_secs_f64() * 1000.0,
                     (if mesh_idle { std::time::Duration::from_secs(0) } else { mesh_time }).as_secs_f64() * 1000.0,
-                instance_time.as_secs_f64() * 1000.0,
-                draw_calls,
-                self.gpu_buffer_items_count,
-                jobs_per_sec,
-                self.stat_empty_meshes,
-                self.stat_vertex_buffers_reused,
-                self.stat_index_buffers_reused,
-                mesh_idle,
-                self.vertex_allocator.allocated_count(),
-                self.index_allocator.allocated_count(),
-                if self.dof_settings.kawase_enabled {"enabled"} else {"disabled"}
-                , self.dof_settings.kawase_iterations
-                , self.dof_settings.kawase_offset
-                , mesh_upload_total_time.as_secs_f64() * 1000.0
-                , mesh_leaf_proc_time.as_secs_f64() * 1000.0
-                , mesh_schedule_time.as_secs_f64() * 1000.0
-                , mesh_pending_sort_time.as_secs_f64() * 1000.0
-                , mesh_result_collect_time.as_secs_f64() * 1000.0
-                , mesh_job_creation_time.as_secs_f64() * 1000.0
-                , mesh_job_neighbors_time.as_secs_f64() * 1000.0
-                , mesh_build_vb_time.as_secs_f64() * 1000.0
-                , mesh_upload_vbuf_time.as_secs_f64() * 1000.0
-                , mesh_upload_ibuf_time.as_secs_f64() * 1000.0
-                , mesh_upload_entry_time.as_secs_f64() * 1000.0
-                , mesh_emitters_proc_time.as_secs_f64() * 1000.0
-                , processed_meshes
-                    , frame_mesh_upload_limit
-            );
+                    instance_time.as_secs_f64() * 1000.0,
+                    draw_calls,
+                    self.gpu_buffer_items_count,
+                    jobs_per_sec,
+                    self.stat_empty_meshes,
+                    self.stat_vertex_buffers_reused,
+                    self.stat_index_buffers_reused,
+                    mesh_idle,
+                    self.vertex_allocator.allocated_count(),
+                    self.index_allocator.allocated_count(),
+                    if self.dof_settings.kawase_enabled {"enabled"} else {"disabled"},
+                    self.dof_settings.kawase_iterations,
+                    self.dof_settings.kawase_offset,
+                    mesh_upload_total_time.as_secs_f64() * 1000.0,
+                    mesh_leaf_proc_time.as_secs_f64() * 1000.0,
+                    mesh_schedule_time.as_secs_f64() * 1000.0,
+                    mesh_pending_sort_time.as_secs_f64() * 1000.0,
+                    mesh_result_collect_time.as_secs_f64() * 1000.0,
+                    mesh_job_creation_time.as_secs_f64() * 1000.0,
+                    mesh_job_neighbors_time.as_secs_f64() * 1000.0,
+                    mesh_build_vb_time.as_secs_f64() * 1000.0,
+                    mesh_upload_vbuf_time.as_secs_f64() * 1000.0,
+                    mesh_upload_ibuf_time.as_secs_f64() * 1000.0,
+                    mesh_upload_entry_time.as_secs_f64() * 1000.0,
+                    mesh_emitters_proc_time.as_secs_f64() * 1000.0,
+                    processed_meshes,
+                    frame_mesh_upload_limit
+                );
+            }
             // Print culling statistics grouped by reason
-            println!(
-                "  Cull Stats: examined={}, visible={}, frustum={}, marginal={}, shell={}, empty={}, no_shell={}, depth={}",
-                self.cull_stats.chunks_examined,
-                self.cull_stats.chunks_visible,
-                self.cull_stats.frustum_aabb_culled,
-                self.cull_stats.marginal_bitmap_culled,
-                self.cull_stats.hierarchy_shell_culled,
-                self.cull_stats.empty_chunk_culled,
-                self.cull_stats.no_shell_available,
-                depth_culled_count,
-            );
+            #[cfg(feature = "cpu-profiling")]
+            {
+                log::info!(
+                    "  Cull Stats: examined={}, visible={}, frustum={}, marginal={}, shell={}, empty={}, no_shell={}, depth={}",
+                    self.cull_stats.chunks_examined,
+                    self.cull_stats.chunks_visible,
+                    self.cull_stats.frustum_aabb_culled,
+                    self.cull_stats.marginal_bitmap_culled,
+                    self.cull_stats.hierarchy_shell_culled,
+                    self.cull_stats.empty_chunk_culled,
+                    self.cull_stats.no_shell_available,
+                    depth_culled_count,
+                );
+            }
 
             // Update UI overlay stats
             self.visible_count = total_visible;
@@ -9981,7 +10339,14 @@ impl App {
                 * 1000.0;
             self.instance_ms = instance_time.as_secs_f64() * 1000.0;
             self.draw_calls_count = draw_calls;
-            self.gpu_buffer_items_count = self.gpu_buffer_items_frame;
+            #[cfg(feature = "perf-counters")]
+            {
+                self.gpu_buffer_items_count = self.gpu_buffer_items_frame;
+            }
+            #[cfg(not(feature = "perf-counters"))]
+            {
+                self.gpu_buffer_items_count = 0;
+            }
 
             // Update UI overlay stats
             self.visible_count = total_visible;
@@ -10030,6 +10395,7 @@ impl ApplicationHandler for App {
         event: WindowEvent,
     ) {
         // Let egui handle the event first
+        #[cfg(feature = "overlay")]
         if let (Some(egui_winit), Some(window)) = (&mut self.egui_winit, &self.window) {
             let response = egui_winit.on_window_event(window, &event);
             if response.consumed {
@@ -10040,7 +10406,7 @@ impl ApplicationHandler for App {
 
         match event {
             WindowEvent::CloseRequested => {
-                println!("Close requested");
+                log::info!("Close requested");
                 self.save_config();
                 event_loop.exit();
             }
@@ -10141,14 +10507,14 @@ impl ApplicationHandler for App {
 fn main() {
     env_logger::init();
 
-    println!("Hierarchical Voxel Viewer");
-    println!("=========================");
-    println!("Controls:");
-    println!("  WASD - Move");
-    println!("  Space/Shift - Up/Down");
-    println!("  Arrow Keys - Rotate (Left/Right yaw, Up/Down pitch)");
-    println!("  Right Mouse - Look around");
-    println!("  ESC - Quit\n");
+    log::info!("Hierarchical Voxel Viewer");
+    log::info!("=========================");
+    log::info!("Controls:");
+    log::info!("  WASD - Move");
+    log::info!("  Space/Shift - Up/Down");
+    log::info!("  Arrow Keys - Rotate (Left/Right yaw, Up/Down pitch)");
+    log::info!("  Right Mouse - Look around");
+    log::info!("  ESC - Quit\n");
 
     let args = ViewerArgs::parse();
     let config_path = args.config_arg.unwrap_or(args.config);
