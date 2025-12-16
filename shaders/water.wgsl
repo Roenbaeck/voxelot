@@ -390,6 +390,9 @@ fn trace_water_reflection(start_pos: vec3<f32>, ray_dir: vec3<f32>, cam_pos: vec
     
     let delta = (end_screen - start_screen) / f32(max_steps);
     let dim = textureDimensions(depth_texture);
+    
+    // Calculate screen-space step magnitude for adaptive thickness
+    let screen_delta_length = length(delta.xy * vec2<f32>(f32(dim.x), f32(dim.y)));
 
     // Jitter the start along the ray in screen-space to avoid visible marching bands.
     // Deterministic per-pixel so it doesn't shimmer frame-to-frame.
@@ -424,7 +427,10 @@ fn trace_water_reflection(start_pos: vec3<f32>, ray_dir: vec3<f32>, cam_pos: vec
             let ray_world_pos = reconstruct_world_pos_uv(uv, ray_depth);
             let dist_diff = distance(ray_world_pos, surface_pos);
             let dist_to_hit = distance(cam_pos, ray_world_pos);
-            let dynamic_thickness = thickness_base + dist_to_hit * 0.05;
+            
+            // Adaptive thickness: increase for distance and screen-space step size (elongation)
+            let screen_space_factor = max(1.0, screen_delta_length * 0.5);
+            let dynamic_thickness = (thickness_base + dist_to_hit * 0.05) * screen_space_factor;
             
             if (dist_diff < dynamic_thickness) {
                 // Refine hit with a few binary-search steps between prev and current.
@@ -531,11 +537,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     
     // Animated water normal + optional boat wake perturbation
     let base_water_normal = get_water_normal(hit_pos, time);
-    let water_normal = get_boat_wake_normal(hit_pos, time, base_water_normal);
+    let water_normal_full = get_boat_wake_normal(hit_pos, time, base_water_normal);
     let view_dir = -world_dir;
     
     // Distance from camera to water
     let dist = distance(cam_pos, hit_pos);
+    
+    // Reduce water normal perturbation for distant water to prevent elongated reflections from becoming noisy
+    let normal_fade_start = 100.0;
+    let normal_fade_end = 400.0;
+    let normal_fade = 1.0 - smoothstep(normal_fade_start, normal_fade_end, dist);
+    let water_normal = normalize(mix(vec3<f32>(0.0, 1.0, 0.0), water_normal_full, normal_fade));
     
     // ========================================================================
     // DEPTH CALCULATION (World-space vertical depth)
