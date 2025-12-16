@@ -936,6 +936,9 @@ struct App {
     water_level: f32,
     water_visibility: f32,
 
+    // Active player pawn (e.g., boat/walker/bird)
+    active_pawn: Option<Box<dyn voxelot::Pawn>>,
+
     // Post-processing state
     dof_coc_pipeline: Option<wgpu::RenderPipeline>,
     dof_bind_group_layout: Option<wgpu::BindGroupLayout>,
@@ -1646,6 +1649,9 @@ impl App {
             lod_distance: cfg.rendering.chunk_lod_distance,
             water_level: cfg.world.water_level,
             water_visibility: cfg.world.water_visibility,
+
+            // Spawn a simple BoatPawn at camera position and immediately 'enter' it for testing
+            active_pawn: Some(Box::new(voxelot::BoatPawn::new(cam_pos, cfg.world.water_level))),
             emissive_texture: None,
             emissive_view: None,
             emissive_texture_bytes: 0,
@@ -6995,6 +7001,12 @@ impl App {
 
         self.camera_controller.update(dt);
 
+        // Update active pawn (boat/walker/etc.) if present and attach camera to it
+        if let Some(pawn) = &mut self.active_pawn {
+            pawn.update(dt, &self.world, self.water_level);
+            pawn.attach_camera(&mut self.camera_controller.camera);
+        }
+
         // Check for GI results (non-blocking, like mesh result polling)
         if let Ok(result) = self.gi_result_rx.try_recv() {
             self.gi_probes = result.probes; // Arc clone is cheap
@@ -7558,6 +7570,20 @@ impl App {
                     if let Some(entry) = self.envelope_mesh_cache.get_mut(&key) {
                         entry.last_used_frame = self.frame_index;
                     }
+                }
+            }
+
+            // Optionally add a debug representation for the active pawn (e.g., boat)
+            if let Some(pawn) = &self.active_pawn {
+                if let Some((pos, scale, color)) = pawn.debug_viz() {
+                    self.cpu_prepopulated_instances.push(VoxelInstanceRaw {
+                        position: pos,
+                        voxel_type: 0,
+                        scale,
+                        ao_factor: 1.0,
+                        custom_color: color,
+                        emissive: [0.0, 0.0, 0.0, 0.0],
+                    });
                 }
             }
 
@@ -10421,6 +10447,23 @@ impl ApplicationHandler for App {
             } => {
                 let pressed = state == ElementState::Pressed;
                 self.camera_controller.process_keyboard(key, pressed);
+
+                // Forward key events to active pawn (if any)
+                if let Some(pawn) = &mut self.active_pawn {
+                    pawn.process_key(key, pressed);
+                }
+
+                // Toggle pawn enter/exit with Digit1 (press only)
+                if key == KeyCode::Digit1 && pressed {
+                    if self.active_pawn.is_some() {
+                        self.active_pawn = None;
+                        log::info!("Exited pawn: returning to free camera");
+                    } else {
+                        let spawn = self.camera_controller.camera.position;
+                        self.active_pawn = Some(Box::new(voxelot::BoatPawn::new(spawn, self.water_level)));
+                        log::info!("Spawned and entered boat at ({:.1},{:.1},{:.1})", spawn[0], spawn[1], spawn[2]);
+                    }
+                }
 
                 // Handle lighting controls on key press only
                 if pressed {

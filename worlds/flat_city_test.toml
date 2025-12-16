@@ -6,7 +6,7 @@ camera_position = [
     150.0,
     511.0,
 ]
-water_level = 25.0
+water_level = 35.0
 water_visibility = 15.0
 
 [rendering]
@@ -14,7 +14,7 @@ chunk_lod_distance = 1500.0
 fov_degrees = 70.0
 near_plane = 0.1
 far_plane = 7000.0
-camera_speed_multiplier = 5.9604645
+camera_speed_multiplier = 7.4505806
 window_width = 1280
 window_height = 720
 macos_hdr = true
