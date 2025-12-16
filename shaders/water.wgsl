@@ -376,10 +376,11 @@ fn reconstruct_world_pos_uv(uv: vec2<f32>, depth: f32) -> vec3<f32> {
 }
 
 // Screen-space reflection ray marching
-fn trace_water_reflection(start_pos: vec3<f32>, ray_dir: vec3<f32>, cam_pos: vec3<f32>) -> vec3<f32> {
-    let max_steps = 32u;
-    let step_size = 2.0;
-    let thickness = 1.5;
+fn trace_water_reflection(start_pos: vec3<f32>, ray_dir: vec3<f32>, cam_pos: vec3<f32>, pixel_uv: vec2<f32>) -> vec3<f32> {
+    // More steps + smaller stride reduces banding; jitter breaks up remaining lines.
+    let max_steps = 48u;
+    let step_size = 1.25;
+    let thickness = 1.25;
     
     let max_dist = f32(max_steps) * step_size;
     let end_pos = start_pos + ray_dir * max_dist;
@@ -388,11 +389,16 @@ fn trace_water_reflection(start_pos: vec3<f32>, ray_dir: vec3<f32>, cam_pos: vec
     let end_screen = world_to_screen_uv(end_pos);
     
     let delta = (end_screen - start_screen) / f32(max_steps);
-    var current_screen = start_screen;
-    
     let dim = textureDimensions(depth_texture);
+
+    // Jitter the start along the ray in screen-space to avoid visible marching bands.
+    // Deterministic per-pixel so it doesn't shimmer frame-to-frame.
+    let jitter = hash2(pixel_uv * vec2<f32>(f32(dim.x), f32(dim.y)));
+    var current_screen = start_screen + delta * jitter;
+    var prev_screen = current_screen;
     
     for (var i = 0u; i < max_steps; i++) {
+        prev_screen = current_screen;
         current_screen += delta;
         
         let uv = current_screen.xy;
@@ -419,12 +425,33 @@ fn trace_water_reflection(start_pos: vec3<f32>, ray_dir: vec3<f32>, cam_pos: vec
             let dist_diff = distance(ray_world_pos, surface_pos);
             
             if (dist_diff < thickness) {
+                // Refine hit with a few binary-search steps between prev and current.
+                var a = prev_screen;
+                var b = current_screen;
+                for (var j = 0u; j < 5u; j++) {
+                    let mid = (a + b) * 0.5;
+                    let mid_uv = mid.xy;
+                    let mid_coords = vec2<i32>(vec2<f32>(dim) * mid_uv);
+                    if (mid_uv.x < 0.0 || mid_uv.x > 1.0 || mid_uv.y < 0.0 || mid_uv.y > 1.0) {
+                        break;
+                    }
+                    if (mid_coords.x < 0 || mid_coords.x >= i32(dim.x) || mid_coords.y < 0 || mid_coords.y >= i32(dim.y)) {
+                        break;
+                    }
+                    let mid_scene_depth = textureLoad(depth_texture, mid_coords, 0);
+                    if (mid.z > mid_scene_depth) {
+                        b = mid;
+                    } else {
+                        a = mid;
+                    }
+                }
+                let hit_uv = b.xy;
                 let edge_fade = min(
-                    min(uv.x, 1.0 - uv.x),
-                    min(uv.y, 1.0 - uv.y)
+                    min(hit_uv.x, 1.0 - hit_uv.x),
+                    min(hit_uv.y, 1.0 - hit_uv.y)
                 );
                 let edge_factor = smoothstep(0.0, 0.1, edge_fade);
-                return vec3<f32>(uv, edge_factor);
+                return vec3<f32>(hit_uv, edge_factor);
             }
         }
     }
@@ -614,7 +641,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var reflection_color = tinted * brightness;
     
     // Screen-space reflections
-    let ssr_hit = trace_water_reflection(hit_pos, reflect_dir_raw, cam_pos);
+    let ssr_hit = trace_water_reflection(hit_pos, reflect_dir_raw, cam_pos, in.uv);
     let ssr_hit_valid = ssr_hit.z;
     
     if (ssr_hit_valid > 0.0) {
