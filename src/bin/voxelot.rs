@@ -1669,6 +1669,7 @@ impl App {
         log::info!("Kawase DoF: X (toggle), U/I (offset -/+), O/P (iterations -/+)");
         log::info!("Bloom: B (toggle)");
         log::info!("HZB: J (toggle)");
+        log::info!("Boat camera: V (cycle), [/] distance, ;/' height, \\ smooth toggle");
         log::info!("Fullscreen: F11 (toggle)");
         log::info!("Quit: ESC");
         log::info!("================\n");

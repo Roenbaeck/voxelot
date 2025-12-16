@@ -13,7 +13,7 @@ pub trait Pawn {
     fn update(&mut self, dt: f32, world: &World, water_level: f32);
 
     /// Attach this pawn's transform to the supplied camera (for follow/cockpit views)
-    fn attach_camera(&self, camera: &mut Camera);
+    fn attach_camera(&mut self, camera: &mut Camera);
 
     /// Optional: pose for drawing a custom mesh (position + yaw radians).
     ///
@@ -38,6 +38,15 @@ pub struct BoatPawn {
     steer: f32,    // -1..1 (left/right)
     hull_half: [f32; 3],
     max_speed: f32,
+
+    // Follow camera tuning
+    cam_distance: f32,
+    cam_height: f32,
+    cam_smoothing: f32, // 0 = snap, higher = smoother
+    cam_pos: [f32; 3],
+    cam_initialized: bool,
+    last_dt: f32,
+    cam_preset: u8,
 }
 
 impl BoatPawn {
@@ -53,6 +62,14 @@ impl BoatPawn {
             steer: 0.0,
             hull_half: [1.0, 0.5, 2.0], // simple hull extents
             max_speed: 20.0,
+
+            cam_distance: 6.0,
+            cam_height: 2.0,
+            cam_smoothing: 10.0,
+            cam_pos: p,
+            cam_initialized: false,
+            last_dt: 1.0 / 60.0,
+            cam_preset: 0,
         }
     }
 
@@ -98,11 +115,51 @@ impl Pawn for BoatPawn {
             KeyCode::KeyS => self.throttle = if pressed { -1.0 } else { 0.0 },
             KeyCode::KeyA => self.steer = if pressed { -1.0 } else { 0.0 },
             KeyCode::KeyD => self.steer = if pressed { 1.0 } else { 0.0 },
+
+            // Camera tuning (press-only)
+            KeyCode::BracketLeft if pressed => {
+                self.cam_distance = (self.cam_distance - 0.5).clamp(2.0, 30.0);
+            }
+            KeyCode::BracketRight if pressed => {
+                self.cam_distance = (self.cam_distance + 0.5).clamp(2.0, 30.0);
+            }
+            KeyCode::Semicolon if pressed => {
+                self.cam_height = (self.cam_height - 0.25).clamp(0.25, 15.0);
+            }
+            KeyCode::Quote if pressed => {
+                self.cam_height = (self.cam_height + 0.25).clamp(0.25, 15.0);
+            }
+            KeyCode::Backslash if pressed => {
+                self.cam_smoothing = if self.cam_smoothing > 0.0 { 0.0 } else { 10.0 };
+            }
+            KeyCode::KeyV if pressed => {
+                // Cycle a few comfortable presets
+                self.cam_preset = self.cam_preset.wrapping_add(1) % 3;
+                match self.cam_preset {
+                    0 => {
+                        self.cam_distance = 6.0;
+                        self.cam_height = 2.0;
+                        self.cam_smoothing = 10.0;
+                    }
+                    1 => {
+                        self.cam_distance = 4.0;
+                        self.cam_height = 1.3;
+                        self.cam_smoothing = 12.0;
+                    }
+                    _ => {
+                        self.cam_distance = 10.0;
+                        self.cam_height = 3.5;
+                        self.cam_smoothing = 8.0;
+                    }
+                }
+            }
             _ => {}
         }
     }
 
     fn update(&mut self, dt: f32, world: &World, water_level: f32) {
+        self.last_dt = dt.max(1.0 / 500.0);
+
         // Simple kinematic model
         let accel = 40.0 * self.throttle; // units/s^2
         let forward = self.forward_vector();
@@ -139,17 +196,45 @@ impl Pawn for BoatPawn {
         }
     }
 
-    fn attach_camera(&self, camera: &mut Camera) {
-        // Put camera slightly above and behind the boat, oriented by yaw
-        let offset_back = 6.0;
-        let offset_up = 2.0;
-        let back = [-self.yaw.cos() * offset_back, 0.0, -self.yaw.sin() * offset_back];
-        camera.position[0] = self.pos[0] + back[0];
-        camera.position[1] = self.pos[1] + offset_up;
-        camera.position[2] = self.pos[2] + back[2];
+    fn attach_camera(&mut self, camera: &mut Camera) {
+        // Chase camera behind the boat, with a couple of tunable parameters.
+        let back = [
+            -self.yaw.cos() * self.cam_distance,
+            0.0,
+            -self.yaw.sin() * self.cam_distance,
+        ];
+        let desired = [
+            self.pos[0] + back[0],
+            self.pos[1] + self.cam_height,
+            self.pos[2] + back[2],
+        ];
 
-        let forward = [self.yaw.cos(), 0.0, self.yaw.sin()];
-        camera.update(camera.position, forward, [0.0, 1.0, 0.0]);
+        if !self.cam_initialized {
+            self.cam_pos = desired;
+            self.cam_initialized = true;
+        } else if self.cam_smoothing <= 0.0 {
+            self.cam_pos = desired;
+        } else {
+            // Exponential smoothing with time-constant controlled by cam_smoothing
+            let alpha = 1.0 - (-self.cam_smoothing * self.last_dt).exp();
+            self.cam_pos[0] += (desired[0] - self.cam_pos[0]) * alpha;
+            self.cam_pos[1] += (desired[1] - self.cam_pos[1]) * alpha;
+            self.cam_pos[2] += (desired[2] - self.cam_pos[2]) * alpha;
+        }
+
+        // Look slightly above the boat origin
+        let look = [self.pos[0], self.pos[1] + 0.9, self.pos[2]];
+        let mut fwd = [
+            look[0] - self.cam_pos[0],
+            look[1] - self.cam_pos[1],
+            look[2] - self.cam_pos[2],
+        ];
+        let len = (fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2]).sqrt().max(1e-6);
+        fwd[0] /= len;
+        fwd[1] /= len;
+        fwd[2] /= len;
+
+        camera.update(self.cam_pos, fwd, [0.0, 1.0, 0.0]);
     }
 
     fn debug_mesh_pose(&self) -> Option<([f32; 3], f32)> {
