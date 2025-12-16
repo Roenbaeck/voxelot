@@ -29,7 +29,91 @@ struct WaterUniforms {
     speed: f32,
     _pad0: f32,
     water_color: vec4<f32>,
+
+    // Boat/wake parameters (optional)
+    // boat_pos_wake.xyz = boat position, boat_pos_wake.w = wake strength (0 disables)
+    boat_pos_wake: vec4<f32>,
+    // boat_dir_speed.xyz = forward direction, boat_dir_speed.w = horizontal speed
+    boat_dir_speed: vec4<f32>,
 };
+
+// ============================================================================
+// BOAT WAKE
+// ============================================================================
+
+fn get_boat_wake(world_pos: vec3<f32>, time: f32) -> f32 {
+    let strength = water.boat_pos_wake.w;
+    if (strength <= 0.0001) {
+        return 0.0;
+    }
+
+    let boat_pos = water.boat_pos_wake.xyz;
+    let d = world_pos.xz - boat_pos.xz;
+
+    var fwd = water.boat_dir_speed.xz;
+    let fwd_len = length(fwd);
+    if (fwd_len < 0.0001) {
+        return 0.0;
+    }
+    fwd = fwd / fwd_len;
+    let right = vec2<f32>(-fwd.y, fwd.x);
+
+    let along = dot(d, fwd);
+    let side = dot(d, right);
+
+    // Only behind the boat (negative along)
+    if (along > 0.0) {
+        return 0.0;
+    }
+
+    let t = -along;
+    let speed = water.boat_dir_speed.w;
+    let speed_factor = clamp(speed * 0.05, 0.0, 1.0);
+
+    // Wake starts narrow behind the stern and spreads as it goes back.
+    // Keep the near-boat wake tighter so the bow doesn't look too wide.
+    // Start narrower right behind the boat, then widen gradually.
+    let spread = 0.25 + t * 0.10;
+    let core = exp(-(side * side) / (spread * spread));
+    let fade = exp(-t / 35.0);
+
+    // Add gentle bands so it reads as waves
+    let bands = 0.65 + 0.35 * sin(t * 1.8 - time * 4.0);
+
+    // A small disturbance ring *behind* the stern (not around the bow)
+    let ring_center = boat_pos.xz - fwd * 1.2;
+    let rd = world_pos.xz - ring_center;
+    let r = length(rd);
+    let ring = exp(-((r - 1.1) * (r - 1.1)) / 0.25) * 0.35;
+
+    return strength * speed_factor * (core * fade * bands + ring);
+}
+
+fn get_boat_wake_normal(world_pos: vec3<f32>, time: f32, base_normal: vec3<f32>) -> vec3<f32> {
+    let strength = water.boat_pos_wake.w;
+    if (strength <= 0.0001) {
+        return base_normal;
+    }
+
+    // Approximate a height-field gradient from the wake scalar (screen-space friendly).
+    // This gives us visible "ridges" in reflection/specular without changing geometry.
+    // Smaller sampling radius = tighter, more localized ripples.
+    let eps = 0.40;
+    let w0 = get_boat_wake(world_pos, time);
+    if (w0 <= 0.0001) {
+        return base_normal;
+    }
+    let wx = get_boat_wake(world_pos + vec3<f32>(eps, 0.0, 0.0), time);
+    let wz = get_boat_wake(world_pos + vec3<f32>(0.0, 0.0, eps), time);
+
+    let ddx = (wx - w0) / eps;
+    let ddz = (wz - w0) / eps;
+
+    // Scale is intentionally subtle; wake scalar already includes speed/strength.
+    let wake_normal_strength = 1.35;
+    let n = normalize(base_normal + vec3<f32>(-ddx * wake_normal_strength, 0.0, -ddz * wake_normal_strength));
+    return n;
+}
 
 @group(0) @binding(0)
 var<uniform> camera: CameraUniforms;
@@ -416,8 +500,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // WATER SURFACE PROPERTIES
     // ========================================================================
     
-    // Animated water normal
-    let water_normal = get_water_normal(hit_pos, time);
+    // Animated water normal + optional boat wake perturbation
+    let base_water_normal = get_water_normal(hit_pos, time);
+    let water_normal = get_boat_wake_normal(hit_pos, time, base_water_normal);
     let view_dir = -world_dir;
     
     // Distance from camera to water
@@ -564,7 +649,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     
     let shore_foam = get_shore_foam(depth_diff, hit_pos, time);
     let surface_foam = get_surface_foam(hit_pos, time);
-    let total_foam = clamp(shore_foam + surface_foam, 0.0, 1.0);
+    let boat_wake = get_boat_wake(hit_pos, time);
+    let total_foam = clamp(shore_foam + surface_foam + boat_wake, 0.0, 1.0);
     
     // Foam color darkens with scene brightness
     let foam_color = vec3<f32>(0.9, 0.92, 0.95) * brightness;

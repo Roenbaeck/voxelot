@@ -309,7 +309,8 @@ fn boat_transform_into_world(
 
         // Rotate around Y and translate
         let wx = lp[0] * cy - lp[2] * sy + pos[0];
-        let wy = lp[1] + pos[1];
+        // Visual-only submersion so the hull intersects the water plane a bit.
+        let wy = lp[1] + pos[1] - 0.18;
         let wz = lp[0] * sy + lp[2] * cy + pos[2];
 
         let nx = ln[0] * cy - ln[2] * sy;
@@ -556,6 +557,10 @@ struct WaterUniforms {
     speed: f32,
     _pad0: f32,
     water_color: [f32; 4],
+
+    // Boat/wake parameters (optional)
+    boat_pos_wake: [f32; 4],   // xyz = boat position, w = wake strength (0 disables)
+    boat_dir_speed: [f32; 4],  // xyz = forward direction, w = horizontal speed
 }
 
 const DOF_UNIFORM_FLOATS: usize = 12;
@@ -2085,6 +2090,8 @@ impl App {
             full_cfg.atmosphere.fog_density = self.fog_density;
 
             // World settings
+            // Persist camera spawn position so next run starts where you left off.
+            full_cfg.world.camera_position = self.camera_controller.camera.position;
             full_cfg.world.water_level = self.water_level;
             full_cfg.world.water_visibility = self.water_visibility;
 
@@ -4594,6 +4601,8 @@ impl App {
             speed: 1.0,
             _pad0: 0.0,
             water_color: [0.0, 0.3, 0.5, 0.6],
+            boat_pos_wake: [0.0, 0.0, 0.0, 0.0],
+            boat_dir_speed: [0.0, 0.0, 0.0, 0.0],
         };
         let water_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Water Uniform Buffer"),
@@ -9096,12 +9105,24 @@ impl App {
 
         // Update water uniforms
         if let Some(water_buffer) = self.water_uniform_buffer.as_ref() {
+            let mut boat_pos_wake = [0.0, 0.0, 0.0, 0.0];
+            let mut boat_dir_speed = [0.0, 0.0, 0.0, 0.0];
+            if let Some(pawn) = &self.active_pawn {
+                if let Some((pos, forward, speed)) = pawn.water_wake() {
+                    // Strength scales with speed; 0 disables the effect in shader.
+                    let wake_strength = (speed * 0.05).clamp(0.0, 1.0);
+                    boat_pos_wake = [pos[0], pos[1], pos[2], wake_strength];
+                    boat_dir_speed = [forward[0], forward[1], forward[2], speed];
+                }
+            }
             let water_uniforms = WaterUniforms {
                 water_level: self.water_level,
                 wave_strength: 0.1,
                 speed: 1.0,
                 _pad0: 0.0,
                 water_color: [0.0, 0.3, 0.5, 0.6],
+                boat_pos_wake,
+                boat_dir_speed,
             };
             queue.write_buffer(water_buffer, 0, bytemuck::bytes_of(&water_uniforms));
         }

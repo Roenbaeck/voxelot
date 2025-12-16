@@ -23,6 +23,12 @@ pub trait Pawn {
         None
     }
 
+    /// Optional: parameters for water interaction (wake/foam).
+    /// Returns (position, forward_dir, horizontal_speed).
+    fn water_wake(&self) -> Option<([f32; 3], [f32; 3], f32)> {
+        None
+    }
+
     /// Optional: provide a simple debug visualization as a colored box: (pos, scale, color)
     fn debug_viz(&self) -> Option<([f32;3],[f32;3],[f32;4])> {
         None
@@ -239,6 +245,12 @@ impl Pawn for BoatPawn {
 
     fn debug_mesh_pose(&self) -> Option<([f32; 3], f32)> {
         Some((self.pos, self.yaw))
+    }
+
+    fn water_wake(&self) -> Option<([f32; 3], [f32; 3], f32)> {
+        let forward = self.forward_vector();
+        let speed = (self.vel[0] * self.vel[0] + self.vel[2] * self.vel[2]).sqrt();
+        Some((self.pos, forward, speed))
     }
 
     fn debug_viz(&self) -> Option<([f32;3],[f32;3],[f32;4])> {
