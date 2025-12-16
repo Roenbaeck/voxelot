@@ -378,9 +378,9 @@ fn reconstruct_world_pos_uv(uv: vec2<f32>, depth: f32) -> vec3<f32> {
 // Screen-space reflection ray marching
 fn trace_water_reflection(start_pos: vec3<f32>, ray_dir: vec3<f32>, cam_pos: vec3<f32>, pixel_uv: vec2<f32>) -> vec3<f32> {
     // More steps + smaller stride reduces banding; jitter breaks up remaining lines.
-    let max_steps = 48u;
-    let step_size = 1.25;
-    let thickness = 1.25;
+    let max_steps = 200u;
+    let step_size = 2.0;
+    let thickness_base = 5.0;
     
     let max_dist = f32(max_steps) * step_size;
     let end_pos = start_pos + ray_dir * max_dist;
@@ -423,8 +423,10 @@ fn trace_water_reflection(start_pos: vec3<f32>, ray_dir: vec3<f32>, cam_pos: vec
             let surface_pos = reconstruct_world_pos_uv(uv, scene_depth);
             let ray_world_pos = reconstruct_world_pos_uv(uv, ray_depth);
             let dist_diff = distance(ray_world_pos, surface_pos);
+            let dist_to_hit = distance(cam_pos, ray_world_pos);
+            let dynamic_thickness = thickness_base + dist_to_hit * 0.05;
             
-            if (dist_diff < thickness) {
+            if (dist_diff < dynamic_thickness) {
                 // Refine hit with a few binary-search steps between prev and current.
                 var a = prev_screen;
                 var b = current_screen;
@@ -648,7 +650,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let scene_sample = textureSample(scene_color_texture, scene_sampler, ssr_hit.xy);
         let ssr_color = scene_sample.rgb;
         
-        let ssr_max_dist = 150.0;
+        let ssr_max_dist = 1000.0;
         let ssr_dist_fade = clamp((ssr_max_dist - dist) / ssr_max_dist, 0.0, 1.0);
         let ssr_effect = ssr_hit_valid * ssr_dist_fade;
         
