@@ -296,26 +296,60 @@ fn boat_transform_into_world(
     src_local: &[MeshVertexRaw],
     pos: [f32; 3],
     yaw: f32,
+    pitch: f32,
+    roll: f32,
 ) {
     dst.clear();
     dst.reserve(src_local.len());
 
     let cy = yaw.cos();
     let sy = yaw.sin();
+    let cp = pitch.cos();
+    let sp = pitch.sin();
+    let cr = roll.cos();
+    let sr = roll.sin();
+
+    // Local axes: +X forward, +Y up, +Z right
+    // Roll about local +X, pitch about local +Z, yaw about world +Y.
+    // Using the same yaw convention as earlier (x' = x*cy - z*sy).
+    // Combined rotation: R = Ry(yaw) * Rz(pitch) * Rx(roll)
+    let r00 = cy * cp;
+    let r01 = -cy * sp * cr - sy * sr;
+    let r02 = cy * sp * sr - sy * cr;
+
+    let r10 = sp;
+    let r11 = cp * cr;
+    let r12 = -cp * sr;
+
+    let r20 = sy * cp;
+    let r21 = -sy * sp * cr + cy * sr;
+    let r22 = sy * sp * sr + cy * cr;
 
     for v in src_local {
         let lp = v.position;
         let ln = v.normal;
 
-        // Rotate around Y and translate
-        let wx = lp[0] * cy - lp[2] * sy + pos[0];
-        // Visual-only submersion so the hull intersects the water plane a bit.
-        let wy = lp[1] + pos[1] - 0.18;
-        let wz = lp[0] * sy + lp[2] * cy + pos[2];
+        // Rotate and translate
+        let rxp = [
+            lp[0] * r00 + lp[1] * r01 + lp[2] * r02,
+            lp[0] * r10 + lp[1] * r11 + lp[2] * r12,
+            lp[0] * r20 + lp[1] * r21 + lp[2] * r22,
+        ];
+        let rnp = [
+            ln[0] * r00 + ln[1] * r01 + ln[2] * r02,
+            ln[0] * r10 + ln[1] * r11 + ln[2] * r12,
+            ln[0] * r20 + ln[1] * r21 + ln[2] * r22,
+        ];
 
-        let nx = ln[0] * cy - ln[2] * sy;
-        let ny = ln[1];
-        let nz = ln[0] * sy + ln[2] * cy;
+        let wx = rxp[0] + pos[0];
+        // Visual-only submersion so the hull intersects the water plane a bit.
+        let wy = rxp[1] + pos[1] - 0.18;
+        let wz = rxp[2] + pos[2];
+
+        let nlen = (rnp[0] * rnp[0] + rnp[1] * rnp[1] + rnp[2] * rnp[2]).sqrt().max(1e-6);
+        let nx = rnp[0] / nlen;
+        let ny = rnp[1] / nlen;
+        let nz = rnp[2] / nlen;
 
         dst.push(MeshVertexRaw {
             position: [wx, wy, wz],
@@ -7238,12 +7272,27 @@ impl App {
         // Update active pawn mesh (boat) vertices/buffer
         self.boat_vertex_count = 0;
         if let (Some(pawn), Some(boat_buf)) = (&self.active_pawn, self.boat_vertex_buffer.as_ref()) {
-            if let Some((pos, yaw)) = pawn.debug_mesh_pose() {
+            if let Some((pos, yaw, pitch, roll)) = pawn.debug_mesh_transform() {
                 boat_transform_into_world(
                     &mut self.boat_world_vertices,
                     &self.boat_local_vertices,
                     pos,
                     yaw,
+                    pitch,
+                    roll,
+                );
+                self.boat_vertex_count = self.boat_world_vertices.len() as u32;
+                if self.boat_vertex_count > 0 {
+                    queue.write_buffer(boat_buf, 0, bytemuck::cast_slice(&self.boat_world_vertices));
+                }
+            } else if let Some((pos, yaw)) = pawn.debug_mesh_pose() {
+                boat_transform_into_world(
+                    &mut self.boat_world_vertices,
+                    &self.boat_local_vertices,
+                    pos,
+                    yaw,
+                    0.0,
+                    0.0,
                 );
                 self.boat_vertex_count = self.boat_world_vertices.len() as u32;
                 if self.boat_vertex_count > 0 {

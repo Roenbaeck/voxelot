@@ -23,6 +23,15 @@ pub trait Pawn {
         None
     }
 
+    /// Optional: richer transform for drawing a custom mesh.
+    /// Returns (position, yaw, pitch, roll) in radians.
+    ///
+    /// This exists so we can do visual-only effects (like wave bobbing) without
+    /// changing collision/physics.
+    fn debug_mesh_transform(&self) -> Option<([f32; 3], f32, f32, f32)> {
+        self.debug_mesh_pose().map(|(pos, yaw)| (pos, yaw, 0.0, 0.0))
+    }
+
     /// Optional: parameters for water interaction (wake/foam).
     /// Returns (position, forward_dir, horizontal_speed).
     fn water_wake(&self) -> Option<([f32; 3], [f32; 3], f32)> {
@@ -44,6 +53,12 @@ pub struct BoatPawn {
     steer: f32,    // -1..1 (left/right)
     hull_half: [f32; 3],
     max_speed: f32,
+
+    // Visual-only wave response
+    wave_time: f32,
+    visual_bob: f32,
+    visual_pitch: f32,
+    visual_roll: f32,
 
     // Follow camera tuning
     cam_distance: f32,
@@ -68,6 +83,11 @@ impl BoatPawn {
             steer: 0.0,
             hull_half: [1.0, 0.5, 2.0], // simple hull extents
             max_speed: 20.0,
+
+            wave_time: 0.0,
+            visual_bob: 0.0,
+            visual_pitch: 0.0,
+            visual_roll: 0.0,
 
             cam_distance: 6.0,
             cam_height: 2.0,
@@ -111,6 +131,36 @@ impl BoatPawn {
             }
         }
         false
+    }
+
+    fn wave_height_at(&self, x: f32, z: f32, t: f32) -> f32 {
+        // Lightweight approximation of the shader waves, used for visual bobbing only.
+        // Keep amplitudes subtle so it doesn't fight gameplay/collision.
+        let wave_strength = 0.10;
+        let wave_speed = 0.5; // matches shader: water.speed * 0.5 (water.speed is 1.0)
+        let wave_scale = 0.08;
+
+        let p = [x, z];
+
+        let w1_dir = [1.0, 0.3];
+        let w1 = (p[0] * w1_dir[0] + p[1] * w1_dir[1]) * (wave_scale)
+            + t * wave_speed;
+        let w1_amp = wave_strength * 0.35;
+
+        let w2_dir = [0.7, 0.7];
+        let w2 = (p[0] * w2_dir[0] + p[1] * w2_dir[1]) * (wave_scale * 1.8)
+            + t * wave_speed * 1.1;
+        let w2_amp = wave_strength * 0.22;
+
+        let w3_dir = [-0.4, 0.9];
+        let w3 = (p[0] * w3_dir[0] + p[1] * w3_dir[1]) * (wave_scale * 3.2)
+            + t * wave_speed * 0.9;
+        let w3_amp = wave_strength * 0.12;
+
+        // Height field = sum of sines.
+        // Scale up a bit for readability (still subtle in meters/voxels).
+        let h = w1_amp * w1.sin() + w2_amp * w2.sin() + w3_amp * w3.sin();
+        h * 2.0
     }
 }
 
@@ -165,6 +215,7 @@ impl Pawn for BoatPawn {
 
     fn update(&mut self, dt: f32, world: &World, water_level: f32) {
         self.last_dt = dt.max(1.0 / 500.0);
+        self.wave_time = (self.wave_time + dt).min(1.0e9);
 
         // Simple kinematic model
         let accel = 40.0 * self.throttle; // units/s^2
@@ -200,6 +251,38 @@ impl Pawn for BoatPawn {
         } else {
             self.pos = candidate;
         }
+
+        // Visual-only wave response (does not affect collision AABB / physics).
+        let t = self.wave_time;
+        let x = self.pos[0];
+        let z = self.pos[2];
+        let h0 = self.wave_height_at(x, z, t);
+        self.visual_bob = h0;
+
+        // Estimate slopes for pitch/roll by sampling around the boat.
+        let sample = 1.2;
+        let fx = self.yaw.cos();
+        let fz = self.yaw.sin();
+        let rx = -fz;
+        let rz = fx;
+
+        let h_front = self.wave_height_at(x + fx * sample, z + fz * sample, t);
+        let h_back = self.wave_height_at(x - fx * sample, z - fz * sample, t);
+        let h_left = self.wave_height_at(x - rx * sample, z - rz * sample, t);
+        let h_right = self.wave_height_at(x + rx * sample, z + rz * sample, t);
+
+        // Small angles from height differences.
+        let pitch = ((h_front - h_back) / (2.0 * sample)).atan();
+        let roll = ((h_right - h_left) / (2.0 * sample)).atan();
+
+        // Clamp and damp to keep it pleasant.
+        let max_tilt = 0.22; // ~12.6 degrees
+        let target_pitch = pitch.clamp(-max_tilt, max_tilt) * 0.75;
+        let target_roll = roll.clamp(-max_tilt, max_tilt) * 0.85;
+
+        let relax = 1.0 - (-8.0 * dt).exp();
+        self.visual_pitch += (target_pitch - self.visual_pitch) * relax;
+        self.visual_roll += (target_roll - self.visual_roll) * relax;
     }
 
     fn attach_camera(&mut self, camera: &mut Camera) {
@@ -211,7 +294,7 @@ impl Pawn for BoatPawn {
         ];
         let desired = [
             self.pos[0] + back[0],
-            self.pos[1] + self.cam_height,
+            (self.pos[1] + self.visual_bob) + self.cam_height,
             self.pos[2] + back[2],
         ];
 
@@ -229,7 +312,7 @@ impl Pawn for BoatPawn {
         }
 
         // Look slightly above the boat origin
-        let look = [self.pos[0], self.pos[1] + 0.9, self.pos[2]];
+        let look = [self.pos[0], (self.pos[1] + self.visual_bob) + 0.9, self.pos[2]];
         let mut fwd = [
             look[0] - self.cam_pos[0],
             look[1] - self.cam_pos[1],
@@ -244,7 +327,19 @@ impl Pawn for BoatPawn {
     }
 
     fn debug_mesh_pose(&self) -> Option<([f32; 3], f32)> {
-        Some((self.pos, self.yaw))
+        Some((
+            [self.pos[0], self.pos[1] + self.visual_bob, self.pos[2]],
+            self.yaw,
+        ))
+    }
+
+    fn debug_mesh_transform(&self) -> Option<([f32; 3], f32, f32, f32)> {
+        Some((
+            [self.pos[0], self.pos[1] + self.visual_bob, self.pos[2]],
+            self.yaw,
+            self.visual_pitch,
+            self.visual_roll,
+        ))
     }
 
     fn water_wake(&self) -> Option<([f32; 3], [f32; 3], f32)> {
