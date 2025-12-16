@@ -142,6 +142,189 @@ struct MeshVertexRaw {
     emissive: [f32; 4],
 }
 
+// -----------------------------------------------------------------------------
+// Simple low-poly boat mesh (CPU-skinned into world-space each frame)
+
+const BOAT_VERTEX_CAPACITY: usize = 192;
+
+fn boat_push_tri(
+    out: &mut Vec<MeshVertexRaw>,
+    a: [f32; 3],
+    b: [f32; 3],
+    c: [f32; 3],
+    color: [f32; 4],
+) {
+    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let n = [
+        ab[1] * ac[2] - ab[2] * ac[1],
+        ab[2] * ac[0] - ab[0] * ac[2],
+        ab[0] * ac[1] - ab[1] * ac[0],
+    ];
+    let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-6);
+    let normal = [n[0] / len, n[1] / len, n[2] / len];
+
+    // Make it double-sided so we don't have to perfectly manage winding while iterating on the model.
+    // This also avoids "invisible hull" if the camera is inside/near the mesh.
+    let emissive = [0.0, 0.0, 0.0, 0.0];
+    out.push(MeshVertexRaw {
+        position: a,
+        normal,
+        color,
+        emissive,
+    });
+    out.push(MeshVertexRaw {
+        position: b,
+        normal,
+        color,
+        emissive,
+    });
+    out.push(MeshVertexRaw {
+        position: c,
+        normal,
+        color,
+        emissive,
+    });
+
+    let normal_back = [-normal[0], -normal[1], -normal[2]];
+    out.push(MeshVertexRaw {
+        position: c,
+        normal: normal_back,
+        color,
+        emissive,
+    });
+    out.push(MeshVertexRaw {
+        position: b,
+        normal: normal_back,
+        color,
+        emissive,
+    });
+    out.push(MeshVertexRaw {
+        position: a,
+        normal: normal_back,
+        color,
+        emissive,
+    });
+}
+
+fn boat_push_quad(out: &mut Vec<MeshVertexRaw>, a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f32; 3], color: [f32; 4]) {
+    boat_push_tri(out, a, b, c, color);
+    boat_push_tri(out, a, c, d, color);
+}
+
+fn boat_build_local_triangles(out: &mut Vec<MeshVertexRaw>) {
+    out.clear();
+
+    // Palette-ish colors (simple, consistent with the provided reference image)
+    let hull_dark = [0.22, 0.18, 0.10, 1.0];
+    let hull_light = [0.88, 0.88, 0.86, 1.0];
+    let stripe = [0.86, 0.56, 0.40, 1.0];
+    let seat = [0.80, 0.80, 0.78, 1.0];
+
+    // Local space: +X forward, +Y up, +Z right
+    // Keep origin roughly at the boat center; bottom slightly below 0 so it sits on water nicely.
+    let y_bottom = -0.35;
+    let y_rim = 0.25;
+    let y_seat = 0.00;
+
+    let x_stern = -3.0;
+    let x_mid = 0.2;
+    let x_bow = 3.2;
+
+    let w_bottom = 0.70;
+    let w_rim = 0.85;
+    let w_seat = 0.55;
+
+    // Key points
+    let sb_l = [x_stern, y_bottom, -w_bottom];
+    let sb_r = [x_stern, y_bottom, w_bottom];
+    let sr_l = [x_stern + 0.35, y_rim, -w_rim];
+    let sr_r = [x_stern + 0.35, y_rim, w_rim];
+
+    let mb_l = [x_mid, y_bottom, -w_bottom];
+    let mb_r = [x_mid, y_bottom, w_bottom];
+    let mr_l = [x_mid, y_rim, -w_rim];
+    let mr_r = [x_mid, y_rim, w_rim];
+
+    let bow_b = [x_bow, y_bottom, 0.0];
+    let bow_r = [x_bow - 0.25, y_rim, 0.0];
+
+    // Bottom (light)
+    boat_push_quad(out, sb_l, mb_l, mb_r, sb_r, hull_light);
+    boat_push_tri(out, mb_l, bow_b, mb_r, hull_light);
+
+    // Sides (dark)
+    boat_push_quad(out, sb_l, sr_l, mr_l, mb_l, hull_dark); // left side stern->mid
+    boat_push_quad(out, mb_l, mr_l, bow_r, bow_b, hull_dark); // left side mid->bow
+    boat_push_quad(out, mb_r, bow_b, bow_r, mr_r, hull_dark); // right side mid->bow
+    boat_push_quad(out, sb_r, mb_r, mr_r, sr_r, hull_dark); // right side stern->mid
+
+    // Stern face (dark)
+    boat_push_quad(out, sb_l, sb_r, sr_r, sr_l, hull_dark);
+
+    // A simple stripe band on the sides (peach)
+    let y_s0 = -0.10;
+    let y_s1 = 0.05;
+    let sb_l0 = [x_stern + 0.10, y_s0, -w_bottom * 0.98];
+    let sb_l1 = [x_stern + 0.10, y_s1, -w_bottom * 0.98];
+    let mb_l0 = [x_mid, y_s0, -w_bottom * 0.98];
+    let mb_l1 = [x_mid, y_s1, -w_bottom * 0.98];
+    boat_push_quad(out, sb_l0, sb_l1, mb_l1, mb_l0, stripe);
+
+    let sb_r0 = [x_stern + 0.10, y_s0, w_bottom * 0.98];
+    let sb_r1 = [x_stern + 0.10, y_s1, w_bottom * 0.98];
+    let mb_r0 = [x_mid, y_s0, w_bottom * 0.98];
+    let mb_r1 = [x_mid, y_s1, w_bottom * 0.98];
+    boat_push_quad(out, mb_r0, mb_r1, sb_r1, sb_r0, stripe);
+
+    // Seats (light)
+    let seat0_a = [-1.2, y_seat, -w_seat];
+    let seat0_b = [-1.2, y_seat, w_seat];
+    let seat0_c = [-0.4, y_seat, w_seat];
+    let seat0_d = [-0.4, y_seat, -w_seat];
+    boat_push_quad(out, seat0_a, seat0_b, seat0_c, seat0_d, seat);
+
+    let seat1_a = [0.6, y_seat, -w_seat];
+    let seat1_b = [0.6, y_seat, w_seat];
+    let seat1_c = [1.4, y_seat, w_seat];
+    let seat1_d = [1.4, y_seat, -w_seat];
+    boat_push_quad(out, seat1_a, seat1_b, seat1_c, seat1_d, seat);
+}
+
+fn boat_transform_into_world(
+    dst: &mut Vec<MeshVertexRaw>,
+    src_local: &[MeshVertexRaw],
+    pos: [f32; 3],
+    yaw: f32,
+) {
+    dst.clear();
+    dst.reserve(src_local.len());
+
+    let cy = yaw.cos();
+    let sy = yaw.sin();
+
+    for v in src_local {
+        let lp = v.position;
+        let ln = v.normal;
+
+        // Rotate around Y and translate
+        let wx = lp[0] * cy - lp[2] * sy + pos[0];
+        let wy = lp[1] + pos[1];
+        let wz = lp[0] * sy + lp[2] * cy + pos[2];
+
+        let nx = ln[0] * cy - ln[2] * sy;
+        let ny = ln[1];
+        let nz = ln[0] * sy + ln[2] * cy;
+
+        dst.push(MeshVertexRaw {
+            position: [wx, wy, wz],
+            normal: [nx, ny, nz],
+            color: v.color,
+            emissive: v.emissive,
+        });
+    }
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct CubeVertex {
@@ -774,6 +957,13 @@ struct App {
     main_bind_group_layout: Option<wgpu::BindGroupLayout>,
     shadow_bind_group_layout: Option<wgpu::BindGroupLayout>,
     cube_vertex_buffer: Option<wgpu::Buffer>,
+
+    // Simple dynamic mesh for the active pawn (e.g., boat)
+    boat_vertex_buffer: Option<wgpu::Buffer>,
+    boat_vertex_capacity: usize,
+    boat_local_vertices: Vec<MeshVertexRaw>,
+    boat_world_vertices: Vec<MeshVertexRaw>,
+    boat_vertex_count: u32,
 
     shadow_texture: Option<wgpu::Texture>,
     shadow_view: Option<wgpu::TextureView>,
@@ -1483,6 +1673,9 @@ impl App {
         log::info!("Quit: ESC");
         log::info!("================\n");
 
+        let mut boat_local_vertices = Vec::with_capacity(BOAT_VERTEX_CAPACITY);
+        boat_build_local_triangles(&mut boat_local_vertices);
+
         Self {
             window: None,
             surface: None,
@@ -1502,6 +1695,12 @@ impl App {
             main_bind_group_layout: None,
             shadow_bind_group_layout: None,
             cube_vertex_buffer: None,
+
+            boat_vertex_buffer: None,
+            boat_vertex_capacity: BOAT_VERTEX_CAPACITY,
+            boat_local_vertices,
+            boat_world_vertices: Vec::with_capacity(BOAT_VERTEX_CAPACITY),
+            boat_vertex_count: 0,
 
             shadow_texture: None,
             shadow_view: None,
@@ -6644,6 +6843,24 @@ impl App {
             &mut self.gpu_buffer_bytes,
         );
 
+        // Create a small dynamic vertex buffer for the active pawn mesh (boat)
+        // (capacity must fit the generated local boat mesh)
+        self.boat_vertex_capacity = self
+            .boat_vertex_capacity
+            .max(self.boat_local_vertices.len())
+            .max(3);
+        if self.boat_world_vertices.capacity() < self.boat_vertex_capacity {
+            self.boat_world_vertices
+                .reserve(self.boat_vertex_capacity - self.boat_world_vertices.capacity());
+        }
+        let boat_vertex_stride = std::mem::size_of::<MeshVertexRaw>() as u64;
+        let boat_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Boat Vertex Buffer"),
+            size: (self.boat_vertex_capacity as u64) * boat_vertex_stride,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // Create Mega Buffers and multi-draw buffers
         let mega_vertex_size = self.vertex_allocator.total_size();
         let mega_index_size = self.index_allocator.total_size();
@@ -6707,6 +6924,7 @@ impl App {
         self.cull_bind_group_layout = Some(cull_bind_group_layout);
         self.cull_params_buffer = Some(cull_params_buffer);
         self.cull_bind_group = None;
+        self.boat_vertex_buffer = Some(boat_vertex_buffer);
         self.mega_vertex_buffer = Some(mega_vertex_buffer);
         self.mega_index_buffer = Some(mega_index_buffer);
         self.multi_draw_indirect_buffer = Some(multi_draw_buf);
@@ -7005,6 +7223,23 @@ impl App {
         if let Some(pawn) = &mut self.active_pawn {
             pawn.update(dt, &self.world, self.water_level);
             pawn.attach_camera(&mut self.camera_controller.camera);
+        }
+
+        // Update active pawn mesh (boat) vertices/buffer
+        self.boat_vertex_count = 0;
+        if let (Some(pawn), Some(boat_buf)) = (&self.active_pawn, self.boat_vertex_buffer.as_ref()) {
+            if let Some((pos, yaw)) = pawn.debug_mesh_pose() {
+                boat_transform_into_world(
+                    &mut self.boat_world_vertices,
+                    &self.boat_local_vertices,
+                    pos,
+                    yaw,
+                );
+                self.boat_vertex_count = self.boat_world_vertices.len() as u32;
+                if self.boat_vertex_count > 0 {
+                    queue.write_buffer(boat_buf, 0, bytemuck::cast_slice(&self.boat_world_vertices));
+                }
+            }
         }
 
         // Check for GI results (non-blocking, like mesh result polling)
@@ -7570,20 +7805,6 @@ impl App {
                     if let Some(entry) = self.envelope_mesh_cache.get_mut(&key) {
                         entry.last_used_frame = self.frame_index;
                     }
-                }
-            }
-
-            // Optionally add a debug representation for the active pawn (e.g., boat)
-            if let Some(pawn) = &self.active_pawn {
-                if let Some((pos, scale, color)) = pawn.debug_viz() {
-                    self.cpu_prepopulated_instances.push(VoxelInstanceRaw {
-                        position: pos,
-                        voxel_type: 0,
-                        scale,
-                        ao_factor: 1.0,
-                        custom_color: color,
-                        emissive: [0.0, 0.0, 0.0, 0.0],
-                    });
                 }
             }
 
@@ -9003,6 +9224,17 @@ impl App {
                         draw_calls += 1;
                     }
                 }
+
+                // Draw the active pawn mesh (boat) into the shadow map
+                if self.boat_vertex_count > 0 {
+                    if let Some(boat_buf) = self.boat_vertex_buffer.as_ref() {
+                        shadow_pass.set_pipeline(shadow_mesh_pipeline);
+                        shadow_pass.set_bind_group(0, shadow_bind_group, &[]);
+                        shadow_pass.set_vertex_buffer(0, boat_buf.slice(..));
+                        shadow_pass.draw(0..self.boat_vertex_count, 0..1);
+                        draw_calls += 1;
+                    }
+                }
             }
 
             if let Some(fallback_indirect) = &self.fallback_indirect_buffer {
@@ -9169,6 +9401,17 @@ impl App {
                     if cfg!(feature = "viewer-debug") && self.frame_count == 0 {
                         viewer_debug!("DEBUG: Drew {} meshes (indirect)", drawn_meshes);
                     }
+                }
+            }
+
+            // Draw active pawn mesh (boat) before instanced cubes
+            if self.boat_vertex_count > 0 {
+                if let Some(boat_buf) = self.boat_vertex_buffer.as_ref() {
+                    render_pass.set_pipeline(self.mesh_pipeline.as_ref().unwrap());
+                    render_pass.set_bind_group(0, self.bind_group.as_ref().unwrap(), &[]);
+                    render_pass.set_vertex_buffer(0, boat_buf.slice(..));
+                    render_pass.draw(0..self.boat_vertex_count, 0..1);
+                    draw_calls += 1;
                 }
             }
 

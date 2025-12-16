@@ -15,6 +15,14 @@ pub trait Pawn {
     /// Attach this pawn's transform to the supplied camera (for follow/cockpit views)
     fn attach_camera(&self, camera: &mut Camera);
 
+    /// Optional: pose for drawing a custom mesh (position + yaw radians).
+    ///
+    /// This is intentionally minimal so we can later swap to a walker/bird mesh without
+    /// touching physics/input code.
+    fn debug_mesh_pose(&self) -> Option<([f32; 3], f32)> {
+        None
+    }
+
     /// Optional: provide a simple debug visualization as a colored box: (pos, scale, color)
     fn debug_viz(&self) -> Option<([f32;3],[f32;3],[f32;4])> {
         None
@@ -142,6 +150,10 @@ impl Pawn for BoatPawn {
 
         let forward = [self.yaw.cos(), 0.0, self.yaw.sin()];
         camera.update(camera.position, forward, [0.0, 1.0, 0.0]);
+    }
+
+    fn debug_mesh_pose(&self) -> Option<([f32; 3], f32)> {
+        Some((self.pos, self.yaw))
     }
 
     fn debug_viz(&self) -> Option<([f32;3],[f32;3],[f32;4])> {
