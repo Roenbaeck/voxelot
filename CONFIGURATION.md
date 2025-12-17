@@ -26,6 +26,20 @@ Each entry shows the default value (as found in `src/config.rs`), a short descri
   - Used: `src/bin/voxelot.rs` (initial camera setup)
   - Effect of change: Modifying this moves the camera to a different starting point in the loaded world.
 
+- `world.start_mode` (string)
+  - Default: `"camera"`
+  - Description: Controls whether the viewer starts by spawning and entering a vessel, or with a free camera.
+    - `"camera"` (default): start with a free camera (no active pawn)
+    - `"boat"`: spawn and enter the `BoatPawn` at startup
+  - Used: `src/bin/voxelot.rs` (initial pawn spawn)
+  - Effect of change: Set to `"camera"` to begin in free camera mode; set to `"boat"` to start inside a boat. In the future this will support selecting specific vessel types via `world.start_vessel`.
+
+- `world.start_vessel` (string, optional)
+  - Default: `null`
+  - Description: Optional name of a vessel to spawn at startup when using a vessel-based `start_mode` (reserved for future use).
+  - Used: `src/bin/voxelot.rs` (planned)
+  - Effect of change: When implemented, will allow starting inside a specific vessel by name.
+
 - `world.water_level` (float)
   - Default: `16.0`
   - Description: Water plane height (in voxel units); used for generating and displaying water volume and for some generator logic.

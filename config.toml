@@ -9,6 +9,14 @@ camera_position = [
 water_level = 16.0
 water_visibility = 20.0
 
+# Set the starting mode when the viewer launches:
+#  - "camera" (default): start with a free camera and no pawn
+#  - "boat": spawn and enter the BoatPawn
+# In the future, this may support specific vessel names via `start_vessel`.
+start_mode = "camera"
+# Optional: name of a vessel to spawn when using a vessel-based start mode
+# start_vessel = "boat"
+
 [rendering]
 chunk_lod_distance = 800.0
 fov_degrees = 70.0

@@ -1889,8 +1889,15 @@ impl App {
             water_level: cfg.world.water_level,
             water_visibility: cfg.world.water_visibility,
 
-            // Spawn a simple BoatPawn at camera position and immediately 'enter' it for testing
-            active_pawn: Some(Box::new(voxelot::BoatPawn::new(cam_pos, cfg.world.water_level))),
+            // Spawn initial pawn based on configuration: camera (default) or a vessel
+            active_pawn: if cfg.world.start_mode == "camera" || cfg.world.start_mode == "free_camera" || cfg.world.start_mode == "freecam" {
+                None
+            } else {
+                // For now, any non-camera start mode spawns the default BoatPawn.
+                // In the future we can use `cfg.world.start_vessel` to select different vessel types.
+                Some(Box::new(voxelot::BoatPawn::new(cam_pos, cfg.world.water_level)))
+            },
+
             emissive_texture: None,
             emissive_view: None,
             emissive_texture_bytes: 0,

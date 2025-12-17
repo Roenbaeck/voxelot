@@ -42,6 +42,17 @@ pub struct WorldConfig {
     pub water_level: f32,
     #[serde(default = "default_water_visibility")]
     pub water_visibility: f32,
+    // Starting mode: "camera" (default) or "boat". In the future this may become more
+    // descriptive (e.g., specify vessel name) to support multiple vessel types.
+    #[serde(default = "default_start_mode")]
+    pub start_mode: String,
+    #[serde(default)]
+    pub start_vessel: Option<String>,
+}
+
+fn default_start_mode() -> String {
+    // Default to starting with the free camera for new configs (backwards compatible with "boat").
+    "camera".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -600,6 +611,8 @@ impl Default for WorldConfig {
             camera_position: default_camera_position(),
             water_level: default_water_level(),
             water_visibility: default_water_visibility(),
+            start_mode: default_start_mode(),
+            start_vessel: None,
         }
     }
 }
