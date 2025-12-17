@@ -21,8 +21,8 @@
 - ✅ Print how many chunks are culled by the depth culler.
 - ✅ It would be very neat if there could be a shoreline somewhere.
 - ✅ Add a beach biome.
+- ✅ Reflections should be stronger at night than in the day, since nothing is drowning out the light.
 
-- 🛑 Reflections should be stronger at night than in the day, since nothing is drowning out the light.
 - 🛑 Sliders instead of buttons to change settings.
 - 🛑 Can all of our code be compiled as wasm?
 

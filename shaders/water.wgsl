@@ -687,8 +687,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
+    // LUMINANCE-DRIVEN BOOST FOR EMISSIVE SAMPLES
+    // Boost bright/emissive SSR/fallback samples to make night-time reflections pop.
+    let ssr_lum = dot(ssr_color, vec3<f32>(0.299, 0.587, 0.114));
+    let lum_thresh = 0.3; // threshold for considering a sample emissive
+    let lum_ramp = smoothstep(lum_thresh, lum_thresh * 2.0, ssr_lum);
+    let ssr_boost = 1.5;
+    ssr_color = mix(ssr_color, ssr_color * ssr_boost, lum_ramp);
+
     reflection_color = mix(reflection_color, ssr_color, ssr_effect);
-    
+
     // ========================================================================
     // SPECULAR HIGHLIGHTS
     // ========================================================================
