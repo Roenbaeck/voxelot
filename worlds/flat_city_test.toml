@@ -2,13 +2,13 @@
 file = "worlds/flat_city_test.vhc"
 palette = "worlds/palette.txt"
 camera_position = [
-    374.2559,
-    47.522602,
-    502.6794,
+    391.68546,
+    47.45282,
+    465.00085,
 ]
 water_level = 45.0
 water_visibility = 15.0
-start_mode = "camera"
+start_mode = "boat"
 
 [rendering]
 chunk_lod_distance = 1500.0

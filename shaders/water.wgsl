@@ -659,10 +659,23 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let ssr_hit_valid = ssr_hit.z;
     var ssr_color = vec3<f32>(0.0);
     var ssr_effect = 0.0;
+    var reflection_distance = 0.0;
+    var sample_center = vec2<f32>(0.0);
 
     if (ssr_hit_valid > 0.0) {
         let scene_sample = textureSample(scene_color_texture, scene_sampler, ssr_hit.xy);
         ssr_color = scene_sample.rgb;
+        sample_center = ssr_hit.xy;
+
+        // Try to reconstruct world position at the hit to get a reflection distance
+        let ssr_coords = vec2<i32>(vec2<f32>(dim) * ssr_hit.xy);
+        if (ssr_coords.x >= 0 && ssr_coords.x < i32(dim.x) && ssr_coords.y >= 0 && ssr_coords.y < i32(dim.y)) {
+            let hit_depth = textureLoad(depth_texture, ssr_coords, 0);
+            if (hit_depth < 0.9999) {
+                let hit_world = reconstruct_world_pos_uv(ssr_hit.xy, hit_depth);
+                reflection_distance = distance(cam_pos, hit_world);
+            }
+        }
 
         let ssr_max_dist = 1000.0;
         let ssr_dist_fade = clamp((ssr_max_dist - dist) / ssr_max_dist, 0.0, 1.0);
@@ -680,6 +693,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 if (fallback_depth < 0.9999) {
                     let fallback_sample = textureSample(scene_color_texture, scene_sampler, fallback_scr.xy);
                     ssr_color = fallback_sample.rgb;
+                    sample_center = fallback_scr.xy;
+                    // Approximate distance to the reflected point using the fallback projection
+                    reflection_distance = distance(cam_pos, fallback_point);
                     // Give it a stronger but still modest effect so it doesn't overpower skybox when inaccurate
                     ssr_effect = 0.8 * clamp((fallback_dist - dist) / fallback_dist, 0.0, 1.0);
                 }
@@ -687,8 +703,45 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
+    // Distance-based 3x3 gather to simulate out-of-focus blur for distant reflections
+    // Relaxed trigger and more aggressive defaults so the effect is visible when needed.
+    if (ssr_effect > 0.01 && (sample_center.x != 0.0 || sample_center.y != 0.0)) {
+        // Start blurring even closer to affect medium-distance reflections
+        let gather_start = 5.0;
+        let gather_end = 400.0;
+        // Linear ramp from gather_start to gather_end for predictable control
+        let gather_strength = clamp((reflection_distance - gather_start) / (gather_end - gather_start), 0.0, 1.0);
+        if (gather_strength > 0.0001) {
+            let texel = vec2<f32>(1.0 / f32(dim.x), 1.0 / f32(dim.y));
+            // Increase spread multiplier for a softer blur on distant reflections
+            let spread = 1.0 + gather_strength * 4.0;
+            var accum = vec3<f32>(0.0);
+            var valid_count = 0.0;
+            for (var oy = -1; oy <= 1; oy = oy + 1) {
+                for (var ox = -1; ox <= 1; ox = ox + 1) {
+                    let offset_uv = sample_center + vec2<f32>(f32(ox), f32(oy)) * texel * spread;
+                    if (offset_uv.x < 0.0 || offset_uv.x > 1.0 || offset_uv.y < 0.0 || offset_uv.y > 1.0) {
+                        continue;
+                    }
+                    let s_coords = vec2<i32>(vec2<f32>(dim) * offset_uv);
+                    if (s_coords.x < 0 || s_coords.x >= i32(dim.x) || s_coords.y < 0 || s_coords.y >= i32(dim.y)) {
+                        continue;
+                    }
+                    let s_depth = textureLoad(depth_texture, s_coords, 0);
+                    if (s_depth >= 0.9999) { continue; }
+                    let s_sample = textureSample(scene_color_texture, scene_sampler, offset_uv);
+                    accum += s_sample.rgb;
+                    valid_count += 1.0;
+                }
+            }
+            if (valid_count > 0.0) {
+                let gathered = accum / valid_count;
+                ssr_color = mix(ssr_color, gathered, gather_strength);
+            }
+        }
+    }
+
     // LUMINANCE-DRIVEN BOOST FOR EMISSIVE SAMPLES
-    // Boost bright/emissive SSR/fallback samples to make night-time reflections pop.
     let ssr_lum = dot(ssr_color, vec3<f32>(0.299, 0.587, 0.114));
     let lum_thresh = 0.3; // threshold for considering a sample emissive
     let lum_ramp = smoothstep(lum_thresh, lum_thresh * 2.0, ssr_lum);
