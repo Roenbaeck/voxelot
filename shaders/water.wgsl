@@ -657,17 +657,37 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Screen-space reflections
     let ssr_hit = trace_water_reflection(hit_pos, reflect_dir_raw, cam_pos, in.uv);
     let ssr_hit_valid = ssr_hit.z;
-    
+    var ssr_color = vec3<f32>(0.0);
+    var ssr_effect = 0.0;
+
     if (ssr_hit_valid > 0.0) {
         let scene_sample = textureSample(scene_color_texture, scene_sampler, ssr_hit.xy);
-        let ssr_color = scene_sample.rgb;
-        
+        ssr_color = scene_sample.rgb;
+
         let ssr_max_dist = 1000.0;
         let ssr_dist_fade = clamp((ssr_max_dist - dist) / ssr_max_dist, 0.0, 1.0);
-        let ssr_effect = ssr_hit_valid * ssr_dist_fade;
-        
-        reflection_color = mix(reflection_color, ssr_color, ssr_effect);
+        ssr_effect = ssr_hit_valid * ssr_dist_fade;
+    } else {
+        // Cheap fallback for missing SSR hits: project a far point along the reflection ray,
+        // sample the scene color there and use it as an approximate fill for distant reflections.
+        let fallback_dist = 800.0;
+        let fallback_point = hit_pos + reflect_dir_raw * fallback_dist;
+        let fallback_scr = world_to_screen_uv(fallback_point);
+        if (fallback_scr.x >= 0.0 && fallback_scr.x <= 1.0 && fallback_scr.y >= 0.0 && fallback_scr.y <= 1.0) {
+            let fallback_coords = vec2<i32>(vec2<f32>(dim) * fallback_scr.xy);
+            if (fallback_coords.x >= 0 && fallback_coords.x < i32(dim.x) && fallback_coords.y >= 0 && fallback_coords.y < i32(dim.y)) {
+                let fallback_depth = textureLoad(depth_texture, fallback_coords, 0);
+                if (fallback_depth < 0.9999) {
+                    let fallback_sample = textureSample(scene_color_texture, scene_sampler, fallback_scr.xy);
+                    ssr_color = fallback_sample.rgb;
+                    // Give it a stronger but still modest effect so it doesn't overpower skybox when inaccurate
+                    ssr_effect = 0.8 * clamp((fallback_dist - dist) / fallback_dist, 0.0, 1.0);
+                }
+            }
+        }
     }
+
+    reflection_color = mix(reflection_color, ssr_color, ssr_effect);
     
     // ========================================================================
     // SPECULAR HIGHLIGHTS
