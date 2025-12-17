@@ -35,6 +35,11 @@ struct WaterUniforms {
     boat_pos_wake: vec4<f32>,
     // boat_dir_speed.xyz = forward direction, boat_dir_speed.w = horizontal speed
     boat_dir_speed: vec4<f32>,
+
+    // DoF parameters: focal distance and focal range (for CoC-consistent reflection blur)
+    dof_focal_distance: f32,
+    dof_focal_range: f32,
+    _pad_dof: f32,
 };
 
 // ============================================================================
@@ -706,10 +711,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Distance-based 3x3 gather to simulate out-of-focus blur for distant reflections
     // Relaxed trigger and more aggressive defaults so the effect is visible when needed.
     if (ssr_effect > 0.01 && (sample_center.x != 0.0 || sample_center.y != 0.0)) {
-        // Start blurring even closer to affect medium-distance reflections
-        let gather_start = 5.0;
-        let gather_end = 400.0;
-        // Linear ramp from gather_start to gather_end for predictable control
+        // Use DoF parameters (focal_range/2 -> focal_distance*2) to determine gather range
+        let gather_start = max(1.0, water.dof_focal_range * 0.5);
+        let gather_end = max(gather_start + 1.0, water.dof_focal_distance * 2.0);
+        // Linear ramp between start and end (clamped)
         let gather_strength = clamp((reflection_distance - gather_start) / (gather_end - gather_start), 0.0, 1.0);
         if (gather_strength > 0.0001) {
             let texel = vec2<f32>(1.0 / f32(dim.x), 1.0 / f32(dim.y));

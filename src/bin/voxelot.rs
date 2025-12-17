@@ -595,6 +595,10 @@ struct WaterUniforms {
     // Boat/wake parameters (optional)
     boat_pos_wake: [f32; 4],   // xyz = boat position, w = wake strength (0 disables)
     boat_dir_speed: [f32; 4],  // xyz = forward direction, w = horizontal speed
+    // DoF parameters passed to water shader to allow CoC-consistent reflection blur
+    dof_focal_distance: f32,
+    dof_focal_range: f32,
+    _pad_dof: [f32; 2],
 }
 
 const DOF_UNIFORM_FLOATS: usize = 12;
@@ -2467,6 +2471,7 @@ impl App {
                     "DoF focal distance: {:.1}",
                     self.dof_settings.focal_distance
                 );
+                self.update_water_uniforms();
             }
             KeyCode::Period => {
                 self.dof_settings.focal_distance =
@@ -2475,22 +2480,27 @@ impl App {
                     "DoF focal distance: {:.1}",
                     self.dof_settings.focal_distance
                 );
+                self.update_water_uniforms();
             }
             KeyCode::BracketLeft => {
                 self.dof_settings.focal_range = (self.dof_settings.focal_range - 5.0).max(5.0);
                 log::info!("DoF focal range: {:.1}", self.dof_settings.focal_range);
+                self.update_water_uniforms();
             }
             KeyCode::BracketRight => {
                 self.dof_settings.focal_range = (self.dof_settings.focal_range + 5.0).min(500.0);
                 log::info!("DoF focal range: {:.1}", self.dof_settings.focal_range);
+                self.update_water_uniforms();
             }
             KeyCode::Semicolon => {
                 self.dof_settings.blur_strength = (self.dof_settings.blur_strength - 0.1).max(0.0);
                 log::info!("DoF blur strength: {:.2}", self.dof_settings.blur_strength);
+                self.update_water_uniforms();
             }
             KeyCode::Quote => {
                 self.dof_settings.blur_strength = (self.dof_settings.blur_strength + 0.1).min(2.5);
                 log::info!("DoF blur strength: {:.2}", self.dof_settings.blur_strength);
+                self.update_water_uniforms();
             }
             KeyCode::Slash => {
                 self.dof_enabled = !self.dof_enabled;
@@ -2502,6 +2512,8 @@ impl App {
                         "disabled"
                     }
                 );
+                // Update water UBO when toggling DoF so gather range/mode can reflect new state
+                self.update_water_uniforms();
             }
             KeyCode::KeyX => {
                 self.dof_settings.kawase_enabled = !self.dof_settings.kawase_enabled;
@@ -4644,6 +4656,10 @@ impl App {
             water_color: [0.0, 0.3, 0.5, 0.6],
             boat_pos_wake: [0.0, 0.0, 0.0, 0.0],
             boat_dir_speed: [0.0, 0.0, 0.0, 0.0],
+            // Initialize DoF params from current DoF settings so reflections can match DoF blur
+            dof_focal_distance: self.dof_settings.focal_distance,
+            dof_focal_range: self.dof_settings.focal_range,
+            _pad_dof: [0.0, 0.0],
         };
         let water_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Water Uniform Buffer"),
@@ -4759,6 +4775,30 @@ impl App {
         self.water_uniform_buffer = Some(water_uniform_buffer);
         self.water_bind_group_layout = Some(bind_group_layout);
         self.water_pipeline = Some(pipeline);
+    }
+
+    fn update_water_uniforms(&mut self) {
+        // Write updated DoF-related fields into the water UBO so shader can read current values.
+        if let (Some(device), Some(queue), Some(buf)) = (
+            self.device.as_ref(),
+            self.queue.as_ref(),
+            self.water_uniform_buffer.as_ref(),
+        ) {
+            // Recreate the WaterUniforms with updated DoF params and write to buffer
+            let wu = WaterUniforms {
+                water_level: self.water_level,
+                wave_strength: 0.1,
+                speed: 1.0,
+                _pad0: 0.0,
+                water_color: [0.0, 0.3, 0.5, 0.6],
+                boat_pos_wake: [0.0, 0.0, 0.0, 0.0],
+                boat_dir_speed: [0.0, 0.0, 0.0, 0.0],
+                dof_focal_distance: self.dof_settings.focal_distance,
+                dof_focal_range: self.dof_settings.focal_range,
+                _pad_dof: [0.0, 0.0],
+            };
+            queue.write_buffer(buf, 0, bytemuck::bytes_of(&wu));
+        }
     }
 
     fn update_water_bind_group(&mut self) {
@@ -9179,6 +9219,9 @@ impl App {
                 water_color: [0.0, 0.3, 0.5, 0.6],
                 boat_pos_wake,
                 boat_dir_speed,
+                dof_focal_distance: self.dof_settings.focal_distance,
+                dof_focal_range: self.dof_settings.focal_range,
+                _pad_dof: [0.0, 0.0],
             };
             queue.write_buffer(water_buffer, 0, bytemuck::bytes_of(&water_uniforms));
         }
