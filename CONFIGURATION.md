@@ -100,6 +100,18 @@ Each entry shows the default value (as found in `src/config.rs`), a short descri
   - Used: `src/bin/voxelot.rs` (Window creation / resume), saves and updates runtime.
   - Effect of change: Sets the initial window size.
 
+- `rendering.culling_overscan` (float)
+  - Default: `0.0`
+  - Description: Enlarges the view frustum used for CPU/GPU culling without changing the rendered FOV.
+  - Used: `src/culling.rs` (frustum plane construction), `shaders/gpu_cull.wgsl` (HZB occlusion conservatism)
+  - Effect of change: Increasing reduces edge pop-in for effects that need off-screen geometry (at a performance cost).
+
+- `rendering.render_overscan` (float)
+  - Default: `0.0`
+  - Description: Renders into a larger offscreen buffer with a wider internal FOV, then centrally crops to the window for presentation.
+  - Used: `src/bin/voxelot.rs` (offscreen target size, projection matrices), `shaders/post_composite.wgsl` (crop sampling)
+  - Effect of change: Increasing gives screen-space effects extra offscreen scene data (reduces water reflection cutoffs at screen edges) at a pixel-cost.
+
 - `rendering.macos_hdr` (bool)
   - Default: `true`
   - Description: Enables HDR presentation on macOS (EDR + extended linear Display P3) when supported.

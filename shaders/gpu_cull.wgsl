@@ -188,6 +188,14 @@ fn cs_main(@builtin(global_invocation_id) global_id : vec3<u32>) {
                     min_depth = min(min_depth, ndc.z);
                 }
             }
+
+            // If the projected bounds extend outside the screen, HZB cannot conservatively
+            // determine occlusion for the missing region. In that case, skip HZB culling.
+            let offscreen = (min_screen.x < 0.0) || (min_screen.y < 0.0) ||
+                (max_screen.x > (params.screen_width - 1.0)) || (max_screen.y > (params.screen_height - 1.0));
+            if (offscreen) {
+                // Keep visible without HZB test
+            } else {
             
             // Clamp AABB to screen bounds
             min_screen = clamp(min_screen, vec2<f32>(0.0), vec2<f32>(params.screen_width - 1.0, params.screen_height - 1.0));
@@ -217,6 +225,7 @@ fn cs_main(@builtin(global_invocation_id) global_id : vec3<u32>) {
             if (min_depth > hzb_depth) {
                 // Fully occluded
                 visible = false;
+            }
             }
         }
 

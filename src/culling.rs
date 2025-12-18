@@ -12,6 +12,7 @@ pub struct RenderConfig {
     pub far_plane: f32,
     pub fov_degrees: f32,
     pub near_plane: f32,
+    pub culling_overscan: f32,
 }
 
 impl Default for RenderConfig {
@@ -22,6 +23,7 @@ impl Default for RenderConfig {
             far_plane: 5000.0,
             fov_degrees: 70.0,
             near_plane: 0.1,
+            culling_overscan: 0.0,
         }
     }
 }
@@ -34,6 +36,7 @@ impl RenderConfig {
             far_plane: cfg.far_plane,
             fov_degrees: cfg.fov_degrees,
             near_plane: cfg.near_plane,
+            culling_overscan: cfg.culling_overscan.max(cfg.render_overscan),
         }
     }
 }
@@ -254,6 +257,7 @@ impl Frustum {
         aspect: f32,
         near: f32,
         far: f32,
+        culling_overscan: f32,
     ) -> Self {
         let forward = normalize(forward);
         let up = normalize(up);
@@ -262,8 +266,10 @@ impl Frustum {
         // Recompute up to ensure orthogonality
         let up = cross(&right, &forward);
 
-        // Half angles
-        let half_v = (fov * 0.5).tan();
+        // Half angles (tangents), widened by overscan.
+        // overscan=0 keeps original frustum; overscan>0 widens culling without changing rendering FOV.
+        let overscan = culling_overscan.max(0.0);
+        let half_v = (fov * 0.5).tan() * (1.0 + overscan);
         let half_h = half_v * aspect;
 
         // Compute frustum planes (normal points inward)
@@ -302,10 +308,10 @@ impl Frustum {
         let near_center = add(&position, &mul_scalar(&forward, near));
         let far_center = add(&position, &mul_scalar(&forward, far));
 
-        let near_height = 2.0 * (fov * 0.5).tan() * near;
+        let near_height = 2.0 * half_v * near;
         let near_width = near_height * aspect;
 
-        let far_height = 2.0 * (fov * 0.5).tan() * far;
+        let far_height = 2.0 * half_v * far;
         let far_width = far_height * aspect;
 
         let mut corners = [[0.0; 3]; 8];
@@ -461,7 +467,16 @@ impl Camera {
         // Normalize forward vector
         let forward = normalize(forward);
 
-        let frustum = Frustum::from_camera(position, forward, up, fov, aspect, near, far);
+        let frustum = Frustum::from_camera(
+            position,
+            forward,
+            up,
+            fov,
+            aspect,
+            near,
+            far,
+            config.culling_overscan,
+        );
 
         Self {
             position,
@@ -489,6 +504,7 @@ impl Camera {
             self.aspect,
             self.near,
             self.far,
+            self.config.culling_overscan,
         );
     }
 

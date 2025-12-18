@@ -10,6 +10,8 @@ struct CompositeUniforms {
     indirect_light_scale: f32, // Modulates emissive bounce light by ambient darkness (0=day, 1=night)
     hdr_highlight_compression: f32,
     _pad2: f32,
+    uv_scale: vec2<f32>,
+    uv_offset: vec2<f32>,
 };
 
 fn compress_highlights_hdr(color: vec3<f32>) -> vec3<f32> {
@@ -56,11 +58,12 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 
 @fragment
 fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    let base = textureSample(post_color, post_sampler, uv).rgb;
-    let bloom = textureSample(bloom_texture, post_sampler, uv).rgb;
+    let sample_uv = composite.uv_offset + uv * composite.uv_scale;
+    let base = textureSample(post_color, post_sampler, sample_uv).rgb;
+    let bloom = textureSample(bloom_texture, post_sampler, sample_uv).rgb;
     
     // Sample SSILVB: RGB = accumulated emissive light, A = ambient occlusion
-    let ssilvb_sample = textureSample(ssao_texture, post_sampler, uv);
+    let ssilvb_sample = textureSample(ssao_texture, post_sampler, sample_uv);
     let indirect_light = ssilvb_sample.rgb;
     let raw_ao = ssilvb_sample.a;
     
@@ -78,7 +81,7 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
 
     // SSR Debug overlay: show SSR texture directly when enabled
     if (composite.ssr_debug > 0.5) {
-        let ssr_col = textureSample(ssr_debug_texture, post_sampler, uv);
+        let ssr_col = textureSample(ssr_debug_texture, post_sampler, sample_uv);
         return vec4<f32>(ssr_col.rgb, 1.0);
     }
 

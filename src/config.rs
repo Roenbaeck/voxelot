@@ -72,6 +72,26 @@ pub struct RenderingConfig {
     #[serde(default = "default_window_height")]
     pub window_height: u32,
 
+    /// Enlarges the view frustum used for CPU/GPU culling (but does not change the rendered FOV).
+    ///
+    /// Value is a fractional margin applied to the tangent of the half-FOV. For example, 0.15
+    /// makes culling behave as if the camera FOV were ~15% wider in X/Y.
+    ///
+    /// This is useful for screen-space effects (e.g., water reflections) that may need geometry
+    /// slightly outside the visible viewport.
+    #[serde(default = "default_culling_overscan")]
+    pub culling_overscan: f32,
+
+    /// Renders the scene with a wider effective FOV into a larger offscreen buffer, then crops to
+    /// the window for presentation. This provides extra off-screen scene color/depth for
+    /// screen-space effects (notably water reflections / SSR) so they don't hard-cut at the
+    /// visible screen edges.
+    ///
+    /// Value is a fractional margin: 0.15 means render at ~15% wider tangent half-FOV in X/Y.
+    /// Increasing this has a GPU cost proportional to the increased pixel count.
+    #[serde(default = "default_render_overscan")]
+    pub render_overscan: f32,
+
     /// Enable HDR presentation on macOS (EDR + extended linear Display P3) when supported.
     /// If disabled, the viewer will prefer an sRGB swapchain format.
     #[serde(default = "default_macos_hdr")]
@@ -94,6 +114,14 @@ fn default_window_width() -> u32 {
 
 fn default_window_height() -> u32 {
     720
+}
+
+fn default_culling_overscan() -> f32 {
+    0.0
+}
+
+fn default_render_overscan() -> f32 {
+    0.0
 }
 
 fn default_macos_hdr() -> bool {
@@ -627,6 +655,8 @@ impl Default for RenderingConfig {
             camera_speed_multiplier: default_camera_speed(),
             window_width: default_window_width(),
             window_height: default_window_height(),
+            culling_overscan: default_culling_overscan(),
+            render_overscan: default_render_overscan(),
             macos_hdr: default_macos_hdr(),
             macos_hdr_exposure_boost: default_macos_hdr_exposure_boost(),
             macos_hdr_colorspace: default_macos_hdr_colorspace(),

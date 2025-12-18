@@ -514,7 +514,9 @@ struct CompositeUniforms {
     ssr_debug: f32,
     indirect_light_scale: f32, // Modulates emissive bounce light by ambient darkness (0=day, 1=night)
     hdr_highlight_compression: f32,
-    _padding2: f32,
+    _pad2: f32,
+    uv_scale: [f32; 2],
+    uv_offset: [f32; 2],
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -788,6 +790,8 @@ impl CameraController {
         log::info!("  LOD render distance: {}", rc.lod_render_distance);
         log::info!("  Far plane: {}", rc.far_plane);
         log::info!("  FOV: {}°", rc.fov_degrees);
+        log::info!("  Culling overscan: {}", rc.culling_overscan);
+        log::info!("  Render overscan: {}", render_cfg.render_overscan);
 
         let mut this = Self {
             camera: Camera::with_config(position, [0.0, 0.0, -1.0], [0.0, 1.0, 0.0], rc),
@@ -1394,6 +1398,19 @@ impl App {
         }
         *agg = agg.saturating_add(new);
         *old = new;
+    }
+
+    fn render_overscan_factor(&self) -> f32 {
+        1.0 + self.user_config.rendering.render_overscan.max(0.0)
+    }
+
+    /// Wider internal render FOV used when `rendering.render_overscan > 0`.
+    /// Final presentation crops centrally to match the configured camera FOV.
+    fn render_fov_radians(&self) -> f32 {
+        let base = self.camera_controller.camera.fov;
+        let factor = self.render_overscan_factor();
+        let tan_half = (base * 0.5).tan();
+        (tan_half * factor).atan() * 2.0
     }
 
     // Compute bytes occupied by a texture with mipmaps
@@ -2254,7 +2271,7 @@ impl App {
     fn build_ssilvb_uniforms(&self, src_width: u32, src_height: u32) -> SsaoUniformsRaw {
         let aspect = src_width as f32 / src_height as f32;
         let projection = Mat4::perspective_rh(
-            self.camera_controller.camera.fov,
+            self.render_fov_radians(),
             aspect,
             self.camera_controller.camera.near,
             self.camera_controller.camera.far,
@@ -2327,6 +2344,10 @@ impl App {
             1.0
         };
 
+        let overscan = self.user_config.rendering.render_overscan.max(0.0);
+        let crop_scale = 1.0 / (1.0 + overscan);
+        let crop_offset = (1.0 - crop_scale) * 0.5;
+
         CompositeUniforms {
             bloom_strength: if self.bloom_enabled && self.bloom_settings.kawase_enabled {
                 self.bloom_settings.bloom_strength
@@ -2341,7 +2362,9 @@ impl App {
             ssr_debug: if self.ssr_debug { 1.0 } else { 0.0 },
             indirect_light_scale,
             hdr_highlight_compression: if self.hdr_active { 1.0 } else { 0.0 },
-            _padding2: 0.0,
+            _pad2: 0.0,
+            uv_scale: [crop_scale, crop_scale],
+            uv_offset: [crop_offset, crop_offset],
         }
     }
 
@@ -5708,8 +5731,11 @@ impl App {
         // Compute and cache logical render target dims using logical window size * render_scale
         let logical_width = ((size.width as f32) / scale).round() as u32;
         let logical_height = ((size.height as f32) / scale).round() as u32;
-        let render_target_width = ((logical_width as f32) * render_scale).round() as u32;
-        let render_target_height = ((logical_height as f32) * render_scale).round() as u32;
+        let overscan_factor = self.render_overscan_factor();
+        let render_target_width =
+            ((logical_width as f32) * render_scale * overscan_factor).round() as u32;
+        let render_target_height =
+            ((logical_height as f32) * render_scale * overscan_factor).round() as u32;
         self.render_target_width = render_target_width.max(1);
         self.render_target_height = render_target_height.max(1);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -7977,10 +8003,11 @@ impl App {
                 _pad_r0: 0,
                 camera_up: self.camera_controller.camera.up,
                 _pad_u0: 0,
-                fov_tan: (self.camera_controller.camera.fov * 0.5).tan(),
+                fov_tan: (self.render_fov_radians() * 0.5).tan(),
                 aspect: self.camera_controller.camera.aspect,
-                screen_width: self.config.as_ref().map_or(1280.0, |c| c.width as f32),
-                screen_height: self.config.as_ref().map_or(720.0, |c| c.height as f32),
+                // These must match the offscreen depth/color sizes used for HZB and projection.
+                screen_width: self.render_target_width.max(1) as f32,
+                screen_height: self.render_target_height.max(1) as f32,
                 lod_render_distance: self.lod_distance,
                 detail_cull_distance: self.fallback_detail_distance,
                 envelope_distance: self.envelope_distance,
@@ -7997,7 +8024,7 @@ impl App {
 
                     // Build projection matrix
                     let proj = glam::Mat4::perspective_rh(
-                        self.camera_controller.camera.fov,
+                        self.render_fov_radians(),
                         self.camera_controller.camera.aspect,
                         self.camera_controller.camera.near,
                         self.camera_controller.camera.far,
@@ -8673,7 +8700,7 @@ impl App {
         // Create MVP matrix using glam (column-major, right-handed)
         let aspect = self.render_target_width as f32 / self.render_target_height as f32;
         let projection = Mat4::perspective_rh(
-            self.camera_controller.camera.fov,
+            self.render_fov_radians(),
             aspect,
             self.camera_controller.camera.near,
             self.camera_controller.camera.far,
@@ -8866,7 +8893,7 @@ impl App {
 
         let frustum_near = self.camera_controller.camera.near.max(0.1);
         let frustum_far = shadow_extent.min(self.camera_controller.camera.far);
-        let tan_half_fov = (self.camera_controller.camera.fov * 0.5).tan();
+        let tan_half_fov = (self.render_fov_radians() * 0.5).tan();
         let near_height = 2.0 * tan_half_fov * frustum_near;
         let near_width = near_height * aspect;
         let far_height = 2.0 * tan_half_fov * frustum_far;
@@ -10385,11 +10412,14 @@ impl App {
                         let scale = window.scale_factor() as f32;
                         let logical_width = ((size.width as f32) / scale).round() as u32;
                         let logical_height = ((size.height as f32) / scale).round() as u32;
+                        let overscan_factor = self.render_overscan_factor();
                         self.render_target_width = ((logical_width as f32)
-                            * self.user_config.performance.render_scale)
+                            * self.user_config.performance.render_scale
+                            * overscan_factor)
                             .round() as u32;
                         self.render_target_height = ((logical_height as f32)
-                            * self.user_config.performance.render_scale)
+                            * self.user_config.performance.render_scale
+                            * overscan_factor)
                             .round() as u32;
                         self.pending_recreate_offscreen = true;
                     }
@@ -10872,10 +10902,11 @@ impl ApplicationHandler for App {
                         let logical_width = ((new_size.width as f32) / scale).round() as u32;
                         let logical_height = ((new_size.height as f32) / scale).round() as u32;
                         let render_scale = self.user_config.performance.render_scale;
+                        let overscan_factor = self.render_overscan_factor();
                         self.render_target_width =
-                            ((logical_width as f32) * render_scale).round() as u32;
+                            ((logical_width as f32) * render_scale * overscan_factor).round() as u32;
                         self.render_target_height =
-                            ((logical_height as f32) * render_scale).round() as u32;
+                            ((logical_height as f32) * render_scale * overscan_factor).round() as u32;
                     }
 
                     if let (Some(surface), Some(device), Some(config)) = (
