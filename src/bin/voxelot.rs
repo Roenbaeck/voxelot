@@ -4669,7 +4669,7 @@ impl App {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Skybox Pipeline Layout"),
             bind_group_layouts: &[main_bind_group_layout, &bind_group_layout],
-            push_constant_ranges: &[],
+            immediate_size: 0,
         });
 
         // Create pipeline
@@ -4711,7 +4711,7 @@ impl App {
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -4828,7 +4828,7 @@ impl App {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Water Pipeline Layout"),
             bind_group_layouts: &[main_bind_group_layout, &bind_group_layout],
-            push_constant_ranges: &[],
+            immediate_size: 0,
         });
 
         // Create pipeline
@@ -4857,7 +4857,7 @@ impl App {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -5028,7 +5028,7 @@ impl App {
                 &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: Some("SSR Pipeline Layout"),
                     bind_group_layouts: &[&bind_group_layout],
-                    push_constant_ranges: &[],
+                    immediate_size: 0,
                 }),
             ),
             vertex: wgpu::VertexState {
@@ -5050,7 +5050,7 @@ impl App {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -5808,14 +5808,14 @@ impl App {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
             bind_group_layouts: &[&main_bind_group_layout],
-            push_constant_ranges: &[],
+            immediate_size: 0,
         });
 
         let shadow_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Shadow Pipeline Layout"),
                 bind_group_layouts: &[&shadow_bind_group_layout],
-                push_constant_ranges: &[],
+                immediate_size: 0,
             });
 
         // Create instanced-cube render pipeline
@@ -5887,7 +5887,7 @@ impl App {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -5948,7 +5948,7 @@ impl App {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -6007,7 +6007,7 @@ impl App {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -6055,7 +6055,7 @@ impl App {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -6173,7 +6173,7 @@ impl App {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("DoF Combine Pipeline Layout"),
                 bind_group_layouts: &[&dof_combine_bind_group_layout],
-                push_constant_ranges: &[],
+                immediate_size: 0,
             });
 
         // Removed separate CoC pipeline (fused into blur pass).
@@ -6200,7 +6200,7 @@ impl App {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -6255,13 +6255,13 @@ impl App {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Kawase Down Pipeline Layout"),
                 bind_group_layouts: &[&kawase_bind_group_layout],
-                push_constant_ranges: &[],
+                immediate_size: 0,
             });
         let kawase_up_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Kawase Up Pipeline Layout"),
                 bind_group_layouts: &[&kawase_bind_group_layout],
-                push_constant_ranges: &[],
+                immediate_size: 0,
             });
 
         let kawase_down_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -6286,7 +6286,7 @@ impl App {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -6312,7 +6312,7 @@ impl App {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -6327,7 +6327,7 @@ impl App {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
 
@@ -6531,21 +6531,21 @@ impl App {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Bloom Extract Pipeline Layout"),
                 bind_group_layouts: &[&bloom_extract_bind_group_layout],
-                push_constant_ranges: &[],
+                immediate_size: 0,
             });
 
         let bloom_blur_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Bloom Blur Pipeline Layout"),
                 bind_group_layouts: &[&bloom_blur_bind_group_layout],
-                push_constant_ranges: &[],
+                immediate_size: 0,
             });
 
         let composite_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Composite Pipeline Layout"),
                 bind_group_layouts: &[&composite_bind_group_layout],
-                push_constant_ranges: &[],
+                immediate_size: 0,
             });
 
         let bloom_extract_pipeline =
@@ -6583,7 +6583,7 @@ impl App {
                     mask: !0,
                     alpha_to_coverage_enabled: false,
                 },
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             });
 
@@ -6609,7 +6609,7 @@ impl App {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -6647,7 +6647,7 @@ impl App {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -6776,7 +6776,7 @@ impl App {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             compare: Some(wgpu::CompareFunction::LessEqual),
             ..Default::default()
         });
@@ -6867,7 +6867,7 @@ impl App {
         let cull_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("GPU Cull Pipeline Layout"),
             bind_group_layouts: &[&cull_bind_group_layout],
-            push_constant_ranges: &[],
+            immediate_size: 0,
         });
 
         let cull_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -6941,7 +6941,7 @@ impl App {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("HZB Gen Pipeline Layout"),
                 bind_group_layouts: &[&hzb_gen_bind_group_layout],
-                push_constant_ranges: &[],
+                immediate_size: 0,
             });
 
         // Copy pipeline (depth -> mip 0)
@@ -7128,7 +7128,7 @@ impl App {
                 &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: Some("DoF CoC Pipeline Layout"),
                     bind_group_layouts: &[&dof_bind_group_layout],
-                    push_constant_ranges: &[],
+                    immediate_size: 0,
                 }),
             ),
             vertex: wgpu::VertexState {
@@ -7150,7 +7150,7 @@ impl App {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         self.dof_coc_pipeline = Some(dof_coc_pipeline);
@@ -7203,7 +7203,7 @@ impl App {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("SSILVB Pipeline Layout"),
                 bind_group_layouts: &[&ssilvb_bind_group_layout],
-                push_constant_ranges: &[],
+                immediate_size: 0,
             });
 
         let ssilvb_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -7228,7 +7228,7 @@ impl App {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -9379,6 +9379,7 @@ impl App {
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
 
             if let Some(_mesh_indirect) = &self.mesh_indirect_buffer {
@@ -9540,6 +9541,7 @@ impl App {
                 }),
                 timestamp_writes: rp_ts,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
 
             // Draw skybox first (background)
@@ -9695,6 +9697,7 @@ impl App {
                     depth_stencil_attachment: None,
                     timestamp_writes: ssr_ts,
                     occlusion_query_set: None,
+                    multiview_mask: None,
                 });
                 ssr_pass.set_pipeline(pipeline);
                 ssr_pass.set_bind_group(0, bind_group, &[]);
@@ -9757,6 +9760,7 @@ impl App {
                 depth_stencil_attachment: None, // No depth attachment, we sample it manually
                 timestamp_writes: water_ts,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
 
             if let (Some(pipeline), Some(bind_group)) =
@@ -9829,6 +9833,7 @@ impl App {
                     depth_stencil_attachment: None,
                     timestamp_writes: post_ts,
                     occlusion_query_set: None,
+                    multiview_mask: None,
                 });
                 post_pass.set_pipeline(dof_coc_pipeline);
                 post_pass.set_scissor_rect(sx, sy, sw, sh);
@@ -9908,6 +9913,7 @@ impl App {
                                     None
                                 },
                                 occlusion_query_set: None,
+                                multiview_mask: None,
                             });
                             pass.set_pipeline(kawase_down_pipeline);
                             pass.set_bind_group(0, bind_group, &[]);
@@ -9977,6 +9983,7 @@ impl App {
                                         None
                                     },
                                     occlusion_query_set: None,
+                                    multiview_mask: None,
                                 });
                             up_pass.set_pipeline(kawase_up_pipeline);
                             up_pass.set_bind_group(0, bind_group, &[]);
@@ -10024,6 +10031,7 @@ impl App {
                     depth_stencil_attachment: None,
                     timestamp_writes: combine_ts,
                     occlusion_query_set: None,
+                    multiview_mask: None,
                 });
                 combine_pass.set_pipeline(dof_combine_pipeline);
                 combine_pass.set_scissor_rect(sx, sy, sw, sh);
@@ -10090,6 +10098,7 @@ impl App {
                                 depth_stencil_attachment: None,
                                 timestamp_writes: ssao_ts,
                                 occlusion_query_set: None,
+                                multiview_mask: None,
                             });
                         ssao_pass.set_pipeline(ssilvb_pipeline);
                         ssao_pass.set_scissor_rect(sx_full, sy_full, sw_full, sh_full);
@@ -10119,6 +10128,7 @@ impl App {
                                     depth_stencil_attachment: None,
                                     timestamp_writes: None,
                                     occlusion_query_set: None,
+                                    multiview_mask: None,
                                 });
                             blur_pass_h.set_pipeline(ssao_blur_pipeline);
                             blur_pass_h.set_scissor_rect(sx_full, sy_full, sw_full, sh_full);
@@ -10148,6 +10158,7 @@ impl App {
                                     depth_stencil_attachment: None,
                                     timestamp_writes: None,
                                     occlusion_query_set: None,
+                                    multiview_mask: None,
                                 });
                             blur_pass_v.set_pipeline(ssao_blur_pipeline);
                             blur_pass_v.set_scissor_rect(sx_full, sy_full, sw_full, sh_full);
@@ -10178,6 +10189,7 @@ impl App {
                     depth_stencil_attachment: None,
                     timestamp_writes: bloom_extract_ts,
                     occlusion_query_set: None,
+                    multiview_mask: None,
                 });
                 extract_pass.set_pipeline(bloom_extract_pipeline);
                 extract_pass.set_scissor_rect(sx_half, sy_half, sw_half, sh_half);
@@ -10232,6 +10244,7 @@ impl App {
                                     None
                                 },
                                 occlusion_query_set: None,
+                                multiview_mask: None,
                             });
                             pass.set_pipeline(kawase_down_pipeline);
                             let (sx_half, sy_half, sw_half, sh_half) = self.scissor_rect_half_res();
@@ -10346,6 +10359,7 @@ impl App {
                 depth_stencil_attachment: None,
                 timestamp_writes: composite_ts,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             composite_pass.set_pipeline(composite_pipeline);
             composite_pass.set_bind_group(0, composite_bind_group, &[]);
