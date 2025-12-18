@@ -2,9 +2,9 @@
 file = "worlds/flat_city_test.vhc"
 palette = "worlds/palette.txt"
 camera_position = [
-    321.77264,
-    47.576275,
-    550.07275,
+    338.37766,
+    47.462242,
+    504.63892,
 ]
 water_level = 45.0
 water_visibility = 15.0
@@ -14,7 +14,7 @@ start_mode = "boat"
 chunk_lod_distance = 1500.0
 fov_degrees = 70.0
 near_plane = 0.1
-far_plane = 7000.0
+far_plane = 7500.0
 camera_speed_multiplier = 7.4505806
 window_width = 1088
 window_height = 703
@@ -46,7 +46,7 @@ enabled = true
 focal_distance = 240.0
 focal_range = 85.0
 blur_strength = 2.5
-kawase_iterations = 3
+kawase_iterations = 2
 kawase_offset = 0.5
 kawase_enabled = true
 

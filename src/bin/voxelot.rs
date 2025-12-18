@@ -1043,6 +1043,10 @@ struct App {
     mesh_cache_mib: f64,
     // Internal render target size (logical * render_scale). These indicate the offscreen texture size
     // we render into; they may differ from the swapchain physical size (`config.width`/`config.height`).
+    // `present_target_*` are the non-overscanned internal dimensions.
+    // `render_target_*` include `rendering.render_overscan`.
+    present_target_width: u32,
+    present_target_height: u32,
     render_target_width: u32,
     render_target_height: u32,
     // If set, recreate offscreen targets at the next safe point (to avoid borrow conflicts)
@@ -1381,6 +1385,36 @@ struct App {
 }
 
 impl App {
+    fn centered_scissor_rect(
+        outer_width: u32,
+        outer_height: u32,
+        inner_width: u32,
+        inner_height: u32,
+    ) -> (u32, u32, u32, u32) {
+        let w = inner_width.min(outer_width).max(1);
+        let h = inner_height.min(outer_height).max(1);
+        let x = outer_width.saturating_sub(w) / 2;
+        let y = outer_height.saturating_sub(h) / 2;
+        (x, y, w, h)
+    }
+
+    fn scissor_rect_full_res(&self) -> (u32, u32, u32, u32) {
+        Self::centered_scissor_rect(
+            self.render_target_width.max(1),
+            self.render_target_height.max(1),
+            self.present_target_width.max(1),
+            self.present_target_height.max(1),
+        )
+    }
+
+    fn scissor_rect_half_res(&self) -> (u32, u32, u32, u32) {
+        Self::centered_scissor_rect(
+            (self.render_target_width / 2).max(1),
+            (self.render_target_height / 2).max(1),
+            (self.present_target_width / 2).max(1),
+            (self.present_target_height / 2).max(1),
+        )
+    }
     // Static helpers that avoid borrowing &mut self during the operation, allowing
     // callers to pass distinct fields as &mut u64 without creating overlapping
     // &mut self borrows which the Rust borrow-checker rejects.
@@ -1770,6 +1804,8 @@ impl App {
             gpu_input_capacity: 0,
             cpu_prepopulated_instances: Vec::with_capacity(4096),
             gpu_inputs: Vec::with_capacity(4096),
+            present_target_width: WINDOW_WIDTH,
+            present_target_height: WINDOW_HEIGHT,
             render_target_width: WINDOW_WIDTH,
             render_target_height: WINDOW_HEIGHT,
             pending_recreate_offscreen: false,
@@ -5728,14 +5764,18 @@ impl App {
             });
 
         // Create pipeline layouts
-        // Compute and cache logical render target dims using logical window size * render_scale
+        // Compute and cache internal render target dims.
+        // - presented: logical window size * render_scale
+        // - render target: presented * render_overscan_factor
         let logical_width = ((size.width as f32) / scale).round() as u32;
         let logical_height = ((size.height as f32) / scale).round() as u32;
         let overscan_factor = self.render_overscan_factor();
-        let render_target_width =
-            ((logical_width as f32) * render_scale * overscan_factor).round() as u32;
-        let render_target_height =
-            ((logical_height as f32) * render_scale * overscan_factor).round() as u32;
+        let present_target_width = ((logical_width as f32) * render_scale).round() as u32;
+        let present_target_height = ((logical_height as f32) * render_scale).round() as u32;
+        let render_target_width = ((present_target_width as f32) * overscan_factor).round() as u32;
+        let render_target_height = ((present_target_height as f32) * overscan_factor).round() as u32;
+        self.present_target_width = present_target_width.max(1);
+        self.present_target_height = present_target_height.max(1);
         self.render_target_width = render_target_width.max(1);
         self.render_target_height = render_target_height.max(1);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -9642,6 +9682,7 @@ impl App {
         // Water Pass (Transparent, reads depth buffer)
         let _water_scope = self.profiler.scope("water_cpu");
         {
+            let (sx, sy, sw, sh) = self.scissor_rect_full_res();
             let water_ts = self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
                 query_set: qs,
                 beginning_of_pass_write_index: Some(10),
@@ -9668,6 +9709,7 @@ impl App {
                 (self.water_pipeline.as_ref(), self.water_bind_group.as_ref())
             {
                 water_pass.set_pipeline(pipeline);
+                water_pass.set_scissor_rect(sx, sy, sw, sh);
                 water_pass.set_bind_group(0, self.bind_group.as_ref().unwrap(), &[]);
                 water_pass.set_bind_group(1, bind_group, &[]);
                 water_pass.draw(0..3, 0..1);
@@ -9707,6 +9749,7 @@ impl App {
                 self.dof_color_view.as_ref(),
                 self.dof_coc_pipeline.as_ref(),
             ) {
+                let (sx, sy, sw, sh) = self.scissor_rect_half_res();
                 let blur_strength = self.dof_settings.blur_strength;
                 let gpu_uniforms = self.pack_dof_uniforms(blur_strength);
                 queue.write_buffer(dof_buffer, 0, bytemuck::cast_slice(&gpu_uniforms));
@@ -9731,6 +9774,7 @@ impl App {
                     occlusion_query_set: None,
                 });
                 post_pass.set_pipeline(dof_coc_pipeline);
+                post_pass.set_scissor_rect(sx, sy, sw, sh);
                 post_pass.set_bind_group(0, dof_bind_group, &[]);
                 post_pass.draw(0..3, 0..1);
             }
@@ -9880,6 +9924,7 @@ impl App {
                 self.dof_combine_bind_group.as_ref(),
                 self.post_color_view.as_ref(),
             ) {
+                let (sx, sy, sw, sh) = self.scissor_rect_full_res();
                 let combine_ts = self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
                     query_set: qs,
                     beginning_of_pass_write_index: None,
@@ -9901,6 +9946,7 @@ impl App {
                     occlusion_query_set: None,
                 });
                 combine_pass.set_pipeline(dof_combine_pipeline);
+                combine_pass.set_scissor_rect(sx, sy, sw, sh);
                 combine_pass.set_bind_group(0, dof_combine_bind_group, &[]);
                 combine_pass.draw(0..3, 0..1);
             }
@@ -9910,18 +9956,12 @@ impl App {
                 self.offscreen_color_texture.as_ref(),
                 self.post_color_texture.as_ref(),
             ) {
-                let size = self.config.as_ref().map(|c| wgpu::Extent3d {
-                    width: c.width,
-                    height: c.height,
+                let extent = wgpu::Extent3d {
+                    width: self.render_target_width.max(1),
+                    height: self.render_target_height.max(1),
                     depth_or_array_layers: 1,
-                });
-                if let Some(extent) = size {
-                    encoder.copy_texture_to_texture(
-                        offscreen_tex.as_image_copy(),
-                        post_tex.as_image_copy(),
-                        extent,
-                    );
-                }
+                };
+                encoder.copy_texture_to_texture(offscreen_tex.as_image_copy(), post_tex.as_image_copy(), extent);
             }
         }
         if self.bloom_enabled && self.bloom_settings.kawase_enabled {
@@ -9934,6 +9974,8 @@ impl App {
                 self.bloom_extract_bind_group.as_ref(),
                 self.bloom_ping_view.as_ref(),
             ) {
+                let (sx_full, sy_full, sw_full, sh_full) = self.scissor_rect_full_res();
+                let (sx_half, sy_half, sw_half, sh_half) = self.scissor_rect_half_res();
                 // SSILVB/SSAO: run before bloom so AO can affect later passes
                 if self.ssao_enabled {
                     if let (Some(ssilvb_pipeline), Some(ssilvb_bind_group), Some(ssao_ping_view)) = (
@@ -9958,6 +10000,7 @@ impl App {
                                 occlusion_query_set: None,
                             });
                         ssao_pass.set_pipeline(ssilvb_pipeline);
+                        ssao_pass.set_scissor_rect(sx_full, sy_full, sw_full, sh_full);
                         ssao_pass.set_bind_group(0, ssilvb_bind_group, &[]);
                         ssao_pass.draw(0..3, 0..1);
                     }
@@ -9986,6 +10029,7 @@ impl App {
                                     occlusion_query_set: None,
                                 });
                             blur_pass_h.set_pipeline(ssao_blur_pipeline);
+                            blur_pass_h.set_scissor_rect(sx_full, sy_full, sw_full, sh_full);
                             blur_pass_h.set_bind_group(0, ssao_blur_h, &[]);
                             blur_pass_h.draw(0..3, 0..1);
                         }
@@ -10014,6 +10058,7 @@ impl App {
                                     occlusion_query_set: None,
                                 });
                             blur_pass_v.set_pipeline(ssao_blur_pipeline);
+                            blur_pass_v.set_scissor_rect(sx_full, sy_full, sw_full, sh_full);
                             blur_pass_v.set_bind_group(0, ssao_blur_v, &[]);
                             blur_pass_v.draw(0..3, 0..1);
                         }
@@ -10035,6 +10080,7 @@ impl App {
                     occlusion_query_set: None,
                 });
                 extract_pass.set_pipeline(bloom_extract_pipeline);
+                extract_pass.set_scissor_rect(sx_half, sy_half, sw_half, sh_half);
                 extract_pass.set_bind_group(0, bloom_extract_bind_group, &[]);
                 extract_pass.draw(0..3, 0..1);
             }
@@ -10078,6 +10124,8 @@ impl App {
                                 occlusion_query_set: None,
                             });
                             pass.set_pipeline(kawase_down_pipeline);
+                            let (sx_half, sy_half, sw_half, sh_half) = self.scissor_rect_half_res();
+                            pass.set_scissor_rect(sx_half, sy_half, sw_half, sh_half);
                             // Use per-iteration bind group if available, else create temporary one
                             if let Some(bg) = self
                                 .bloom_kawase_bind_groups
@@ -10128,22 +10176,31 @@ impl App {
                         // Ensure final result is in bloom_ping_view (composite expects ping view)
                         if iterations % 2 == 1 {
                             // Copy pong to ping to make final output in ping view
+                            let (sx_half, sy_half, sw_half, sh_half) = self.scissor_rect_half_res();
                             encoder.copy_texture_to_texture(
                                 wgpu::TexelCopyTextureInfo {
                                     texture: self.bloom_pong_texture.as_ref().unwrap(),
                                     mip_level: 0,
-                                    origin: wgpu::Origin3d::ZERO,
+                                    origin: wgpu::Origin3d {
+                                        x: sx_half,
+                                        y: sy_half,
+                                        z: 0,
+                                    },
                                     aspect: wgpu::TextureAspect::All,
                                 },
                                 wgpu::TexelCopyTextureInfo {
                                     texture: self.bloom_ping_texture.as_ref().unwrap(),
                                     mip_level: 0,
-                                    origin: wgpu::Origin3d::ZERO,
+                                    origin: wgpu::Origin3d {
+                                        x: sx_half,
+                                        y: sy_half,
+                                        z: 0,
+                                    },
                                     aspect: wgpu::TextureAspect::All,
                                 },
                                 wgpu::Extent3d {
-                                    width: (self.render_target_width / 2).max(1),
-                                    height: (self.render_target_height / 2).max(1),
+                                    width: sw_half,
+                                    height: sh_half,
                                     depth_or_array_layers: 1,
                                 },
                             );
@@ -10412,15 +10469,16 @@ impl App {
                         let scale = window.scale_factor() as f32;
                         let logical_width = ((size.width as f32) / scale).round() as u32;
                         let logical_height = ((size.height as f32) / scale).round() as u32;
+                        let render_scale = self.user_config.performance.render_scale;
                         let overscan_factor = self.render_overscan_factor();
-                        self.render_target_width = ((logical_width as f32)
-                            * self.user_config.performance.render_scale
-                            * overscan_factor)
-                            .round() as u32;
-                        self.render_target_height = ((logical_height as f32)
-                            * self.user_config.performance.render_scale
-                            * overscan_factor)
-                            .round() as u32;
+                        let present_target_width = ((logical_width as f32) * render_scale).round() as u32;
+                        let present_target_height = ((logical_height as f32) * render_scale).round() as u32;
+                        self.present_target_width = present_target_width.max(1);
+                        self.present_target_height = present_target_height.max(1);
+                        self.render_target_width =
+                            ((self.present_target_width as f32) * overscan_factor).round() as u32;
+                        self.render_target_height =
+                            ((self.present_target_height as f32) * overscan_factor).round() as u32;
                         self.pending_recreate_offscreen = true;
                     }
                 }
@@ -10903,10 +10961,14 @@ impl ApplicationHandler for App {
                         let logical_height = ((new_size.height as f32) / scale).round() as u32;
                         let render_scale = self.user_config.performance.render_scale;
                         let overscan_factor = self.render_overscan_factor();
+                        let present_target_width = ((logical_width as f32) * render_scale).round() as u32;
+                        let present_target_height = ((logical_height as f32) * render_scale).round() as u32;
+                        self.present_target_width = present_target_width.max(1);
+                        self.present_target_height = present_target_height.max(1);
                         self.render_target_width =
-                            ((logical_width as f32) * render_scale * overscan_factor).round() as u32;
+                            ((self.present_target_width as f32) * overscan_factor).round() as u32;
                         self.render_target_height =
-                            ((logical_height as f32) * render_scale * overscan_factor).round() as u32;
+                            ((self.present_target_height as f32) * overscan_factor).round() as u32;
                     }
 
                     if let (Some(surface), Some(device), Some(config)) = (
