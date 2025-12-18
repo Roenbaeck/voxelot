@@ -2,12 +2,13 @@
 file = "worlds/water_level_test.vhc"
 palette = "worlds/palette.txt"
 camera_position = [
-    511.0,
-    550.0,
-    511.0,
+    479.5553,
+    462.4513,
+    382.7892,
 ]
 water_level = 460.0
 water_visibility = 50.0
+start_mode = "camera"
 
 [rendering]
 chunk_lod_distance = 1500.0
@@ -17,10 +18,16 @@ far_plane = 3000.0
 camera_speed_multiplier = 5.9604645
 window_width = 1280
 window_height = 720
+culling_overscan = 0.2
+render_overscan = 0.2
+macos_hdr = true
+macos_hdr_exposure_boost = 1.0
+macos_hdr_colorspace = "extended_linear_srgb"
 
 [atmosphere]
 fog_density = 0.00019999995
-time_of_day = 0.47289187
+time_of_day = 0.34495798
+time_paused = false
 night_skybox_brightness = 0.04
 horizon_fade_up = 0.05
 horizon_fade_down = 0.25
@@ -66,6 +73,17 @@ strength = 1.0
 blur_enabled = true
 blur_radius = 1.0
 
+[effects.gi]
+enabled = true
+indirect_scale = 0.003
+fade_distance = 400.0
+fade_range = 100.0
+grid_dims = [
+    32,
+    16,
+    32,
+]
+
 [effects.ssr]
 enabled = true
 max_steps = 32
@@ -96,7 +114,3 @@ mega_index_buffer_mb = 128
 max_draw_capacity = 10000
 render_scale = 1.42
 max_gpu_instances = 3000000
-
-[debug]
-show_fps = true
-show_chunk_stats = true

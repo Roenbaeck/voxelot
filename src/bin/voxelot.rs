@@ -207,7 +207,14 @@ fn boat_push_tri(
     });
 }
 
-fn boat_push_quad(out: &mut Vec<MeshVertexRaw>, a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f32; 3], color: [f32; 4]) {
+fn boat_push_quad(
+    out: &mut Vec<MeshVertexRaw>,
+    a: [f32; 3],
+    b: [f32; 3],
+    c: [f32; 3],
+    d: [f32; 3],
+    color: [f32; 4],
+) {
     boat_push_tri(out, a, b, c, color);
     boat_push_tri(out, a, c, d, color);
 }
@@ -346,7 +353,9 @@ fn boat_transform_into_world(
         let wy = rxp[1] + pos[1] - 0.18;
         let wz = rxp[2] + pos[2];
 
-        let nlen = (rnp[0] * rnp[0] + rnp[1] * rnp[1] + rnp[2] * rnp[2]).sqrt().max(1e-6);
+        let nlen = (rnp[0] * rnp[0] + rnp[1] * rnp[1] + rnp[2] * rnp[2])
+            .sqrt()
+            .max(1e-6);
         let nx = rnp[0] / nlen;
         let ny = rnp[1] / nlen;
         let nz = rnp[2] / nlen;
@@ -595,8 +604,8 @@ struct WaterUniforms {
     water_color: [f32; 4],
 
     // Boat/wake parameters (optional)
-    boat_pos_wake: [f32; 4],   // xyz = boat position, w = wake strength (0 disables)
-    boat_dir_speed: [f32; 4],  // xyz = forward direction, w = horizontal speed
+    boat_pos_wake: [f32; 4], // xyz = boat position, w = wake strength (0 disables)
+    boat_dir_speed: [f32; 4], // xyz = forward direction, w = horizontal speed
     // DoF parameters passed to water shader to allow CoC-consistent reflection blur
     dof_focal_distance: f32,
     dof_focal_range: f32,
@@ -1379,6 +1388,7 @@ struct App {
     gpu_timing_accum_dof_ms: f64,
     gpu_timing_accum_kawase_ms: f64,
     gpu_timing_accum_bloom_ms: f64,
+    gpu_timing_accum_ssilvb_ms: f64,
     gpu_timing_accum_post_ms: f64,
     gpu_timing_accum_frames: u32,
     gpu_timing_print_interval_frames: u32,
@@ -1546,21 +1556,27 @@ impl App {
                     viewer_debug!("  ✗ Leaf chunk not found");
                 }
             }
-            
+
             // Load palette and do LOD updates BEFORE wrapping in Arc
             log::info!("Loading palette from {}...", cfg.world.palette);
             let temp_palette = Palette::load(&cfg.world.palette);
-            
+
             log::info!("Updating LOD metadata...");
             let lod_start = Instant::now();
             temp_world.update_all_lod_metadata(&temp_palette);
-            log::info!("LOD metadata updated (took {:.3}s)", lod_start.elapsed().as_secs_f32());
+            log::info!(
+                "LOD metadata updated (took {:.3}s)",
+                lod_start.elapsed().as_secs_f32()
+            );
 
             log::info!("Generating hierarchy shells...");
             let shell_start = Instant::now();
             temp_world.generate_all_hierarchy_shells();
-            log::info!("Hierarchy shells generated (took {:.3}s)", shell_start.elapsed().as_secs_f32());
-            
+            log::info!(
+                "Hierarchy shells generated (took {:.3}s)",
+                shell_start.elapsed().as_secs_f32()
+            );
+
             world = Arc::new(temp_world);
         } else {
             initial_camera = cfg.world.camera_position;
@@ -1568,16 +1584,15 @@ impl App {
             log::info!("Loading voxel data from {}...", cfg.world.file);
             // Load hierarchical chunk format (.vhc) from configured path — loader accepts legacy .oct for compatibility
             let load_start = Instant::now();
-            let mut temp_world = voxelot::load_world_file(std::path::Path::new(&cfg.world.file)).unwrap_or_else(
-                |e| {
+            let mut temp_world = voxelot::load_world_file(std::path::Path::new(&cfg.world.file))
+                .unwrap_or_else(|e| {
                     eprintln!(
                         "ERROR: Failed to load world file '{}': {}",
                         cfg.world.file, e
                     );
                     eprintln!("Please check that the file path in your configuration is correct.");
                     std::process::exit(1);
-                },
-            );
+                });
             let load_elapsed = load_start.elapsed();
             #[cfg(feature = "cpu-profiling")]
             {
@@ -1588,22 +1603,28 @@ impl App {
                     load_elapsed.as_secs_f32()
                 );
             }
-            
+
             // Load palette BEFORE wrapping world in Arc (needed for LOD metadata)
             log::info!("Loading palette from {}...", cfg.world.palette);
             let temp_palette = Palette::load(&cfg.world.palette);
-            
+
             // Update LOD metadata and generate hierarchy shells BEFORE wrapping in Arc
             log::info!("Updating LOD metadata...");
             let lod_start = Instant::now();
             temp_world.update_all_lod_metadata(&temp_palette);
-            log::info!("LOD metadata updated (took {:.3}s)", lod_start.elapsed().as_secs_f32());
+            log::info!(
+                "LOD metadata updated (took {:.3}s)",
+                lod_start.elapsed().as_secs_f32()
+            );
 
             log::info!("Generating hierarchy shells...");
             let shell_start = Instant::now();
             temp_world.generate_all_hierarchy_shells();
-            log::info!("Hierarchy shells generated (took {:.3}s)", shell_start.elapsed().as_secs_f32());
-            
+            log::info!(
+                "Hierarchy shells generated (took {:.3}s)",
+                shell_start.elapsed().as_secs_f32()
+            );
+
             world = Arc::new(temp_world);
         }
 
@@ -1636,7 +1657,9 @@ impl App {
             if cam_pos[1] <= solid_y as f32 {
                 log::info!(
                     "Camera was at y={:.1} (inside/below terrain at y={}), moved to y={:.1}",
-                    start_y, solid_y, safe_y
+                    start_y,
+                    solid_y,
+                    safe_y
                 );
                 cam_pos[1] = safe_y;
                 initial_camera = cam_pos;
@@ -1665,7 +1688,8 @@ impl App {
             if corrected {
                 log::info!(
                     "Camera was inside terrain at y={:.1}, moved to y={:.1}",
-                    start_y, cam_pos[1]
+                    start_y,
+                    cam_pos[1]
                 );
                 initial_camera = cam_pos;
             }
@@ -1740,11 +1764,8 @@ impl App {
         // Spawn GI worker thread (similar to mesh workers)
         log::info!("Spawning GI worker thread...");
         let gi_grid_dims = glam::IVec3::from_array(cfg.effects.gi.grid_dims);
-        let (gi_request_tx, gi_result_rx) = voxelot::gi::spawn_gi_worker(
-            world.clone(),
-            palette.clone(),
-            gi_grid_dims,
-        );
+        let (gi_request_tx, gi_result_rx) =
+            voxelot::gi::spawn_gi_worker(world.clone(), palette.clone(), gi_grid_dims);
 
         let mesh_upload_baseline = cfg.performance.mesh_upload_baseline;
         let mesh_upload_max = (mesh_worker_count * 4).max(mesh_upload_baseline * 2);
@@ -1910,9 +1931,10 @@ impl App {
             gi_result_rx,
             gi_probes: Arc::new(vec![
                 voxelot::gi::GiProbe::default();
-                (cfg.effects.gi.grid_dims[0] * 
-                 cfg.effects.gi.grid_dims[1] * 
-                 cfg.effects.gi.grid_dims[2]) as usize
+                (cfg.effects.gi.grid_dims[0]
+                    * cfg.effects.gi.grid_dims[1]
+                    * cfg.effects.gi.grid_dims[2])
+                    as usize
             ]),
             gi_grid_origin: glam::IVec3::ZERO,
             gi_grid_dims: glam::IVec3::from_array(cfg.effects.gi.grid_dims),
@@ -1947,12 +1969,18 @@ impl App {
             water_visibility: cfg.world.water_visibility,
 
             // Spawn initial pawn based on configuration: camera (default) or a vessel
-            active_pawn: if cfg.world.start_mode == "camera" || cfg.world.start_mode == "free_camera" || cfg.world.start_mode == "freecam" {
+            active_pawn: if cfg.world.start_mode == "camera"
+                || cfg.world.start_mode == "free_camera"
+                || cfg.world.start_mode == "freecam"
+            {
                 None
             } else {
                 // For now, any non-camera start mode spawns the default BoatPawn.
                 // In the future we can use `cfg.world.start_vessel` to select different vessel types.
-                Some(Box::new(voxelot::BoatPawn::new(cam_pos, cfg.world.water_level)))
+                Some(Box::new(voxelot::BoatPawn::new(
+                    cam_pos,
+                    cfg.world.water_level,
+                )))
             },
 
             emissive_texture: None,
@@ -1975,6 +2003,7 @@ impl App {
             gpu_timing_accum_dof_ms: 0.0,
             gpu_timing_accum_kawase_ms: 0.0,
             gpu_timing_accum_bloom_ms: 0.0,
+            gpu_timing_accum_ssilvb_ms: 0.0,
             gpu_timing_accum_post_ms: 0.0,
             gpu_timing_accum_frames: 0,
             gpu_timing_print_interval_frames: 120,
@@ -2975,28 +3004,29 @@ impl App {
                     App::compute_texture_bytes(config.format, target_width, target_height, 1, 1);
 
                 // SSR texture (also used as scene color copy for water reflections)
-                let (ssr_texture_loc, ssr_texture_view_loc) = if self.user_config.effects.ssr.enabled {
-                    let ssr_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("SSR Texture"),
-                    size: wgpu::Extent3d {
-                        width: target_width,
-                        height: target_height,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba16Float,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                        | wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
-                });
-                    let ssr_texture_view_loc =
-                        ssr_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
-                    (Some(ssr_texture_loc), Some(ssr_texture_view_loc))
-                } else {
-                    (None, None)
-                };
+                let (ssr_texture_loc, ssr_texture_view_loc) =
+                    if self.user_config.effects.ssr.enabled {
+                        let ssr_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
+                            label: Some("SSR Texture"),
+                            size: wgpu::Extent3d {
+                                width: target_width,
+                                height: target_height,
+                                depth_or_array_layers: 1,
+                            },
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: wgpu::TextureFormat::Rgba16Float,
+                            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                                | wgpu::TextureUsages::TEXTURE_BINDING,
+                            view_formats: &[],
+                        });
+                        let ssr_texture_view_loc =
+                            ssr_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
+                        (Some(ssr_texture_loc), Some(ssr_texture_view_loc))
+                    } else {
+                        (None, None)
+                    };
 
                 // Scene color copy texture (for water reflections - same format as offscreen)
                 let scene_copy_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
@@ -3092,8 +3122,8 @@ impl App {
         );
         self.offscreen_color_view = Some(color_view);
         self.offscreen_color_texture = Some(color_texture);
-    self.ssr_texture = ssr_texture_loc;
-    self.ssr_texture_view = ssr_texture_view_loc;
+        self.ssr_texture = ssr_texture_loc;
+        self.ssr_texture_view = ssr_texture_view_loc;
         self.scene_copy_texture = Some(scene_copy_texture_loc);
         self.scene_copy_view = Some(scene_copy_view_loc);
         self.emissive_texture = Some(emissive_texture_loc);
@@ -3724,7 +3754,7 @@ impl App {
         let Some(offscreen_view) = self.offscreen_color_view.as_ref() else {
             return;
         };
-        
+
         let Some(bloom_ping_view) = self.bloom_ping_view.as_ref() else {
             return;
         };
@@ -5173,11 +5203,14 @@ impl App {
                     };
                     queue.write_buffer(params_buf, 0, bytemuck::bytes_of(&params));
 
-                    let ts_writes = self.query_set.as_ref().map(|qs| wgpu::ComputePassTimestampWrites {
-                        query_set: qs,
-                        beginning_of_pass_write_index: Some(2),
-                        end_of_pass_write_index: Some(3),
-                    });
+                    let ts_writes =
+                        self.query_set
+                            .as_ref()
+                            .map(|qs| wgpu::ComputePassTimestampWrites {
+                                query_set: qs,
+                                beginning_of_pass_write_index: Some(2),
+                                end_of_pass_write_index: Some(3),
+                            });
 
                     let mut hzb_copy_pass =
                         encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -5221,12 +5254,15 @@ impl App {
             }
         }
 
-                let ts_writes = self.query_set.as_ref().map(|qs| wgpu::ComputePassTimestampWrites {
-                    query_set: qs,
-                    beginning_of_pass_write_index: Some(6),
-                    end_of_pass_write_index: Some(7),
-                });
-                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        let ts_writes = self
+            .query_set
+            .as_ref()
+            .map(|qs| wgpu::ComputePassTimestampWrites {
+                query_set: qs,
+                beginning_of_pass_write_index: Some(6),
+                end_of_pass_write_index: Some(7),
+            });
+        let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("GPU Cull Pass"),
             timestamp_writes: ts_writes,
         });
@@ -5242,25 +5278,7 @@ impl App {
             self.pending_recreate_offscreen = false;
             self.recreate_offscreen_targets();
         }
-        // All GPU timestamp queries are resolved at end-of-frame; per-pass resolves removed to avoid alignment constraints.
-        #[cfg(feature = "gpu-profiling")]
-        {
-            if let (Some(qs), Some(resolve_buf), Some(readback_buf)) = (
-                self.query_set.as_ref(),
-                self.query_resolve_buffer.as_ref(),
-                self.query_readback_buffer.as_ref(),
-            ) {
-                // Resolve the full set at end of frame and copy into staging readback buffer
-                if !self.query_readback_in_flight {
-                    log::debug!("performing resolve+copy into readback buffer");
-                    encoder.resolve_query_set(qs, 0..20, resolve_buf, 0);
-                    let total_bytes = (20u64) * 8u64;
-                    encoder.copy_buffer_to_buffer(resolve_buf, 0, readback_buf, 0, total_bytes);
-                } else {
-                    log::debug!("skipping resolve+copy: previous readback still in flight");
-                }
-            }
-        }
+        // resolve + copy moved to the end of render() to capture all passes correctly.
         queue.submit(std::iter::once(encoder.finish()));
     }
 
@@ -5441,8 +5459,8 @@ impl App {
         colorspace: voxelot::config::MacosHdrColorspace,
     ) {
         use libc::c_void;
-        use objc::{msg_send, sel, sel_impl};
         use objc::runtime::{Object, BOOL, NO, YES};
+        use objc::{msg_send, sel, sel_impl};
 
         // CoreGraphics color space helpers (no extra crates).
         #[link(name = "CoreGraphics", kind = "framework")]
@@ -5564,41 +5582,45 @@ impl App {
         #[cfg(feature = "gpu-profiling")]
         {
             if device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
-            // Reserve up to 64 timestamps; adjust as needed
-            let query_count: u32 = 64;
-            let qs = device.create_query_set(&wgpu::QuerySetDescriptor {
-                label: Some("Timestamp QuerySet"),
-                ty: wgpu::QueryType::Timestamp,
-                count: query_count,
-            });
-            // Buffer to resolve query results into (8 bytes per query) - GPU-only buffer
-            let query_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Query Resolve Buffer"),
-                size: (query_count as u64) * 8u64,
-                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            // Staging buffer for reading back resolved queries (MAP_READ + COPY_DST)
-            let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Query Readback Buffer"),
-                size: (query_count as u64) * 8u64,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            // Create an unbounded notifier for mapping completion events
-            let (tx, rx) = crossbeam_channel::unbounded();
-            self.query_set = Some(qs);
-            self.query_resolve_buffer = Some(query_buffer);
-            self.query_readback_buffer = Some(readback_buffer);
-            self.query_readback_notifier_tx = Some(tx);
-            self.query_readback_notifier_rx = Some(rx);
-            log::info!(
-                "GPU profiling enabled: query_count={} timestamp_period_ns={:.3}ns",
-                query_count,
-                self.timestamp_period_ns
-            );
+                // Reserve up to 64 timestamps; adjust as needed
+                let query_count: u32 = 64;
+                let qs = device.create_query_set(&wgpu::QuerySetDescriptor {
+                    label: Some("Timestamp QuerySet"),
+                    ty: wgpu::QueryType::Timestamp,
+                    count: query_count,
+                });
+                // Buffer to resolve query results into (8 bytes per query) - GPU-only buffer
+                let query_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Query Resolve Buffer"),
+                    size: (query_count as u64) * 8u64,
+                    usage: wgpu::BufferUsages::QUERY_RESOLVE
+                        | wgpu::BufferUsages::COPY_SRC
+                        | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                // Staging buffer for reading back resolved queries (MAP_READ + COPY_DST)
+                let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Query Readback Buffer"),
+                    size: (query_count as u64) * 8u64,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                // Create an unbounded notifier for mapping completion events
+                let (tx, rx) = crossbeam_channel::unbounded();
+                self.query_set = Some(qs);
+                self.query_resolve_buffer = Some(query_buffer);
+                self.query_readback_buffer = Some(readback_buffer);
+                self.query_readback_notifier_tx = Some(tx);
+                self.query_readback_notifier_rx = Some(rx);
+                log::info!(
+                    "GPU profiling enabled: query_count={} timestamp_period_ns={:.3}ns",
+                    query_count,
+                    self.timestamp_period_ns
+                );
             } else {
-                log::info!("GPU profiling requested but adapter lacks TIMESTAMP_QUERY; profiling disabled");
+                log::info!(
+                    "GPU profiling requested but adapter lacks TIMESTAMP_QUERY; profiling disabled"
+                );
             }
         }
         #[cfg(not(feature = "gpu-profiling"))]
@@ -5613,7 +5635,11 @@ impl App {
             {
                 // Allow forcing SDR for easy A/B comparison.
                 let want_hdr = self.user_config.rendering.macos_hdr;
-                if want_hdr && surface_caps.formats.contains(&wgpu::TextureFormat::Rgba16Float) {
+                if want_hdr
+                    && surface_caps
+                        .formats
+                        .contains(&wgpu::TextureFormat::Rgba16Float)
+                {
                     wgpu::TextureFormat::Rgba16Float
                 } else {
                     surface_caps
@@ -5773,7 +5799,8 @@ impl App {
         let present_target_width = ((logical_width as f32) * render_scale).round() as u32;
         let present_target_height = ((logical_height as f32) * render_scale).round() as u32;
         let render_target_width = ((present_target_width as f32) * overscan_factor).round() as u32;
-        let render_target_height = ((present_target_height as f32) * overscan_factor).round() as u32;
+        let render_target_height =
+            ((present_target_height as f32) * overscan_factor).round() as u32;
         self.present_target_width = present_target_width.max(1);
         self.present_target_height = present_target_height.max(1);
         self.render_target_width = render_target_width.max(1);
@@ -7339,13 +7366,20 @@ impl App {
     }
 
     fn render(&mut self) {
-        log::debug!("render() enter frame={}, frame_index={}", self.frame_count, self.frame_index);
+        log::debug!(
+            "render() enter frame={}, frame_index={}",
+            self.frame_count,
+            self.frame_index
+        );
         let device = self.device.as_ref().unwrap().clone();
         let queue = self.queue.as_ref().unwrap().clone();
         let config = self.config.as_ref().unwrap().clone();
 
         let _frame_scope = self.profiler.scope("frame");
-        log::debug!("render: entered profiler frame scope for frame={}", self.frame_count);
+        log::debug!(
+            "render: entered profiler frame scope for frame={}",
+            self.frame_count
+        );
 
         // Update camera
         let now = Instant::now();
@@ -7384,7 +7418,8 @@ impl App {
 
         // Update active pawn mesh (boat) vertices/buffer
         self.boat_vertex_count = 0;
-        if let (Some(pawn), Some(boat_buf)) = (&self.active_pawn, self.boat_vertex_buffer.as_ref()) {
+        if let (Some(pawn), Some(boat_buf)) = (&self.active_pawn, self.boat_vertex_buffer.as_ref())
+        {
             if let Some((pos, yaw, pitch, roll)) = pawn.debug_mesh_transform() {
                 boat_transform_into_world(
                     &mut self.boat_world_vertices,
@@ -7396,7 +7431,11 @@ impl App {
                 );
                 self.boat_vertex_count = self.boat_world_vertices.len() as u32;
                 if self.boat_vertex_count > 0 {
-                    queue.write_buffer(boat_buf, 0, bytemuck::cast_slice(&self.boat_world_vertices));
+                    queue.write_buffer(
+                        boat_buf,
+                        0,
+                        bytemuck::cast_slice(&self.boat_world_vertices),
+                    );
                 }
             } else if let Some((pos, yaw)) = pawn.debug_mesh_pose() {
                 boat_transform_into_world(
@@ -7409,7 +7448,11 @@ impl App {
                 );
                 self.boat_vertex_count = self.boat_world_vertices.len() as u32;
                 if self.boat_vertex_count > 0 {
-                    queue.write_buffer(boat_buf, 0, bytemuck::cast_slice(&self.boat_world_vertices));
+                    queue.write_buffer(
+                        boat_buf,
+                        0,
+                        bytemuck::cast_slice(&self.boat_world_vertices),
+                    );
                 }
             }
         }
@@ -7418,7 +7461,7 @@ impl App {
         if let Ok(result) = self.gi_result_rx.try_recv() {
             self.gi_probes = result.probes; // Arc clone is cheap
             self.gi_grid_origin = result.grid_origin;
-            
+
             // Upload new probes to GPU
             if let Some(buffer) = &self.gi_probe_buffer {
                 queue.write_buffer(buffer, 0, bytemuck::cast_slice(&*self.gi_probes));
@@ -7438,10 +7481,10 @@ impl App {
             cull_visible_voxels_parallel(&self.world, &self.camera_controller.camera);
         self.cull_stats = cull_stats;
         let cull_time = cull_start.elapsed();
-        
+
         // Send async GI update request with visible chunks (non-blocking, after culling)
         let camera_pos = glam::Vec3::from(self.camera_controller.camera.position);
-        let _ = self.gi_request_tx.send(voxelot::gi::GiUpdateRequest { 
+        let _ = self.gi_request_tx.send(voxelot::gi::GiUpdateRequest {
             camera_pos,
             visible_chunks,
         });
@@ -8255,7 +8298,9 @@ impl App {
         let schedule_start = std::time::Instant::now();
         let mut jobs_scheduled_this_frame = 0;
         let max_jobs_per_frame = 8; // Throttle mesh job creation to prevent stuttering
-        while self.mesh_jobs_in_flight < max_inflight && jobs_scheduled_this_frame < max_jobs_per_frame {
+        while self.mesh_jobs_in_flight < max_inflight
+            && jobs_scheduled_this_frame < max_jobs_per_frame
+        {
             // Backpressure: don't schedule more worker jobs if the ready result queue is already
             // large. This avoids generating more meshes than we can upload and prevents a
             // runaway backlog that keeps workers busy indefinitely.
@@ -9449,11 +9494,14 @@ impl App {
             .expect("offscreen depth view missing");
 
         {
-            let rp_ts = self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
-                query_set: qs,
-                beginning_of_pass_write_index: Some(0),
-                end_of_pass_write_index: Some(1),
-            });
+            let rp_ts = self
+                .query_set
+                .as_ref()
+                .map(|qs| wgpu::RenderPassTimestampWrites {
+                    query_set: qs,
+                    beginning_of_pass_write_index: Some(0),
+                    end_of_pass_write_index: Some(1),
+                });
 
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Scene Pass"),
@@ -9625,11 +9673,14 @@ impl App {
                 self.ssr_bind_group.as_ref(),
                 self.ssr_texture_view.as_ref(),
             ) {
-                let ssr_ts = self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
-                    query_set: qs,
-                    beginning_of_pass_write_index: Some(8),
-                    end_of_pass_write_index: Some(9),
-                });
+                let ssr_ts = self
+                    .query_set
+                    .as_ref()
+                    .map(|qs| wgpu::RenderPassTimestampWrites {
+                        query_set: qs,
+                        beginning_of_pass_write_index: Some(8),
+                        end_of_pass_write_index: Some(9),
+                    });
                 let mut ssr_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("SSR Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -9683,11 +9734,14 @@ impl App {
         let _water_scope = self.profiler.scope("water_cpu");
         {
             let (sx, sy, sw, sh) = self.scissor_rect_full_res();
-            let water_ts = self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
-                query_set: qs,
-                beginning_of_pass_write_index: Some(10),
-                end_of_pass_write_index: Some(11),
-            });
+            let water_ts = self
+                .query_set
+                .as_ref()
+                .map(|qs| wgpu::RenderPassTimestampWrites {
+                    query_set: qs,
+                    beginning_of_pass_write_index: Some(10),
+                    end_of_pass_write_index: Some(11),
+                });
 
             let mut water_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Water Pass"),
@@ -9753,11 +9807,14 @@ impl App {
                 let blur_strength = self.dof_settings.blur_strength;
                 let gpu_uniforms = self.pack_dof_uniforms(blur_strength);
                 queue.write_buffer(dof_buffer, 0, bytemuck::cast_slice(&gpu_uniforms));
-                let post_ts = self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
-                    query_set: qs,
-                    beginning_of_pass_write_index: Some(4),
-                    end_of_pass_write_index: None,
-                });
+                let post_ts = self
+                    .query_set
+                    .as_ref()
+                    .map(|qs| wgpu::RenderPassTimestampWrites {
+                        query_set: qs,
+                        beginning_of_pass_write_index: Some(4),
+                        end_of_pass_write_index: None,
+                    });
                 let mut post_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("DoF CoC Copy Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -9839,7 +9896,17 @@ impl App {
                                     depth_slice: None,
                                 })],
                                 depth_stencil_attachment: None,
-                                timestamp_writes: if level == 0 { self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites { query_set: qs, beginning_of_pass_write_index: Some(14), end_of_pass_write_index: None }) } else { None },
+                                timestamp_writes: if level == 0 {
+                                    self.query_set.as_ref().map(|qs| {
+                                        wgpu::RenderPassTimestampWrites {
+                                            query_set: qs,
+                                            beginning_of_pass_write_index: Some(14),
+                                            end_of_pass_write_index: None,
+                                        }
+                                    })
+                                } else {
+                                    None
+                                },
                                 occlusion_query_set: None,
                             });
                             pass.set_pipeline(kawase_down_pipeline);
@@ -9898,7 +9965,17 @@ impl App {
                                         depth_slice: None,
                                     })],
                                     depth_stencil_attachment: None,
-                                    timestamp_writes: if level_rev == 0 { self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites { query_set: qs, beginning_of_pass_write_index: None, end_of_pass_write_index: Some(15) }) } else { None },
+                                    timestamp_writes: if level_rev == 0 {
+                                        self.query_set.as_ref().map(|qs| {
+                                            wgpu::RenderPassTimestampWrites {
+                                                query_set: qs,
+                                                beginning_of_pass_write_index: None,
+                                                end_of_pass_write_index: Some(15),
+                                            }
+                                        })
+                                    } else {
+                                        None
+                                    },
                                     occlusion_query_set: None,
                                 });
                             up_pass.set_pipeline(kawase_up_pipeline);
@@ -9925,11 +10002,14 @@ impl App {
                 self.post_color_view.as_ref(),
             ) {
                 let (sx, sy, sw, sh) = self.scissor_rect_full_res();
-                let combine_ts = self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
-                    query_set: qs,
-                    beginning_of_pass_write_index: None,
-                    end_of_pass_write_index: Some(5),
-                });
+                let combine_ts =
+                    self.query_set
+                        .as_ref()
+                        .map(|qs| wgpu::RenderPassTimestampWrites {
+                            query_set: qs,
+                            beginning_of_pass_write_index: None,
+                            end_of_pass_write_index: Some(5),
+                        });
                 let mut combine_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("DoF Combine Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -9961,7 +10041,11 @@ impl App {
                     height: self.render_target_height.max(1),
                     depth_or_array_layers: 1,
                 };
-                encoder.copy_texture_to_texture(offscreen_tex.as_image_copy(), post_tex.as_image_copy(), extent);
+                encoder.copy_texture_to_texture(
+                    offscreen_tex.as_image_copy(),
+                    post_tex.as_image_copy(),
+                    extent,
+                );
             }
         }
         if self.bloom_enabled && self.bloom_settings.kawase_enabled {
@@ -9983,6 +10067,14 @@ impl App {
                         self.ssilvb_bind_group.as_ref(),
                         self.ssao_ping_view.as_ref(),
                     ) {
+                        let ssao_ts =
+                            self.query_set
+                                .as_ref()
+                                .map(|qs| wgpu::RenderPassTimestampWrites {
+                                    query_set: qs,
+                                    beginning_of_pass_write_index: Some(12),
+                                    end_of_pass_write_index: Some(13),
+                                });
                         let mut ssao_pass =
                             encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                 label: Some("SSILVB Pass"),
@@ -9996,7 +10088,7 @@ impl App {
                                     depth_slice: None,
                                 })],
                                 depth_stencil_attachment: None,
-                                timestamp_writes: None,
+                                timestamp_writes: ssao_ts,
                                 occlusion_query_set: None,
                             });
                         ssao_pass.set_pipeline(ssilvb_pipeline);
@@ -10064,6 +10156,14 @@ impl App {
                         }
                     }
                 }
+                let bloom_extract_ts =
+                    self.query_set
+                        .as_ref()
+                        .map(|qs| wgpu::RenderPassTimestampWrites {
+                            query_set: qs,
+                            beginning_of_pass_write_index: Some(16),
+                            end_of_pass_write_index: None,
+                        });
                 let mut extract_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Bloom Extract Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -10076,7 +10176,7 @@ impl App {
                         depth_slice: None,
                     })],
                     depth_stencil_attachment: None,
-                    timestamp_writes: None,
+                    timestamp_writes: bloom_extract_ts,
                     occlusion_query_set: None,
                 });
                 extract_pass.set_pipeline(bloom_extract_pipeline);
@@ -10120,7 +10220,17 @@ impl App {
                                     depth_slice: None,
                                 })],
                                 depth_stencil_attachment: None,
-                                timestamp_writes: if level == 0 || level == (iterations - 1) { self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites { query_set: qs, beginning_of_pass_write_index: if level == 0 { Some(16) } else { None }, end_of_pass_write_index: if level == (iterations - 1) { Some(17) } else { None } }) } else { None },
+                                timestamp_writes: if level == (iterations - 1) {
+                                    self.query_set.as_ref().map(|qs| {
+                                        wgpu::RenderPassTimestampWrites {
+                                            query_set: qs,
+                                            beginning_of_pass_write_index: None,
+                                            end_of_pass_write_index: Some(17),
+                                        }
+                                    })
+                                } else {
+                                    None
+                                },
                                 occlusion_query_set: None,
                             });
                             pass.set_pipeline(kawase_down_pipeline);
@@ -10214,11 +10324,14 @@ impl App {
             self.composite_pipeline.as_ref(),
             self.composite_bind_group.as_ref(),
         ) {
-            let composite_ts = self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
-                query_set: qs,
-                beginning_of_pass_write_index: Some(18),
-                end_of_pass_write_index: Some(19),
-            });
+            let composite_ts = self
+                .query_set
+                .as_ref()
+                .map(|qs| wgpu::RenderPassTimestampWrites {
+                    query_set: qs,
+                    beginning_of_pass_write_index: Some(18),
+                    end_of_pass_write_index: Some(19),
+                });
             let mut composite_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Composite Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -10471,8 +10584,10 @@ impl App {
                         let logical_height = ((size.height as f32) / scale).round() as u32;
                         let render_scale = self.user_config.performance.render_scale;
                         let overscan_factor = self.render_overscan_factor();
-                        let present_target_width = ((logical_width as f32) * render_scale).round() as u32;
-                        let present_target_height = ((logical_height as f32) * render_scale).round() as u32;
+                        let present_target_width =
+                            ((logical_width as f32) * render_scale).round() as u32;
+                        let present_target_height =
+                            ((logical_height as f32) * render_scale).round() as u32;
                         self.present_target_width = present_target_width.max(1);
                         self.present_target_height = present_target_height.max(1);
                         self.render_target_width =
@@ -10549,6 +10664,26 @@ impl App {
             }
         }
 
+        // All GPU timestamp queries are resolved at end-of-frame
+        #[cfg(feature = "gpu-profiling")]
+        {
+            if let (Some(qs), Some(resolve_buf), Some(readback_buf)) = (
+                self.query_set.as_ref(),
+                self.query_resolve_buffer.as_ref(),
+                self.query_readback_buffer.as_ref(),
+            ) {
+                // Resolve the full set at end of frame and copy into staging readback buffer
+                if !self.query_readback_in_flight {
+                    log::debug!("performing resolve+copy into readback buffer");
+                    encoder.resolve_query_set(qs, 0..20, resolve_buf, 0);
+                    let total_bytes = (20u64) * 8u64;
+                    encoder.copy_buffer_to_buffer(resolve_buf, 0, readback_buf, 0, total_bytes);
+                } else {
+                    log::debug!("skipping resolve+copy: previous readback still in flight");
+                }
+            }
+        }
+
         queue.submit(std::iter::once(encoder.finish()));
         log::debug!("submitted frame {} to GPU queue", self.frame_count);
         output.present();
@@ -10559,7 +10694,7 @@ impl App {
             if let Some(readback_buf) = self.query_readback_buffer.as_ref() {
                 let slice = readback_buf.slice(..((20 * 8) as u64));
                 if !self.query_readback_in_flight {
-                        if let Some(tx) = &self.query_readback_notifier_tx {
+                    if let Some(tx) = &self.query_readback_notifier_tx {
                         // Requesting readback for this frame (map_async non-blocking)
                         let tx = tx.clone();
                         slice.map_async(wgpu::MapMode::Read, move |_res| {
@@ -10588,37 +10723,111 @@ impl App {
                         self.query_readback_in_flight = false;
 
                         let period_ns = self.timestamp_period_ns;
-                        let gpu_ms = |idx_start: usize, idx_end: usize| -> f64 {
-                            let s = stamps[idx_start];
-                            let e = stamps[idx_end];
+
+                        // NOTE: On some hardware (like Apple Silicon), beginning_of_pass_write_index
+                        // may return the start time of the entire command buffer.
+                        // To get reliable isolated pass durations, we calculate the delta between
+                        // a pass's end timestamp and the end timestamp of the pass that executed immediately before it.
+                        // We use a helper that returns 0.0 if any stamp is missing or invalid.
+                        let stamp_to_ms = |s: u64, e: u64| -> f64 {
                             if s == 0 || e == 0 || e <= s {
-                                return 0.0;
+                                0.0
+                            } else {
+                                ((e - s) as f64 * period_ns) / 1_000_000.0
                             }
-                            let delta = (e - s) as f64;
-                            (delta * period_ns) / 1_000_000.0
                         };
 
-                        let scene_ms = gpu_ms(0, 1);
-                        let hzb_copy_ms = gpu_ms(2, 3);
-                        let dof_ms = gpu_ms(4, 5);
-                        let gpu_cull_ms = gpu_ms(6, 7);
-                        let ssr_ms = gpu_ms(8, 9);
-                        let water_ms = gpu_ms(10, 11);
-                        let kawase_ms = gpu_ms(14, 15);
-                        let bloom_ms = gpu_ms(16, 17);
-                        let post_ms = gpu_ms(18, 19);
+                        let scene_ms = stamp_to_ms(stamps[0], stamps[1]);
+                        let hzb_copy_ms = stamp_to_ms(stamps[2], stamps[3]);
+                        let dof_ms = stamp_to_ms(stamps[4], stamps[5]);
+                        let gpu_cull_ms = stamp_to_ms(stamps[6], stamps[7]);
+                        let ssr_ms = stamp_to_ms(stamps[8], stamps[9]);
+                        let water_ms = stamp_to_ms(stamps[10], stamps[11]);
+                        let ssilvb_ms = stamp_to_ms(stamps[12], stamps[13]);
+                        let kawase_ms = stamp_to_ms(stamps[14], stamps[15]);
+                        let bloom_ms = stamp_to_ms(stamps[16], stamps[17]);
+                        let post_ms = stamp_to_ms(stamps[18], stamps[19]);
 
-                        // Accumulate GPU timings; averaging is printed periodically
-                        self.gpu_timing_accum_scene_ms += scene_ms;
-                        self.gpu_timing_accum_hzb_copy_ms += hzb_copy_ms;
-                        self.gpu_timing_accum_dof_ms += dof_ms;
-                        self.gpu_timing_accum_gpu_cull_ms += gpu_cull_ms;
-                        self.gpu_timing_accum_ssr_ms += ssr_ms;
-                        self.gpu_timing_accum_water_ms += water_ms;
-                        self.gpu_timing_accum_kawase_ms += kawase_ms;
-                        self.gpu_timing_accum_bloom_ms += bloom_ms;
-                        self.gpu_timing_accum_post_ms += post_ms;
-                        self.gpu_timing_accum_frames = self.gpu_timing_accum_frames.saturating_add(1);
+                        // Determine the absolute order of execution to calculate non-cumulative durations.
+                        // Execution order in render():
+                        // 1. Scene (1)
+                        // 2. SSR (9)
+                        // 3. Water (11)
+                        // 4. DoF CoC+Kawase+Combine (5)
+                        // 5. SSILVB (13)
+                        // 6. Bloom (17)
+                        // 7. Post (19)
+                        // Cull (7) and HZB (3) are in a separate encoder submitted earlier.
+
+                        let iso_scene = scene_ms;
+                        let iso_ssr = if ssr_ms > 0.0 {
+                            (ssr_ms - scene_ms).max(0.0)
+                        } else {
+                            0.0
+                        };
+                        let iso_water = if water_ms > 0.0 {
+                            (water_ms - scene_ms.max(ssr_ms)).max(0.0)
+                        } else {
+                            0.0
+                        };
+                        let iso_dof = if dof_ms > 0.0 {
+                            (dof_ms - scene_ms.max(ssr_ms).max(water_ms)).max(0.0)
+                        } else {
+                            0.0
+                        };
+                        let iso_ssilvb = if ssilvb_ms > 0.0 {
+                            (ssilvb_ms - scene_ms.max(ssr_ms).max(water_ms).max(dof_ms)).max(0.0)
+                        } else {
+                            0.0
+                        };
+                        let iso_bloom = if bloom_ms > 0.0 {
+                            (bloom_ms
+                                - scene_ms
+                                    .max(ssr_ms)
+                                    .max(water_ms)
+                                    .max(dof_ms)
+                                    .max(ssilvb_ms))
+                            .max(0.0)
+                        } else {
+                            0.0
+                        };
+                        let iso_post = if post_ms > 0.0 {
+                            (post_ms
+                                - scene_ms
+                                    .max(ssr_ms)
+                                    .max(water_ms)
+                                    .max(dof_ms)
+                                    .max(ssilvb_ms)
+                                    .max(bloom_ms))
+                            .max(0.0)
+                        } else {
+                            0.0
+                        };
+
+                        let hzb_iso = hzb_copy_ms;
+                        let cull_iso = if gpu_cull_ms > 0.0 {
+                            (gpu_cull_ms - hzb_copy_ms).max(0.0)
+                        } else {
+                            0.0
+                        };
+
+                        // We also want to know the internal time of DoF Kawase (14-15) and Bloom (16-17)
+                        let kawase_internal = kawase_ms; // 14-15 is specific to DoF Kawase passes
+                                                         // Note: bloom_ms (16-17) is now Extract + Kawase loop.
+
+                        // Accumulate isolated timings for averaging
+                        self.gpu_timing_accum_scene_ms += iso_scene;
+                        self.gpu_timing_accum_hzb_copy_ms += hzb_iso;
+                        self.gpu_timing_accum_dof_ms += iso_dof;
+                        self.gpu_timing_accum_gpu_cull_ms += cull_iso;
+                        self.gpu_timing_accum_ssr_ms += iso_ssr;
+                        self.gpu_timing_accum_water_ms += iso_water;
+                        self.gpu_timing_accum_kawase_ms += kawase_internal;
+                        self.gpu_timing_accum_bloom_ms += iso_bloom;
+                        self.gpu_timing_accum_ssilvb_ms += iso_ssilvb;
+                        self.gpu_timing_accum_post_ms += iso_post;
+                        self.gpu_timing_accum_frames =
+                            self.gpu_timing_accum_frames.saturating_add(1);
 
                         if self.gpu_timing_accum_frames >= self.gpu_timing_print_interval_frames {
                             let frames = self.gpu_timing_accum_frames as f64;
@@ -10630,10 +10839,11 @@ impl App {
                             let avg_water = self.gpu_timing_accum_water_ms / frames;
                             let avg_kawase = self.gpu_timing_accum_kawase_ms / frames;
                             let avg_bloom = self.gpu_timing_accum_bloom_ms / frames;
+                            let avg_ssilvb = self.gpu_timing_accum_ssilvb_ms / frames;
                             let avg_post = self.gpu_timing_accum_post_ms / frames;
 
                             log::info!(
-                                "GPU avg timings over {} frames - scene: {:.3}ms, hzb_copy: {:.3}ms, dof: {:.3}ms, gpu_cull: {:.3}ms, ssr: {:.3}ms, water: {:.3}ms, kawase: {:.3}ms, bloom: {:.3}ms, post: {:.3}ms",
+                                "GPU avg timings over {} frames - scene: {:.3}ms, hzb_copy: {:.3}ms, dof: {:.3}ms, gpu_cull: {:.3}ms, ssr: {:.3}ms, water: {:.3}ms, kawase: {:.3}ms, bloom: {:.3}ms, ssilvb: {:.3}ms, post: {:.3}ms",
                                 self.gpu_timing_accum_frames,
                                 avg_scene,
                                 avg_hzb_copy,
@@ -10643,6 +10853,7 @@ impl App {
                                 avg_water,
                                 avg_kawase,
                                 avg_bloom,
+                                avg_ssilvb,
                                 avg_post
                             );
 
@@ -10655,6 +10866,7 @@ impl App {
                             self.gpu_timing_accum_water_ms = 0.0;
                             self.gpu_timing_accum_kawase_ms = 0.0;
                             self.gpu_timing_accum_bloom_ms = 0.0;
+                            self.gpu_timing_accum_ssilvb_ms = 0.0;
                             self.gpu_timing_accum_post_ms = 0.0;
                             self.gpu_timing_accum_frames = 0;
                         }
@@ -10912,8 +11124,14 @@ impl ApplicationHandler for App {
                         log::info!("Exited pawn: returning to free camera");
                     } else {
                         let spawn = self.camera_controller.camera.position;
-                        self.active_pawn = Some(Box::new(voxelot::BoatPawn::new(spawn, self.water_level)));
-                        log::info!("Spawned and entered boat at ({:.1},{:.1},{:.1})", spawn[0], spawn[1], spawn[2]);
+                        self.active_pawn =
+                            Some(Box::new(voxelot::BoatPawn::new(spawn, self.water_level)));
+                        log::info!(
+                            "Spawned and entered boat at ({:.1},{:.1},{:.1})",
+                            spawn[0],
+                            spawn[1],
+                            spawn[2]
+                        );
                     }
                 }
 
@@ -10961,8 +11179,10 @@ impl ApplicationHandler for App {
                         let logical_height = ((new_size.height as f32) / scale).round() as u32;
                         let render_scale = self.user_config.performance.render_scale;
                         let overscan_factor = self.render_overscan_factor();
-                        let present_target_width = ((logical_width as f32) * render_scale).round() as u32;
-                        let present_target_height = ((logical_height as f32) * render_scale).round() as u32;
+                        let present_target_width =
+                            ((logical_width as f32) * render_scale).round() as u32;
+                        let present_target_height =
+                            ((logical_height as f32) * render_scale).round() as u32;
                         self.present_target_width = present_target_width.max(1);
                         self.present_target_height = present_target_height.max(1);
                         self.render_target_width =

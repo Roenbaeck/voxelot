@@ -2,9 +2,9 @@
 file = "worlds/flat_city_test.vhc"
 palette = "worlds/palette.txt"
 camera_position = [
-    338.37766,
-    47.462242,
-    504.63892,
+    251.66454,
+    47.39429,
+    446.33594,
 ]
 water_level = 45.0
 water_visibility = 15.0
@@ -26,7 +26,7 @@ macos_hdr_colorspace = "extended_linear_srgb"
 
 [atmosphere]
 fog_density = 0.00019999995
-time_of_day = 0.98635316
+time_of_day = 0.038885955
 time_paused = true
 night_skybox_brightness = 0.02
 horizon_fade_up = 0.05
@@ -65,8 +65,8 @@ kawase_offset = 0.5
 
 [effects.ssao]
 enabled = true
-sample_count = 16
-slice_count = 4
+sample_count = 8
+slice_count = 2
 radius = 100.0
 thickness = 8.0
 strength = 1.0
