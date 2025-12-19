@@ -304,7 +304,7 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     let lod_alpha = 1.0 - smoothstep(alpha_fade_start, alpha_fade_end, distance);
     
     // Apply both LOD fade and underwater fade (multiplicative)
-    let alpha = lod_alpha * underwater_alpha;
+    let alpha = lod_alpha * underwater_alpha * input.color.a;
 
     var out: FragmentOutput;
     out.color = vec4<f32>(brightened, alpha);
@@ -482,7 +482,7 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     let lod_alpha_mesh = 1.0 - smoothstep(alpha_fade_start, alpha_fade_end, distance);
     
     // Apply both LOD fade and underwater fade (multiplicative)
-    let alpha = lod_alpha_mesh * underwater_alpha_mesh;
+    let alpha = lod_alpha_mesh * underwater_alpha_mesh * input.color.a;
     
     var out: FragmentOutput;
     out.color = vec4<f32>(brightened, alpha);

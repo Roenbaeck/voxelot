@@ -2,9 +2,9 @@
 file = "worlds/water_level_test.vhc"
 palette = "worlds/palette.txt"
 camera_position = [
-    479.5553,
-    462.4513,
-    382.7892,
+    342.63235,
+    477.09222,
+    487.4337,
 ]
 water_level = 460.0
 water_visibility = 50.0
@@ -26,7 +26,7 @@ macos_hdr_colorspace = "extended_linear_srgb"
 
 [atmosphere]
 fog_density = 0.00019999995
-time_of_day = 0.34495798
+time_of_day = 0.7262848
 time_paused = false
 night_skybox_brightness = 0.04
 horizon_fade_up = 0.05

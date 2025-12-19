@@ -1490,36 +1490,6 @@ struct App {
 }
 
 impl App {
-    fn centered_scissor_rect(
-        outer_width: u32,
-        outer_height: u32,
-        inner_width: u32,
-        inner_height: u32,
-    ) -> (u32, u32, u32, u32) {
-        let w = inner_width.min(outer_width).max(1);
-        let h = inner_height.min(outer_height).max(1);
-        let x = outer_width.saturating_sub(w) / 2;
-        let y = outer_height.saturating_sub(h) / 2;
-        (x, y, w, h)
-    }
-
-    fn scissor_rect_full_res(&self) -> (u32, u32, u32, u32) {
-        Self::centered_scissor_rect(
-            self.render_target_width.max(1),
-            self.render_target_height.max(1),
-            self.present_target_width.max(1),
-            self.present_target_height.max(1),
-        )
-    }
-
-    fn scissor_rect_half_res(&self) -> (u32, u32, u32, u32) {
-        Self::centered_scissor_rect(
-            (self.render_target_width / 2).max(1),
-            (self.render_target_height / 2).max(1),
-            (self.present_target_width / 2).max(1),
-            (self.present_target_height / 2).max(1),
-        )
-    }
     // Static helpers that avoid borrowing &mut self during the operation, allowing
     // callers to pass distinct fields as &mut u64 without creating overlapping
     // &mut self borrows which the Rust borrow-checker rejects.
@@ -7420,23 +7390,29 @@ impl App {
         let cam_right = self.camera_controller.camera.right();
         let cam_up = self.camera_controller.camera.up;
 
+        // When overscan is enabled, the projection matrix uses a wider FOV.
+        // Since the UI is rendered directly into the final swapchain (after the crop),
+        // we must scale its world-space size and offsets to compensate for the wider FOV
+        // so it appears at the same screen-space size and position.
+        let overscan = self.render_overscan_factor();
+
         // Position text in the top-left corner
         // Distance 0.5 to allow more room for offsets without clipping
         let ui_origin = [
-            cam_pos[0] + cam_forward[0] * 0.5 - cam_right[0] * 0.45 + cam_up[0] * 0.3,
-            cam_pos[1] + cam_forward[1] * 0.5 - cam_right[1] * 0.45 + cam_up[1] * 0.3,
-            cam_pos[2] + cam_forward[2] * 0.5 - cam_right[2] * 0.45 + cam_up[2] * 0.3,
+            cam_pos[0] + cam_forward[0] * 0.5 - cam_right[0] * 0.45 * overscan + cam_up[0] * 0.3 * overscan,
+            cam_pos[1] + cam_forward[1] * 0.5 - cam_right[1] * 0.45 * overscan + cam_up[1] * 0.3 * overscan,
+            cam_pos[2] + cam_forward[2] * 0.5 - cam_right[2] * 0.45 * overscan + cam_up[2] * 0.3 * overscan,
         ];
 
-        let char_size = 0.0012;
+        let char_size = 0.0012 * overscan;
         let white = [1.0, 1.0, 1.0, 1.0];
         let glow = [1.0, 1.0, 1.0, 2.0];
 
         let fps_text = format!("FPS: {}", self.last_fps);
-        self.render_voxel_text(&fps_text, ui_origin, char_size, white, glow);
+        self.render_voxel_text(&fps_text, ui_origin, char_size, white, glow, true);
 
-        let mut current_y = 0.015;
-        let line_spacing = 0.015;
+        let mut current_y = 0.015 * overscan;
+        let line_spacing = 0.015 * overscan;
 
         let stats = [
             format!("MESH JOBS/S: {}", self.jobs_per_sec_snapshot),
@@ -7450,7 +7426,7 @@ impl App {
                 ui_origin[1] - cam_up[1] * current_y,
                 ui_origin[2] - cam_up[2] * current_y,
             ];
-            self.render_voxel_text(&stat, pos, char_size, white, glow);
+            self.render_voxel_text(&stat, pos, char_size, white, glow, true);
             current_y += line_spacing;
         }
 
@@ -7489,7 +7465,7 @@ impl App {
                 ui_origin[1] - cam_up[1] * current_y,
                 ui_origin[2] - cam_up[2] * current_y,
             ];
-            self.render_voxel_text(&stat, pos, char_size, white, glow);
+            self.render_voxel_text(&stat, pos, char_size, white, glow, true);
             current_y += line_spacing;
         }
 
@@ -7534,11 +7510,49 @@ impl App {
         char_size: f32,
         color: [f32; 4],
         emissive: [f32; 4],
+        draw_background: bool,
     ) {
         let mut x_offset = 0.0;
         // Basic billboard orientation (using camera right/up)
         let right = self.camera_controller.camera.right();
         let up = self.camera_controller.camera.up;
+        let forward = self.camera_controller.camera.forward;
+
+        if draw_background {
+            let text_len = text.len();
+            let total_width = text_len as f32 * 9.0;
+            
+            // Render background for the entire line using a grid of small voxels.
+            // We use small blocks (2x2 pixels) to maintain the billboarding effect
+            // without needing a voxel for every single pixel.
+            let step = 2.0;
+            let mut row_f = -1.0;
+            while row_f < 9.0 {
+                let mut col_f = -1.0;
+                while col_f < total_width {
+                    let px = start_pos[0] + col_f * char_size * right[0]
+                        - row_f * char_size * up[0]
+                        - 0.0001 * forward[0];
+                    let py = start_pos[1] + col_f * char_size * right[1]
+                        - row_f * char_size * up[1]
+                        - 0.0001 * forward[1];
+                    let pz = start_pos[2] + col_f * char_size * right[2]
+                        - row_f * char_size * up[2]
+                        - 0.0001 * forward[2];
+
+                    self.debug_ui_instances.push(VoxelInstanceRaw {
+                        position: [px, py, pz],
+                        voxel_type: 1,
+                        scale: [char_size * step, char_size * step, char_size],
+                        ao_factor: 1.0,
+                        custom_color: [0.0, 0.0, 0.0, 0.7],
+                        emissive: [0.0, 0.0, 0.0, 1.0], // Unlit black
+                    });
+                    col_f += step;
+                }
+                row_f += step;
+            }
+        }
 
         for c in text.to_ascii_uppercase().chars() {
             let glyph_idx = (c as u32).min(127) as usize;
@@ -9962,7 +9976,6 @@ impl App {
         // Water Pass (Transparent, reads depth buffer)
         let _water_scope = self.profiler.scope("water_cpu");
         {
-            let (sx, sy, sw, sh) = self.scissor_rect_full_res();
             let water_ts = self
                 .query_set
                 .as_ref()
@@ -9993,7 +10006,6 @@ impl App {
                 (self.water_pipeline.as_ref(), self.water_bind_group.as_ref())
             {
                 water_pass.set_pipeline(pipeline);
-                water_pass.set_scissor_rect(sx, sy, sw, sh);
                 water_pass.set_bind_group(0, self.bind_group.as_ref().unwrap(), &[]);
                 water_pass.set_bind_group(1, bind_group, &[]);
                 water_pass.draw(0..3, 0..1);
@@ -10033,7 +10045,6 @@ impl App {
                 self.dof_color_view.as_ref(),
                 self.dof_coc_pipeline.as_ref(),
             ) {
-                let (sx, sy, sw, sh) = self.scissor_rect_half_res();
                 let blur_strength = self.dof_settings.blur_strength;
                 let gpu_uniforms = self.pack_dof_uniforms(blur_strength);
                 queue.write_buffer(dof_buffer, 0, bytemuck::cast_slice(&gpu_uniforms));
@@ -10051,9 +10062,7 @@ impl App {
                         view: dof_color_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::DontCare(unsafe {
-                                wgpu::LoadOpDontCare::enabled()
-                            }),
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                             store: wgpu::StoreOp::Store,
                         },
                         depth_slice: None,
@@ -10064,7 +10073,6 @@ impl App {
                     multiview_mask: None,
                 });
                 post_pass.set_pipeline(dof_coc_pipeline);
-                post_pass.set_scissor_rect(sx, sy, sw, sh);
                 post_pass.set_bind_group(0, dof_bind_group, &[]);
                 post_pass.draw(0..3, 0..1);
             }
@@ -10188,7 +10196,6 @@ impl App {
                 self.dof_combine_bind_group.as_ref(),
                 self.post_color_view.as_ref(),
             ) {
-                let (sx, sy, sw, sh) = self.scissor_rect_full_res();
                 let combine_ts =
                     self.query_set
                         .as_ref()
@@ -10214,7 +10221,6 @@ impl App {
                     multiview_mask: None,
                 });
                 combine_pass.set_pipeline(dof_combine_pipeline);
-                combine_pass.set_scissor_rect(sx, sy, sw, sh);
                 combine_pass.set_bind_group(0, dof_combine_bind_group, &[]);
                 combine_pass.draw(0..3, 0..1);
             }
@@ -10246,8 +10252,6 @@ impl App {
                 self.bloom_extract_bind_group.as_ref(),
                 self.bloom_ping_view.as_ref(),
             ) {
-                let (sx_full, sy_full, sw_full, sh_full) = self.scissor_rect_full_res();
-                let (sx_half, sy_half, sw_half, sh_half) = self.scissor_rect_half_res();
                 // SSILVB/SSAO: run before bloom so AO can affect later passes
                 if self.ssao_enabled {
                     if let (Some(ssilvb_pipeline), Some(ssilvb_bind_group), Some(ssao_ping_view)) = (
@@ -10283,7 +10287,6 @@ impl App {
                                 multiview_mask: None,
                             });
                         ssao_pass.set_pipeline(ssilvb_pipeline);
-                        ssao_pass.set_scissor_rect(sx_full, sy_full, sw_full, sh_full);
                         ssao_pass.set_bind_group(0, ssilvb_bind_group, &[]);
                         ssao_pass.draw(0..3, 0..1);
                     }
@@ -10302,9 +10305,7 @@ impl App {
                                         view: ssao_pong_view,
                                         resolve_target: None,
                                         ops: wgpu::Operations {
-                                            load: wgpu::LoadOp::DontCare(unsafe {
-                                                wgpu::LoadOpDontCare::enabled()
-                                            }),
+                                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                                             store: wgpu::StoreOp::Store,
                                         },
                                         depth_slice: None,
@@ -10315,7 +10316,6 @@ impl App {
                                     multiview_mask: None,
                                 });
                             blur_pass_h.set_pipeline(ssao_blur_pipeline);
-                            blur_pass_h.set_scissor_rect(sx_full, sy_full, sw_full, sh_full);
                             blur_pass_h.set_bind_group(0, ssao_blur_h, &[]);
                             blur_pass_h.draw(0..3, 0..1);
                         }
@@ -10334,9 +10334,7 @@ impl App {
                                         view: ssao_ping_view,
                                         resolve_target: None,
                                         ops: wgpu::Operations {
-                                            load: wgpu::LoadOp::DontCare(unsafe {
-                                                wgpu::LoadOpDontCare::enabled()
-                                            }),
+                                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                                             store: wgpu::StoreOp::Store,
                                         },
                                         depth_slice: None,
@@ -10353,7 +10351,6 @@ impl App {
                                     multiview_mask: None,
                                 });
                             blur_pass_v.set_pipeline(ssao_blur_pipeline);
-                            blur_pass_v.set_scissor_rect(sx_full, sy_full, sw_full, sh_full);
                             blur_pass_v.set_bind_group(0, ssao_blur_v, &[]);
                             blur_pass_v.draw(0..3, 0..1);
                         }
@@ -10384,7 +10381,6 @@ impl App {
                     multiview_mask: None,
                 });
                 extract_pass.set_pipeline(bloom_extract_pipeline);
-                extract_pass.set_scissor_rect(sx_half, sy_half, sw_half, sh_half);
                 extract_pass.set_bind_group(0, bloom_extract_bind_group, &[]);
                 extract_pass.draw(0..3, 0..1);
             }
@@ -10418,9 +10414,7 @@ impl App {
                                     view: dst_view,
                                     resolve_target: None,
                                     ops: wgpu::Operations {
-                                        load: wgpu::LoadOp::DontCare(unsafe {
-                                            wgpu::LoadOpDontCare::enabled()
-                                        }),
+                                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                                         store: wgpu::StoreOp::Store,
                                     },
                                     depth_slice: None,
@@ -10441,8 +10435,6 @@ impl App {
                                 multiview_mask: None,
                             });
                             pass.set_pipeline(kawase_down_pipeline);
-                            let (sx_half, sy_half, sw_half, sh_half) = self.scissor_rect_half_res();
-                            pass.set_scissor_rect(sx_half, sy_half, sw_half, sh_half);
 
                             let bloom_w = (self.render_target_width / 2).max(1);
                             let bloom_h = (self.render_target_height / 2).max(1);
@@ -10487,31 +10479,24 @@ impl App {
                         // Ensure final result is in bloom_ping_view (composite expects ping view)
                         if iterations % 2 == 1 {
                             // Copy pong to ping to make final output in ping view
-                            let (sx_half, sy_half, sw_half, sh_half) = self.scissor_rect_half_res();
+                            let bw = (self.render_target_width / 2).max(1);
+                            let bh = (self.render_target_height / 2).max(1);
                             encoder.copy_texture_to_texture(
                                 wgpu::TexelCopyTextureInfo {
                                     texture: self.bloom_pong_texture.as_ref().unwrap(),
                                     mip_level: 0,
-                                    origin: wgpu::Origin3d {
-                                        x: sx_half,
-                                        y: sy_half,
-                                        z: 0,
-                                    },
+                                    origin: wgpu::Origin3d::ZERO,
                                     aspect: wgpu::TextureAspect::All,
                                 },
                                 wgpu::TexelCopyTextureInfo {
                                     texture: self.bloom_ping_texture.as_ref().unwrap(),
                                     mip_level: 0,
-                                    origin: wgpu::Origin3d {
-                                        x: sx_half,
-                                        y: sy_half,
-                                        z: 0,
-                                    },
+                                    origin: wgpu::Origin3d::ZERO,
                                     aspect: wgpu::TextureAspect::All,
                                 },
                                 wgpu::Extent3d {
-                                    width: sw_half,
-                                    height: sh_half,
+                                    width: bw,
+                                    height: bh,
                                     depth_or_array_layers: 1,
                                 },
                             );
