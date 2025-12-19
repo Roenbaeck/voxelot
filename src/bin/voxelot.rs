@@ -7419,22 +7419,23 @@ impl App {
         let cam_right = self.camera_controller.camera.right();
         let cam_up = self.camera_controller.camera.up;
 
-        // Position text roughly in front of the camera
+        // Position text in the top-left corner
+        // Distance 0.5 to allow more room for offsets without clipping
         let ui_origin = [
-            cam_pos[0] + cam_forward[0] * 2.0 - cam_right[0] * 1.2 + cam_up[0] * 0.8,
-            cam_pos[1] + cam_forward[1] * 2.0 - cam_right[1] * 1.2 + cam_up[1] * 0.8,
-            cam_pos[2] + cam_forward[2] * 2.0 - cam_right[2] * 1.2 + cam_up[2] * 0.8,
+            cam_pos[0] + cam_forward[0] * 0.5 - cam_right[0] * 0.45 + cam_up[0] * 0.3,
+            cam_pos[1] + cam_forward[1] * 0.5 - cam_right[1] * 0.45 + cam_up[1] * 0.3,
+            cam_pos[2] + cam_forward[2] * 0.5 - cam_right[2] * 0.45 + cam_up[2] * 0.3,
         ];
 
-        let char_size = 0.005;
+        let char_size = 0.0012;
         let white = [1.0, 1.0, 1.0, 1.0];
         let glow = [1.0, 1.0, 1.0, 2.0];
 
         let fps_text = format!("FPS: {}", self.last_fps);
         self.render_voxel_text(&fps_text, ui_origin, char_size, white, glow);
 
-        let mut current_y = 0.06;
-        let line_spacing = 0.06;
+        let mut current_y = 0.015;
+        let line_spacing = 0.015;
 
         let stats = [
             format!("VISIBLE: {}", self.visible_count),
@@ -7577,7 +7578,6 @@ impl App {
     }
 
     fn render(&mut self) {
-        self.draw_debug_voxels();
         log::debug!(
             "render() enter frame={}, frame_index={}",
             self.frame_count,
@@ -9559,6 +9559,8 @@ impl App {
         if self.bind_group.is_none() {
             self.update_main_bind_group();
         }
+
+        self.draw_debug_voxels();
 
         // Create command encoder
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
