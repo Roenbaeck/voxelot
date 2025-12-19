@@ -5947,7 +5947,7 @@ impl App {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba16Float,
+                    format: surface_format,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -10560,40 +10560,26 @@ impl App {
             composite_pass.set_pipeline(composite_pipeline);
             composite_pass.set_bind_group(0, composite_bind_group, &[]);
             composite_pass.draw(0..3, 0..1);
+
+            // Custom Voxel UI (Overlay)
+            if self.gui_visible && self.debug_instance_count > 0 {
+                if let (Some(pipeline), Some(buf), Some(bind_group)) = (
+                    self.ui_pipeline.as_ref(),
+                    self.debug_instance_buffer.as_ref(),
+                    self.bind_group.as_ref(), // Bind group 0 has common uniforms/palette
+                ) {
+                    composite_pass.set_pipeline(pipeline);
+                    composite_pass.set_bind_group(0, bind_group, &[]);
+                    composite_pass.set_vertex_buffer(
+                        0,
+                        self.cube_vertex_buffer.as_ref().unwrap().slice(..),
+                    );
+                    composite_pass.set_vertex_buffer(1, buf.slice(..));
+                    composite_pass.draw(0..CUBE_VERTICES.len() as u32, 0..self.debug_instance_count);
+                }
+            }
         } else {
             eprintln!("Composite resources unavailable; skipping final pass!");
-        }
-
-        // Custom Voxel UI Pass
-        if self.gui_visible && self.debug_instance_count > 0 {
-            let mut ui_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Debug UI Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-
-            if let (Some(pipeline), Some(buf), Some(bind_group)) = (
-                self.ui_pipeline.as_ref(),
-                self.debug_instance_buffer.as_ref(),
-                self.bind_group.as_ref(), // Bind group 0 has common uniforms/palette
-            ) {
-                ui_pass.set_pipeline(pipeline);
-                ui_pass.set_bind_group(0, bind_group, &[]);
-                ui_pass.set_vertex_buffer(0, self.cube_vertex_buffer.as_ref().unwrap().slice(..));
-                ui_pass.set_vertex_buffer(1, buf.slice(..));
-                ui_pass.draw(0..CUBE_VERTICES.len() as u32, 0..self.debug_instance_count);
-            }
         }
 
         // All GPU timestamp queries are resolved at end-of-frame
