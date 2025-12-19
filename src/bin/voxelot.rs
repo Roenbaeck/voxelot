@@ -12,7 +12,7 @@
 use clap::Parser;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use glam::{Mat4, Vec3};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::Instant;
 use wgpu::util::DeviceExt;
@@ -1593,7 +1593,7 @@ impl App {
                     eprintln!("Please check that the file path in your configuration is correct.");
                     std::process::exit(1);
                 });
-            let load_elapsed = load_start.elapsed();
+            let _load_elapsed = load_start.elapsed();
             #[cfg(feature = "cpu-profiling")]
             {
                 log::info!(
@@ -1716,7 +1716,7 @@ impl App {
 
         for worker_index in 0..mesh_worker_count {
             let job_rx = mesh_job_rx.clone();
-            let jobs_executed = mesh_jobs_executed.clone();
+            let _jobs_executed = mesh_jobs_executed.clone();
             let result_tx = mesh_result_tx.clone();
             let palette = worker_palette.clone();
 
@@ -3851,35 +3851,12 @@ impl App {
 
             // Separable bloom bloom vertical bind group removed (using Kawase instead)
 
-            // If bloom kawase is enabled, create per-iteration UBOs and bind groups for Kawase blur
             if self.bloom_settings.kawase_enabled {
                 // Clear and allocate new arrays
                 self.bloom_kawase_uniform_buffers.clear();
                 self.bloom_kawase_bind_groups.clear();
                 let iterations = self.bloom_settings.kawase_iterations.min(6).max(1);
-                // bloom ping/pong extents
-                let bloom_w = (self.render_target_width / 2).max(1);
-                let bloom_h = (self.render_target_height / 2).max(1);
-                let texel_x = 1.0 / bloom_w as f32;
-                let texel_y = 1.0 / bloom_h as f32;
                 for level in 0..iterations {
-                    let offset = self.bloom_settings.kawase_offset
-                        * (level as f32 + 1.0)
-                        * self.bloom_settings.blur_radius;
-                    let ubo_data = [texel_x, texel_y, offset, 0.0_f32];
-                    let ubo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some(&format!("Bloom Kawase Uniform L{}", level)),
-                        contents: bytemuck::cast_slice(&ubo_data),
-                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    });
-                    let kawase_ubo_bytes = std::mem::size_of::<[f32; 4]>() as u64;
-                    App::replace_buffer_bytes_static(
-                        &mut self.uniform_buffer_bytes,
-                        kawase_ubo_bytes,
-                        &mut self.gpu_buffer_bytes,
-                    );
-                    self.bloom_kawase_uniform_buffers.push(Some(ubo));
-
                     // pick input view depending on iteration parity: even -> ping, odd -> pong
                     let input_view = if level % 2 == 0 {
                         bloom_ping_view
@@ -3892,21 +3869,16 @@ impl App {
                     let Some(sampler) = self.post_sampler.as_ref() else {
                         continue;
                     };
-                    let ubo_ref = self.bloom_kawase_uniform_buffers[level].as_ref().unwrap();
                     let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some(&format!("Bloom Kawase BG L{}", level)),
                         layout: kawa_layout,
                         entries: &[
                             wgpu::BindGroupEntry {
                                 binding: 0,
-                                resource: ubo_ref.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
                                 resource: wgpu::BindingResource::TextureView(input_view),
                             },
                             wgpu::BindGroupEntry {
-                                binding: 2,
+                                binding: 1,
                                 resource: wgpu::BindingResource::Sampler(sampler),
                             },
                         ],
@@ -3914,7 +3886,7 @@ impl App {
                     self.bloom_kawase_bind_groups.push(Some(bg));
                 }
             } else {
-                // If disabled, keep arrays empty so we fall back to default horizontal/vertical blur.
+                // If disabled, keep arrays empty
                 self.bloom_kawase_uniform_buffers.clear();
                 self.bloom_kawase_bind_groups.clear();
             }
@@ -4006,40 +3978,13 @@ impl App {
         self.kawase_uniform_buffers.clear();
 
         let iterations = self.dof_settings.kawase_iterations.min(6).max(1);
-        for level in 0..iterations {
-            // Create uniform buffer for this level (texel size updated every frame)
-            // Determine initial texel_size from kawase_level_sizes if available
-            let (texel_x, texel_y) = if let Some((w, h)) = self.kawase_level_sizes.get(level) {
-                (1.0 / (*w) as f32, 1.0 / (*h) as f32)
-            } else {
-                (0.0_f32, 0.0_f32)
-            };
-            let offset = self.dof_settings.kawase_offset
-                * (level as f32 + 1.0)
-                * self.dof_settings.blur_strength;
-            let ubo_data = [texel_x, texel_y, offset, 0.0f32];
-            let ubo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(&format!("Kawase Uniform L{}", level)),
-                contents: bytemuck::cast_slice(&ubo_data),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
-            // Track Kawase UBO bytes (4 floats)
-            let kawase_ubo_bytes = std::mem::size_of::<[f32; 4]>() as u64;
-            App::replace_buffer_bytes_static(
-                &mut self.uniform_buffer_bytes,
-                kawase_ubo_bytes,
-                &mut self.gpu_buffer_bytes,
-            );
-
-            self.kawase_uniform_buffers.push(Some(ubo));
-            // Create empty placeholders for bind groups; we'll populate them now if we have the required resources
+        for _ in 0..iterations {
+            self.kawase_uniform_buffers.push(None); // Placeholder
             self.kawase_down_bind_groups.push(None);
             self.kawase_up_bind_groups.push(None);
-            // initialize last_ubo data vector
-            self.kawase_last_ubo.push(ubo_data);
         }
 
-        // Create/update the bind groups now that we have UBOs and textures created
+        // Create/update the bind groups now that we have textures created
         let Some(layout) = self.kawase_bind_group_layout.as_ref() else {
             return;
         };
@@ -4064,21 +4009,16 @@ impl App {
                     continue;
                 }
             };
-            let ubo_ref = self.kawase_uniform_buffers[level].as_ref().unwrap();
             let down_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(&format!("Kawase Down BG L{}", level)),
                 layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: ubo_ref.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
                         resource: wgpu::BindingResource::TextureView(input_view),
                     },
                     wgpu::BindGroupEntry {
-                        binding: 2,
+                        binding: 1,
                         resource: wgpu::BindingResource::Sampler(sampler),
                     },
                 ],
@@ -4096,14 +4036,10 @@ impl App {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: ubo_ref.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
                         resource: wgpu::BindingResource::TextureView(up_input_view),
                     },
                     wgpu::BindGroupEntry {
-                        binding: 2,
+                        binding: 1,
                         resource: wgpu::BindingResource::Sampler(sampler),
                     },
                 ],
@@ -4868,7 +4804,7 @@ impl App {
 
     fn update_water_uniforms(&mut self) {
         // Write updated DoF-related fields into the water UBO so shader can read current values.
-        if let (Some(device), Some(queue), Some(buf)) = (
+        if let (Some(_device), Some(queue), Some(buf)) = (
             self.device.as_ref(),
             self.queue.as_ref(),
             self.water_uniform_buffer.as_ref(),
@@ -5554,8 +5490,12 @@ impl App {
         let mut limits = wgpu::Limits::default();
         limits.max_buffer_size = 1_073_741_824; // 1 GB (up from 256 MB default)
         limits.max_storage_buffer_binding_size = 536_870_912; // 512 MB (up from 128 MB default)
+        limits.max_immediate_size = 128;
 
         let mut req_features = wgpu::Features::FLOAT32_FILTERABLE;
+        if adapter.features().contains(wgpu::Features::IMMEDIATES) {
+            req_features |= wgpu::Features::IMMEDIATES;
+        }
         #[cfg(feature = "gpu-profiling")]
         {
             if adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
@@ -6225,16 +6165,6 @@ impl App {
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
                         visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
                             sample_type: wgpu::TextureSampleType::Float { filterable: true },
                             view_dimension: wgpu::TextureViewDimension::D2,
@@ -6243,7 +6173,7 @@ impl App {
                         count: None,
                     },
                     wgpu::BindGroupLayoutEntry {
-                        binding: 2,
+                        binding: 1,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
@@ -6255,13 +6185,13 @@ impl App {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Kawase Down Pipeline Layout"),
                 bind_group_layouts: &[&kawase_bind_group_layout],
-                immediate_size: 0,
+                immediate_size: 16,
             });
         let kawase_up_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Kawase Up Pipeline Layout"),
                 bind_group_layouts: &[&kawase_bind_group_layout],
-                immediate_size: 0,
+                immediate_size: 16,
             });
 
         let kawase_down_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -7502,7 +7432,7 @@ impl App {
                 max_y >= min_visible_y
             })
             .collect();
-        let depth_culled_count = pre_depth_cull_count - visible.len();
+        let _depth_culled_count = pre_depth_cull_count - visible.len();
 
         let mut _voxel_expansion_count = 0;
         // Reuse persistent allocation across frames to avoid heap churn
@@ -8655,7 +8585,7 @@ impl App {
                 missing_chunks.remove(&key);
             }
         }
-        let mesh_upload_total_time = mesh_upload_total_start.elapsed();
+        let _mesh_upload_total_time = mesh_upload_total_start.elapsed();
         let mesh_time = mesh_start.elapsed();
 
         if self.mesh_cache_bytes > self.mesh_cache_byte_budget() {
@@ -9689,7 +9619,9 @@ impl App {
                         view: ssr_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            load: wgpu::LoadOp::DontCare(unsafe {
+                                wgpu::LoadOpDontCare::enabled()
+                            }),
                             store: wgpu::StoreOp::Store,
                         },
                         depth_slice: None,
@@ -9825,7 +9757,9 @@ impl App {
                         view: dof_color_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            load: wgpu::LoadOp::DontCare(unsafe {
+                                wgpu::LoadOpDontCare::enabled()
+                            }),
                             store: wgpu::StoreOp::Store,
                         },
                         depth_slice: None,
@@ -9860,33 +9794,16 @@ impl App {
                             .as_ref()
                             .expect("Kawase ping view missing");
                         // Update UBO for this level with texel size and offset
-                        if let Some(Some(ubo)) = self.kawase_uniform_buffers.get(level) {
-                            if let Some((w, h)) = self.kawase_level_sizes.get(level) {
-                                let texel_size = [1.0 / (*w) as f32, 1.0 / (*h) as f32];
-                                let offset = self.dof_settings.kawase_offset
-                                    * (level as f32 + 1.0)
-                                    * self.dof_settings.blur_strength;
-                                let ubo_data = [texel_size[0], texel_size[1], offset, 0.0f32];
-                                let changed = match self.kawase_last_ubo.get(level) {
-                                    Some(prev) => {
-                                        (prev[0] - ubo_data[0]).abs() > 1e-6
-                                            || (prev[1] - ubo_data[1]).abs() > 1e-6
-                                            || (prev[2] - ubo_data[2]).abs() > 1e-6
-                                            || (prev[3] - ubo_data[3]).abs() > 1e-6
-                                    }
-                                    None => true,
-                                };
-                                if changed {
-                                    let write_start = std::time::Instant::now();
-                                    let queue_ref = self.queue.as_ref().unwrap();
-                                    queue_ref.write_buffer(ubo, 0, bytemuck::cast_slice(&ubo_data));
-                                    if let Some(prev) = self.kawase_last_ubo.get_mut(level) {
-                                        *prev = ubo_data;
-                                    }
-                                    self.kawase_write_acc += write_start.elapsed();
-                                }
-                            }
-                        }
+                        let (tex_w, tex_h) = self
+                            .kawase_level_sizes
+                            .get(level)
+                            .cloned()
+                            .unwrap_or((1, 1));
+                        let texel_size = [1.0 / tex_w as f32, 1.0 / tex_h as f32];
+                        let offset = self.dof_settings.kawase_offset
+                            * (level as f32 + 1.0)
+                            * self.dof_settings.blur_strength;
+                        let immediate_data = [texel_size[0], texel_size[1], offset, 0.0f32];
 
                         if let Some(Some(bind_group)) = self.kawase_down_bind_groups.get(level) {
                             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -9895,7 +9812,9 @@ impl App {
                                     view: target_view,
                                     resolve_target: None,
                                     ops: wgpu::Operations {
-                                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                        load: wgpu::LoadOp::DontCare(unsafe {
+                                            wgpu::LoadOpDontCare::enabled()
+                                        }),
                                         store: wgpu::StoreOp::Store,
                                     },
                                     depth_slice: None,
@@ -9916,6 +9835,7 @@ impl App {
                                 multiview_mask: None,
                             });
                             pass.set_pipeline(kawase_down_pipeline);
+                            pass.set_immediates(0, bytemuck::cast_slice(&immediate_data));
                             pass.set_bind_group(0, bind_group, &[]);
                             pass.draw(0..3, 0..1);
                         }
@@ -9928,33 +9848,16 @@ impl App {
                         } else {
                             self.kawase_pong_views[level_rev - 1].as_ref().unwrap()
                         };
-                        if let Some(Some(ubo)) = self.kawase_uniform_buffers.get(level_rev) {
-                            if let Some((w, h)) = self.kawase_level_sizes.get(level_rev) {
-                                let texel_size = [1.0 / (*w) as f32, 1.0 / (*h) as f32];
-                                let offset = self.dof_settings.kawase_offset
-                                    * (level_rev as f32 + 1.0)
-                                    * self.dof_settings.blur_strength;
-                                let ubo_data = [texel_size[0], texel_size[1], offset, 0.0f32];
-                                let changed = match self.kawase_last_ubo.get(level_rev) {
-                                    Some(prev) => {
-                                        (prev[0] - ubo_data[0]).abs() > 1e-6
-                                            || (prev[1] - ubo_data[1]).abs() > 1e-6
-                                            || (prev[2] - ubo_data[2]).abs() > 1e-6
-                                            || (prev[3] - ubo_data[3]).abs() > 1e-6
-                                    }
-                                    None => true,
-                                };
-                                if changed {
-                                    let write_start = std::time::Instant::now();
-                                    let queue_ref = self.queue.as_ref().unwrap();
-                                    queue_ref.write_buffer(ubo, 0, bytemuck::cast_slice(&ubo_data));
-                                    if let Some(prev) = self.kawase_last_ubo.get_mut(level_rev) {
-                                        *prev = ubo_data;
-                                    }
-                                    self.kawase_write_acc += write_start.elapsed();
-                                }
-                            }
-                        }
+                        let (tex_w, tex_h) = self
+                            .kawase_level_sizes
+                            .get(level_rev)
+                            .cloned()
+                            .unwrap_or((1, 1));
+                        let texel_size = [1.0 / tex_w as f32, 1.0 / tex_h as f32];
+                        let offset = self.dof_settings.kawase_offset
+                            * (level_rev as f32 + 1.0)
+                            * self.dof_settings.blur_strength;
+                        let immediate_data = [texel_size[0], texel_size[1], offset, 0.0f32];
 
                         if let Some(Some(bind_group)) = self.kawase_up_bind_groups.get(level_rev) {
                             let pass_start = std::time::Instant::now();
@@ -9965,7 +9868,9 @@ impl App {
                                         view: target_view,
                                         resolve_target: None,
                                         ops: wgpu::Operations {
-                                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                            load: wgpu::LoadOp::DontCare(unsafe {
+                                                wgpu::LoadOpDontCare::enabled()
+                                            }),
                                             store: wgpu::StoreOp::Store,
                                         },
                                         depth_slice: None,
@@ -9986,6 +9891,7 @@ impl App {
                                     multiview_mask: None,
                                 });
                             up_pass.set_pipeline(kawase_up_pipeline);
+                            up_pass.set_immediates(0, bytemuck::cast_slice(&immediate_data));
                             up_pass.set_bind_group(0, bind_group, &[]);
                             up_pass.draw(0..3, 0..1);
                             self.kawase_pass_acc += pass_start.elapsed();
@@ -10023,7 +9929,9 @@ impl App {
                         view: post_color_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            load: wgpu::LoadOp::DontCare(unsafe {
+                                wgpu::LoadOpDontCare::enabled()
+                            }),
                             store: wgpu::StoreOp::Store,
                         },
                         depth_slice: None,
@@ -10090,7 +9998,9 @@ impl App {
                                     view: ssao_ping_view,
                                     resolve_target: None,
                                     ops: wgpu::Operations {
-                                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                        load: wgpu::LoadOp::DontCare(unsafe {
+                                            wgpu::LoadOpDontCare::enabled()
+                                        }),
                                         store: wgpu::StoreOp::Store,
                                     },
                                     depth_slice: None,
@@ -10120,7 +10030,9 @@ impl App {
                                         view: ssao_pong_view,
                                         resolve_target: None,
                                         ops: wgpu::Operations {
-                                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                            load: wgpu::LoadOp::DontCare(unsafe {
+                                                wgpu::LoadOpDontCare::enabled()
+                                            }),
                                             store: wgpu::StoreOp::Store,
                                         },
                                         depth_slice: None,
@@ -10150,7 +10062,9 @@ impl App {
                                         view: ssao_ping_view,
                                         resolve_target: None,
                                         ops: wgpu::Operations {
-                                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                            load: wgpu::LoadOp::DontCare(unsafe {
+                                                wgpu::LoadOpDontCare::enabled()
+                                            }),
                                             store: wgpu::StoreOp::Store,
                                         },
                                         depth_slice: None,
@@ -10181,7 +10095,9 @@ impl App {
                         view: bloom_ping_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            load: wgpu::LoadOp::DontCare(unsafe {
+                                wgpu::LoadOpDontCare::enabled()
+                            }),
                             store: wgpu::StoreOp::Store,
                         },
                         depth_slice: None,
@@ -10226,7 +10142,9 @@ impl App {
                                     view: dst_view,
                                     resolve_target: None,
                                     ops: wgpu::Operations {
-                                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                        load: wgpu::LoadOp::DontCare(unsafe {
+                                            wgpu::LoadOpDontCare::enabled()
+                                        }),
                                         store: wgpu::StoreOp::Store,
                                     },
                                     depth_slice: None,
@@ -10249,50 +10167,44 @@ impl App {
                             pass.set_pipeline(kawase_down_pipeline);
                             let (sx_half, sy_half, sw_half, sh_half) = self.scissor_rect_half_res();
                             pass.set_scissor_rect(sx_half, sy_half, sw_half, sh_half);
+
+                            let bloom_w = (self.render_target_width / 2).max(1);
+                            let bloom_h = (self.render_target_height / 2).max(1);
+                            let texel_x = 1.0 / bloom_w as f32;
+                            let texel_y = 1.0 / bloom_h as f32;
+                            let offset = self.bloom_settings.kawase_offset
+                                * (level as f32 + 1.0)
+                                * self.bloom_settings.blur_radius;
+                            let immediate_data = [texel_x, texel_y, offset, 0.0_f32];
+                            pass.set_immediates(0, bytemuck::cast_slice(&immediate_data));
+
                             // Use per-iteration bind group if available, else create temporary one
                             if let Some(bg) = self
                                 .bloom_kawase_bind_groups
                                 .get(level)
                                 .and_then(|b| b.as_ref())
                             {
-                                // We need the bind group to reference the correct input texture, but the stored bind groups were created
-                                // to match parity (even -> ping, odd -> pong) — they should match our source view.
                                 pass.set_bind_group(0, bg, &[]);
                             } else {
                                 // Create a temporary bind group on the fly if missing (fallback)
-                                if let Some(ubo) = self
-                                    .bloom_kawase_uniform_buffers
-                                    .get(level)
-                                    .and_then(|b| b.as_ref())
-                                {
-                                    let bg_temp =
-                                        device.create_bind_group(&wgpu::BindGroupDescriptor {
-                                            label: Some(&format!(
-                                                "Bloom Kawase Temp BG L{}",
-                                                level
-                                            )),
-                                            layout: kawase_layout,
-                                            entries: &[
-                                                wgpu::BindGroupEntry {
-                                                    binding: 0,
-                                                    resource: ubo.as_entire_binding(),
-                                                },
-                                                wgpu::BindGroupEntry {
-                                                    binding: 1,
-                                                    resource: wgpu::BindingResource::TextureView(
-                                                        src_view,
-                                                    ),
-                                                },
-                                                wgpu::BindGroupEntry {
-                                                    binding: 2,
-                                                    resource: wgpu::BindingResource::Sampler(
-                                                        sampler,
-                                                    ),
-                                                },
-                                            ],
-                                        });
-                                    pass.set_bind_group(0, &bg_temp, &[]);
-                                }
+                                let bg_temp =
+                                    device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                        label: Some(&format!("Bloom Kawase Temp BG L{}", level)),
+                                        layout: kawase_layout,
+                                        entries: &[
+                                            wgpu::BindGroupEntry {
+                                                binding: 0,
+                                                resource: wgpu::BindingResource::TextureView(
+                                                    src_view,
+                                                ),
+                                            },
+                                            wgpu::BindGroupEntry {
+                                                binding: 1,
+                                                resource: wgpu::BindingResource::Sampler(sampler),
+                                            },
+                                        ],
+                                    });
+                                pass.set_bind_group(0, &bg_temp, &[]);
                             }
                             pass.draw(0..3, 0..1);
                         }
@@ -10351,7 +10263,7 @@ impl App {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::DontCare(unsafe { wgpu::LoadOpDontCare::enabled() }),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -10899,7 +10811,7 @@ impl App {
             let mesh_cache_mib = self.mesh_cache_bytes as f64 / (1024.0 * 1024.0);
             let mesh_budget_mib = self.mesh_cache_byte_budget() as f64 / (1024.0 * 1024.0);
             self.system_info.refresh_process(self.process_pid);
-            let (process_mem_mib, process_vmem_mib) = self
+            let (process_mem_mib, _process_vmem_mib) = self
                 .system_info
                 .process(self.process_pid)
                 .map(|p| {
@@ -10924,10 +10836,10 @@ impl App {
                     (self.fallback_instance_capacity as u64)
                         * std::mem::size_of::<VoxelInstanceRaw>() as u64,
                 );
-            let tracked_mem_mib = tracked_bytes as f64 / (1024.0 * 1024.0);
+            let _tracked_mem_mib = tracked_bytes as f64 / (1024.0 * 1024.0);
             // Tracked GPU reserved bytes collected from allocations:
             let gpu_reserved_bytes = self.gpu_buffer_bytes.saturating_add(self.gpu_texture_bytes);
-            let gpu_reserved_mib = gpu_reserved_bytes as f64 / (1024.0 * 1024.0);
+            let _gpu_reserved_mib = gpu_reserved_bytes as f64 / (1024.0 * 1024.0);
             let ready_count = self.ready_chunk_meshes.len();
             // Compute average FPS across the elapsed interval and store in last_fps for UI
             let elapsed_fps_seconds = (now - self.last_fps_print).as_secs_f64();
