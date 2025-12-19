@@ -1474,12 +1474,12 @@ struct App {
     query_readback_notifier_rx: Option<crossbeam_channel::Receiver<()>>,
     query_readback_in_flight: bool,
     gpu_timing_accum_scene_ms: f64,
+    gpu_timing_accum_shadow_ms: f64,
     gpu_timing_accum_hzb_copy_ms: f64,
     gpu_timing_accum_gpu_cull_ms: f64,
     gpu_timing_accum_ssr_ms: f64,
     gpu_timing_accum_water_ms: f64,
     gpu_timing_accum_dof_ms: f64,
-    gpu_timing_accum_kawase_ms: f64,
     gpu_timing_accum_bloom_ms: f64,
     gpu_timing_accum_ssilvb_ms: f64,
     gpu_timing_accum_post_ms: f64,
@@ -2087,12 +2087,12 @@ impl App {
             query_readback_notifier_rx: None,
             query_readback_in_flight: false,
             gpu_timing_accum_scene_ms: 0.0,
+            gpu_timing_accum_shadow_ms: 0.0,
             gpu_timing_accum_hzb_copy_ms: 0.0,
             gpu_timing_accum_gpu_cull_ms: 0.0,
             gpu_timing_accum_ssr_ms: 0.0,
             gpu_timing_accum_water_ms: 0.0,
             gpu_timing_accum_dof_ms: 0.0,
-            gpu_timing_accum_kawase_ms: 0.0,
             gpu_timing_accum_bloom_ms: 0.0,
             gpu_timing_accum_ssilvb_ms: 0.0,
             gpu_timing_accum_post_ms: 0.0,
@@ -7456,38 +7456,42 @@ impl App {
         }
 
         // GPU Timings
-        if self.gpu_timing_accum_frames > 0 {
-            let div = self.gpu_timing_accum_frames as f64;
-            let gpu_stats = [
-                format!(
-                    "GPU TOTAL: {:.2}MS",
-                    (self.gpu_timing_accum_scene_ms
-                        + self.gpu_timing_accum_hzb_copy_ms
-                        + self.gpu_timing_accum_gpu_cull_ms
-                        + self.gpu_timing_accum_ssr_ms
-                        + self.gpu_timing_accum_water_ms
-                        + self.gpu_timing_accum_dof_ms
-                        + self.gpu_timing_accum_ssilvb_ms
-                        + self.gpu_timing_accum_bloom_ms
-                        + self.gpu_timing_accum_post_ms)
-                        / div
-                ),
-                format!("  SCENE: {:.2}MS", self.gpu_timing_accum_scene_ms / div),
-                format!("  CULL: {:.2}MS", self.gpu_timing_accum_gpu_cull_ms / div),
-                format!("  SSR: {:.2}MS", self.gpu_timing_accum_ssr_ms / div),
-                format!("  WATER: {:.2}MS", self.gpu_timing_accum_water_ms / div),
-                format!("  POST: {:.2}MS", self.gpu_timing_accum_post_ms / div),
-            ];
+        let div = self.gpu_timing_accum_frames.max(1) as f64;
+        let gpu_stats = [
+            format!(
+                "GPU TOTAL: {:.2}MS",
+                (self.gpu_timing_accum_scene_ms
+                    + self.gpu_timing_accum_shadow_ms
+                    + self.gpu_timing_accum_hzb_copy_ms
+                    + self.gpu_timing_accum_gpu_cull_ms
+                    + self.gpu_timing_accum_ssr_ms
+                    + self.gpu_timing_accum_water_ms
+                    + self.gpu_timing_accum_dof_ms
+                    + self.gpu_timing_accum_ssilvb_ms
+                    + self.gpu_timing_accum_bloom_ms
+                    + self.gpu_timing_accum_post_ms)
+                    / div
+            ),
+            format!("  SHADOW:{:.2}MS", self.gpu_timing_accum_shadow_ms / div),
+            format!("  SCENE: {:.2}MS", self.gpu_timing_accum_scene_ms / div),
+            format!("  HZB:   {:.2}MS", self.gpu_timing_accum_hzb_copy_ms / div),
+            format!("  CULL:  {:.2}MS", self.gpu_timing_accum_gpu_cull_ms / div),
+            format!("  SSR:   {:.2}MS", self.gpu_timing_accum_ssr_ms / div),
+            format!("  WATER: {:.2}MS", self.gpu_timing_accum_water_ms / div),
+            format!("  DOF:   {:.2}MS", self.gpu_timing_accum_dof_ms / div),
+            format!("  SSILVB:{:.2}MS", self.gpu_timing_accum_ssilvb_ms / div),
+            format!("  BLOOM: {:.2}MS", self.gpu_timing_accum_bloom_ms / div),
+            format!("  POST:  {:.2}MS", self.gpu_timing_accum_post_ms / div),
+        ];
 
-            for stat in gpu_stats {
-                let pos = [
-                    ui_origin[0] - cam_up[0] * current_y,
-                    ui_origin[1] - cam_up[1] * current_y,
-                    ui_origin[2] - cam_up[2] * current_y,
-                ];
-                self.render_voxel_text(&stat, pos, char_size, white, glow);
-                current_y += line_spacing;
-            }
+        for stat in gpu_stats {
+            let pos = [
+                ui_origin[0] - cam_up[0] * current_y,
+                ui_origin[1] - cam_up[1] * current_y,
+                ui_origin[2] - cam_up[2] * current_y,
+            ];
+            self.render_voxel_text(&stat, pos, char_size, white, glow);
+            current_y += line_spacing;
         }
 
         // Update the GPU buffer
@@ -9591,7 +9595,13 @@ impl App {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: self.query_set.as_ref().map(|qs| {
+                    wgpu::RenderPassTimestampWrites {
+                        query_set: qs,
+                        beginning_of_pass_write_index: Some(14),
+                        end_of_pass_write_index: Some(15),
+                    }
+                }),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -10104,17 +10114,7 @@ impl App {
                                     depth_slice: None,
                                 })],
                                 depth_stencil_attachment: None,
-                                timestamp_writes: if level == 0 {
-                                    self.query_set.as_ref().map(|qs| {
-                                        wgpu::RenderPassTimestampWrites {
-                                            query_set: qs,
-                                            beginning_of_pass_write_index: Some(14),
-                                            end_of_pass_write_index: None,
-                                        }
-                                    })
-                                } else {
-                                    None
-                                },
+                                timestamp_writes: None,
                                 occlusion_query_set: None,
                                 multiview_mask: None,
                             });
@@ -10160,17 +10160,7 @@ impl App {
                                         depth_slice: None,
                                     })],
                                     depth_stencil_attachment: None,
-                                    timestamp_writes: if level_rev == 0 {
-                                        self.query_set.as_ref().map(|qs| {
-                                            wgpu::RenderPassTimestampWrites {
-                                                query_set: qs,
-                                                beginning_of_pass_write_index: None,
-                                                end_of_pass_write_index: Some(15),
-                                            }
-                                        })
-                                    } else {
-                                        None
-                                    },
+                                    timestamp_writes: None,
                                     occlusion_query_set: None,
                                     multiview_mask: None,
                                 });
@@ -10213,9 +10203,7 @@ impl App {
                         view: post_color_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::DontCare(unsafe {
-                                wgpu::LoadOpDontCare::enabled()
-                            }),
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                             store: wgpu::StoreOp::Store,
                         },
                         depth_slice: None,
@@ -10267,14 +10255,6 @@ impl App {
                         self.ssilvb_bind_group.as_ref(),
                         self.ssao_ping_view.as_ref(),
                     ) {
-                        let ssao_ts =
-                            self.query_set
-                                .as_ref()
-                                .map(|qs| wgpu::RenderPassTimestampWrites {
-                                    query_set: qs,
-                                    beginning_of_pass_write_index: Some(12),
-                                    end_of_pass_write_index: Some(13),
-                                });
                         let mut ssao_pass =
                             encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                 label: Some("SSILVB Pass"),
@@ -10282,15 +10262,23 @@ impl App {
                                     view: ssao_ping_view,
                                     resolve_target: None,
                                     ops: wgpu::Operations {
-                                        load: wgpu::LoadOp::DontCare(unsafe {
-                                            wgpu::LoadOpDontCare::enabled()
-                                        }),
+                                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                                         store: wgpu::StoreOp::Store,
                                     },
                                     depth_slice: None,
                                 })],
                                 depth_stencil_attachment: None,
-                                timestamp_writes: ssao_ts,
+                                timestamp_writes: self.query_set.as_ref().map(|qs| {
+                                    wgpu::RenderPassTimestampWrites {
+                                        query_set: qs,
+                                        beginning_of_pass_write_index: Some(12),
+                                        end_of_pass_write_index: if self.ssao_settings.blur_enabled {
+                                            None
+                                        } else {
+                                            Some(13)
+                                        },
+                                    }
+                                }),
                                 occlusion_query_set: None,
                                 multiview_mask: None,
                             });
@@ -10354,7 +10342,13 @@ impl App {
                                         depth_slice: None,
                                     })],
                                     depth_stencil_attachment: None,
-                                    timestamp_writes: None,
+                                    timestamp_writes: self.query_set.as_ref().map(|qs| {
+                                        wgpu::RenderPassTimestampWrites {
+                                            query_set: qs,
+                                            beginning_of_pass_write_index: None,
+                                            end_of_pass_write_index: Some(13),
+                                        }
+                                    }),
                                     occlusion_query_set: None,
                                     multiview_mask: None,
                                 });
@@ -10379,9 +10373,7 @@ impl App {
                         view: bloom_ping_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::DontCare(unsafe {
-                                wgpu::LoadOpDontCare::enabled()
-                            }),
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                             store: wgpu::StoreOp::Store,
                         },
                         depth_slice: None,
@@ -10547,7 +10539,7 @@ impl App {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::DontCare(unsafe { wgpu::LoadOpDontCare::enabled() }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -10660,12 +10652,13 @@ impl App {
                         let ssr_ms = stamp_to_ms(stamps[8], stamps[9]);
                         let water_ms = stamp_to_ms(stamps[10], stamps[11]);
                         let ssilvb_ms = stamp_to_ms(stamps[12], stamps[13]);
-                        let kawase_ms = stamp_to_ms(stamps[14], stamps[15]);
+                        let shadow_ms = stamp_to_ms(stamps[14], stamps[15]);
                         let bloom_ms = stamp_to_ms(stamps[16], stamps[17]);
                         let post_ms = stamp_to_ms(stamps[18], stamps[19]);
 
                         // Determine the absolute order of execution to calculate non-cumulative durations.
                         // Execution order in render():
+                        // 0. Shadows (15)
                         // 1. Scene (1)
                         // 2. SSR (9)
                         // 3. Water (11)
@@ -10675,7 +10668,12 @@ impl App {
                         // 7. Post (19)
                         // Cull (7) and HZB (3) are in a separate encoder submitted earlier.
 
-                        let iso_scene = scene_ms;
+                        let iso_shadow = shadow_ms;
+                        let iso_scene = if scene_ms > 0.0 {
+                            (scene_ms - shadow_ms).max(0.0)
+                        } else {
+                            0.0
+                        };
                         let iso_ssr = if ssr_ms > 0.0 {
                             (ssr_ms - scene_ms).max(0.0)
                         } else {
@@ -10727,18 +10725,14 @@ impl App {
                             0.0
                         };
 
-                        // We also want to know the internal time of DoF Kawase (14-15) and Bloom (16-17)
-                        let kawase_internal = kawase_ms; // 14-15 is specific to DoF Kawase passes
-                                                         // Note: bloom_ms (16-17) is now Extract + Kawase loop.
-
                         // Accumulate isolated timings for averaging
                         self.gpu_timing_accum_scene_ms += iso_scene;
+                        self.gpu_timing_accum_shadow_ms += iso_shadow;
                         self.gpu_timing_accum_hzb_copy_ms += hzb_iso;
                         self.gpu_timing_accum_dof_ms += iso_dof;
                         self.gpu_timing_accum_gpu_cull_ms += cull_iso;
                         self.gpu_timing_accum_ssr_ms += iso_ssr;
                         self.gpu_timing_accum_water_ms += iso_water;
-                        self.gpu_timing_accum_kawase_ms += kawase_internal;
                         self.gpu_timing_accum_bloom_ms += iso_bloom;
                         self.gpu_timing_accum_ssilvb_ms += iso_ssilvb;
                         self.gpu_timing_accum_post_ms += iso_post;
@@ -10748,26 +10742,26 @@ impl App {
                         if self.gpu_timing_accum_frames >= self.gpu_timing_print_interval_frames {
                             let frames = self.gpu_timing_accum_frames as f64;
                             let avg_scene = self.gpu_timing_accum_scene_ms / frames;
+                            let avg_shadow = self.gpu_timing_accum_shadow_ms / frames;
                             let avg_hzb_copy = self.gpu_timing_accum_hzb_copy_ms / frames;
                             let avg_dof = self.gpu_timing_accum_dof_ms / frames;
                             let avg_gpu_cull = self.gpu_timing_accum_gpu_cull_ms / frames;
                             let avg_ssr = self.gpu_timing_accum_ssr_ms / frames;
                             let avg_water = self.gpu_timing_accum_water_ms / frames;
-                            let avg_kawase = self.gpu_timing_accum_kawase_ms / frames;
                             let avg_bloom = self.gpu_timing_accum_bloom_ms / frames;
                             let avg_ssilvb = self.gpu_timing_accum_ssilvb_ms / frames;
                             let avg_post = self.gpu_timing_accum_post_ms / frames;
 
                             log::info!(
-                                "GPU avg timings over {} frames - scene: {:.3}ms, hzb_copy: {:.3}ms, dof: {:.3}ms, gpu_cull: {:.3}ms, ssr: {:.3}ms, water: {:.3}ms, kawase: {:.3}ms, bloom: {:.3}ms, ssilvb: {:.3}ms, post: {:.3}ms",
+                                "GPU avg timings over {} frames - scene: {:.3}ms, shadow: {:.3}ms, hzb_copy: {:.3}ms, dof: {:.3}ms, gpu_cull: {:.3}ms, ssr: {:.3}ms, water: {:.3}ms, bloom: {:.3}ms, ssilvb: {:.3}ms, post: {:.3}ms",
                                 self.gpu_timing_accum_frames,
                                 avg_scene,
+                                avg_shadow,
                                 avg_hzb_copy,
                                 avg_dof,
                                 avg_gpu_cull,
                                 avg_ssr,
                                 avg_water,
-                                avg_kawase,
                                 avg_bloom,
                                 avg_ssilvb,
                                 avg_post
@@ -10775,12 +10769,12 @@ impl App {
 
                             // reset accumulators
                             self.gpu_timing_accum_scene_ms = 0.0;
+                            self.gpu_timing_accum_shadow_ms = 0.0;
                             self.gpu_timing_accum_hzb_copy_ms = 0.0;
                             self.gpu_timing_accum_dof_ms = 0.0;
                             self.gpu_timing_accum_gpu_cull_ms = 0.0;
                             self.gpu_timing_accum_ssr_ms = 0.0;
                             self.gpu_timing_accum_water_ms = 0.0;
-                            self.gpu_timing_accum_kawase_ms = 0.0;
                             self.gpu_timing_accum_bloom_ms = 0.0;
                             self.gpu_timing_accum_ssilvb_ms = 0.0;
                             self.gpu_timing_accum_post_ms = 0.0;
