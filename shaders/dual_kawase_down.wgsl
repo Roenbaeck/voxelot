@@ -6,12 +6,11 @@ struct KawaseUniforms {
     _pad: f32,
 };
 
-@group(0) @binding(0)
-var<uniform> kawase: KawaseUniforms;
+var<immediate> kawase: KawaseUniforms;
 
-@group(0) @binding(1)
+@group(0) @binding(0)
 var input_texture: texture_2d<f32>;
-@group(0) @binding(2)
+@group(0) @binding(1)
 var input_sampler: sampler;
 
 struct VertexOutput {
