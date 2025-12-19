@@ -12,7 +12,7 @@
 use clap::Parser;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use glam::{Mat4, Vec3};
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use wgpu::util::DeviceExt;
@@ -65,6 +65,106 @@ const SHADOW_FRUSTUM_EXTENT_MIN: f32 = 150.0;
 const SHADOW_FRUSTUM_EXTENT_MAX: f32 = 600.0;
 const SHADOW_DISTANCE_MULTIPLIER: f32 = 2.5;
 const SHADOW_BIAS: f32 = 0.001;
+
+// 8x8 monochrome bitmap font (ASCII 0-127, some gaps)
+const VOXEL_FONT_BASIC: [u8; 768] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 0
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 1
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 2
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 3
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 4
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 5
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 6
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 7
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 8
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 9
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 10
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 11
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 12
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 13
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 14
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 15
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 16
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 17
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 18
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 19
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 20
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 21
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 22
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 23
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 24
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 25
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 26
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 27
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 28
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 29
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 30
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 31
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // space
+    0x18, 0x3C, 0x3C, 0x18, 0x18, 0x00, 0x18, 0x00, // !
+    0x36, 0x36, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // "
+    0x36, 0x36, 0x7F, 0x36, 0x7F, 0x36, 0x36, 0x00, // #
+    0x0C, 0x3E, 0x03, 0x1E, 0x30, 0x1F, 0x0C, 0x00, // $
+    0x00, 0x63, 0x33, 0x18, 0x0C, 0x66, 0x63, 0x00, // %
+    0x1C, 0x36, 0x1C, 0x6E, 0x3B, 0x33, 0x6E, 0x00, // &
+    0x06, 0x06, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, // '
+    0x18, 0x0C, 0x06, 0x06, 0x06, 0x0C, 0x18, 0x00, // (
+    0x06, 0x0C, 0x18, 0x18, 0x18, 0x0C, 0x06, 0x00, // )
+    0x00, 0x66, 0x3C, 0xFF, 0x3C, 0x66, 0x00, 0x00, // *
+    0x00, 0x0C, 0x0C, 0x3F, 0x0C, 0x0C, 0x00, 0x00, // +
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C, 0x06, // ,
+    0x00, 0x00, 0x00, 0x3F, 0x00, 0x00, 0x00, 0x00, // -
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C, 0x00, // .
+    0x60, 0x30, 0x18, 0x0C, 0x06, 0x03, 0x01, 0x00, // /
+    0x3E, 0x63, 0x73, 0x7B, 0x6F, 0x67, 0x3E, 0x00, // 0
+    0x0C, 0x0E, 0x0C, 0x0C, 0x0C, 0x0C, 0x3F, 0x00, // 1
+    0x1E, 0x33, 0x30, 0x1C, 0x06, 0x33, 0x3F, 0x00, // 2
+    0x1E, 0x33, 0x30, 0x1C, 0x30, 0x33, 0x1E, 0x00, // 3
+    0x38, 0x3C, 0x36, 0x33, 0x7F, 0x30, 0x78, 0x00, // 4
+    0x3F, 0x03, 0x1F, 0x30, 0x30, 0x33, 0x1E, 0x00, // 5
+    0x1C, 0x06, 0x03, 0x1F, 0x33, 0x33, 0x1E, 0x00, // 6
+    0x3F, 0x33, 0x30, 0x18, 0x0C, 0x0C, 0x0C, 0x00, // 7
+    0x1E, 0x33, 0x33, 0x1E, 0x33, 0x33, 0x1E, 0x00, // 8
+    0x1E, 0x33, 0x33, 0x3E, 0x30, 0x18, 0x0E, 0x00, // 9
+    0x00, 0x0C, 0x0C, 0x00, 0x00, 0x0C, 0x0C, 0x00, // :
+    0x00, 0x0C, 0x0C, 0x00, 0x00, 0x0C, 0x0C, 0x06, // ;
+    0x18, 0x0C, 0x06, 0x03, 0x06, 0x0C, 0x18, 0x00, // <
+    0x00, 0x00, 0x3F, 0x00, 0x00, 0x3F, 0x00, 0x00, // =
+    0x06, 0x0C, 0x18, 0x30, 0x18, 0x0C, 0x06, 0x00, // >
+    0x1E, 0x33, 0x30, 0x18, 0x0C, 0x00, 0x0C, 0x00, // ?
+    0x3E, 0x63, 0x7B, 0x7B, 0x7B, 0x03, 0x1E, 0x00, // @
+    0x0C, 0x1E, 0x33, 0x33, 0x3F, 0x33, 0x33, 0x00, // A
+    0x3F, 0x66, 0x66, 0x3E, 0x66, 0x66, 0x3F, 0x00, // B
+    0x3C, 0x66, 0x03, 0x03, 0x03, 0x66, 0x3C, 0x00, // C
+    0x1F, 0x36, 0x66, 0x66, 0x66, 0x36, 0x1F, 0x00, // D
+    0x7F, 0x46, 0x16, 0x1E, 0x16, 0x46, 0x7F, 0x00, // E
+    0x7F, 0x46, 0x16, 0x1E, 0x16, 0x06, 0x0F, 0x00, // F
+    0x3C, 0x66, 0x03, 0x03, 0x73, 0x66, 0x7C, 0x00, // G
+    0x33, 0x33, 0x33, 0x3F, 0x33, 0x33, 0x33, 0x00, // H
+    0x1E, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x1E, 0x00, // I
+    0x78, 0x30, 0x30, 0x30, 0x33, 0x33, 0x1E, 0x00, // J
+    0x67, 0x66, 0x36, 0x1E, 0x36, 0x66, 0x67, 0x00, // K
+    0x0F, 0x06, 0x06, 0x06, 0x46, 0x66, 0x7F, 0x00, // L
+    0x63, 0x77, 0x7F, 0x7F, 0x6B, 0x63, 0x63, 0x00, // M
+    0x63, 0x67, 0x6F, 0x7B, 0x73, 0x63, 0x63, 0x00, // N
+    0x1C, 0x36, 0x63, 0x63, 0x63, 0x36, 0x1C, 0x00, // O
+    0x3F, 0x66, 0x66, 0x3E, 0x06, 0x06, 0x0F, 0x00, // P
+    0x1E, 0x33, 0x33, 0x33, 0x3B, 0x1E, 0x38, 0x00, // Q
+    0x3F, 0x66, 0x66, 0x3E, 0x36, 0x66, 0x67, 0x00, // R
+    0x1E, 0x33, 0x07, 0x0E, 0x38, 0x33, 0x1E, 0x00, // S
+    0x3F, 0x2D, 0x0C, 0x0C, 0x0C, 0x0C, 0x1E, 0x00, // T
+    0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x3F, 0x00, // U
+    0x33, 0x33, 0x33, 0x33, 0x33, 0x1E, 0x0C, 0x00, // V
+    0x63, 0x63, 0x63, 0x6B, 0x7F, 0x77, 0x63, 0x00, // W
+    0x63, 0x63, 0x36, 0x1C, 0x1C, 0x36, 0x63, 0x00, // X
+    0x33, 0x33, 0x33, 0x1E, 0x0C, 0x0C, 0x1E, 0x00, // Y
+    0x7F, 0x63, 0x31, 0x18, 0x4C, 0x66, 0x7F, 0x00, // Z
+    0x1C, 0x0C, 0x0C, 0x18, 0x0C, 0x0C, 0x1C, 0x00, // {
+    0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x00, // |
+    0x38, 0x30, 0x30, 0x18, 0x30, 0x30, 0x38, 0x00, // }
+    0x00, 0x00, 0x33, 0x7E, 0x33, 0x00, 0x00, 0x00, // ~
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 127
+];
 const SHADOW_STRENGTH_MULTIPLIER: f32 = 1.75;
 
 /// Voxel instance data for GPU
@@ -555,11 +655,9 @@ struct SsaoSettings {
 }
 
 struct GiSettings {
-    enabled: bool,
     indirect_scale: f32,
     fade_distance: f32,
     fade_range: f32,
-    grid_dims: glam::IVec3,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -1003,6 +1101,7 @@ struct App {
     /// True when HDR presentation is active (platform + config + swapchain format support).
     hdr_active: bool,
     render_pipeline: Option<wgpu::RenderPipeline>,
+    ui_pipeline: Option<wgpu::RenderPipeline>,
     mesh_pipeline: Option<wgpu::RenderPipeline>,
     shadow_pipeline: Option<wgpu::RenderPipeline>,
     shadow_mesh_pipeline: Option<wgpu::RenderPipeline>,
@@ -1299,9 +1398,6 @@ struct App {
     kawase_pong_views: Vec<Option<wgpu::TextureView>>,
     // Kawase per-level extents (width, height)
     kawase_level_sizes: Vec<(u32, u32)>,
-    kawase_last_ubo: Vec<[f32; 4]>,
-    // Performance instrumentation: accumulate kawase timing
-    kawase_write_acc: std::time::Duration,
     kawase_pass_acc: std::time::Duration,
     kawase_acc_frames: u64,
     bloom_settings: BloomSettings,
@@ -1316,15 +1412,13 @@ struct App {
     // Mesh statistics
     _mesh_buffer_pool_max_entries: usize,
 
-    // egui UI state
-    #[cfg(feature = "overlay")]
-    egui_ctx: Option<egui::Context>,
-    #[cfg(feature = "overlay")]
-    egui_winit: Option<egui_winit::State>,
-    #[cfg(feature = "overlay")]
-    egui_renderer: Option<egui_wgpu::Renderer>,
     last_fps: u32,
     fps_ema: f32,
+
+    // Debug voxel UI
+    debug_instance_buffer: Option<wgpu::Buffer>,
+    debug_instance_count: u32,
+    debug_ui_instances: Vec<VoxelInstanceRaw>,
 
     // Culling statistics
     cull_stats: CullStats,
@@ -1361,7 +1455,6 @@ struct App {
     kawase_pong_bytes: u64,
     ssao_ping_bytes: u64,
     ssao_pong_bytes: u64,
-    shadow_map_bytes: u64,
     hzb_texture_bytes: u64,
     hzb_params_buffer_bytes: u64,
     cube_vertex_buffer_bytes: u64,
@@ -1801,6 +1894,7 @@ impl App {
             user_config: cfg.clone(),
             hdr_active: false,
             render_pipeline: None,
+            ui_pipeline: None,
             mesh_pipeline: None,
             shadow_pipeline: None,
             shadow_mesh_pipeline: None,
@@ -1861,14 +1955,11 @@ impl App {
             multi_mesh_args_tmp: Vec::with_capacity(4096),
             multi_env_args_tmp: Vec::with_capacity(4096),
 
-            #[cfg(feature = "overlay")]
-            egui_ctx: None,
-            #[cfg(feature = "overlay")]
-            egui_winit: None,
-            #[cfg(feature = "overlay")]
-            egui_renderer: None,
             last_fps: 0,
             fps_ema: 0.0,
+            debug_instance_buffer: None,
+            debug_instance_count: 0,
+            debug_ui_instances: Vec::new(),
             cull_stats: CullStats::default(),
             mesh_chunk_arc_cache: FxHashMap::default(),
             // empty_mesh buffers removed; placeholders use offsets into mega buffers
@@ -2094,9 +2185,6 @@ impl App {
             kawase_pong_textures: Vec::new(),
             kawase_pong_views: Vec::new(),
             kawase_level_sizes: Vec::new(),
-            kawase_last_ubo: Vec::new(),
-            // Instrumentation init
-            kawase_write_acc: std::time::Duration::from_secs(0),
             kawase_pass_acc: std::time::Duration::from_secs(0),
             kawase_acc_frames: 0,
             bloom_settings: BloomSettings {
@@ -2123,11 +2211,9 @@ impl App {
                 _bias: 0.01,
             },
             gi_settings: GiSettings {
-                enabled: cfg.effects.gi.enabled,
                 indirect_scale: cfg.effects.gi.indirect_scale,
                 fade_distance: cfg.effects.gi.fade_distance,
                 fade_range: cfg.effects.gi.fade_range,
-                grid_dims: glam::IVec3::from_array(cfg.effects.gi.grid_dims),
             },
             ssr_settings: SSRSettings {
                 max_steps: cfg.effects.ssr.max_steps,
@@ -2185,7 +2271,6 @@ impl App {
             kawase_pong_bytes: 0,
             ssao_ping_bytes: 0,
             ssao_pong_bytes: 0,
-            shadow_map_bytes: 0,
             hzb_texture_bytes: 0,
             hzb_params_buffer_bytes: 0,
             cube_vertex_buffer_bytes: 0,
@@ -5496,11 +5581,8 @@ impl App {
         if adapter.features().contains(wgpu::Features::IMMEDIATES) {
             req_features |= wgpu::Features::IMMEDIATES;
         }
-        #[cfg(feature = "gpu-profiling")]
-        {
-            if adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
-                req_features |= wgpu::Features::TIMESTAMP_QUERY;
-            }
+        if adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            req_features |= wgpu::Features::TIMESTAMP_QUERY;
         }
 
         let (device, queue) = adapter
@@ -5519,7 +5601,6 @@ impl App {
         self.timestamp_period_ns = queue.get_timestamp_period() as f64;
 
         // Create a query set and resolve buffer if GPU profiling is requested and supported
-        #[cfg(feature = "gpu-profiling")]
         {
             if device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
                 // Reserve up to 64 timestamps; adjust as needed
@@ -5822,6 +5903,66 @@ impl App {
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // Create UI pipeline (single target, no depth)
+        let ui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("UI Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[
+                    // Slot 0: Per-vertex data (position + normal)
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<CubeVertex>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![4 => Float32x3, 5 => Float32x3],
+                    },
+                    // Slot 1: Per-instance data (position, type, scale, custom_color)
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<VoxelInstanceRaw>()
+                            as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &wgpu::vertex_attr_array![
+                            0 => Float32x3,  // position
+                            1 => Uint32,     // voxel_type
+                            2 => Float32x3,  // scale
+                            3 => Float32,    // ao_factor
+                            7 => Float32x4,  // custom_color (RGBA) -- moved to avoid vertex attribute conflict
+                            6 => Float32x4   // emissive (RGB + intensity)
+                        ],
+                    },
+                ],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
             multisample: wgpu::MultisampleState {
                 count: 1,
                 mask: !0,
@@ -7179,6 +7320,7 @@ impl App {
         self.queue = Some(queue);
         self.config = Some(config);
         self.render_pipeline = Some(render_pipeline);
+        self.ui_pipeline = Some(ui_pipeline);
         self.mesh_pipeline = Some(mesh_pipeline);
         self.shadow_pipeline = Some(shadow_pipeline);
         self.shadow_mesh_pipeline = Some(shadow_mesh_pipeline);
@@ -7190,34 +7332,6 @@ impl App {
         self.shadow_bind_group_layout = Some(shadow_bind_group_layout);
         self.shadow_sampler = Some(shadow_sampler);
 
-        #[cfg(feature = "overlay")]
-        {
-            // Initialize egui
-            let egui_ctx = egui::Context::default();
-            let egui_winit = egui_winit::State::new(
-                egui_ctx.clone(),
-                egui::ViewportId::ROOT,
-                self.window.as_ref().unwrap(),
-                Some(self.window.as_ref().unwrap().scale_factor() as f32),
-                None, // theme
-                Some(
-                    self.device
-                        .as_ref()
-                        .unwrap()
-                        .limits()
-                        .max_texture_dimension_2d as usize,
-                ),
-            );
-            let egui_renderer = egui_wgpu::Renderer::new(
-                self.device.as_ref().unwrap(),
-                self.config.as_ref().unwrap().format,
-                egui_wgpu::RendererOptions::default(),
-            );
-
-            self.egui_ctx = Some(egui_ctx);
-            self.egui_winit = Some(egui_winit);
-            self.egui_renderer = Some(egui_renderer);
-        }
         self.cube_vertex_buffer = Some(cube_vertex_buffer);
 
         self.update_shadow_bind_group();
@@ -7295,7 +7409,175 @@ impl App {
         );
     }
 
+    fn draw_debug_voxels(&mut self) {
+        self.debug_ui_instances.clear();
+
+        // Screen-space position (rough approximation for now)
+        // We'll render these at a fixed Z near the camera or using a separate pass later.
+        let cam_pos = self.camera_controller.camera.position;
+        let cam_forward = self.camera_controller.camera.forward;
+        let cam_right = self.camera_controller.camera.right();
+        let cam_up = self.camera_controller.camera.up;
+
+        // Position text roughly in front of the camera
+        let ui_origin = [
+            cam_pos[0] + cam_forward[0] * 2.0 - cam_right[0] * 1.2 + cam_up[0] * 0.8,
+            cam_pos[1] + cam_forward[1] * 2.0 - cam_right[1] * 1.2 + cam_up[1] * 0.8,
+            cam_pos[2] + cam_forward[2] * 2.0 - cam_right[2] * 1.2 + cam_up[2] * 0.8,
+        ];
+
+        let char_size = 0.005;
+        let white = [1.0, 1.0, 1.0, 1.0];
+        let glow = [1.0, 1.0, 1.0, 2.0];
+
+        let fps_text = format!("FPS: {}", self.last_fps);
+        self.render_voxel_text(&fps_text, ui_origin, char_size, white, glow);
+
+        let mut current_y = 0.06;
+        let line_spacing = 0.06;
+
+        let stats = [
+            format!("VISIBLE: {}", self.visible_count),
+            format!("MESHED: {}", self.meshed_chunk_count),
+            format!("PENDING: {}", self.pending_mesh_count),
+            format!("JOBS/S: {}", self.jobs_per_sec_snapshot),
+            format!("MEM: {:.0} MIB", self.process_mem_mib),
+        ];
+
+        for stat in stats {
+            let pos = [
+                ui_origin[0] - cam_up[0] * current_y,
+                ui_origin[1] - cam_up[1] * current_y,
+                ui_origin[2] - cam_up[2] * current_y,
+            ];
+            self.render_voxel_text(&stat, pos, char_size, white, glow);
+            current_y += line_spacing;
+        }
+
+        // GPU Timings
+        if self.gpu_timing_accum_frames > 0 {
+            let div = self.gpu_timing_accum_frames as f64;
+            let gpu_stats = [
+                format!(
+                    "GPU TOTAL: {:.2}MS",
+                    (self.gpu_timing_accum_scene_ms
+                        + self.gpu_timing_accum_hzb_copy_ms
+                        + self.gpu_timing_accum_gpu_cull_ms
+                        + self.gpu_timing_accum_ssr_ms
+                        + self.gpu_timing_accum_water_ms
+                        + self.gpu_timing_accum_dof_ms
+                        + self.gpu_timing_accum_ssilvb_ms
+                        + self.gpu_timing_accum_bloom_ms
+                        + self.gpu_timing_accum_post_ms)
+                        / div
+                ),
+                format!("  SCENE: {:.2}MS", self.gpu_timing_accum_scene_ms / div),
+                format!("  CULL: {:.2}MS", self.gpu_timing_accum_gpu_cull_ms / div),
+                format!("  SSR: {:.2}MS", self.gpu_timing_accum_ssr_ms / div),
+                format!("  WATER: {:.2}MS", self.gpu_timing_accum_water_ms / div),
+                format!("  POST: {:.2}MS", self.gpu_timing_accum_post_ms / div),
+            ];
+
+            for stat in gpu_stats {
+                let pos = [
+                    ui_origin[0] - cam_up[0] * current_y,
+                    ui_origin[1] - cam_up[1] * current_y,
+                    ui_origin[2] - cam_up[2] * current_y,
+                ];
+                self.render_voxel_text(&stat, pos, char_size, white, glow);
+                current_y += line_spacing;
+            }
+        }
+
+        // Update the GPU buffer
+        if !self.debug_ui_instances.is_empty() {
+            let data = bytemuck::cast_slice(&self.debug_ui_instances);
+            let device = self.device.as_ref().unwrap();
+
+            // Recreate or update the buffer
+            let needed_size = data.len() as u64;
+            let mut recreate = true;
+            if let Some(buf) = &self.debug_instance_buffer {
+                if buf.size() >= needed_size {
+                    recreate = false;
+                }
+            }
+
+            if recreate {
+                self.debug_instance_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Debug UI Instance Buffer"),
+                    size: needed_size,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+
+            self.queue.as_ref().unwrap().write_buffer(
+                self.debug_instance_buffer.as_ref().unwrap(),
+                0,
+                data,
+            );
+            self.debug_instance_count = self.debug_ui_instances.len() as u32;
+        } else {
+            self.debug_instance_count = 0;
+        }
+    }
+
+    fn render_voxel_text(
+        &mut self,
+        text: &str,
+        start_pos: [f32; 3],
+        char_size: f32,
+        color: [f32; 4],
+        emissive: [f32; 4],
+    ) {
+        let mut x_offset = 0.0;
+        // Basic billboard orientation (using camera right/up)
+        let right = self.camera_controller.camera.right();
+        let up = self.camera_controller.camera.up;
+
+        for c in text.to_ascii_uppercase().chars() {
+            let glyph_idx = (c as u32).min(127) as usize;
+            let font_idx = if glyph_idx > 90 {
+                if glyph_idx >= 123 {
+                    glyph_idx - 32
+                } else {
+                    32 // fallback to space for missing chars
+                }
+            } else {
+                glyph_idx
+            };
+            let glyph_offset = font_idx * 8;
+
+            for row in 0..8 {
+                let row_bits = VOXEL_FONT_BASIC[glyph_offset + row];
+                for col in 0..8 {
+                    // The font data is LSB-on-the-left, so we use (1 << col)
+                    if (row_bits & (1 << col)) != 0 {
+                        let px = start_pos[0] + (x_offset + col as f32) * char_size * right[0]
+                            - (row as f32) * char_size * up[0];
+                        let py = start_pos[1] + (x_offset + col as f32) * char_size * right[1]
+                            - (row as f32) * char_size * up[1];
+                        let pz = start_pos[2] + (x_offset + col as f32) * char_size * right[2]
+                            - (row as f32) * char_size * up[2];
+
+                        self.debug_ui_instances.push(VoxelInstanceRaw {
+                            position: [px, py, pz],
+                            voxel_type: 1, // generic voxel
+                            scale: [char_size, char_size, char_size],
+                            ao_factor: 1.0,
+                            custom_color: color,
+                            emissive,
+                        });
+                    }
+                }
+            }
+            x_offset += 9.0; // 8 bits + 1 bit spacing
+        }
+    }
+
     fn render(&mut self) {
+        self.draw_debug_voxels();
         log::debug!(
             "render() enter frame={}, frame_index={}",
             self.frame_count,
@@ -8585,7 +8867,7 @@ impl App {
                 missing_chunks.remove(&key);
             }
         }
-        let _mesh_upload_total_time = mesh_upload_total_start.elapsed();
+        let mesh_upload_total_time = mesh_upload_total_start.elapsed();
         let mesh_time = mesh_start.elapsed();
 
         if self.mesh_cache_bytes > self.mesh_cache_byte_budget() {
@@ -10280,318 +10562,39 @@ impl App {
             eprintln!("Composite resources unavailable; skipping final pass!");
         }
 
-        // Egui rendering
-        #[cfg(feature = "overlay")]
-        if self.gui_visible {
-            if let (Some(egui_ctx), Some(egui_winit), Some(window)) =
-                (&self.egui_ctx, &mut self.egui_winit, &self.window)
-            {
-                let raw_input = egui_winit.take_egui_input(window);
-                egui_ctx.begin_pass(raw_input);
+        // Custom Voxel UI Pass
+        if self.gui_visible && self.debug_instance_count > 0 {
+            let mut ui_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Debug UI Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
 
-                let mut need_recreate_offscreen = false;
-                let mut new_render_scale_val = self.user_config.performance.render_scale;
-                egui::Area::new(egui::Id::new("fps_counter"))
-                    .fixed_pos(egui::pos2(10.0, 10.0))
-                    .show(egui_ctx, |ui| {
-                        egui::Frame::default()
-                            .fill(egui::Color32::from_black_alpha(222))
-                            .inner_margin(5.0)
-                            .corner_radius(5.0)
-                            .show(ui, |ui| {
-                                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                                ui.label(
-                                    egui::RichText::new(format!("FPS: {}", self.last_fps))
-                                        .color(egui::Color32::WHITE)
-                                        .size(10.0),
-                                );
-                                // Additional stats: mirror the console output but in overlay
-                                ui.label(
-                                    egui::RichText::new(format!("Visible: {}", self.visible_count))
-                                        .color(egui::Color32::WHITE)
-                                        .size(10.0),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "Meshed: {}",
-                                        self.meshed_chunk_count
-                                    ))
-                                    .color(egui::Color32::WHITE)
-                                    .size(10.0),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "Pending: {}",
-                                        self.pending_mesh_count
-                                    ))
-                                    .color(egui::Color32::WHITE)
-                                    .size(10.0),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "Jobs/s: {}",
-                                        self.jobs_per_sec_snapshot
-                                    ))
-                                    .color(egui::Color32::WHITE)
-                                    .size(10.0),
-                                );
-                                // (Moved) Mesh cache and envelopes will be printed under 'Process' for clarity
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "Process: {:.0} MiB",
-                                        self.process_mem_mib
-                                    ))
-                                    .color(egui::Color32::WHITE)
-                                    .size(10.0),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "  Mesh cache: {:.0}/{:.0} MiB",
-                                        self.mesh_cache_mib, self.mesh_budget_mib
-                                    ))
-                                    .color(egui::Color32::WHITE)
-                                    .size(10.0),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "  Envelopes: {:.0}/{:.0} MiB",
-                                        self.envelope_cache_mib, self.mesh_budget_mib
-                                    ))
-                                    .color(egui::Color32::WHITE)
-                                    .size(10.0),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "GPU tracked: {:.0} MiB",
-                                        (self.gpu_buffer_bytes + self.gpu_texture_bytes) as f64
-                                            / (1024.0 * 1024.0)
-                                    ))
-                                    .color(egui::Color32::WHITE)
-                                    .size(10.0),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "  Uniforms: {:.1} MiB",
-                                        (self.uniform_buffer_bytes as f64) / (1024.0 * 1024.0)
-                                    ))
-                                    .color(egui::Color32::WHITE)
-                                    .size(10.0),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "  Mega VB/IB: {:.1}/{:.1} MiB",
-                                        (self.mega_vertex_buffer_bytes as f64) / (1024.0 * 1024.0),
-                                        (self.mega_index_buffer_bytes as f64) / (1024.0 * 1024.0)
-                                    ))
-                                    .color(egui::Color32::WHITE)
-                                    .size(10.0),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "  GPU Input: {:.1} MiB",
-                                        (self.gpu_input_buffer_bytes as f64) / (1024.0 * 1024.0)
-                                    ))
-                                    .color(egui::Color32::WHITE)
-                                    .size(10.0),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "  Indirects (mesh/env): {:.1}/{:.1} MiB",
-                                        (self.mesh_indirect_bytes as f64) / (1024.0 * 1024.0),
-                                        (self.envelope_indirect_bytes as f64) / (1024.0 * 1024.0)
-                                    ))
-                                    .color(egui::Color32::WHITE)
-                                    .size(10.0),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "  Offscreen/Depth/Post: {:.1}/{:.1}/{:.1} MiB",
-                                        (self.offscreen_color_texture_bytes as f64)
-                                            / (1024.0 * 1024.0),
-                                        (self.depth_texture_bytes as f64) / (1024.0 * 1024.0),
-                                        (self.post_color_texture_bytes as f64) / (1024.0 * 1024.0)
-                                    ))
-                                    .color(egui::Color32::WHITE)
-                                    .size(10.0),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "  Kawase ping/pong: {:.1}/{:.1} MiB",
-                                        (self.kawase_ping_bytes as f64) / (1024.0 * 1024.0),
-                                        (self.kawase_pong_bytes as f64) / (1024.0 * 1024.0)
-                                    ))
-                                    .color(egui::Color32::WHITE)
-                                    .size(10.0),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "  Bloom ping/pong: {:.1}/{:.1} MiB",
-                                        (self.bloom_ping_bytes as f64) / (1024.0 * 1024.0),
-                                        (self.bloom_pong_bytes as f64) / (1024.0 * 1024.0)
-                                    ))
-                                    .color(egui::Color32::WHITE)
-                                    .size(10.0),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "  SSAO ping/pong: {:.1}/{:.1} MiB",
-                                        (self.ssao_ping_bytes as f64) / (1024.0 * 1024.0),
-                                        (self.ssao_pong_bytes as f64) / (1024.0 * 1024.0)
-                                    ))
-                                    .color(egui::Color32::WHITE)
-                                    .size(10.0),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "  Shadow/Skybox: {:.1}/{:.1} MiB",
-                                        (self.shadow_map_bytes as f64) / (1024.0 * 1024.0),
-                                        (self.skybox_texture_bytes as f64) / (1024.0 * 1024.0)
-                                    ))
-                                    .color(egui::Color32::WHITE)
-                                    .size(10.0),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!("Cull: {:.2}ms", self.cull_ms))
-                                        .color(egui::Color32::WHITE)
-                                        .size(10.0),
-                                );
-                                // Render scale slider (runtime performance tuning)
-                                let r = ui.add(
-                                    egui::Slider::new(&mut new_render_scale_val, 0.25..=2.0)
-                                        .text("Render scale"),
-                                );
-                                if r.changed() {
-                                    need_recreate_offscreen = true;
-                                }
-                                // Bloom Kawase controls removed from runtime UI — use config or recompile to change defaults
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "Group: {:.2}ms",
-                                        self.grouping_ms
-                                    ))
-                                    .color(egui::Color32::WHITE)
-                                    .size(10.0),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!("Mesh: {:.2}ms", self.mesh_ms))
-                                        .color(egui::Color32::WHITE)
-                                        .size(10.0),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "Instancing: {:.2}ms",
-                                        self.instance_ms
-                                    ))
-                                    .color(egui::Color32::WHITE)
-                                    .size(10.0),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "GPU Items: {}",
-                                        self.gpu_buffer_items_count
-                                    ))
-                                    .color(egui::Color32::WHITE)
-                                    .size(10.0),
-                                );
-                            });
-                    });
-
-                let full_output = egui_ctx.end_pass();
-                // If render_scale was changed in the GUI, apply it now to avoid borrow conflicts
-                if need_recreate_offscreen
-                    && (new_render_scale_val - self.user_config.performance.render_scale).abs()
-                        > 0.0001
-                {
-                    self.user_config.performance.render_scale = new_render_scale_val;
-                    if let Some(window) = self.window.as_ref() {
-                        let size = window.inner_size();
-                        let scale = window.scale_factor() as f32;
-                        let logical_width = ((size.width as f32) / scale).round() as u32;
-                        let logical_height = ((size.height as f32) / scale).round() as u32;
-                        let render_scale = self.user_config.performance.render_scale;
-                        let overscan_factor = self.render_overscan_factor();
-                        let present_target_width =
-                            ((logical_width as f32) * render_scale).round() as u32;
-                        let present_target_height =
-                            ((logical_height as f32) * render_scale).round() as u32;
-                        self.present_target_width = present_target_width.max(1);
-                        self.present_target_height = present_target_height.max(1);
-                        self.render_target_width =
-                            ((self.present_target_width as f32) * overscan_factor).round() as u32;
-                        self.render_target_height =
-                            ((self.present_target_height as f32) * overscan_factor).round() as u32;
-                        self.pending_recreate_offscreen = true;
-                    }
-                }
-                let paint_jobs =
-                    egui_ctx.tessellate(full_output.shapes, egui_ctx.pixels_per_point());
-                let screen_descriptor = egui_wgpu::ScreenDescriptor {
-                    size_in_pixels: [
-                        self.config.as_ref().unwrap().width,
-                        self.config.as_ref().unwrap().height,
-                    ],
-                    pixels_per_point: egui_ctx.pixels_per_point(),
-                };
-
-                // Take the renderer out to avoid mutable borrow issues
-                if let Some(mut egui_renderer) = self.egui_renderer.take() {
-                    egui_winit.handle_platform_output(window, full_output.platform_output);
-
-                    for (id, image_delta) in &full_output.textures_delta.set {
-                        egui_renderer.update_texture(
-                            self.device.as_ref().unwrap(),
-                            self.queue.as_ref().unwrap(),
-                            *id,
-                            image_delta,
-                        );
-                    }
-
-                    egui_renderer.update_buffers(
-                        self.device.as_ref().unwrap(),
-                        self.queue.as_ref().unwrap(),
-                        &mut encoder,
-                        &paint_jobs,
-                        &screen_descriptor,
-                    );
-
-                    {
-                        let egui_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("egui_pass"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &view,
-                                resolve_target: None,
-                                depth_slice: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Load,
-                                    store: wgpu::StoreOp::Store,
-                                },
-                            })],
-                            depth_stencil_attachment: None,
-                            timestamp_writes: None,
-                            occlusion_query_set: None,
-                        });
-
-                        // Convert to 'static lifetime for egui-wgpu
-                        let mut egui_pass_static = egui_pass.forget_lifetime();
-
-                        egui_renderer.render(
-                            &mut egui_pass_static,
-                            &paint_jobs,
-                            &screen_descriptor,
-                        );
-                    }
-
-                    for id in &full_output.textures_delta.free {
-                        egui_renderer.free_texture(id);
-                    }
-
-                    self.egui_renderer = Some(egui_renderer);
-                }
+            if let (Some(pipeline), Some(buf), Some(bind_group)) = (
+                self.ui_pipeline.as_ref(),
+                self.debug_instance_buffer.as_ref(),
+                self.bind_group.as_ref(), // Bind group 0 has common uniforms/palette
+            ) {
+                ui_pass.set_pipeline(pipeline);
+                ui_pass.set_bind_group(0, bind_group, &[]);
+                ui_pass.set_vertex_buffer(0, self.cube_vertex_buffer.as_ref().unwrap().slice(..));
+                ui_pass.set_vertex_buffer(1, buf.slice(..));
+                ui_pass.draw(0..CUBE_VERTICES.len() as u32, 0..self.debug_instance_count);
             }
         }
 
         // All GPU timestamp queries are resolved at end-of-frame
-        #[cfg(feature = "gpu-profiling")]
         {
             if let (Some(qs), Some(resolve_buf), Some(readback_buf)) = (
                 self.query_set.as_ref(),
@@ -10615,7 +10618,6 @@ impl App {
         output.present();
         log::debug!("presented output for frame {}", self.frame_count);
 
-        #[cfg(feature = "gpu-profiling")]
         {
             if let Some(readback_buf) = self.query_readback_buffer.as_ref() {
                 let slice = readback_buf.slice(..((20 * 8) as u64));
@@ -10811,7 +10813,7 @@ impl App {
             let mesh_cache_mib = self.mesh_cache_bytes as f64 / (1024.0 * 1024.0);
             let mesh_budget_mib = self.mesh_cache_byte_budget() as f64 / (1024.0 * 1024.0);
             self.system_info.refresh_process(self.process_pid);
-            let (process_mem_mib, _process_vmem_mib) = self
+            let (process_mem_mib, process_vmem_mib) = self
                 .system_info
                 .process(self.process_pid)
                 .map(|p| {
@@ -10836,10 +10838,10 @@ impl App {
                     (self.fallback_instance_capacity as u64)
                         * std::mem::size_of::<VoxelInstanceRaw>() as u64,
                 );
-            let _tracked_mem_mib = tracked_bytes as f64 / (1024.0 * 1024.0);
+            let tracked_mem_mib = tracked_bytes as f64 / (1024.0 * 1024.0);
             // Tracked GPU reserved bytes collected from allocations:
             let gpu_reserved_bytes = self.gpu_buffer_bytes.saturating_add(self.gpu_texture_bytes);
-            let _gpu_reserved_mib = gpu_reserved_bytes as f64 / (1024.0 * 1024.0);
+            let gpu_reserved_mib = gpu_reserved_bytes as f64 / (1024.0 * 1024.0);
             let ready_count = self.ready_chunk_meshes.len();
             // Compute average FPS across the elapsed interval and store in last_fps for UI
             let elapsed_fps_seconds = (now - self.last_fps_print).as_secs_f64();
@@ -10852,19 +10854,11 @@ impl App {
             let jobs_in_flight = self.mesh_jobs_in_flight;
             let pending_set_count = self.pending_chunk_set.len();
             let jobs_per_sec = {
-                #[cfg(feature = "perf-counters")]
-                {
-                    self.mesh_jobs_executed.swap(0, Ordering::Relaxed)
-                }
-                #[cfg(not(feature = "perf-counters"))]
-                {
-                    0
-                }
+                self.mesh_jobs_executed.swap(0, Ordering::Relaxed)
             };
             let mesh_idle = self.pending_chunk_meshes.is_empty()
                 && self.ready_chunk_meshes.is_empty()
                 && jobs_in_flight == 0;
-            #[cfg(feature = "cpu-profiling")]
             {
                 log::info!(
                     "FPS: {:.2}, Visible items: {}, Leaf chunks: {}, Meshed chunks: {}, Pending: {}, PendingSet: {}, Ready: {}, InFlight: {}, Fallback: {}, Mesh cache: {:.1}/{:.1} MiB, Process (RSS/VM): {:.1}/{:.1} MiB, Tracked: {:.1} MiB, GPU reserved: {:.1} MiB, Cull: {:.2}ms, Group: {:.2}ms, Mesh: {:.2}ms, Instances: {:.2}ms, Draws: {}, GPU items: {}, Jobs/sec: {}, EmptyMeshes: {}, VReuse: {}, IReuse: {}, VPool: {}, IPool: {}, MeshIdle: {}, DoF Kawase: {} (iter={}, off={:.2}), MeshUp: {:.2}ms parts:(leaf:{:.2} sched:{:.2} sort:{:.2} res:{:.2} jobc:{:.2} jobn:{:.2}) vbld:{:.2} v:{:.2} i:{:.2} ins:{:.2} emit:{:.2} processed:{} limit:{}",
@@ -11010,16 +11004,6 @@ impl ApplicationHandler for App {
         _window_id: winit::window::WindowId,
         event: WindowEvent,
     ) {
-        // Let egui handle the event first
-        #[cfg(feature = "overlay")]
-        if let (Some(egui_winit), Some(window)) = (&mut self.egui_winit, &self.window) {
-            let response = egui_winit.on_window_event(window, &event);
-            if response.consumed {
-                // egui consumed the event, don't pass it to the game
-                return;
-            }
-        }
-
         match event {
             WindowEvent::CloseRequested => {
                 log::info!("Close requested");
