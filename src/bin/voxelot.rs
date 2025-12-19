@@ -1147,6 +1147,8 @@ struct App {
     ready_mesh_count: usize,
     jobs_in_flight: usize,
     jobs_per_sec_snapshot: usize,
+    gi_jobs_per_sec_snapshot: usize,
+    gi_jobs_executed_counter: usize,
     process_mem_mib: f64,
     mesh_cache_mib: f64,
     // Internal render target size (logical * render_scale). These indicate the offscreen texture size
@@ -1809,7 +1811,7 @@ impl App {
 
         for worker_index in 0..mesh_worker_count {
             let job_rx = mesh_job_rx.clone();
-            let _jobs_executed = mesh_jobs_executed.clone();
+            let jobs_executed = mesh_jobs_executed.clone();
             let result_tx = mesh_result_tx.clone();
             let palette = worker_palette.clone();
 
@@ -1842,10 +1844,7 @@ impl App {
                             break;
                         }
                         // Account for this processed mesh job
-                        #[cfg(feature = "perf-counters")]
-                        {
-                            jobs_executed.fetch_add(1, Ordering::Relaxed);
-                        }
+                        jobs_executed.fetch_add(1, Ordering::Relaxed);
                     }
                 })
                 .expect("failed to spawn mesh worker");
@@ -1993,6 +1992,8 @@ impl App {
             ready_mesh_count: 0,
             jobs_in_flight: 0,
             jobs_per_sec_snapshot: 0,
+            gi_jobs_per_sec_snapshot: 0,
+            gi_jobs_executed_counter: 0,
             process_mem_mib: 0.0,
             mesh_cache_mib: 0.0,
             mesh_budget_mib: 0.0,
@@ -7438,10 +7439,8 @@ impl App {
         let line_spacing = 0.015;
 
         let stats = [
-            format!("VISIBLE: {}", self.visible_count),
-            format!("MESHED: {}", self.meshed_chunk_count),
-            format!("PENDING: {}", self.pending_mesh_count),
-            format!("JOBS/S: {}", self.jobs_per_sec_snapshot),
+            format!("MESH JOBS/S: {}", self.jobs_per_sec_snapshot),
+            format!("GI PROBES/S: {}", self.gi_jobs_per_sec_snapshot),
             format!("MEM: {:.0} MIB", self.process_mem_mib),
         ];
 
@@ -7674,9 +7673,10 @@ impl App {
         }
 
         // Check for GI results (non-blocking, like mesh result polling)
-        if let Ok(result) = self.gi_result_rx.try_recv() {
+        while let Ok(result) = self.gi_result_rx.try_recv() {
             self.gi_probes = result.probes; // Arc clone is cheap
             self.gi_grid_origin = result.grid_origin;
+            self.gi_jobs_executed_counter += result.probes_calculated;
 
             // Upload new probes to GPU
             if let Some(buffer) = &self.gi_probe_buffer {
@@ -10838,6 +10838,7 @@ impl App {
             let jobs_per_sec = {
                 self.mesh_jobs_executed.swap(0, Ordering::Relaxed)
             };
+            let gi_jobs_per_sec = std::mem::replace(&mut self.gi_jobs_executed_counter, 0);
             let mesh_idle = self.pending_chunk_meshes.is_empty()
                 && self.ready_chunk_meshes.is_empty()
                 && jobs_in_flight == 0;
@@ -10916,6 +10917,7 @@ impl App {
             self.ready_mesh_count = ready_count;
             self.jobs_in_flight = jobs_in_flight;
             self.jobs_per_sec_snapshot = jobs_per_sec;
+            self.gi_jobs_per_sec_snapshot = gi_jobs_per_sec;
             self.process_mem_mib = process_mem_mib;
             self.mesh_cache_mib = mesh_cache_mib;
             self.mesh_budget_mib = mesh_budget_mib;
@@ -10940,15 +10942,6 @@ impl App {
                 self.gpu_buffer_items_count = 0;
             }
 
-            // Update UI overlay stats
-            self.visible_count = total_visible;
-            self.leaf_chunk_count = leaf_chunks.len();
-            self.meshed_chunk_count = draw_mesh_keys.len();
-            self.pending_mesh_count = self.pending_chunk_meshes.len();
-            self.pending_mesh_set_count = pending_set_count;
-            self.ready_mesh_count = ready_count;
-            self.jobs_in_flight = jobs_in_flight;
-            self.jobs_per_sec_snapshot = jobs_per_sec;
             self.frame_count = 0;
             self.last_fps_print = now;
         }

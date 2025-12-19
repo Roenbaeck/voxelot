@@ -17,6 +17,7 @@ pub struct GiUpdateRequest {
 pub struct GiUpdateResult {
     pub probes: Arc<Vec<GiProbe>>,
     pub grid_origin: IVec3,
+    pub probes_calculated: usize,
 }
 
 /// Compact representation of an emissive voxel within a chunk
@@ -80,7 +81,7 @@ impl GiSystem {
     }
 
     /// Update probes based on camera position and visible chunks from culling
-    pub fn update(&mut self, world: &World, palette: &Palette, camera_pos: Vec3, visible_chunks: &[IVec3]) {
+    pub fn update(&mut self, world: &World, palette: &Palette, camera_pos: Vec3, visible_chunks: &[IVec3]) -> usize {
         // 1. Determine new grid origin (centered on camera, snapped to chunk size)
         let chunk_size = 16.0;
         let cam_chunk = (camera_pos / chunk_size).floor().as_ivec3();
@@ -131,10 +132,12 @@ impl GiSystem {
         // However, we should also check if we need to load lights for new areas.
         // For simplicity, we drive light loading by probe requirements.
         
+        let mut probes_calculated = 0;
         if !self.missing_probes.is_empty() {
             // Throttle: only process up to 64 probes per update to prevent frame drops
             // Since GI runs async on background thread, this won't impact frame rate
             let probes_to_process: Vec<IVec3> = self.missing_probes.iter().take(64).cloned().collect();
+            probes_calculated = probes_to_process.len();
             
             // Remove processed probes from missing list
             self.missing_probes.drain(0..probes_to_process.len().min(self.missing_probes.len()));
@@ -417,6 +420,8 @@ impl GiSystem {
         // For now, let's skip or do a simple check.
         // self.probe_cache.retain(|k, _| (*k - center).abs().max_element() < prune_dist);
         // self.light_cache.retain(|k, _| (*k - center).abs().max_element() < prune_dist + 4);
+
+        probes_calculated
     }
 }
 
@@ -437,12 +442,13 @@ pub fn spawn_gi_worker(
         
         while let Ok(request) = request_rx.recv() {
             // Update GI system - world is already Arc, no lock needed (World is Sync)
-            gi_system.update(&world, &palette, request.camera_pos, &request.visible_chunks);
+            let probes_calculated = gi_system.update(&world, &palette, request.camera_pos, &request.visible_chunks);
             
             // Send result back to main thread (Arc clone is cheap)
             let result = GiUpdateResult {
                 probes: Arc::new(gi_system.probes.clone()),
                 grid_origin: gi_system.grid_origin,
+                probes_calculated,
             };
             
             // If send fails, main thread has dropped the receiver (shutdown)
