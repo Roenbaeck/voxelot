@@ -3,19 +3,12 @@ file = "worlds/flat_city_test.vhc"
 palette = "worlds/palette.txt"
 camera_position = [
     308.0,
-    18.415348,
-    320.0,
+    77.75388,
+    283.21426,
 ]
 water_level = 16.0
 water_visibility = 20.0
-
-# Set the starting mode when the viewer launches:
-#  - "camera" (default): start with a free camera and no pawn
-#  - "boat": spawn and enter the BoatPawn
-# In the future, this may support specific vessel names via `start_vessel`.
 start_mode = "camera"
-# Optional: name of a vessel to spawn when using a vessel-based start mode
-# start_vessel = "boat"
 
 [rendering]
 chunk_lod_distance = 800.0
@@ -33,7 +26,7 @@ macos_hdr_colorspace = "extended_linear_srgb"
 
 [atmosphere]
 fog_density = 0.003
-time_of_day = 0.5843285
+time_of_day = 0.8947547
 time_paused = false
 night_skybox_brightness = 0.02
 horizon_fade_up = 0.05

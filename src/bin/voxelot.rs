@@ -167,6 +167,11 @@ const VOXEL_FONT_BASIC: [u8; 768] = [
 ];
 const SHADOW_STRENGTH_MULTIPLIER: f32 = 1.75;
 
+// Conservative estimate of how many frames can be in-flight on the GPU.
+// We avoid evicting (and therefore reusing) megabuffer regions that were used
+// within this window to prevent visible corruption/flicker when the mesh cache is full.
+const GPU_EVICTION_SAFE_FRAMES: u64 = 3;
+
 /// Voxel instance data for GPU
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -4372,9 +4377,14 @@ impl App {
             return;
         }
 
+        let safe_before = self
+            .frame_index
+            .saturating_sub(GPU_EVICTION_SAFE_FRAMES);
+
         let mut entries: Vec<_> = self
             .envelope_mesh_cache
             .iter()
+            .filter(|(_, entry)| entry.last_used_frame <= safe_before)
             .map(|(key, entry)| (*key, entry.last_used_frame))
             .collect();
         entries.sort_by(|a, b| a.1.cmp(&b.1));
@@ -4405,6 +4415,15 @@ impl App {
                 // freed_bytes += entry_bytes;
                 // evicted += 1;
             }
+        }
+
+        if cfg!(feature = "viewer-debug") && self.envelope_mesh_cache_bytes > budget {
+            viewer_debug!(
+                "Envelope mesh cache over budget but no safe eviction candidates (usage {:.2} MiB, budget {:.2} MiB, safe window {} frames)",
+                self.envelope_mesh_cache_bytes as f64 / (1024.0 * 1024.0),
+                budget as f64 / (1024.0 * 1024.0),
+                GPU_EVICTION_SAFE_FRAMES
+            );
         }
         /*
         if evicted > 0 {
@@ -4481,10 +4500,15 @@ impl App {
     }
 
     fn force_evict_lru(&mut self) -> bool {
-        // Find oldest entry
+        // Find oldest entry that is old enough to be safe to evict.
+        let safe_before = self
+            .frame_index
+            .saturating_sub(GPU_EVICTION_SAFE_FRAMES);
+
         let oldest = self
             .mesh_cache
             .iter()
+            .filter(|(_, entry)| entry.last_used_frame <= safe_before)
             .min_by_key(|(_, entry)| entry.last_used_frame)
             .map(|(k, _)| *k);
 
@@ -4503,9 +4527,14 @@ impl App {
             return;
         }
 
+        let safe_before = self
+            .frame_index
+            .saturating_sub(GPU_EVICTION_SAFE_FRAMES);
+
         let mut entries: Vec<_> = self
             .mesh_cache
             .iter()
+            .filter(|(_, entry)| entry.last_used_frame <= safe_before)
             .map(|(key, entry)| (*key, entry.last_used_frame))
             .collect();
         entries.sort_by(|a, b| a.1.cmp(&b.1));
@@ -4531,6 +4560,15 @@ impl App {
                 evicted,
                 budget as f64 / (1024.0 * 1024.0),
                 self.mesh_cache_bytes as f64 / (1024.0 * 1024.0)
+            );
+        }
+
+        if cfg!(feature = "viewer-debug") && self.mesh_cache_bytes > budget && evicted == 0 {
+            viewer_debug!(
+                "Mesh cache over budget but no safe eviction candidates (usage {:.2} MiB, budget {:.2} MiB, safe window {} frames)",
+                self.mesh_cache_bytes as f64 / (1024.0 * 1024.0),
+                budget as f64 / (1024.0 * 1024.0),
+                GPU_EVICTION_SAFE_FRAMES
             );
         }
     }
@@ -8703,7 +8741,7 @@ impl App {
         let mut mesh_build_vb_time = std::time::Duration::ZERO;
         let mut mesh_emitters_proc_time = std::time::Duration::ZERO;
         let mesh_upload_total_start = std::time::Instant::now();
-        while processed_meshes < frame_mesh_upload_limit {
+        'mesh_upload: while processed_meshes < frame_mesh_upload_limit {
             let Some(result) = self.ready_chunk_meshes.pop_front() else {
                 break;
             };
@@ -8809,36 +8847,52 @@ impl App {
             }));
             mesh_build_vb_time += vb_build_start.elapsed();
             let vbuf_start = std::time::Instant::now();
-            let (vertex_offset, index_offset) =
-                match self.allocate_mesh_in_megabuffer(&device, &queue, &vb_local, &mesh.indices) {
-                    Ok(res) => res,
-                    Err(_) => {
-                        // Try to evict and retry
-                        let mut evicted_count = 0;
-                        loop {
-                            if !self.force_evict_lru() {
-                                panic!(
-                                    "Failed to allocate in mega-buffers: OutOfMemory (cache empty)"
-                                );
-                            }
-                            evicted_count += 1;
-                            if let Ok(res) = self.allocate_mesh_in_megabuffer(
-                                &device,
-                                &queue,
-                                &vb_local,
-                                &mesh.indices,
-                            ) {
-                                if cfg!(feature = "viewer-debug") {
-                                    viewer_debug!(
-                                        "Forced eviction of {} entries to fit new mesh",
-                                        evicted_count
-                                    );
-                                }
-                                break res;
-                            }
-                        }
+            let mut alloc = self.allocate_mesh_in_megabuffer(&device, &queue, &vb_local, &mesh.indices);
+            let mut evicted_count = 0usize;
+            while alloc.is_err() {
+                if !self.force_evict_lru() {
+                    // Cache may be non-empty, but all entries are too recent to safely
+                    // evict/reuse (GPU work may still be in-flight). Defer this upload.
+                    if cfg!(feature = "viewer-debug") {
+                        viewer_debug!(
+                            "Deferring mesh upload for ({},{},{}): megabuffer OOM and no safe eviction candidates (safe window {} frames)",
+                            key.0,
+                            key.1,
+                            key.2,
+                            GPU_EVICTION_SAFE_FRAMES
+                        );
                     }
-                };
+
+                    // Restore temp VB buffer capacity before deferring.
+                    self.vb_data_tmp = vb_local;
+
+                    // Prevent re-scheduling a duplicate CPU meshing job: mark as pending
+                    // and re-queue the finished mesh result for a later frame.
+                    self.pending_chunk_set.insert(key);
+                    self.ready_chunk_meshes.push_front(MeshResult {
+                        key,
+                        mesh,
+                        voxel_count,
+                        is_envelope,
+                    });
+
+                    // Stop processing uploads this frame; we're memory-bound.
+                    processed_meshes = frame_mesh_upload_limit;
+                    continue 'mesh_upload;
+                }
+
+                evicted_count += 1;
+                alloc = self.allocate_mesh_in_megabuffer(&device, &queue, &vb_local, &mesh.indices);
+            }
+
+            if evicted_count > 0 && cfg!(feature = "viewer-debug") {
+                viewer_debug!(
+                    "Forced eviction of {} entries to fit new mesh",
+                    evicted_count
+                );
+            }
+
+            let (vertex_offset, index_offset) = alloc.expect("allocate_mesh_in_megabuffer should succeed after eviction loop");
             mesh_upload_vbuf_time += vbuf_start.elapsed();
             let ibuf_start = std::time::Instant::now();
             mesh_upload_ibuf_time += ibuf_start.elapsed();
