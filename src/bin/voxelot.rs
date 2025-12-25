@@ -5130,6 +5130,17 @@ impl App {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // Normal G-buffer (world normals + view_z)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -5215,6 +5226,7 @@ impl App {
             Some(depth_view),
             Some(scene_color_view),
             Some(post_sampler),
+            Some(normal_view),
         ) = (
             self.device.as_ref(),
             self.water_bind_group_layout.as_ref(),
@@ -5224,6 +5236,7 @@ impl App {
             self.offscreen_depth_view.as_ref(),
             self.scene_copy_view.as_ref(), // Use scene copy texture for reflection sampling
             self.post_sampler.as_ref(),
+            self.normal_view.as_ref(),
         ) {
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Water Bind Group"),
@@ -5254,6 +5267,11 @@ impl App {
                     wgpu::BindGroupEntry {
                         binding: 5,
                         resource: wgpu::BindingResource::Sampler(post_sampler),
+                    },
+                    // Normal G-buffer
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::TextureView(normal_view),
                     },
                 ],
             });

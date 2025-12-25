@@ -139,6 +139,10 @@ var scene_color_texture: texture_2d<f32>;
 @group(1) @binding(5)
 var scene_sampler: sampler;
 
+// Normal G-buffer: RGB = world normal encoded as n*0.5+0.5, A = view_z (positive view-space depth)
+@group(1) @binding(6)
+var normal_gbuffer: texture_2d<f32>;
+
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
@@ -362,6 +366,11 @@ fn get_specular(normal: vec3<f32>, view_dir: vec3<f32>, light_dir: vec3<f32>, sm
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
+
+fn decode_world_normal(encoded: vec3<f32>) -> vec3<f32> {
+    let n = encoded * 2.0 - 1.0;
+    return normalize(select(n, vec3<f32>(0.0, 1.0, 0.0), dot(n, n) < 1e-8));
+}
 
 // Project world position to screen UV coordinates
 fn world_to_screen_uv(world_pos: vec3<f32>) -> vec3<f32> {
@@ -672,19 +681,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         ssr_color = scene_sample.rgb;
         sample_center = ssr_hit.xy;
 
-        // Try to reconstruct world position at the hit to get a reflection distance
-        let ssr_coords = vec2<i32>(vec2<f32>(dim) * ssr_hit.xy);
-        if (ssr_coords.x >= 0 && ssr_coords.x < i32(dim.x) && ssr_coords.y >= 0 && ssr_coords.y < i32(dim.y)) {
-            let hit_depth = textureLoad(depth_texture, ssr_coords, 0);
-            if (hit_depth < 0.9999) {
-                let hit_world = reconstruct_world_pos_uv(ssr_hit.xy, hit_depth);
-                reflection_distance = distance(cam_pos, hit_world);
-            }
-        }
+        // Use the G-buffer at the hit point:
+        // - A provides a stable view-space distance (view_z)
+        // - RGB provides world normal for a cheap hit validity check (reduces silhouette/false hits)
+        let hit_gbuf = textureSample(normal_gbuffer, scene_sampler, ssr_hit.xy);
+        reflection_distance = max(hit_gbuf.a, 0.0);
+        let hit_normal = decode_world_normal(hit_gbuf.rgb);
+        // Ray marches from water toward the scene along reflect_dir_raw.
+        // For a plausible hit, the surface should face the incoming ray somewhat.
+        let facing = dot(hit_normal, -reflect_dir_raw);
+        let facing_factor = smoothstep(0.0, 0.2, facing);
 
         let ssr_max_dist = 1000.0;
         let ssr_dist_fade = clamp((ssr_max_dist - dist) / ssr_max_dist, 0.0, 1.0);
-        ssr_effect = ssr_hit_valid * ssr_dist_fade;
+        ssr_effect = ssr_hit_valid * ssr_dist_fade * facing_factor;
     } else {
         // Cheap fallback for missing SSR hits: project a far point along the reflection ray,
         // sample the scene color there and use it as an approximate fill for distant reflections.
