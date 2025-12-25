@@ -683,7 +683,8 @@ struct RadianceCascadesParams {
     ray_count_base: u32,
     step_size: f32,
     max_dist: f32,
-    _pad1: [f32; 2],
+    light_probe_count: u32,
+    frame_count: u32,
 }
 
 #[repr(C)]
@@ -2551,11 +2552,12 @@ impl App {
         RadianceCascadesParams {
             screen_width: self.render_target_width as f32,
             screen_height: self.render_target_height as f32,
-            cascade_count: 4,
-            ray_count_base: 16,
+            cascade_count: 2,
+            ray_count_base: 4,
             step_size: 1.0,
             max_dist: 100.0,
-            _pad1: [0.0; 2],
+            light_probe_count: self.light_probes.len() as u32,
+            frame_count: self.frame_count as u32,
         }
     }
 
@@ -4229,6 +4231,7 @@ impl App {
             Some(depth_view),
             Some(hzb_view),
             Some(gi_probe_buf),
+            Some(light_probe_buf),
             Some(sampler),
             Some(rc_view),
             Some(rc_layout),
@@ -4239,6 +4242,7 @@ impl App {
             self.offscreen_depth_view.as_ref(),
             self.hzb_view.as_ref(),
             self.gi_probe_buffer.as_ref(),
+            self.light_probe_buffer.as_ref(),
             self.post_sampler.as_ref(),
             self.rc_texture_view.as_ref(),
             self.rc_bind_group_layout.as_ref(),
@@ -4278,6 +4282,10 @@ impl App {
                     wgpu::BindGroupEntry {
                         binding: 7,
                         resource: wgpu::BindingResource::TextureView(rc_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: light_probe_buf.as_entire_binding(),
                     },
                 ],
             }));
@@ -6786,6 +6794,16 @@ impl App {
                         access: wgpu::StorageTextureAccess::WriteOnly,
                         format: wgpu::TextureFormat::Rgba16Float,
                         view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
                     count: None,
                 },
@@ -9836,6 +9854,43 @@ impl App {
                     position: chunk_center,
                     _pad0: 0.0,
                     color_power: [total_color[0], total_color[1], total_color[2], total_power],
+                });
+            }
+        }
+
+        // Add a red light at the fore end of the boat for testing Radiance Cascades
+        if let Some(pawn) = &self.active_pawn {
+            if let Some((pos, yaw, pitch, roll)) = pawn.debug_mesh_transform() {
+                // Local position of the light: +3.2 forward (bow), +0.5 up
+                let lp = [3.2f32, 0.5f32, 0.0f32];
+
+                let cy = yaw.cos();
+                let sy = yaw.sin();
+                let cp = pitch.cos();
+                let sp = pitch.sin();
+                let cr = roll.cos();
+                let sr = roll.sin();
+
+                let r00 = cy * cp;
+                let r01 = -cy * sp * cr - sy * sr;
+                let r02 = cy * sp * sr - sy * cr;
+
+                let r10 = sp;
+                let r11 = cp * cr;
+                let r12 = -cp * sr;
+
+                let r20 = sy * cp;
+                let r21 = -sy * sp * cr + cy * sr;
+                let r22 = sy * sp * sr + cy * cr;
+
+                let wx = lp[0] * r00 + lp[1] * r01 + lp[2] * r02 + pos[0];
+                let wy = lp[0] * r10 + lp[1] * r11 + lp[2] * r12 + pos[1];
+                let wz = lp[0] * r20 + lp[1] * r21 + lp[2] * r22 + pos[2];
+
+                self.light_probes.push(LightProbe {
+                    position: [wx, wy, wz],
+                    _pad0: 0.0,
+                    color_power: [1.0, 0.0, 0.0, 1500.0], // Bright red light
                 });
             }
         }

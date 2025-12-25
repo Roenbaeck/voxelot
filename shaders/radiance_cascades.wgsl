@@ -15,12 +15,14 @@ struct RCParams {
     ray_count_base: u32,
     step_size: f32,
     max_dist: f32,
-    _pad1: vec2<f32>,
+    light_probe_count: u32,
+    frame_count: u32,
 };
 
-struct GiProbe {
-    position: vec4<f32>,
-    light_data: array<vec4<f32>, 6>,
+struct LightProbe {
+    position: vec3<f32>,
+    _pad0: f32,
+    color_power: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
@@ -28,13 +30,21 @@ struct GiProbe {
 @group(0) @binding(2) var scene_color: texture_2d<f32>;
 @group(0) @binding(3) var scene_depth: texture_depth_2d;
 @group(0) @binding(4) var hzb_texture: texture_2d<f32>;
-@group(0) @binding(5) var<storage, read> gi_probes: array<GiProbe>;
 @group(0) @binding(6) var post_sampler: sampler;
 
 // Output texture for the radiance
 @group(0) @binding(7) var output_tex: texture_storage_2d<rgba16float, write>;
 
+@group(0) @binding(8) var<storage, read> light_probes: array<LightProbe>;
+
 const PI: f32 = 3.14159265359;
+const GOLDEN_RATIO: f32 = 1.61803398875;
+
+fn hash22(p: vec2<f32>) -> vec2<f32> {
+    var p3 = fract(vec3<f32>(p.xyx) * vec3<f32>(0.1031, 0.1030, 0.0973));
+    p3 = p3 + dot(p3, p3.yzx + 33.33);
+    return fract((p3.xx + p3.yz) * p3.zy);
+}
 
 fn reconstruct_world_pos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     let ndc = vec3<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth);
@@ -42,22 +52,27 @@ fn reconstruct_world_pos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     return world_pos.xyz / world_pos.w;
 }
 
-// Samples the cubemap-like probe data
-fn sample_probe_radiance(probe_idx: u32, dir: vec3<f32>) -> vec3<f32> {
-    let probe = gi_probes[probe_idx];
-    let normal = normalize(dir);
-    
-    let w_x = normal.x * normal.x;
-    let w_y = normal.y * normal.y;
-    let w_z = normal.z * normal.z;
-    
-    let idx_x = select(0u, 1u, normal.x > 0.0);
-    let idx_y = select(2u, 3u, normal.y > 0.0);
-    let idx_z = select(4u, 5u, normal.z > 0.0);
-    
-    return probe.light_data[idx_x].rgb * w_x + 
-           probe.light_data[idx_y].rgb * w_y + 
-           probe.light_data[idx_z].rgb * w_z;
+fn sample_dynamic_lights(world_pos: vec3<f32>, ray_dir: vec3<f32>, max_dist: f32) -> vec3<f32> {
+    var light_acc = vec3<f32>(0.0);
+    for (var i = 0u; i < params.light_probe_count; i++) {
+        let probe = light_probes[i];
+        let to_light = probe.position - world_pos;
+        let dist_sq = dot(to_light, to_light);
+        
+        if (dist_sq > 0.001 && dist_sq < max_dist * max_dist) {
+            let dist = sqrt(dist_sq);
+            let dir_to_light = to_light / dist;
+            let alignment = dot(ray_dir, dir_to_light);
+            
+            // Smooth falloff to fix "bokeh" circles and handle low ray counts
+            let smooth_alignment = smoothstep(0.7, 1.0, alignment);
+            if (smooth_alignment > 0.0) {
+                let attenuation = (probe.color_power.a * 0.1) / (dist_sq + 1.0);
+                light_acc += probe.color_power.rgb * attenuation * smooth_alignment;
+            }
+        }
+    }
+    return light_acc;
 }
 
 @compute @workgroup_size(8, 8)
@@ -77,6 +92,28 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     let world_pos = reconstruct_world_pos(uv, depth);
     
+    // Early exit: Distance culling for dynamic lights
+    // If no dynamic lights are within range, we don't need to run the expensive ray loops.
+    var near_light = false;
+    for (var i = 0u; i < params.light_probe_count; i++) {
+        let probe_pos = light_probes[i].position;
+        let dist_sq = dot(probe_pos - world_pos, probe_pos - world_pos);
+        // Use a reasonable influence radius (e.g., 48 units)
+        if (dist_sq < 2304.0) { // 48 * 48
+            near_light = true;
+            break;
+        }
+    }
+
+    if (!near_light) {
+        textureStore(output_tex, vec2<i32>(id.xy), vec4<f32>(0.0));
+        return;
+    }
+
+    // Per-pixel jitter to break up aliasing patterns
+    let jitter = hash22(uv * 1000.0 + f32(params.frame_count % 1000u));
+    let rotation_offset = jitter.x * 2.0 * PI;
+
     // Radiance Cascades Merging Logic
     // In a full implementation, this would be multiple passes.
     // Here we implement a single-pass version that leverages the probe grid.
@@ -92,15 +129,16 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         var cascade_radiance = vec3<f32>(0.0);
         
         for (var r = 0u; r < ray_count; r++) {
-            // Fibonacci sphere or similar for 3D ray distribution
-            let phi = acos(1.0 - 2.0 * (f32(r) + 0.5) / f32(ray_count));
-            let theta = PI * (1.0 + sqrt(5.0)) * (f32(r) + 0.5);
-            let ray_dir = vec3<f32>(sin(phi) * cos(theta), sin(phi) * sin(theta), cos(phi));
+            // Optimized Fibonacci sphere distribution with per-pixel rotation jitter
+            let z = 1.0 - 2.0 * (f32(r) + 0.5) / f32(ray_count);
+            let radius = sqrt(max(0.0, 1.0 - z * z));
+            let theta = 2.0 * PI * GOLDEN_RATIO * f32(r) + rotation_offset;
+            let ray_dir = vec3<f32>(radius * cos(theta), radius * sin(theta), z);
             
-            // Trace ray against HZB for local occlusion
-            // (Simplified for this example)
-            let hit_radiance = sample_probe_radiance(0u, ray_dir); // Sample nearest probe for now
-            cascade_radiance += hit_radiance;
+            // Trace ray against dynamic lights
+            let dynamic_radiance = sample_dynamic_lights(world_pos, ray_dir, cascade_dist);
+            
+            cascade_radiance += dynamic_radiance;
         }
         
         total_radiance += (cascade_radiance / f32(ray_count)) / f32(cascade_count);

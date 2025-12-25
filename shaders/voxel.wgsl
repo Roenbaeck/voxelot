@@ -194,8 +194,8 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
         
         indirect_light += normalized_color * attenuation;
     }
-    // Keep it very subtle - max 3% brightness from emissive lights
-    indirect_light = min(indirect_light, vec3<f32>(0.03, 0.03, 0.03));
+    // Keep it subtle but visible for testing (increased from 0.03)
+    indirect_light = min(indirect_light, vec3<f32>(0.5, 0.5, 0.5));
     
     let lighting = ambient + sun_contribution + moon_light + indirect_light;
     
@@ -385,8 +385,8 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
         
         indirect_light += normalized_color * attenuation;
     }
-    // Keep it very subtle - max 3% brightness from emissive lights
-    indirect_light = min(indirect_light, vec3<f32>(0.03, 0.03, 0.03));
+    // Keep it subtle but visible for testing (increased from 0.03)
+    indirect_light = min(indirect_light, vec3<f32>(0.5, 0.5, 0.5));
     
     let lighting = ambient + sun_contribution + moon_light + indirect_light;
     
