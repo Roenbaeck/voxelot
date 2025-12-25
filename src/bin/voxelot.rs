@@ -11157,77 +11157,94 @@ impl App {
                         // 2. SSR (9)
                         // 3. Water (11)
                         // 4. DoF CoC+Kawase+Combine (5)
-                        // 5. SSILVB (13)
-                        // 6. Bloom (17)
-                        // 7. Post (19)
+                        // 5. Radiance Cascades (21)
+                        // 6. SSILVB (13)
+                        // 7. Bloom (17)
+                        // 8. Post (19)
                         // Cull (7) and HZB (3) are in a separate encoder submitted earlier.
 
-                        let iso_shadow = shadow_ms;
-                        let iso_scene = if scene_ms > 0.0 {
-                            (scene_ms - shadow_ms).max(0.0)
-                        } else {
-                            0.0
-                        };
-                        let iso_ssr = if ssr_ms > 0.0 {
-                            (ssr_ms - scene_ms).max(0.0)
-                        } else {
-                            0.0
-                        };
-                        let iso_water = if water_ms > 0.0 {
-                            (water_ms - scene_ms.max(ssr_ms)).max(0.0)
-                        } else {
-                            0.0
-                        };
-                        let iso_dof = if dof_ms > 0.0 {
-                            (dof_ms - scene_ms.max(ssr_ms).max(water_ms)).max(0.0)
-                        } else {
-                            0.0
-                        };
-                        let iso_rc = if rc_ms > 0.0 {
-                            (rc_ms - scene_ms.max(ssr_ms).max(water_ms).max(dof_ms)).max(0.0)
-                        } else {
-                            0.0
-                        };
-                        let iso_ssilvb = if ssilvb_ms > 0.0 {
-                            (ssilvb_ms
-                                - scene_ms
-                                    .max(ssr_ms)
-                                    .max(water_ms)
-                                    .max(dof_ms)
-                                    .max(rc_ms))
-                            .max(0.0)
-                        } else {
-                            0.0
-                        };
-                        let iso_bloom = if bloom_ms > 0.0 {
-                            (bloom_ms
-                                - scene_ms
-                                    .max(ssr_ms)
-                                    .max(water_ms)
-                                    .max(dof_ms)
-                                    .max(rc_ms)
-                                    .max(ssilvb_ms))
-                            .max(0.0)
-                        } else {
-                            0.0
-                        };
-                        let iso_post = if post_ms > 0.0 {
-                            (post_ms
-                                - scene_ms
-                                    .max(ssr_ms)
-                                    .max(water_ms)
-                                    .max(dof_ms)
-                                    .max(rc_ms)
-                                    .max(ssilvb_ms)
-                                    .max(bloom_ms))
-                            .max(0.0)
+                        let mut last_end_ms = 0.0;
+
+                        let iso_shadow = if shadow_ms > 0.0 {
+                            let d = (shadow_ms - last_end_ms).max(0.0);
+                            last_end_ms = shadow_ms;
+                            d
                         } else {
                             0.0
                         };
 
-                        let hzb_iso = hzb_copy_ms;
+                        let iso_scene = if scene_ms > 0.0 {
+                            let d = (scene_ms - last_end_ms).max(0.0);
+                            last_end_ms = scene_ms;
+                            d
+                        } else {
+                            0.0
+                        };
+
+                        let iso_ssr = if ssr_ms > 0.0 {
+                            let d = (ssr_ms - last_end_ms).max(0.0);
+                            last_end_ms = ssr_ms;
+                            d
+                        } else {
+                            0.0
+                        };
+
+                        let iso_water = if water_ms > 0.0 {
+                            let d = (water_ms - last_end_ms).max(0.0);
+                            last_end_ms = water_ms;
+                            d
+                        } else {
+                            0.0
+                        };
+
+                        let iso_dof = if dof_ms > 0.0 {
+                            let d = (dof_ms - last_end_ms).max(0.0);
+                            last_end_ms = dof_ms;
+                            d
+                        } else {
+                            0.0
+                        };
+
+                        let iso_rc = if rc_ms > 0.0 {
+                            let d = (rc_ms - last_end_ms).max(0.0);
+                            last_end_ms = rc_ms;
+                            d
+                        } else {
+                            0.0
+                        };
+
+                        let iso_ssilvb = if ssilvb_ms > 0.0 {
+                            let d = (ssilvb_ms - last_end_ms).max(0.0);
+                            last_end_ms = ssilvb_ms;
+                            d
+                        } else {
+                            0.0
+                        };
+
+                        let iso_bloom = if bloom_ms > 0.0 {
+                            let d = (bloom_ms - last_end_ms).max(0.0);
+                            last_end_ms = bloom_ms;
+                            d
+                        } else {
+                            0.0
+                        };
+
+                        let iso_post = if post_ms > 0.0 {
+                            (post_ms - last_end_ms).max(0.0)
+                        } else {
+                            0.0
+                        };
+
+                        let mut last_pre_ms = 0.0;
+                        let hzb_iso = if hzb_copy_ms > 0.0 {
+                            let d = (hzb_copy_ms - last_pre_ms).max(0.0);
+                            last_pre_ms = hzb_copy_ms;
+                            d
+                        } else {
+                            0.0
+                        };
                         let cull_iso = if gpu_cull_ms > 0.0 {
-                            (gpu_cull_ms - hzb_copy_ms).max(0.0)
+                            (gpu_cull_ms - last_pre_ms).max(0.0)
                         } else {
                             0.0
                         };

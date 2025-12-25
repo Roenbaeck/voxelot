@@ -2,9 +2,9 @@
 file = "worlds/flat_city_test.vhc"
 palette = "worlds/palette.txt"
 camera_position = [
-    635.0235,
-    47.51129,
-    291.34567,
+    588.591,
+    47.521984,
+    325.0959,
 ]
 water_level = 45.0
 water_visibility = 15.0
@@ -85,7 +85,7 @@ grid_dims = [
 ]
 
 [effects.ssr]
-enabled = false
+enabled = true
 max_steps = 32
 max_binary_steps = 4
 step_size = 0.5
