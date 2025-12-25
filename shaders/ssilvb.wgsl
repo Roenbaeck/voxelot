@@ -28,6 +28,7 @@ struct GiProbe {
 @group(0) @binding(1) var depth_tex: texture_depth_2d;
 @group(0) @binding(2) var post_sampler: sampler;
 @group(0) @binding(3) var<storage, read> gi_probes: array<GiProbe>;
+@group(0) @binding(4) var normal_tex: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -59,6 +60,14 @@ fn reconstruct_position(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     let ndc = vec4<f32>(ndc_xy, ndc_z, 1.0);
     let view_pos = ssao.inverse_projection * ndc;
     return view_pos.xyz / view_pos.w;
+}
+
+// Reconstruct view-space position from linear depth
+fn reconstruct_position_linear(uv: vec2<f32>, linear_depth: f32) -> vec3<f32> {
+    let ndc_xy = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    let x = ndc_xy.x * linear_depth * ssao.inverse_projection[0][0];
+    let y = ndc_xy.y * linear_depth * ssao.inverse_projection[1][1];
+    return vec3<f32>(x, y, -linear_depth);
 }
 
 // Fetch depth directly from texture
@@ -215,22 +224,37 @@ fn sample_grid_irradiance(world_pos: vec3<f32>, normal: vec3<f32>, camera_pos: v
 
 @fragment
 fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    let depth = textureSample(depth_tex, post_sampler, uv);
-    if (depth >= 1.0) {
+    // Sample G-buffer normal and linear depth
+    let normal_sample = textureSample(normal_tex, post_sampler, uv);
+    let linear_depth = normal_sample.w;
+    
+    // If linear depth is 0, it's likely the skybox or background
+    if (linear_depth <= 0.0) {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
 
-    let view_pos = reconstruct_position(uv, depth);
-    let normal = compute_normal_from_depth(uv);
+    let view_pos = reconstruct_position_linear(uv, linear_depth);
+    // Sample world-space normal from G-buffer and decode from [0,1] to [-1,1]
+    let world_normal = normalize(normal_sample.rgb * 2.0 - 1.0);
+    // Transform world normal to view-space for GTAO calculations
+    // For orthogonal matrices: view_matrix = transpose(inverse_view)
+    // So view_space_normal = transpose(inverse_view) * world_normal
+    // But we can use inverse_view directly as columns form an orthonormal basis
+    // Actually: for rotation R, R^-1 = R^T, so (R^-1)^T = R
+    // inverse_view stores view->world, so transpose gives world->view
+    let view_mat_rot = transpose(mat3x3<f32>(
+        ssao.inverse_view[0].xyz,
+        ssao.inverse_view[1].xyz,
+        ssao.inverse_view[2].xyz
+    ));
+    let normal = normalize(view_mat_rot * world_normal);
     let view_vec = normalize(-view_pos); // View vector pointing to camera (0,0,0) in view space
 
     // Reconstruct world position
     let world_pos_4 = ssao.inverse_view * vec4<f32>(view_pos, 1.0);
     let world_pos = world_pos_4.xyz / world_pos_4.w;
     
-    // Reconstruct world normal
-    // inverse_view is view-to-world. Normal is direction, so w=0.
-    let world_normal = normalize((ssao.inverse_view * vec4<f32>(normal, 0.0)).xyz);
+    // world_normal is already available from G-buffer (sampled at line 227)
 
     let screen_size = vec2<f32>(ssao.screen_width, ssao.screen_height);
     let frag_coord = uv * screen_size;
@@ -285,8 +309,12 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
                 
                 if (sample_uv.x < 0.0 || sample_uv.x > 1.0 || sample_uv.y < 0.0 || sample_uv.y > 1.0) { break; }
                 
-                let sample_depth = textureSampleLevel(depth_tex, post_sampler, sample_uv, 0);
-                let sample_pos = reconstruct_position(sample_uv, sample_depth);
+                let sample_normal = textureSampleLevel(normal_tex, post_sampler, sample_uv, 0);
+                let sample_linear_depth = sample_normal.w;
+                
+                if (sample_linear_depth <= 0.0) { continue; }
+                
+                let sample_pos = reconstruct_position_linear(sample_uv, sample_linear_depth);
                 
                 let delta = sample_pos - view_pos;
                 let dist_sq = dot(delta, delta);

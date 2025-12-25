@@ -47,6 +47,7 @@ struct VertexOutputInstanced {
     @location(3) light_space_pos: vec4<f32>,
     @location(4) world_pos: vec3<f32>,
     @location(5) ao: f32,
+    @location(6) view_z: f32,  // Linear depth for G-buffer
 }
 
 struct VertexOutputMesh {
@@ -56,6 +57,7 @@ struct VertexOutputMesh {
     @location(2) emissive: vec4<f32>,
     @location(3) light_space_pos: vec4<f32>,
     @location(4) world_pos: vec3<f32>,
+    @location(5) view_z: f32,  // Linear depth for G-buffer
 }
 
 struct ShadowVertexOutput {
@@ -137,6 +139,8 @@ fn vs_main(
         output.ao = instance_ao;
 
     output.emissive = instance_emissive;
+    // For perspective projection, clip.w = -view_z, so clip.w is positive view distance
+    output.view_z = output.position.w;
     
     return output;
 }
@@ -144,6 +148,7 @@ fn vs_main(
 struct FragmentOutput {
     @location(0) color: vec4<f32>,
     @location(1) emissive: vec4<f32>,
+    @location(2) normal: vec4<f32>,
 }
 
 @fragment
@@ -312,6 +317,9 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     // Scale emissive by strength and apply fades so it doesn't pop in/out
     let final_emissive = input.emissive.rgb * input.emissive.a * (1.0 - env_fade_factor) * alpha;
     out.emissive = vec4<f32>(final_emissive, input.emissive.a);
+    // Encode world-space normal: map [-1,1] to [0,1] for storage
+    // Store linear depth in W channel for SSILVB/GTAO
+    out.normal = vec4<f32>(input.normal * 0.5 + 0.5, input.view_z);
     return out;
 }
 
@@ -331,6 +339,8 @@ fn vs_mesh(
     out.normal = normal;
     out.color = color;
     out.emissive = emissive;
+    // For perspective projection, clip.w = -view_z, so clip.w is positive view distance
+    out.view_z = out.position.w;
     return out;
 }
 
@@ -490,6 +500,9 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     // Scale emissive by strength and apply fades so it doesn't pop in/out
     let final_emissive = input.emissive.rgb * input.emissive.a * (1.0 - env_fade_factor) * alpha;
     out.emissive = vec4<f32>(final_emissive, input.emissive.a);
+    // Encode world-space normal: map [-1,1] to [0,1] for storage
+    // Store linear depth in W channel for SSILVB/GTAO
+    out.normal = vec4<f32>(input.normal * 0.5 + 0.5, input.view_z);
     return out;
 }
 

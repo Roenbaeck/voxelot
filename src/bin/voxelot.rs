@@ -1469,6 +1469,10 @@ struct App {
     emissive_texture: Option<wgpu::Texture>,
     emissive_view: Option<wgpu::TextureView>,
     emissive_texture_bytes: u64,
+    // G-Buffer normal texture (world-space normals for SSILVB/SSR)
+    normal_texture: Option<wgpu::Texture>,
+    normal_view: Option<wgpu::TextureView>,
+    normal_texture_bytes: u64,
     // Path to loaded config file (user provided or default)
     config_path: String,
     // Profiling helper (CPU scopes). No-op if compiled without `cpu-profiling` feature.
@@ -2053,6 +2057,9 @@ impl App {
             emissive_texture: None,
             emissive_view: None,
             emissive_texture_bytes: 0,
+            normal_texture: None,
+            normal_view: None,
+            normal_texture_bytes: 0,
             config_path: config_path.to_string(),
             profiler: voxelot::profiling::Profiler::new(),
             timestamp_period_ns: 0.0,
@@ -2796,6 +2803,9 @@ impl App {
             emissive_texture_loc,
             emissive_view_loc,
             emissive_bytes,
+            normal_texture_loc,
+            normal_view_loc,
+            normal_bytes,
         ) =
             {
                 let (Some(device), Some(config)) = (self.device.as_ref(), self.config.as_ref())
@@ -3133,6 +3143,32 @@ impl App {
                     1,
                 );
 
+                // G-Buffer normal texture (world-space normals for SSILVB/SSR)
+                let normal_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("Normal G-Buffer Texture"),
+                    size: wgpu::Extent3d {
+                        width: target_width,
+                        height: target_height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                });
+                let normal_view_loc =
+                    normal_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
+                let normal_bytes = App::compute_texture_bytes(
+                    wgpu::TextureFormat::Rgba16Float,
+                    target_width,
+                    target_height,
+                    1,
+                    1,
+                );
+
                 // Collect locals for assignment outside the scope
                 (
                     color_texture_loc,
@@ -3172,6 +3208,9 @@ impl App {
                     emissive_texture_loc,
                     emissive_view_loc,
                     emissive_bytes,
+                    normal_texture_loc,
+                    normal_view_loc,
+                    normal_bytes,
                 )
             };
 
@@ -3192,6 +3231,13 @@ impl App {
         App::replace_texture_bytes_static(
             &mut self.emissive_texture_bytes,
             emissive_bytes,
+            &mut self.gpu_texture_bytes,
+        );
+        self.normal_texture = Some(normal_texture_loc);
+        self.normal_view = Some(normal_view_loc);
+        App::replace_texture_bytes_static(
+            &mut self.normal_texture_bytes,
+            normal_bytes,
             &mut self.gpu_texture_bytes,
         );
         // Assign and track other created textures
@@ -3879,11 +3925,18 @@ impl App {
             }
 
             // SSAO bind group uses uniform 0, offscreen depth (1), and post sampler (2)
-            if let (Some(ssao_ubo), Some(depth_view), Some(psampler), Some(gi_probe_buf)) = (
+            if let (
+                Some(ssao_ubo),
+                Some(depth_view),
+                Some(psampler),
+                Some(gi_probe_buf),
+                Some(normal_view),
+            ) = (
                 self.ssilvb_uniform_buffer.as_ref(),
                 self.offscreen_depth_view.as_ref(),
                 self.post_sampler.as_ref(),
                 self.gi_probe_buffer.as_ref(),
+                self.normal_view.as_ref(),
             ) {
                 self.ssilvb_bind_group =
                     Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3905,6 +3958,10 @@ impl App {
                             wgpu::BindGroupEntry {
                                 binding: 3,
                                 resource: gi_probe_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: wgpu::BindingResource::TextureView(normal_view),
                             },
                         ],
                     }));
@@ -4377,9 +4434,7 @@ impl App {
             return;
         }
 
-        let safe_before = self
-            .frame_index
-            .saturating_sub(GPU_EVICTION_SAFE_FRAMES);
+        let safe_before = self.frame_index.saturating_sub(GPU_EVICTION_SAFE_FRAMES);
 
         let mut entries: Vec<_> = self
             .envelope_mesh_cache
@@ -4501,9 +4556,7 @@ impl App {
 
     fn force_evict_lru(&mut self) -> bool {
         // Find oldest entry that is old enough to be safe to evict.
-        let safe_before = self
-            .frame_index
-            .saturating_sub(GPU_EVICTION_SAFE_FRAMES);
+        let safe_before = self.frame_index.saturating_sub(GPU_EVICTION_SAFE_FRAMES);
 
         let oldest = self
             .mesh_cache
@@ -4527,9 +4580,7 @@ impl App {
             return;
         }
 
-        let safe_before = self
-            .frame_index
-            .saturating_sub(GPU_EVICTION_SAFE_FRAMES);
+        let safe_before = self.frame_index.saturating_sub(GPU_EVICTION_SAFE_FRAMES);
 
         let mut entries: Vec<_> = self
             .mesh_cache
@@ -4716,6 +4767,11 @@ impl App {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 targets: &[
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
                     Some(wgpu::ColorTargetState {
                         format: wgpu::TextureFormat::Rgba16Float,
                         blend: None,
@@ -5893,6 +5949,11 @@ impl App {
                         blend: Some(wgpu::BlendState::REPLACE),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
                 ],
                 compilation_options: Default::default(),
             }),
@@ -6004,6 +6065,11 @@ impl App {
                 module: &shader,
                 entry_point: Some("fs_mesh"),
                 targets: &[
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
                     Some(wgpu::ColorTargetState {
                         format: wgpu::TextureFormat::Rgba16Float,
                         blend: Some(wgpu::BlendState::REPLACE),
@@ -6505,6 +6571,17 @@ impl App {
                             ty: wgpu::BufferBindingType::Storage { read_only: true },
                             has_dynamic_offset: false,
                             min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // G-Buffer normal texture
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
                         },
                         count: None,
                     },
@@ -7437,9 +7514,12 @@ impl App {
         // Position text in the top-left corner
         // Distance 0.5 to allow more room for offsets without clipping
         let ui_origin = [
-            cam_pos[0] + cam_forward[0] * 0.5 - cam_right[0] * 0.45 * overscan + cam_up[0] * 0.3 * overscan,
-            cam_pos[1] + cam_forward[1] * 0.5 - cam_right[1] * 0.45 * overscan + cam_up[1] * 0.3 * overscan,
-            cam_pos[2] + cam_forward[2] * 0.5 - cam_right[2] * 0.45 * overscan + cam_up[2] * 0.3 * overscan,
+            cam_pos[0] + cam_forward[0] * 0.5 - cam_right[0] * 0.45 * overscan
+                + cam_up[0] * 0.3 * overscan,
+            cam_pos[1] + cam_forward[1] * 0.5 - cam_right[1] * 0.45 * overscan
+                + cam_up[1] * 0.3 * overscan,
+            cam_pos[2] + cam_forward[2] * 0.5 - cam_right[2] * 0.45 * overscan
+                + cam_up[2] * 0.3 * overscan,
         ];
 
         let char_size = 0.0012 * overscan;
@@ -7559,7 +7639,7 @@ impl App {
         if draw_background {
             let text_len = text.len();
             let total_width = text_len as f32 * 9.0;
-            
+
             // Render background for the entire line using a grid of small voxels.
             // We use small blocks (2x2 pixels) to maintain the billboarding effect
             // without needing a voxel for every single pixel.
@@ -8847,7 +8927,8 @@ impl App {
             }));
             mesh_build_vb_time += vb_build_start.elapsed();
             let vbuf_start = std::time::Instant::now();
-            let mut alloc = self.allocate_mesh_in_megabuffer(&device, &queue, &vb_local, &mesh.indices);
+            let mut alloc =
+                self.allocate_mesh_in_megabuffer(&device, &queue, &vb_local, &mesh.indices);
             let mut evicted_count = 0usize;
             while alloc.is_err() {
                 if !self.force_evict_lru() {
@@ -8892,7 +8973,8 @@ impl App {
                 );
             }
 
-            let (vertex_offset, index_offset) = alloc.expect("allocate_mesh_in_megabuffer should succeed after eviction loop");
+            let (vertex_offset, index_offset) =
+                alloc.expect("allocate_mesh_in_megabuffer should succeed after eviction loop");
             mesh_upload_vbuf_time += vbuf_start.elapsed();
             let ibuf_start = std::time::Instant::now();
             mesh_upload_ibuf_time += ibuf_start.elapsed();
@@ -9822,6 +9904,16 @@ impl App {
                         },
                         depth_slice: None,
                     }),
+                    // G-Buffer normal texture (world-space normals)
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: self.normal_view.as_ref().unwrap(),
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    }),
                 ],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: offscreen_depth_view,
@@ -10330,7 +10422,8 @@ impl App {
                                     wgpu::RenderPassTimestampWrites {
                                         query_set: qs,
                                         beginning_of_pass_write_index: Some(12),
-                                        end_of_pass_write_index: if self.ssao_settings.blur_enabled {
+                                        end_of_pass_write_index: if self.ssao_settings.blur_enabled
+                                        {
                                             None
                                         } else {
                                             Some(13)
@@ -10601,12 +10694,11 @@ impl App {
                 ) {
                     composite_pass.set_pipeline(pipeline);
                     composite_pass.set_bind_group(0, bind_group, &[]);
-                    composite_pass.set_vertex_buffer(
-                        0,
-                        self.cube_vertex_buffer.as_ref().unwrap().slice(..),
-                    );
+                    composite_pass
+                        .set_vertex_buffer(0, self.cube_vertex_buffer.as_ref().unwrap().slice(..));
                     composite_pass.set_vertex_buffer(1, buf.slice(..));
-                    composite_pass.draw(0..CUBE_VERTICES.len() as u32, 0..self.debug_instance_count);
+                    composite_pass
+                        .draw(0..CUBE_VERTICES.len() as u32, 0..self.debug_instance_count);
                 }
             }
         } else {
@@ -10874,9 +10966,7 @@ impl App {
             self.last_fps = avg_fps.round() as u32;
             let jobs_in_flight = self.mesh_jobs_in_flight;
             let pending_set_count = self.pending_chunk_set.len();
-            let jobs_per_sec = {
-                self.mesh_jobs_executed.swap(0, Ordering::Relaxed)
-            };
+            let jobs_per_sec = { self.mesh_jobs_executed.swap(0, Ordering::Relaxed) };
             let gi_jobs_per_sec = std::mem::replace(&mut self.gi_jobs_executed_counter, 0);
             let mesh_idle = self.pending_chunk_meshes.is_empty()
                 && self.ready_chunk_meshes.is_empty()
