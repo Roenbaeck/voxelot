@@ -45,6 +45,11 @@ const GOLDEN_RATIO: f32 = 1.61803398875;
 // This replaces the previous low-ray-count Monte Carlo integration (which produced visible speckle).
 const AVG_SMOOTH_ALIGNMENT: f32 = 0.075;
 
+// Match CPU-side probe culling radius (see voxelot.rs LIGHT_RADIUS_SQ).
+const LIGHT_INFLUENCE_RADIUS: f32 = 48.0;
+// Smoothly fade RC on/off near the influence edge to avoid popping.
+const LIGHT_FADE_RANGE: f32 = 10.0;
+
 fn reconstruct_world_pos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     let ndc = vec3<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth);
     let world_pos = camera.inverse_view_proj * vec4<f32>(ndc, 1.0);
@@ -85,20 +90,19 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     let world_pos = reconstruct_world_pos(uv, depth);
     
-    // Early exit: Distance culling for dynamic lights
-    // If no dynamic lights are within range, we don't need to run the expensive ray loops.
-    var near_light = false;
+    // Distance culling + smooth fade for dynamic lights.
+    // We fade in near the probe influence edge to avoid abrupt popping.
+    var nearest_dist_sq = 1e30;
     for (var i = 0u; i < params.light_probe_count; i++) {
         let probe_pos = light_probes[i].position;
-        let dist_sq = dot(probe_pos - world_pos, probe_pos - world_pos);
-        // Use a reasonable influence radius (e.g., 48 units)
-        if (dist_sq < 2304.0) { // 48 * 48
-            near_light = true;
-            break;
-        }
+        let d = probe_pos - world_pos;
+        let dist_sq = dot(d, d);
+        nearest_dist_sq = min(nearest_dist_sq, dist_sq);
     }
 
-    if (!near_light) {
+    let nearest_dist = sqrt(max(0.0, nearest_dist_sq));
+    let fade = 1.0 - smoothstep(LIGHT_INFLUENCE_RADIUS - LIGHT_FADE_RANGE, LIGHT_INFLUENCE_RADIUS, nearest_dist);
+    if (fade <= 0.0) {
         textureStore(output_tex, vec2<i32>(id.xy), vec4<f32>(0.0));
         return;
     }
@@ -118,6 +122,6 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         total_radiance += cascade_radiance / f32(cascade_count);
     }
     
-    textureStore(output_tex, vec2<i32>(id.xy), vec4<f32>(total_radiance, 1.0));
+    textureStore(output_tex, vec2<i32>(id.xy), vec4<f32>(total_radiance * fade, 1.0));
 }
 

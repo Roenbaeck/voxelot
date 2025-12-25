@@ -2574,7 +2574,17 @@ impl App {
             self.camera_controller.camera.far,
         );
 
-        let view_proj = proj * view;
+        // Match wgpu's NDC depth range (0..1). glam's perspective matrices are OpenGL-style
+        // (depth -1..1), so apply the same correction used elsewhere (e.g. SSAO unprojection).
+        const OPENGL_TO_WGPU_MATRIX: glam::Mat4 = glam::Mat4::from_cols_array(&[
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 0.5, 0.0,
+            0.0, 0.0, 0.5, 1.0,
+        ]);
+        let corrected_proj = OPENGL_TO_WGPU_MATRIX * proj;
+
+        let view_proj = corrected_proj * view;
         let inverse_view_proj = view_proj.inverse();
 
         RadianceCascadesCamera {
@@ -9810,55 +9820,14 @@ impl App {
             sun_shadow_strength * sun_fade + moon_shadow_strength_base * (1.0 - sun_fade);
         let shadow_texel = 1.0 / self.shadow_map_size as f32;
 
-        // Collect light probes from nearby emissive chunks (reuse vector)
+        // Radiance Cascades: only feed *mobile/dynamic* lights.
+        // Static emissive voxels are handled by the CPU GI probe system (SSILVB), and including
+        // chunk emissives here caused non-physical highlights and camera-distance popping due to
+        // hard culling at the RC probe radius.
         self.light_probes.clear();
         self.light_probes.reserve(32);
         const MAX_LIGHT_PROBES: usize = 32;
-        const LIGHT_RADIUS_SQ: f32 = 48.0 * 48.0; // Only consider chunks within 48 units (3 chunks)
-        const MIN_EMISSIVE_POWER: f32 = 0.5; // Ignore weak emitters
-
-        // Collect emitters from chunks with cached meshes
-        for (chunk_key, emitters) in &self.chunk_emitters {
-            if self.light_probes.len() >= MAX_LIGHT_PROBES {
-                break;
-            }
-
-            // Check if chunk is reasonably close to camera
-            let chunk_center = [
-                chunk_key.0 as f32 + 8.0,
-                chunk_key.1 as f32 + 8.0,
-                chunk_key.2 as f32 + 8.0,
-            ];
-            let dx = chunk_center[0] - camera_pos[0];
-            let dy = chunk_center[1] - camera_pos[1];
-            let dz = chunk_center[2] - camera_pos[2];
-            let dist_sq = dx * dx + dy * dy + dz * dz;
-
-            if dist_sq > LIGHT_RADIUS_SQ {
-                continue;
-            }
-
-            // Aggregate all emitters in this chunk into one light probe
-            let mut total_color = [0.0f32; 3];
-            let mut total_power = 0.0f32;
-
-            for emitter in emitters {
-                total_color[0] += emitter.color[0] * emitter.intensity;
-                total_color[1] += emitter.color[1] * emitter.intensity;
-                total_color[2] += emitter.color[2] * emitter.intensity;
-                total_power += emitter.intensity;
-            }
-
-            if total_power > MIN_EMISSIVE_POWER {
-                self.light_probes.push(LightProbe {
-                    position: chunk_center,
-                    _pad0: 0.0,
-                    color_power: [total_color[0], total_color[1], total_color[2], total_power],
-                });
-            }
-        }
-
-        // Add a red light at the fore end of the boat for testing Radiance Cascades
+        // Add a red light at the fore end of the boat (mobile light)
         if let Some(pawn) = &self.active_pawn {
             if let Some((pos, yaw, pitch, roll)) = pawn.debug_mesh_transform() {
                 // Local position of the light: +3.2 forward (bow), +0.5 up
