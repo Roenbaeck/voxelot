@@ -40,11 +40,10 @@ struct LightProbe {
 const PI: f32 = 3.14159265359;
 const GOLDEN_RATIO: f32 = 1.61803398875;
 
-fn hash22(p: vec2<f32>) -> vec2<f32> {
-    var p3 = fract(vec3<f32>(p.xyx) * vec3<f32>(0.1031, 0.1030, 0.0973));
-    p3 = p3 + dot(p3, p3.yzx + 33.33);
-    return fract((p3.xx + p3.yz) * p3.zy);
-}
+// Average value of: smoothstep(0.7, 1.0, dot(ray_dir, dir_to_light))
+// when ray_dir is uniformly distributed on the sphere.
+// This replaces the previous low-ray-count Monte Carlo integration (which produced visible speckle).
+const AVG_SMOOTH_ALIGNMENT: f32 = 0.075;
 
 fn reconstruct_world_pos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     let ndc = vec3<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth);
@@ -52,7 +51,7 @@ fn reconstruct_world_pos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     return world_pos.xyz / world_pos.w;
 }
 
-fn sample_dynamic_lights(world_pos: vec3<f32>, ray_dir: vec3<f32>, max_dist: f32) -> vec3<f32> {
+fn sample_dynamic_lights_avg(world_pos: vec3<f32>, max_dist: f32) -> vec3<f32> {
     var light_acc = vec3<f32>(0.0);
     for (var i = 0u; i < params.light_probe_count; i++) {
         let probe = light_probes[i];
@@ -60,16 +59,10 @@ fn sample_dynamic_lights(world_pos: vec3<f32>, ray_dir: vec3<f32>, max_dist: f32
         let dist_sq = dot(to_light, to_light);
         
         if (dist_sq > 0.001 && dist_sq < max_dist * max_dist) {
-            let dist = sqrt(dist_sq);
-            let dir_to_light = to_light / dist;
-            let alignment = dot(ray_dir, dir_to_light);
-            
-            // Smooth falloff to fix "bokeh" circles and handle low ray counts
-            let smooth_alignment = smoothstep(0.7, 1.0, alignment);
-            if (smooth_alignment > 0.0) {
-                let attenuation = (probe.color_power.a * 0.1) / (dist_sq + 1.0);
-                light_acc += probe.color_power.rgb * attenuation * smooth_alignment;
-            }
+            // Deterministic replacement for the previous Monte Carlo alignment sampling.
+            // Using an analytically averaged alignment term removes visible black/colored speckle.
+            let attenuation = (probe.color_power.a * 0.1) / (dist_sq + 1.0);
+            light_acc += probe.color_power.rgb * attenuation * AVG_SMOOTH_ALIGNMENT;
         }
     }
     return light_acc;
@@ -110,10 +103,6 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
-    // Per-pixel jitter to break up aliasing patterns
-    let jitter = hash22(uv * 1000.0 + f32(params.frame_count % 1000u));
-    let rotation_offset = jitter.x * 2.0 * PI;
-
     // Radiance Cascades Merging Logic
     // In a full implementation, this would be multiple passes.
     // Here we implement a single-pass version that leverages the probe grid.
@@ -122,26 +111,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let cascade_count = params.cascade_count;
     
     for (var c = 0u; c < cascade_count; c++) {
-        // Each cascade has more rays but covers a larger area
-        let ray_count = params.ray_count_base * (1u << c);
+        // Each cascade covers a larger area. (Ray count no longer applies: we use a deterministic integral.)
         let cascade_dist = params.max_dist * f32(c + 1u) / f32(cascade_count);
-        
-        var cascade_radiance = vec3<f32>(0.0);
-        
-        for (var r = 0u; r < ray_count; r++) {
-            // Optimized Fibonacci sphere distribution with per-pixel rotation jitter
-            let z = 1.0 - 2.0 * (f32(r) + 0.5) / f32(ray_count);
-            let radius = sqrt(max(0.0, 1.0 - z * z));
-            let theta = 2.0 * PI * GOLDEN_RATIO * f32(r) + rotation_offset;
-            let ray_dir = vec3<f32>(radius * cos(theta), radius * sin(theta), z);
-            
-            // Trace ray against dynamic lights
-            let dynamic_radiance = sample_dynamic_lights(world_pos, ray_dir, cascade_dist);
-            
-            cascade_radiance += dynamic_radiance;
-        }
-        
-        total_radiance += (cascade_radiance / f32(ray_count)) / f32(cascade_count);
+
+        let cascade_radiance = sample_dynamic_lights_avg(world_pos, cascade_dist);
+        total_radiance += cascade_radiance / f32(cascade_count);
     }
     
     textureStore(output_tex, vec2<i32>(id.xy), vec4<f32>(total_radiance, 1.0));
