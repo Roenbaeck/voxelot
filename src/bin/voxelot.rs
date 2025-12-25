@@ -676,6 +676,27 @@ struct SSRSettings {
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct RadianceCascadesParams {
+    screen_width: f32,
+    screen_height: f32,
+    cascade_count: u32,
+    ray_count_base: u32,
+    step_size: f32,
+    max_dist: f32,
+    _pad1: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct RadianceCascadesCamera {
+    view_proj: [[f32; 4]; 4],
+    inverse_view_proj: [[f32; 4]; 4],
+    camera_pos: [f32; 3],
+    _pad0: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct SsaoUniformsRaw {
     sample_count: u32,
     slice_count: u32,
@@ -1398,6 +1419,17 @@ struct App {
     kawase_bind_group_layout: Option<wgpu::BindGroupLayout>,
     kawase_down_bind_groups: Vec<Option<wgpu::BindGroup>>,
     kawase_up_bind_groups: Vec<Option<wgpu::BindGroup>>,
+
+    // Radiance Cascades
+    rc_pipeline: Option<wgpu::ComputePipeline>,
+    rc_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    rc_bind_group: Option<wgpu::BindGroup>,
+    rc_params_buffer: Option<wgpu::Buffer>,
+    rc_camera_buffer: Option<wgpu::Buffer>,
+    rc_texture: Option<wgpu::Texture>,
+    rc_texture_view: Option<wgpu::TextureView>,
+    rc_texture_bytes: u64,
+    rc_enabled: bool,
     kawase_uniform_buffers: Vec<Option<wgpu::Buffer>>,
     kawase_ping_textures: Vec<Option<wgpu::Texture>>,
     kawase_ping_views: Vec<Option<wgpu::TextureView>>,
@@ -1493,6 +1525,7 @@ struct App {
     gpu_timing_accum_dof_ms: f64,
     gpu_timing_accum_bloom_ms: f64,
     gpu_timing_accum_ssilvb_ms: f64,
+    gpu_timing_accum_rc_ms: f64,
     gpu_timing_accum_post_ms: f64,
     gpu_timing_accum_frames: u32,
     gpu_timing_print_interval_frames: u32,
@@ -2078,6 +2111,7 @@ impl App {
             gpu_timing_accum_dof_ms: 0.0,
             gpu_timing_accum_bloom_ms: 0.0,
             gpu_timing_accum_ssilvb_ms: 0.0,
+            gpu_timing_accum_rc_ms: 0.0,
             gpu_timing_accum_post_ms: 0.0,
             gpu_timing_accum_frames: 0,
             gpu_timing_print_interval_frames: 120,
@@ -2170,6 +2204,18 @@ impl App {
             kawase_level_sizes: Vec::new(),
             kawase_pass_acc: std::time::Duration::from_secs(0),
             kawase_acc_frames: 0,
+
+            // Radiance Cascades
+            rc_pipeline: None,
+            rc_bind_group_layout: None,
+            rc_bind_group: None,
+            rc_params_buffer: None,
+            rc_camera_buffer: None,
+            rc_texture: None,
+            rc_texture_view: None,
+            rc_texture_bytes: 0,
+            rc_enabled: cfg.effects.gi.enabled,
+
             bloom_settings: BloomSettings {
                 threshold: cfg.effects.bloom.threshold,
                 knee: cfg.effects.bloom.knee,
@@ -2501,6 +2547,42 @@ impl App {
         }
     }
 
+    fn build_rc_params(&self) -> RadianceCascadesParams {
+        RadianceCascadesParams {
+            screen_width: self.render_target_width as f32,
+            screen_height: self.render_target_height as f32,
+            cascade_count: 4,
+            ray_count_base: 16,
+            step_size: 1.0,
+            max_dist: 100.0,
+            _pad1: [0.0; 2],
+        }
+    }
+
+    fn build_rc_camera(&self) -> RadianceCascadesCamera {
+        let cam_pos = glam::Vec3::from_array(self.camera_controller.camera.position);
+        let cam_forward = glam::Vec3::from_array(self.camera_controller.camera.forward);
+        let cam_up = glam::Vec3::from_array(self.camera_controller.camera.up);
+        let view = glam::Mat4::look_to_rh(cam_pos, cam_forward, cam_up);
+
+        let proj = glam::Mat4::perspective_rh(
+            self.render_fov_radians(),
+            self.camera_controller.camera.aspect,
+            self.camera_controller.camera.near,
+            self.camera_controller.camera.far,
+        );
+
+        let view_proj = proj * view;
+        let inverse_view_proj = view_proj.inverse();
+
+        RadianceCascadesCamera {
+            view_proj: view_proj.to_cols_array_2d(),
+            inverse_view_proj: inverse_view_proj.to_cols_array_2d(),
+            camera_pos: [cam_pos.x, cam_pos.y, cam_pos.z],
+            _pad0: 0.0,
+        }
+    }
+
     fn process_lighting_key(&mut self, key: KeyCode) {
         match key {
             KeyCode::KeyT => {
@@ -2806,6 +2888,9 @@ impl App {
             normal_texture_loc,
             normal_view_loc,
             normal_bytes,
+            rc_texture_loc,
+            rc_view_loc,
+            rc_bytes,
         ) =
             {
                 let (Some(device), Some(config)) = (self.device.as_ref(), self.config.as_ref())
@@ -3169,6 +3254,30 @@ impl App {
                     1,
                 );
 
+                // Radiance Cascades Output Texture
+                let rc_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("Radiance Cascades Texture"),
+                    size: wgpu::Extent3d {
+                        width: target_width,
+                        height: target_height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                });
+                let rc_view_loc = rc_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
+                let rc_bytes = App::compute_texture_bytes(
+                    wgpu::TextureFormat::Rgba16Float,
+                    target_width,
+                    target_height,
+                    1,
+                    1,
+                );
+
                 // Collect locals for assignment outside the scope
                 (
                     color_texture_loc,
@@ -3211,10 +3320,21 @@ impl App {
                     normal_texture_loc,
                     normal_view_loc,
                     normal_bytes,
+                    rc_texture_loc,
+                    rc_view_loc,
+                    rc_bytes,
                 )
             };
 
         // Now that device/config borrows are dropped, update self with textures and tallies
+        self.rc_texture = Some(rc_texture_loc);
+        self.rc_texture_view = Some(rc_view_loc);
+        App::replace_texture_bytes_static(
+            &mut self.rc_texture_bytes,
+            rc_bytes,
+            &mut self.gpu_texture_bytes,
+        );
+
         App::replace_texture_bytes_static(
             &mut self.offscreen_color_texture_bytes,
             offscreen_color_bytes,
@@ -3832,6 +3952,17 @@ impl App {
             queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[data]));
         }
 
+        // Radiance Cascades uniforms
+        if let (Some(params_buf), Some(cam_buf)) = (
+            self.rc_params_buffer.as_ref(),
+            self.rc_camera_buffer.as_ref(),
+        ) {
+            let params = self.build_rc_params();
+            let camera = self.build_rc_camera();
+            queue.write_buffer(params_buf, 0, bytemuck::cast_slice(&[params]));
+            queue.write_buffer(cam_buf, 0, bytemuck::cast_slice(&[camera]));
+        }
+
         // SSILVB uniforms
         if let Some(buffer) = self.ssilvb_uniform_buffer.as_ref() {
             let data =
@@ -4039,11 +4170,18 @@ impl App {
             }
         }
 
-        if let (Some(composite_ubo), Some(sampler), Some(ssao_ping_view), Some(post_view_ref)) = (
+        if let (
+            Some(composite_ubo),
+            Some(sampler),
+            Some(ssao_ping_view),
+            Some(post_view_ref),
+            Some(rc_view),
+        ) = (
             self.composite_uniform_buffer.as_ref(),
             self.post_sampler.as_ref(),
             self.ssao_ping_view.as_ref(),
             self.post_color_view.as_ref(),
+            self.rc_texture_view.as_ref(),
         ) {
             let ssr_view = self.ssr_texture_view.as_ref().unwrap_or(post_view_ref);
             self.composite_bind_group =
@@ -4072,11 +4210,77 @@ impl App {
                             resource: wgpu::BindingResource::TextureView(ssr_view),
                         },
                         wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: wgpu::BindingResource::TextureView(rc_view),
+                        },
+                        wgpu::BindGroupEntry {
                             binding: 3,
                             resource: wgpu::BindingResource::Sampler(sampler),
                         },
                     ],
                 }));
+        }
+
+        // Radiance Cascades Bind Group
+        if let (
+            Some(rc_params_buf),
+            Some(rc_cam_buf),
+            Some(offscreen_view),
+            Some(depth_view),
+            Some(hzb_view),
+            Some(gi_probe_buf),
+            Some(sampler),
+            Some(rc_view),
+            Some(rc_layout),
+        ) = (
+            self.rc_params_buffer.as_ref(),
+            self.rc_camera_buffer.as_ref(),
+            self.offscreen_color_view.as_ref(),
+            self.offscreen_depth_view.as_ref(),
+            self.hzb_view.as_ref(),
+            self.gi_probe_buffer.as_ref(),
+            self.post_sampler.as_ref(),
+            self.rc_texture_view.as_ref(),
+            self.rc_bind_group_layout.as_ref(),
+        ) {
+            self.rc_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Radiance Cascades Bind Group"),
+                layout: rc_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: rc_cam_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: rc_params_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(offscreen_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(depth_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(hzb_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: gi_probe_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: wgpu::BindingResource::TextureView(rc_view),
+                    },
+                ],
+            }));
         }
 
         self.update_water_bind_group();
@@ -6501,6 +6705,127 @@ impl App {
             ),
         });
 
+        let rc_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Radiance Cascades Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/radiance_cascades.wgsl").into()),
+        });
+
+        let rc_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Radiance Cascades Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let rc_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Radiance Cascades Pipeline Layout"),
+            bind_group_layouts: &[&rc_bind_group_layout],
+            immediate_size: 0,
+        });
+
+        let rc_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Radiance Cascades Pipeline"),
+            layout: Some(&rc_pipeline_layout),
+            module: &rc_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        self.rc_pipeline = Some(rc_pipeline);
+        self.rc_bind_group_layout = Some(rc_bind_group_layout);
+
+        let rc_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Radiance Cascades Params Buffer"),
+            size: std::mem::size_of::<RadianceCascadesParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.rc_params_buffer = Some(rc_params_buffer);
+
+        let rc_camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Radiance Cascades Camera Buffer"),
+            size: std::mem::size_of::<RadianceCascadesCamera>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.rc_camera_buffer = Some(rc_camera_buffer);
+
         let bloom_extract_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Bloom Extract Bind Group Layout"),
@@ -6667,6 +6992,16 @@ impl App {
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 5,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
                             sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -7560,6 +7895,7 @@ impl App {
                     + self.gpu_timing_accum_ssr_ms
                     + self.gpu_timing_accum_water_ms
                     + self.gpu_timing_accum_dof_ms
+                    + self.gpu_timing_accum_rc_ms
                     + self.gpu_timing_accum_ssilvb_ms
                     + self.gpu_timing_accum_bloom_ms
                     + self.gpu_timing_accum_post_ms)
@@ -7572,6 +7908,7 @@ impl App {
             format!("  SSR:   {:.2}MS", self.gpu_timing_accum_ssr_ms / div),
             format!("  WATER: {:.2}MS", self.gpu_timing_accum_water_ms / div),
             format!("  DOF:   {:.2}MS", self.gpu_timing_accum_dof_ms / div),
+            format!("  RC:    {:.2}MS", self.gpu_timing_accum_rc_ms / div),
             format!("  SSILVB:{:.2}MS", self.gpu_timing_accum_ssilvb_ms / div),
             format!("  BLOOM: {:.2}MS", self.gpu_timing_accum_bloom_ms / div),
             format!("  POST:  {:.2}MS", self.gpu_timing_accum_post_ms / div),
@@ -10167,6 +10504,7 @@ impl App {
         if self.composite_bind_group.is_none()
             || self.bloom_extract_bind_group.is_none()
             || (self.bloom_settings.kawase_enabled && self.bloom_kawase_bind_groups.is_empty())
+            || (self.rc_enabled && self.rc_bind_group.is_none())
         {
             self.update_bloom_bind_groups();
         }
@@ -10388,6 +10726,30 @@ impl App {
                 );
             }
         }
+        // Radiance Cascades Pass
+        if self.rc_enabled {
+            if let (Some(rc_pipeline), Some(rc_bind_group)) = (
+                self.rc_pipeline.as_ref(),
+                self.rc_bind_group.as_ref(),
+            ) {
+                let mut rc_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Radiance Cascades Pass"),
+                    timestamp_writes: self.query_set.as_ref().map(|qs| {
+                        wgpu::ComputePassTimestampWrites {
+                            query_set: qs,
+                            beginning_of_pass_write_index: Some(20),
+                            end_of_pass_write_index: Some(21),
+                        }
+                    }),
+                });
+                rc_pass.set_pipeline(rc_pipeline);
+                rc_pass.set_bind_group(0, rc_bind_group, &[]);
+                let workgroup_x = (self.render_target_width + 7) / 8;
+                let workgroup_y = (self.render_target_height + 7) / 8;
+                rc_pass.dispatch_workgroups(workgroup_x, workgroup_y, 1);
+            }
+        }
+
         if self.bloom_enabled && self.bloom_settings.kawase_enabled {
             if let (
                 Some(bloom_extract_pipeline),
@@ -10715,8 +11077,8 @@ impl App {
                 // Resolve the full set at end of frame and copy into staging readback buffer
                 if !self.query_readback_in_flight {
                     log::debug!("performing resolve+copy into readback buffer");
-                    encoder.resolve_query_set(qs, 0..20, resolve_buf, 0);
-                    let total_bytes = (20u64) * 8u64;
+                    encoder.resolve_query_set(qs, 0..22, resolve_buf, 0);
+                    let total_bytes = (22u64) * 8u64;
                     encoder.copy_buffer_to_buffer(resolve_buf, 0, readback_buf, 0, total_bytes);
                 } else {
                     log::debug!("skipping resolve+copy: previous readback still in flight");
@@ -10731,7 +11093,7 @@ impl App {
 
         {
             if let Some(readback_buf) = self.query_readback_buffer.as_ref() {
-                let slice = readback_buf.slice(..((20 * 8) as u64));
+                let slice = readback_buf.slice(..((22 * 8) as u64));
                 if !self.query_readback_in_flight {
                     if let Some(tx) = &self.query_readback_notifier_tx {
                         // Requesting readback for this frame (map_async non-blocking)
@@ -10749,8 +11111,8 @@ impl App {
                     if let Ok(()) = rx.try_recv() {
                         // readback notifier received; processing mapped buffer now
                         let data = slice.get_mapped_range();
-                        let mut stamps: Vec<u64> = Vec::with_capacity(20);
-                        for i in 0..20 {
+                        let mut stamps: Vec<u64> = Vec::with_capacity(22);
+                        for i in 0..22 {
                             let start = (i * 8) as usize;
                             let mut b = [0u8; 8];
                             b.copy_from_slice(&data[start..start + 8]);
@@ -10786,6 +11148,7 @@ impl App {
                         let shadow_ms = stamp_to_ms(stamps[14], stamps[15]);
                         let bloom_ms = stamp_to_ms(stamps[16], stamps[17]);
                         let post_ms = stamp_to_ms(stamps[18], stamps[19]);
+                        let rc_ms = stamp_to_ms(stamps[20], stamps[21]);
 
                         // Determine the absolute order of execution to calculate non-cumulative durations.
                         // Execution order in render():
@@ -10820,8 +11183,19 @@ impl App {
                         } else {
                             0.0
                         };
+                        let iso_rc = if rc_ms > 0.0 {
+                            (rc_ms - scene_ms.max(ssr_ms).max(water_ms).max(dof_ms)).max(0.0)
+                        } else {
+                            0.0
+                        };
                         let iso_ssilvb = if ssilvb_ms > 0.0 {
-                            (ssilvb_ms - scene_ms.max(ssr_ms).max(water_ms).max(dof_ms)).max(0.0)
+                            (ssilvb_ms
+                                - scene_ms
+                                    .max(ssr_ms)
+                                    .max(water_ms)
+                                    .max(dof_ms)
+                                    .max(rc_ms))
+                            .max(0.0)
                         } else {
                             0.0
                         };
@@ -10831,6 +11205,7 @@ impl App {
                                     .max(ssr_ms)
                                     .max(water_ms)
                                     .max(dof_ms)
+                                    .max(rc_ms)
                                     .max(ssilvb_ms))
                             .max(0.0)
                         } else {
@@ -10842,6 +11217,7 @@ impl App {
                                     .max(ssr_ms)
                                     .max(water_ms)
                                     .max(dof_ms)
+                                    .max(rc_ms)
                                     .max(ssilvb_ms)
                                     .max(bloom_ms))
                             .max(0.0)
@@ -10864,6 +11240,7 @@ impl App {
                         self.gpu_timing_accum_gpu_cull_ms += cull_iso;
                         self.gpu_timing_accum_ssr_ms += iso_ssr;
                         self.gpu_timing_accum_water_ms += iso_water;
+                        self.gpu_timing_accum_rc_ms += iso_rc;
                         self.gpu_timing_accum_bloom_ms += iso_bloom;
                         self.gpu_timing_accum_ssilvb_ms += iso_ssilvb;
                         self.gpu_timing_accum_post_ms += iso_post;
@@ -10879,12 +11256,13 @@ impl App {
                             let avg_gpu_cull = self.gpu_timing_accum_gpu_cull_ms / frames;
                             let avg_ssr = self.gpu_timing_accum_ssr_ms / frames;
                             let avg_water = self.gpu_timing_accum_water_ms / frames;
+                            let avg_rc = self.gpu_timing_accum_rc_ms / frames;
                             let avg_bloom = self.gpu_timing_accum_bloom_ms / frames;
                             let avg_ssilvb = self.gpu_timing_accum_ssilvb_ms / frames;
                             let avg_post = self.gpu_timing_accum_post_ms / frames;
 
                             log::info!(
-                                "GPU avg timings over {} frames - scene: {:.3}ms, shadow: {:.3}ms, hzb_copy: {:.3}ms, dof: {:.3}ms, gpu_cull: {:.3}ms, ssr: {:.3}ms, water: {:.3}ms, bloom: {:.3}ms, ssilvb: {:.3}ms, post: {:.3}ms",
+                                "GPU avg timings over {} frames - scene: {:.3}ms, shadow: {:.3}ms, hzb_copy: {:.3}ms, dof: {:.3}ms, gpu_cull: {:.3}ms, ssr: {:.3}ms, water: {:.3}ms, rc: {:.3}ms, bloom: {:.3}ms, ssilvb: {:.3}ms, post: {:.3}ms",
                                 self.gpu_timing_accum_frames,
                                 avg_scene,
                                 avg_shadow,
@@ -10893,6 +11271,7 @@ impl App {
                                 avg_gpu_cull,
                                 avg_ssr,
                                 avg_water,
+                                avg_rc,
                                 avg_bloom,
                                 avg_ssilvb,
                                 avg_post
@@ -10906,6 +11285,7 @@ impl App {
                             self.gpu_timing_accum_gpu_cull_ms = 0.0;
                             self.gpu_timing_accum_ssr_ms = 0.0;
                             self.gpu_timing_accum_water_ms = 0.0;
+                            self.gpu_timing_accum_rc_ms = 0.0;
                             self.gpu_timing_accum_bloom_ms = 0.0;
                             self.gpu_timing_accum_ssilvb_ms = 0.0;
                             self.gpu_timing_accum_post_ms = 0.0;
