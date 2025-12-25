@@ -22,6 +22,7 @@ struct SSRParams {
 @group(0) @binding(4) var linear_sampler: sampler;
 @group(0) @binding(5) var hzb_texture: texture_2d<f32>;
 @group(0) @binding(6) var hzb_sampler: sampler;
+@group(0) @binding(7) var normal_gbuffer: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -62,21 +63,11 @@ fn world_to_screen(world_pos: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(uv, ndc.z);
 }
 
-// Estimate normal from depth buffer using screen-space derivatives
-fn estimate_normal(uv: vec2<f32>, depth: f32, texel_size: vec2<f32>) -> vec3<f32> {
-    let center_pos = reconstruct_world_pos(uv, depth);
-    
-    // Sample neighboring depths
-    let depth_right = textureSample(scene_depth, linear_sampler, uv + vec2<f32>(texel_size.x, 0.0));
-    let depth_up = textureSample(scene_depth, linear_sampler, uv + vec2<f32>(0.0, -texel_size.y));
-    
-    let pos_right = reconstruct_world_pos(uv + vec2<f32>(texel_size.x, 0.0), depth_right);
-    let pos_up = reconstruct_world_pos(uv + vec2<f32>(0.0, -texel_size.y), depth_up);
-    
-    let dx = pos_right - center_pos;
-    let dy = pos_up - center_pos;
-    
-    return normalize(cross(dy, dx));
+fn decode_world_normal(encoded: vec3<f32>) -> vec3<f32> {
+    // Stored as (n * 0.5 + 0.5) in voxel.wgsl
+    let n = encoded * 2.0 - 1.0;
+    // Guard against zero/denormals
+    return normalize(select(n, vec3<f32>(0.0, 1.0, 0.0), dot(n, n) < 1e-8));
 }
 
 // Calculate max mip level for HZB
@@ -185,7 +176,10 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
     
     let world_pos = reconstruct_world_pos(input.uv, depth);
-    let normal = estimate_normal(input.uv, depth, texel_size);
+    // Use the G-buffer world normal instead of estimating from depth.
+    // This is cheaper and much more stable near edges.
+    let gbuf = textureSample(normal_gbuffer, linear_sampler, input.uv);
+    let normal = decode_world_normal(gbuf.rgb);
     let view_dir = normalize(world_pos - camera.camera_pos);
     
     // Reflect view direction around normal

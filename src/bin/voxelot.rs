@@ -4402,6 +4402,7 @@ impl App {
             Some(depth_view),
             Some(sampler),
             Some(hzb_view),
+            Some(normal_view),
         ) = (
             self.ssr_bind_group_layout.as_ref(),
             self.ssr_uniform_buffer.as_ref(),
@@ -4410,6 +4411,7 @@ impl App {
             self.offscreen_depth_view.as_ref(),
             self.post_sampler.as_ref(),
             self.hzb_view.as_ref(),
+            self.normal_view.as_ref(),
         )
         else {
             return;
@@ -4448,6 +4450,11 @@ impl App {
                 wgpu::BindGroupEntry {
                     binding: 6,
                     resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                // Normal G-buffer
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(normal_view),
                 },
             ],
         });
@@ -5325,6 +5332,17 @@ impl App {
                     binding: 6,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // Normal G-buffer (world-space normals encoded in RGB)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
                     count: None,
                 },
             ],
