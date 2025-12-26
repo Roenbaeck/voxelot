@@ -12,6 +12,7 @@
 use clap::Parser;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use glam::{Mat4, Vec3};
+use half::f16;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -1251,10 +1252,23 @@ struct App {
     // Async GI system: worker thread communicates via channels (like mesh workers)
     gi_request_tx: Sender<voxelot::gi::GiUpdateRequest>,
     gi_result_rx: Receiver<voxelot::gi::GiUpdateResult>,
-    gi_probes: Arc<Vec<voxelot::gi::GiProbe>>,
+    gi_probes: Vec<voxelot::gi::GiProbe>,
     gi_grid_origin: glam::IVec3,
     gi_grid_dims: glam::IVec3,
-    gi_probe_buffer: Option<wgpu::Buffer>,
+
+    // SSILVB GI probe 3D textures (6 faces: +X, -X, +Y, -Y, +Z, -Z)
+    gi_probe_tex_px: Option<wgpu::Texture>,
+    gi_probe_tex_nx: Option<wgpu::Texture>,
+    gi_probe_tex_py: Option<wgpu::Texture>,
+    gi_probe_tex_ny: Option<wgpu::Texture>,
+    gi_probe_tex_pz: Option<wgpu::Texture>,
+    gi_probe_tex_nz: Option<wgpu::Texture>,
+    gi_probe_view_px: Option<wgpu::TextureView>,
+    gi_probe_view_nx: Option<wgpu::TextureView>,
+    gi_probe_view_py: Option<wgpu::TextureView>,
+    gi_probe_view_ny: Option<wgpu::TextureView>,
+    gi_probe_view_pz: Option<wgpu::TextureView>,
+    gi_probe_view_nz: Option<wgpu::TextureView>,
     camera_controller: CameraController,
     pending_chunk_meshes: VecDeque<(i64, i64, i64)>,
     pending_chunk_set: FxHashSet<(i64, i64, i64)>,
@@ -1550,6 +1564,220 @@ impl App {
         }
         *agg = agg.saturating_add(new);
         *old = new;
+    }
+
+    fn gi_probe_padded_bytes_per_row(width: u32, bytes_per_texel: u32) -> u32 {
+        let bytes_per_row = width * bytes_per_texel;
+        ((bytes_per_row + 255) / 256) * 256
+    }
+
+    fn pack_gi_probe_face_volume_f16(
+        &self,
+        face_idx: usize,
+    ) -> Option<(Vec<u8>, u32, wgpu::Extent3d)> {
+        let extent = wgpu::Extent3d {
+            width: self.gi_grid_dims.x.max(0) as u32,
+            height: self.gi_grid_dims.y.max(0) as u32,
+            depth_or_array_layers: self.gi_grid_dims.z.max(0) as u32,
+        };
+
+        if extent.width == 0 || extent.height == 0 || extent.depth_or_array_layers == 0 {
+            return None;
+        }
+
+        // Rgba16Float
+        let bytes_per_texel = 8u32;
+        let padded_bpr = Self::gi_probe_padded_bytes_per_row(extent.width, bytes_per_texel);
+        let bytes_per_image = padded_bpr * extent.height;
+        let total_bytes = bytes_per_image as usize * extent.depth_or_array_layers as usize;
+
+        let probe_count = (extent.width * extent.height * extent.depth_or_array_layers) as usize;
+        if self.gi_probes.len() != probe_count {
+            // Shouldn't happen unless config/grid dims mismatch; avoid panic.
+            return None;
+        }
+
+        let mut out = vec![0u8; total_bytes];
+        let row_stride = padded_bpr as usize;
+        let image_stride = bytes_per_image as usize;
+        let texel_stride = bytes_per_texel as usize;
+
+        let wh = (extent.width as usize) * (extent.height as usize);
+        for z in 0..extent.depth_or_array_layers as usize {
+            let z_base = z * image_stride;
+            for y in 0..extent.height as usize {
+                let row_base = z_base + y * row_stride;
+                for x in 0..extent.width as usize {
+                    let idx = x + y * extent.width as usize + z * wh;
+                    let rgba = self.gi_probes[idx].light_data[face_idx];
+                    let dst = row_base + x * texel_stride;
+
+                    let r = f16::from_f32(rgba[0]).to_le_bytes();
+                    let g = f16::from_f32(rgba[1]).to_le_bytes();
+                    let b = f16::from_f32(rgba[2]).to_le_bytes();
+                    let a = f16::from_f32(rgba[3]).to_le_bytes();
+
+                    out[dst..dst + 2].copy_from_slice(&r);
+                    out[dst + 2..dst + 4].copy_from_slice(&g);
+                    out[dst + 4..dst + 6].copy_from_slice(&b);
+                    out[dst + 6..dst + 8].copy_from_slice(&a);
+                }
+            }
+        }
+
+        Some((out, padded_bpr, extent))
+    }
+
+    fn pack_rgba16f_padded_256(rgba: [f32; 4]) -> [u8; 256] {
+        let mut out = [0u8; 256];
+
+        // Rgba16Float texel: 8 bytes
+        let r = f16::from_f32(rgba[0]).to_le_bytes();
+        let g = f16::from_f32(rgba[1]).to_le_bytes();
+        let b = f16::from_f32(rgba[2]).to_le_bytes();
+        let a = f16::from_f32(rgba[3]).to_le_bytes();
+
+        out[0..2].copy_from_slice(&r);
+        out[2..4].copy_from_slice(&g);
+        out[4..6].copy_from_slice(&b);
+        out[6..8].copy_from_slice(&a);
+
+        out
+    }
+
+    fn upload_gi_probe_texture_updates(
+        &self,
+        queue: &wgpu::Queue,
+        updates: &[voxelot::gi::GiProbeUpdate],
+    ) {
+        let Some(tex_px) = self.gi_probe_tex_px.as_ref() else {
+            return;
+        };
+        let Some(tex_nx) = self.gi_probe_tex_nx.as_ref() else {
+            return;
+        };
+        let Some(tex_py) = self.gi_probe_tex_py.as_ref() else {
+            return;
+        };
+        let Some(tex_ny) = self.gi_probe_tex_ny.as_ref() else {
+            return;
+        };
+        let Some(tex_pz) = self.gi_probe_tex_pz.as_ref() else {
+            return;
+        };
+        let Some(tex_nz) = self.gi_probe_tex_nz.as_ref() else {
+            return;
+        };
+
+        let dx = self.gi_grid_dims.x.max(0) as u32;
+        let dy = self.gi_grid_dims.y.max(0) as u32;
+        let dz = self.gi_grid_dims.z.max(0) as u32;
+        if dx == 0 || dy == 0 || dz == 0 {
+            return;
+        }
+        let wh = dx * dy;
+
+        let textures: [(&wgpu::Texture, usize); 6] = [
+            (tex_px, 0),
+            (tex_nx, 1),
+            (tex_py, 2),
+            (tex_ny, 3),
+            (tex_pz, 4),
+            (tex_nz, 5),
+        ];
+
+        let extent = wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        };
+
+        for update in updates {
+            let idx = update.index;
+            let z = idx / wh;
+            let rem = idx - z * wh;
+            let y = rem / dx;
+            let x = rem - y * dx;
+
+            if x >= dx || y >= dy || z >= dz {
+                continue;
+            }
+
+            let origin = wgpu::Origin3d { x, y, z };
+
+            for (texture, face_idx) in textures {
+                let rgba = update.probe.light_data[face_idx];
+                let data = Self::pack_rgba16f_padded_256(rgba);
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture,
+                        mip_level: 0,
+                        origin,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &data,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(256),
+                        rows_per_image: Some(1),
+                    },
+                    extent,
+                );
+            }
+        }
+    }
+
+    fn upload_gi_probe_textures(&self, queue: &wgpu::Queue) {
+        let Some(tex_px) = self.gi_probe_tex_px.as_ref() else {
+            return;
+        };
+        let Some(tex_nx) = self.gi_probe_tex_nx.as_ref() else {
+            return;
+        };
+        let Some(tex_py) = self.gi_probe_tex_py.as_ref() else {
+            return;
+        };
+        let Some(tex_ny) = self.gi_probe_tex_ny.as_ref() else {
+            return;
+        };
+        let Some(tex_pz) = self.gi_probe_tex_pz.as_ref() else {
+            return;
+        };
+        let Some(tex_nz) = self.gi_probe_tex_nz.as_ref() else {
+            return;
+        };
+
+        let textures: [(&wgpu::Texture, usize); 6] = [
+            (tex_px, 0),
+            (tex_nx, 1),
+            (tex_py, 2),
+            (tex_ny, 3),
+            (tex_pz, 4),
+            (tex_nz, 5),
+        ];
+
+        for (texture, face_idx) in textures {
+            let Some((data, padded_bpr, extent)) = self.pack_gi_probe_face_volume_f16(face_idx)
+            else {
+                continue;
+            };
+
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bpr),
+                    rows_per_image: Some(extent.height),
+                },
+                extent,
+            );
+        }
     }
 
     fn render_overscan_factor(&self) -> f32 {
@@ -2034,16 +2262,28 @@ impl App {
             // Spawn async GI worker (like mesh workers)
             gi_request_tx,
             gi_result_rx,
-            gi_probes: Arc::new(vec![
+            gi_probes: vec![
                 voxelot::gi::GiProbe::default();
                 (cfg.effects.gi.grid_dims[0]
                     * cfg.effects.gi.grid_dims[1]
                     * cfg.effects.gi.grid_dims[2])
                     as usize
-            ]),
+            ],
             gi_grid_origin: glam::IVec3::ZERO,
             gi_grid_dims: glam::IVec3::from_array(cfg.effects.gi.grid_dims),
-            gi_probe_buffer: None,
+
+            gi_probe_tex_px: None,
+            gi_probe_tex_nx: None,
+            gi_probe_tex_py: None,
+            gi_probe_tex_ny: None,
+            gi_probe_tex_pz: None,
+            gi_probe_tex_nz: None,
+            gi_probe_view_px: None,
+            gi_probe_view_nx: None,
+            gi_probe_view_py: None,
+            gi_probe_view_ny: None,
+            gi_probe_view_pz: None,
+            gi_probe_view_nz: None,
 
             camera_controller: CameraController::new(initial_camera, &cfg.rendering),
             pending_chunk_meshes: VecDeque::new(),
@@ -2215,7 +2455,7 @@ impl App {
             rc_texture: None,
             rc_texture_view: None,
             rc_texture_bytes: 0,
-            rc_enabled: cfg.effects.gi.enabled,
+            rc_enabled: cfg.effects.gi.enabled && cfg.effects.radiance_cascades.enabled,
 
             bloom_settings: BloomSettings {
                 threshold: cfg.effects.bloom.threshold,
@@ -3780,7 +4020,7 @@ impl App {
             Some(uniform_buffer),
             Some(shadow_view),
             Some(shadow_sampler),
-            Some(gi_probe_buffer),
+            Some(light_probe_buffer),
             Some(palette_buffer),
         ) = (
             self.device.as_ref(),
@@ -3788,7 +4028,7 @@ impl App {
             self.uniform_buffer.as_ref(),
             self.shadow_view.as_ref(),
             self.shadow_sampler.as_ref(),
-            self.gi_probe_buffer.as_ref(),
+            self.light_probe_buffer.as_ref(),
             self.palette_buffer.as_ref(),
         )
         else {
@@ -3813,7 +4053,7 @@ impl App {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: gi_probe_buffer.as_entire_binding(),
+                    resource: light_probe_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -4072,13 +4312,23 @@ impl App {
                 Some(ssao_ubo),
                 Some(depth_view),
                 Some(psampler),
-                Some(gi_probe_buf),
+                Some(gi_view_px),
+                Some(gi_view_nx),
+                Some(gi_view_py),
+                Some(gi_view_ny),
+                Some(gi_view_pz),
+                Some(gi_view_nz),
                 Some(normal_view),
             ) = (
                 self.ssilvb_uniform_buffer.as_ref(),
                 self.offscreen_depth_view.as_ref(),
                 self.post_sampler.as_ref(),
-                self.gi_probe_buffer.as_ref(),
+                self.gi_probe_view_px.as_ref(),
+                self.gi_probe_view_nx.as_ref(),
+                self.gi_probe_view_py.as_ref(),
+                self.gi_probe_view_ny.as_ref(),
+                self.gi_probe_view_pz.as_ref(),
+                self.gi_probe_view_nz.as_ref(),
                 self.normal_view.as_ref(),
             ) {
                 self.ssilvb_bind_group =
@@ -4100,10 +4350,30 @@ impl App {
                             },
                             wgpu::BindGroupEntry {
                                 binding: 3,
-                                resource: gi_probe_buf.as_entire_binding(),
+                                resource: wgpu::BindingResource::TextureView(gi_view_px),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 4,
+                                resource: wgpu::BindingResource::TextureView(gi_view_nx),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: wgpu::BindingResource::TextureView(gi_view_py),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 6,
+                                resource: wgpu::BindingResource::TextureView(gi_view_ny),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 7,
+                                resource: wgpu::BindingResource::TextureView(gi_view_pz),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 8,
+                                resource: wgpu::BindingResource::TextureView(gi_view_nz),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 9,
                                 resource: wgpu::BindingResource::TextureView(normal_view),
                             },
                         ],
@@ -4240,7 +4510,6 @@ impl App {
             Some(offscreen_view),
             Some(depth_view),
             Some(hzb_view),
-            Some(gi_probe_buf),
             Some(light_probe_buf),
             Some(sampler),
             Some(rc_view),
@@ -4251,7 +4520,6 @@ impl App {
             self.offscreen_color_view.as_ref(),
             self.offscreen_depth_view.as_ref(),
             self.hzb_view.as_ref(),
-            self.gi_probe_buffer.as_ref(),
             self.light_probe_buffer.as_ref(),
             self.post_sampler.as_ref(),
             self.rc_texture_view.as_ref(),
@@ -4280,10 +4548,6 @@ impl App {
                     wgpu::BindGroupEntry {
                         binding: 4,
                         resource: wgpu::BindingResource::TextureView(hzb_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: gi_probe_buf.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 6,
@@ -5547,14 +5811,17 @@ impl App {
                     };
                     queue.write_buffer(params_buf, 0, bytemuck::bytes_of(&params));
 
-                    let ts_writes =
+                    let ts_writes = if self.gui_visible {
                         self.query_set
                             .as_ref()
                             .map(|qs| wgpu::ComputePassTimestampWrites {
                                 query_set: qs,
                                 beginning_of_pass_write_index: Some(2),
                                 end_of_pass_write_index: Some(3),
-                            });
+                            })
+                    } else {
+                        None
+                    };
 
                     let mut hzb_copy_pass =
                         encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -5598,14 +5865,17 @@ impl App {
             }
         }
 
-        let ts_writes = self
-            .query_set
-            .as_ref()
-            .map(|qs| wgpu::ComputePassTimestampWrites {
-                query_set: qs,
-                beginning_of_pass_write_index: Some(6),
-                end_of_pass_write_index: Some(7),
-            });
+        let ts_writes = if self.gui_visible {
+            self.query_set
+                .as_ref()
+                .map(|qs| wgpu::ComputePassTimestampWrites {
+                    query_set: qs,
+                    beginning_of_pass_write_index: Some(6),
+                    end_of_pass_write_index: Some(7),
+                })
+        } else {
+            None
+        };
         let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("GPU Cull Pass"),
             timestamp_writes: ts_writes,
@@ -6818,16 +7088,6 @@ impl App {
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
                     binding: 6,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
@@ -6953,19 +7213,70 @@ impl App {
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
+                    // GI probe volumes (+X, -X, +Y, -Y, +Z, -Z)
                     wgpu::BindGroupLayoutEntry {
                         binding: 3,
                         visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 8,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
                         },
                         count: None,
                     },
                     // G-Buffer normal texture
                     wgpu::BindGroupLayoutEntry {
-                        binding: 4,
+                        binding: 9,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
                             sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -7318,12 +7629,95 @@ impl App {
             &mut self.gpu_buffer_bytes,
         );
 
-        // Create GI probe buffer
-        let gi_probe_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("GI Probe Buffer"),
-            contents: bytemuck::cast_slice(&self.gi_probes),
+        // Create light probe buffer (used by voxel.wgsl and radiance_cascades.wgsl)
+        // Allocate a small initial capacity so the main bind group can be created immediately.
+        self.light_probe_capacity = 64;
+        let light_probe_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Light Probe Buffer"),
+            size: (self.light_probe_capacity * std::mem::size_of::<LightProbe>())
+                as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
+        let initial_light_probe_bytes =
+            (self.light_probe_capacity * std::mem::size_of::<LightProbe>()) as u64;
+        App::replace_buffer_bytes_static(
+            &mut self.light_probe_buffer_bytes,
+            initial_light_probe_bytes,
+            &mut self.gpu_buffer_bytes,
+        );
+
+        // Create GI probe 3D textures (6 faces) for SSILVB hardware trilinear filtering.
+        let gi_extent = wgpu::Extent3d {
+            width: self.gi_grid_dims.x.max(1) as u32,
+            height: self.gi_grid_dims.y.max(1) as u32,
+            depth_or_array_layers: self.gi_grid_dims.z.max(1) as u32,
+        };
+
+        let gi_tex_desc = |label: &'static str| wgpu::TextureDescriptor {
+            label: Some(label),
+            size: gi_extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        };
+
+        let gi_tex_px = device.create_texture(&gi_tex_desc("GI Probe +X 3D"));
+        let gi_tex_nx = device.create_texture(&gi_tex_desc("GI Probe -X 3D"));
+        let gi_tex_py = device.create_texture(&gi_tex_desc("GI Probe +Y 3D"));
+        let gi_tex_ny = device.create_texture(&gi_tex_desc("GI Probe -Y 3D"));
+        let gi_tex_pz = device.create_texture(&gi_tex_desc("GI Probe +Z 3D"));
+        let gi_tex_nz = device.create_texture(&gi_tex_desc("GI Probe -Z 3D"));
+
+        let gi_view_px = gi_tex_px.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            ..Default::default()
+        });
+        let gi_view_nx = gi_tex_nx.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            ..Default::default()
+        });
+        let gi_view_py = gi_tex_py.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            ..Default::default()
+        });
+        let gi_view_ny = gi_tex_ny.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            ..Default::default()
+        });
+        let gi_view_pz = gi_tex_pz.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            ..Default::default()
+        });
+        let gi_view_nz = gi_tex_nz.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            ..Default::default()
+        });
+
+        // Initialize volumes to zero so early frames don't sample uninitialized memory.
+        let padded_bpr = App::gi_probe_padded_bytes_per_row(gi_extent.width, 8);
+        let bytes_per_image = padded_bpr * gi_extent.height;
+        let zero_bytes = vec![0u8; (bytes_per_image as usize) * (gi_extent.depth_or_array_layers as usize)];
+        for texture in [&gi_tex_px, &gi_tex_nx, &gi_tex_py, &gi_tex_ny, &gi_tex_pz, &gi_tex_nz] {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &zero_bytes,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bpr),
+                    rows_per_image: Some(gi_extent.height),
+                },
+                gi_extent,
+            );
+        }
 
         let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Shadow Sampler"),
@@ -7812,7 +8206,20 @@ impl App {
         self.uniform_buffer = Some(uniform_buffer);
         self.palette_buffer = Some(palette_buffer);
 
-        self.gi_probe_buffer = Some(gi_probe_buffer);
+        self.light_probe_buffer = Some(light_probe_buffer);
+
+        self.gi_probe_tex_px = Some(gi_tex_px);
+        self.gi_probe_tex_nx = Some(gi_tex_nx);
+        self.gi_probe_tex_py = Some(gi_tex_py);
+        self.gi_probe_tex_ny = Some(gi_tex_ny);
+        self.gi_probe_tex_pz = Some(gi_tex_pz);
+        self.gi_probe_tex_nz = Some(gi_tex_nz);
+        self.gi_probe_view_px = Some(gi_view_px);
+        self.gi_probe_view_nx = Some(gi_view_nx);
+        self.gi_probe_view_py = Some(gi_view_py);
+        self.gi_probe_view_ny = Some(gi_view_ny);
+        self.gi_probe_view_pz = Some(gi_view_pz);
+        self.gi_probe_view_nz = Some(gi_view_nz);
         self.main_bind_group_layout = Some(main_bind_group_layout);
         self.shadow_bind_group_layout = Some(shadow_bind_group_layout);
         self.shadow_sampler = Some(shadow_sampler);
@@ -8207,13 +8614,37 @@ impl App {
 
         // Check for GI results (non-blocking, like mesh result polling)
         while let Ok(result) = self.gi_result_rx.try_recv() {
-            self.gi_probes = result.probes; // Arc clone is cheap
-            self.gi_grid_origin = result.grid_origin;
-            self.gi_jobs_executed_counter += result.probes_calculated;
+            match result {
+                voxelot::gi::GiUpdateResult::Full {
+                    probes,
+                    grid_origin,
+                    probes_calculated,
+                } => {
+                    self.gi_probes = probes;
+                    self.gi_grid_origin = grid_origin;
+                    self.gi_jobs_executed_counter += probes_calculated;
 
-            // Upload new probes to GPU
-            if let Some(buffer) = &self.gi_probe_buffer {
-                queue.write_buffer(buffer, 0, bytemuck::cast_slice(&*self.gi_probes));
+                    // Full upload to SSILVB 3D textures (grid moved / initial)
+                    self.upload_gi_probe_textures(&queue);
+                }
+                voxelot::gi::GiUpdateResult::Partial {
+                    updates,
+                    grid_origin,
+                    probes_calculated,
+                } => {
+                    self.gi_grid_origin = grid_origin;
+                    self.gi_jobs_executed_counter += probes_calculated;
+
+                    // Apply updates to CPU cache
+                    for update in &updates {
+                        if let Some(slot) = self.gi_probes.get_mut(update.index as usize) {
+                            *slot = update.probe;
+                        }
+                    }
+
+                    // Sparse upload only changed texels to 3D textures
+                    self.upload_gi_probe_texture_updates(&queue, &updates);
+                }
             }
         }
 
@@ -10142,13 +10573,17 @@ impl App {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: self.query_set.as_ref().map(|qs| {
-                    wgpu::RenderPassTimestampWrites {
-                        query_set: qs,
-                        beginning_of_pass_write_index: Some(14),
-                        end_of_pass_write_index: Some(15),
-                    }
-                }),
+                timestamp_writes: if self.gui_visible {
+                    self.query_set.as_ref().map(|qs| {
+                        wgpu::RenderPassTimestampWrites {
+                            query_set: qs,
+                            beginning_of_pass_write_index: Some(14),
+                            end_of_pass_write_index: Some(15),
+                        }
+                    })
+                } else {
+                    None
+                },
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -10266,14 +10701,17 @@ impl App {
             .expect("offscreen depth view missing");
 
         {
-            let rp_ts = self
-                .query_set
-                .as_ref()
-                .map(|qs| wgpu::RenderPassTimestampWrites {
-                    query_set: qs,
-                    beginning_of_pass_write_index: Some(0),
-                    end_of_pass_write_index: Some(1),
-                });
+            let rp_ts = if self.gui_visible {
+                self.query_set
+                    .as_ref()
+                    .map(|qs| wgpu::RenderPassTimestampWrites {
+                        query_set: qs,
+                        beginning_of_pass_write_index: Some(0),
+                        end_of_pass_write_index: Some(1),
+                    })
+            } else {
+                None
+            };
 
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Scene Pass"),
@@ -10456,14 +10894,17 @@ impl App {
                 self.ssr_bind_group.as_ref(),
                 self.ssr_texture_view.as_ref(),
             ) {
-                let ssr_ts = self
-                    .query_set
-                    .as_ref()
-                    .map(|qs| wgpu::RenderPassTimestampWrites {
-                        query_set: qs,
-                        beginning_of_pass_write_index: Some(8),
-                        end_of_pass_write_index: Some(9),
-                    });
+                let ssr_ts = if self.gui_visible {
+                    self.query_set
+                        .as_ref()
+                        .map(|qs| wgpu::RenderPassTimestampWrites {
+                            query_set: qs,
+                            beginning_of_pass_write_index: Some(8),
+                            end_of_pass_write_index: Some(9),
+                        })
+                } else {
+                    None
+                };
                 let mut ssr_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("SSR Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -10519,14 +10960,17 @@ impl App {
         // Water Pass (Transparent, reads depth buffer)
         let _water_scope = self.profiler.scope("water_cpu");
         {
-            let water_ts = self
-                .query_set
-                .as_ref()
-                .map(|qs| wgpu::RenderPassTimestampWrites {
-                    query_set: qs,
-                    beginning_of_pass_write_index: Some(10),
-                    end_of_pass_write_index: Some(11),
-                });
+            let water_ts = if self.gui_visible {
+                self.query_set
+                    .as_ref()
+                    .map(|qs| wgpu::RenderPassTimestampWrites {
+                        query_set: qs,
+                        beginning_of_pass_write_index: Some(10),
+                        end_of_pass_write_index: Some(11),
+                    })
+            } else {
+                None
+            };
 
             let mut water_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Water Pass"),
@@ -10592,14 +11036,17 @@ impl App {
                 let blur_strength = self.dof_settings.blur_strength;
                 let gpu_uniforms = self.pack_dof_uniforms(blur_strength);
                 queue.write_buffer(dof_buffer, 0, bytemuck::cast_slice(&gpu_uniforms));
-                let post_ts = self
-                    .query_set
-                    .as_ref()
-                    .map(|qs| wgpu::RenderPassTimestampWrites {
-                        query_set: qs,
-                        beginning_of_pass_write_index: Some(4),
-                        end_of_pass_write_index: None,
-                    });
+                let post_ts = if self.gui_visible {
+                    self.query_set
+                        .as_ref()
+                        .map(|qs| wgpu::RenderPassTimestampWrites {
+                            query_set: qs,
+                            beginning_of_pass_write_index: Some(4),
+                            end_of_pass_write_index: None,
+                        })
+                } else {
+                    None
+                };
                 let mut post_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("DoF CoC Copy Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -10740,14 +11187,17 @@ impl App {
                 self.dof_combine_bind_group.as_ref(),
                 self.post_color_view.as_ref(),
             ) {
-                let combine_ts =
+                let combine_ts = if self.gui_visible {
                     self.query_set
                         .as_ref()
                         .map(|qs| wgpu::RenderPassTimestampWrites {
                             query_set: qs,
                             beginning_of_pass_write_index: None,
                             end_of_pass_write_index: Some(5),
-                        });
+                        })
+                } else {
+                    None
+                };
                 let mut combine_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("DoF Combine Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -10787,26 +11237,81 @@ impl App {
             }
         }
         // Radiance Cascades Pass
+        // Compute timestamps don't work reliably on all backends, so we use empty render passes
+        // as timestamp "fences" before and after the compute work.
+        // Only capture timestamps when GUI is visible.
         if self.rc_enabled {
-            if let (Some(rc_pipeline), Some(rc_bind_group)) = (
+            if let (Some(rc_pipeline), Some(rc_bind_group), Some(post_view)) = (
                 self.rc_pipeline.as_ref(),
                 self.rc_bind_group.as_ref(),
+                self.post_color_view.as_ref(),
             ) {
-                let mut rc_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Radiance Cascades Pass"),
-                    timestamp_writes: self.query_set.as_ref().map(|qs| {
-                        wgpu::ComputePassTimestampWrites {
-                            query_set: qs,
-                            beginning_of_pass_write_index: Some(20),
-                            end_of_pass_write_index: Some(21),
-                        }
-                    }),
-                });
-                rc_pass.set_pipeline(rc_pipeline);
-                rc_pass.set_bind_group(0, rc_bind_group, &[]);
-                let workgroup_x = (self.render_target_width + 7) / 8;
-                let workgroup_y = (self.render_target_height + 7) / 8;
-                rc_pass.dispatch_workgroups(workgroup_x, workgroup_y, 1);
+                // Timestamp fence: mark start of RC (only when GUI visible)
+                if self.gui_visible {
+                    let mut _fence = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("RC Start Timestamp"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: post_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: self.query_set.as_ref().map(|qs| {
+                            wgpu::RenderPassTimestampWrites {
+                                query_set: qs,
+                                beginning_of_pass_write_index: Some(20),
+                                end_of_pass_write_index: None,
+                            }
+                        }),
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    // Pass ends immediately, writing timestamp at index 20
+                }
+
+                // Actual RC compute work
+                {
+                    let mut rc_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("Radiance Cascades Pass"),
+                        timestamp_writes: None,
+                    });
+                    rc_pass.set_pipeline(rc_pipeline);
+                    rc_pass.set_bind_group(0, rc_bind_group, &[]);
+                    let workgroup_x = (self.render_target_width + 7) / 8;
+                    let workgroup_y = (self.render_target_height + 7) / 8;
+                    rc_pass.dispatch_workgroups(workgroup_x, workgroup_y, 1);
+                }
+
+                // Timestamp fence: mark end of RC (only when GUI visible)
+                if self.gui_visible {
+                    let mut _fence = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("RC End Timestamp"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: post_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: self.query_set.as_ref().map(|qs| {
+                            wgpu::RenderPassTimestampWrites {
+                                query_set: qs,
+                                beginning_of_pass_write_index: None,
+                                end_of_pass_write_index: Some(21),
+                            }
+                        }),
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    // Pass ends immediately, writing timestamp at index 21
+                }
             }
         }
 
@@ -10840,18 +11345,22 @@ impl App {
                                     depth_slice: None,
                                 })],
                                 depth_stencil_attachment: None,
-                                timestamp_writes: self.query_set.as_ref().map(|qs| {
-                                    wgpu::RenderPassTimestampWrites {
-                                        query_set: qs,
-                                        beginning_of_pass_write_index: Some(12),
-                                        end_of_pass_write_index: if self.ssao_settings.blur_enabled
-                                        {
-                                            None
-                                        } else {
-                                            Some(13)
-                                        },
-                                    }
-                                }),
+                                timestamp_writes: if self.gui_visible {
+                                    self.query_set.as_ref().map(|qs| {
+                                        wgpu::RenderPassTimestampWrites {
+                                            query_set: qs,
+                                            beginning_of_pass_write_index: Some(12),
+                                            end_of_pass_write_index: if self.ssao_settings.blur_enabled
+                                            {
+                                                None
+                                            } else {
+                                                Some(13)
+                                            },
+                                        }
+                                    })
+                                } else {
+                                    None
+                                },
                                 occlusion_query_set: None,
                                 multiview_mask: None,
                             });
@@ -10909,13 +11418,17 @@ impl App {
                                         depth_slice: None,
                                     })],
                                     depth_stencil_attachment: None,
-                                    timestamp_writes: self.query_set.as_ref().map(|qs| {
-                                        wgpu::RenderPassTimestampWrites {
-                                            query_set: qs,
-                                            beginning_of_pass_write_index: None,
-                                            end_of_pass_write_index: Some(13),
-                                        }
-                                    }),
+                                    timestamp_writes: if self.gui_visible {
+                                        self.query_set.as_ref().map(|qs| {
+                                            wgpu::RenderPassTimestampWrites {
+                                                query_set: qs,
+                                                beginning_of_pass_write_index: None,
+                                                end_of_pass_write_index: Some(13),
+                                            }
+                                        })
+                                    } else {
+                                        None
+                                    },
                                     occlusion_query_set: None,
                                     multiview_mask: None,
                                 });
@@ -10925,14 +11438,17 @@ impl App {
                         }
                     }
                 }
-                let bloom_extract_ts =
+                let bloom_extract_ts = if self.gui_visible {
                     self.query_set
                         .as_ref()
                         .map(|qs| wgpu::RenderPassTimestampWrites {
                             query_set: qs,
                             beginning_of_pass_write_index: Some(16),
                             end_of_pass_write_index: None,
-                        });
+                        })
+                } else {
+                    None
+                };
                 let mut extract_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Bloom Extract Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -10989,7 +11505,7 @@ impl App {
                                     depth_slice: None,
                                 })],
                                 depth_stencil_attachment: None,
-                                timestamp_writes: if level == (iterations - 1) {
+                                timestamp_writes: if self.gui_visible && level == (iterations - 1) {
                                     self.query_set.as_ref().map(|qs| {
                                         wgpu::RenderPassTimestampWrites {
                                             query_set: qs,
@@ -11079,14 +11595,17 @@ impl App {
             self.composite_pipeline.as_ref(),
             self.composite_bind_group.as_ref(),
         ) {
-            let composite_ts = self
-                .query_set
-                .as_ref()
-                .map(|qs| wgpu::RenderPassTimestampWrites {
-                    query_set: qs,
-                    beginning_of_pass_write_index: Some(18),
-                    end_of_pass_write_index: Some(19),
-                });
+            let composite_ts = if self.gui_visible {
+                self.query_set
+                    .as_ref()
+                    .map(|qs| wgpu::RenderPassTimestampWrites {
+                        query_set: qs,
+                        beginning_of_pass_write_index: Some(18),
+                        end_of_pass_write_index: Some(19),
+                    })
+            } else {
+                None
+            };
             let mut composite_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Composite Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -11127,8 +11646,8 @@ impl App {
             eprintln!("Composite resources unavailable; skipping final pass!");
         }
 
-        // All GPU timestamp queries are resolved at end-of-frame
-        {
+        // All GPU timestamp queries are resolved at end-of-frame (only when GUI is visible)
+        if self.gui_visible {
             if let (Some(qs), Some(resolve_buf), Some(readback_buf)) = (
                 self.query_set.as_ref(),
                 self.query_resolve_buffer.as_ref(),
@@ -11151,7 +11670,7 @@ impl App {
         output.present();
         log::debug!("presented output for frame {}", self.frame_count);
 
-        {
+        if self.gui_visible {
             if let Some(readback_buf) = self.query_readback_buffer.as_ref() {
                 let slice = readback_buf.slice(..((22 * 8) as u64));
                 if !self.query_readback_in_flight {
@@ -11185,129 +11704,68 @@ impl App {
 
                         let period_ns = self.timestamp_period_ns;
 
-                        // NOTE: On some hardware (like Apple Silicon), beginning_of_pass_write_index
-                        // may return the start time of the entire command buffer.
-                        // To get reliable isolated pass durations, we calculate the delta between
-                        // a pass's end timestamp and the end timestamp of the pass that executed immediately before it.
-                        // We use a helper that returns 0.0 if any stamp is missing or invalid.
-                        let stamp_to_ms = |s: u64, e: u64| -> f64 {
-                            if s == 0 || e == 0 || e <= s {
-                                0.0
+                        // Robust GPU timing (Metal-friendly):
+                        // Some backends may return a command-buffer-relative value for beginning-of-pass stamps.
+                        // If you use (begin,end) for every pass, you can accidentally measure "time since encoder start",
+                        // making many passes look similarly large/cumulative.
+                        //
+                        // Approach:
+                        // - Use (begin,end) only for the *first* pass in an encoder (to establish baseline).
+                        // - For all subsequent passes, compute isolated duration from successive end timestamps.
+                        // This matches the previous behavior that was stable for Bloom/SSILVB.
+                        let ticks_to_ms = |dt_ticks: u64| -> f64 {
+                            (dt_ticks as f64 * period_ns) / 1_000_000.0
+                        };
+
+                        let iso_first = |begin: u64, end: u64| -> f64 {
+                            if begin != 0 && end != 0 && end > begin {
+                                ticks_to_ms(end - begin)
                             } else {
-                                ((e - s) as f64 * period_ns) / 1_000_000.0
+                                0.0
                             }
                         };
 
-                        let scene_ms = stamp_to_ms(stamps[0], stamps[1]);
-                        let hzb_copy_ms = stamp_to_ms(stamps[2], stamps[3]);
-                        let dof_ms = stamp_to_ms(stamps[4], stamps[5]);
-                        let gpu_cull_ms = stamp_to_ms(stamps[6], stamps[7]);
-                        let ssr_ms = stamp_to_ms(stamps[8], stamps[9]);
-                        let water_ms = stamp_to_ms(stamps[10], stamps[11]);
-                        let ssilvb_ms = stamp_to_ms(stamps[12], stamps[13]);
-                        let shadow_ms = stamp_to_ms(stamps[14], stamps[15]);
-                        let bloom_ms = stamp_to_ms(stamps[16], stamps[17]);
-                        let post_ms = stamp_to_ms(stamps[18], stamps[19]);
-                        let rc_ms = stamp_to_ms(stamps[20], stamps[21]);
-
-                        // Determine the absolute order of execution to calculate non-cumulative durations.
-                        // Execution order in render():
-                        // 0. Shadows (15)
-                        // 1. Scene (1)
-                        // 2. SSR (9)
-                        // 3. Water (11)
-                        // 4. DoF CoC+Kawase+Combine (5)
-                        // 5. Radiance Cascades (21)
-                        // 6. SSILVB (13)
-                        // 7. Bloom (17)
-                        // 8. Post (19)
-                        // Cull (7) and HZB (3) are in a separate encoder submitted earlier.
-
-                        let mut last_end_ms = 0.0;
-
-                        let iso_shadow = if shadow_ms > 0.0 {
-                            let d = (shadow_ms - last_end_ms).max(0.0);
-                            last_end_ms = shadow_ms;
-                            d
-                        } else {
-                            0.0
+                        let iso_next = |prev_end_tick: &mut Option<u64>, end: u64| -> f64 {
+                            if end == 0 {
+                                return 0.0;
+                            }
+                            let dt_ticks = if let Some(prev) = *prev_end_tick {
+                                if end > prev { end - prev } else { 0 }
+                            } else {
+                                0
+                            };
+                            *prev_end_tick = Some(end);
+                            ticks_to_ms(dt_ticks)
                         };
 
-                        let iso_scene = if scene_ms > 0.0 {
-                            let d = (scene_ms - last_end_ms).max(0.0);
-                            last_end_ms = scene_ms;
-                            d
+                        // Main encoder execution order in render():
+                        // Shadows -> Scene -> SSR -> Water -> DoF -> Radiance Cascades -> SSILVB -> Bloom -> Composite
+                        let mut prev_end_tick_main: Option<u64> = None;
+                        let iso_shadow = iso_first(stamps[14], stamps[15]);
+                        prev_end_tick_main = if stamps[15] != 0 {
+                            Some(stamps[15])
                         } else {
-                            0.0
+                            prev_end_tick_main
                         };
 
-                        let iso_ssr = if ssr_ms > 0.0 {
-                            let d = (ssr_ms - last_end_ms).max(0.0);
-                            last_end_ms = ssr_ms;
-                            d
-                        } else {
-                            0.0
-                        };
+                        let iso_scene = iso_next(&mut prev_end_tick_main, stamps[1]);
+                        let iso_ssr = iso_next(&mut prev_end_tick_main, stamps[9]);
+                        let iso_water = iso_next(&mut prev_end_tick_main, stamps[11]);
+                        let iso_dof = iso_next(&mut prev_end_tick_main, stamps[5]);
+                        let iso_rc = iso_next(&mut prev_end_tick_main, stamps[21]);
+                        let iso_ssilvb = iso_next(&mut prev_end_tick_main, stamps[13]);
+                        let iso_bloom = iso_next(&mut prev_end_tick_main, stamps[17]);
+                        let iso_post = iso_next(&mut prev_end_tick_main, stamps[19]);
 
-                        let iso_water = if water_ms > 0.0 {
-                            let d = (water_ms - last_end_ms).max(0.0);
-                            last_end_ms = water_ms;
-                            d
+                        // Pre-encoder (submitted earlier): HZB + cull
+                        let mut prev_end_tick_pre: Option<u64> = None;
+                        let hzb_iso = iso_first(stamps[2], stamps[3]);
+                        prev_end_tick_pre = if stamps[3] != 0 {
+                            Some(stamps[3])
                         } else {
-                            0.0
+                            prev_end_tick_pre
                         };
-
-                        let iso_dof = if dof_ms > 0.0 {
-                            let d = (dof_ms - last_end_ms).max(0.0);
-                            last_end_ms = dof_ms;
-                            d
-                        } else {
-                            0.0
-                        };
-
-                        let iso_rc = if rc_ms > 0.0 {
-                            let d = (rc_ms - last_end_ms).max(0.0);
-                            last_end_ms = rc_ms;
-                            d
-                        } else {
-                            0.0
-                        };
-
-                        let iso_ssilvb = if ssilvb_ms > 0.0 {
-                            let d = (ssilvb_ms - last_end_ms).max(0.0);
-                            last_end_ms = ssilvb_ms;
-                            d
-                        } else {
-                            0.0
-                        };
-
-                        let iso_bloom = if bloom_ms > 0.0 {
-                            let d = (bloom_ms - last_end_ms).max(0.0);
-                            last_end_ms = bloom_ms;
-                            d
-                        } else {
-                            0.0
-                        };
-
-                        let iso_post = if post_ms > 0.0 {
-                            (post_ms - last_end_ms).max(0.0)
-                        } else {
-                            0.0
-                        };
-
-                        let mut last_pre_ms = 0.0;
-                        let hzb_iso = if hzb_copy_ms > 0.0 {
-                            let d = (hzb_copy_ms - last_pre_ms).max(0.0);
-                            last_pre_ms = hzb_copy_ms;
-                            d
-                        } else {
-                            0.0
-                        };
-                        let cull_iso = if gpu_cull_ms > 0.0 {
-                            (gpu_cull_ms - last_pre_ms).max(0.0)
-                        } else {
-                            0.0
-                        };
+                        let cull_iso = iso_next(&mut prev_end_tick_pre, stamps[7]);
 
                         // Accumulate isolated timings for averaging
                         self.gpu_timing_accum_scene_ms += iso_scene;

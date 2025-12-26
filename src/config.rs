@@ -171,9 +171,17 @@ pub struct EffectsConfig {
     #[serde(default)]
     pub ssao: SsaoConfig,
     #[serde(default)]
+    pub radiance_cascades: RadianceCascadesConfig,
+    #[serde(default)]
     pub gi: GiConfig,
     #[serde(default)]
     pub ssr: SsrConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RadianceCascadesConfig {
+    #[serde(default = "default_radiance_cascades_enabled")]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -524,6 +532,10 @@ fn default_ssao_blur_radius() -> f32 {
     2.0
 }
 
+fn default_radiance_cascades_enabled() -> bool {
+    true
+}
+
 fn default_gi_enabled() -> bool {
     true
 }
@@ -732,8 +744,17 @@ impl Default for EffectsConfig {
             depth_of_field: DepthOfFieldConfig::default(),
             bloom: BloomConfig::default(),
             ssao: SsaoConfig::default(),
+            radiance_cascades: RadianceCascadesConfig::default(),
             gi: GiConfig::default(),
             ssr: SsrConfig::default(),
+        }
+    }
+}
+
+impl Default for RadianceCascadesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_radiance_cascades_enabled(),
         }
     }
 }
