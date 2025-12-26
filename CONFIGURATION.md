@@ -235,6 +235,16 @@ Each entry shows the default value (as found in `src/config.rs`), a short descri
   - Effect of change: More iterations increase blur and cost more GPU time.
 
 ---
+
+### Radiance Cascades (`effects.radiance_cascades`)
+
+- `enabled` (bool)
+  - Default: `true`
+  - Description: Toggle Radiance Cascades.
+  - Used: `src/bin/voxelot.rs` (RC pipeline creation + per-frame pass execution), `shaders/radiance_cascades.wgsl`
+  - Effect of change: Set to `false` to skip the RC pass entirely (useful for performance A/B tests).
+
+---
 ### Screen-Space Reflections (`effects.ssr`)
 
 - `enabled` (bool)

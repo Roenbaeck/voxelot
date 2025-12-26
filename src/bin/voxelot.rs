@@ -2455,7 +2455,7 @@ impl App {
             rc_texture: None,
             rc_texture_view: None,
             rc_texture_bytes: 0,
-            rc_enabled: cfg.effects.gi.enabled,
+            rc_enabled: cfg.effects.gi.enabled && cfg.effects.radiance_cascades.enabled,
 
             bloom_settings: BloomSettings {
                 threshold: cfg.effects.bloom.threshold,
@@ -11212,26 +11212,80 @@ impl App {
             }
         }
         // Radiance Cascades Pass
+        // Compute timestamps don't work reliably on all backends, so we use empty render passes
+        // as timestamp "fences" before and after the compute work.
         if self.rc_enabled {
-            if let (Some(rc_pipeline), Some(rc_bind_group)) = (
+            if let (Some(rc_pipeline), Some(rc_bind_group), Some(post_view)) = (
                 self.rc_pipeline.as_ref(),
                 self.rc_bind_group.as_ref(),
+                self.post_color_view.as_ref(),
             ) {
-                let mut rc_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Radiance Cascades Pass"),
-                    timestamp_writes: self.query_set.as_ref().map(|qs| {
-                        wgpu::ComputePassTimestampWrites {
-                            query_set: qs,
-                            beginning_of_pass_write_index: Some(20),
-                            end_of_pass_write_index: Some(21),
-                        }
-                    }),
-                });
-                rc_pass.set_pipeline(rc_pipeline);
-                rc_pass.set_bind_group(0, rc_bind_group, &[]);
-                let workgroup_x = (self.render_target_width + 7) / 8;
-                let workgroup_y = (self.render_target_height + 7) / 8;
-                rc_pass.dispatch_workgroups(workgroup_x, workgroup_y, 1);
+                // Timestamp fence: mark start of RC
+                {
+                    let mut _fence = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("RC Start Timestamp"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: post_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: self.query_set.as_ref().map(|qs| {
+                            wgpu::RenderPassTimestampWrites {
+                                query_set: qs,
+                                beginning_of_pass_write_index: Some(20),
+                                end_of_pass_write_index: None,
+                            }
+                        }),
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    // Pass ends immediately, writing timestamp at index 20
+                }
+
+                // Actual RC compute work
+                {
+                    let mut rc_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("Radiance Cascades Pass"),
+                        timestamp_writes: None,
+                    });
+                    rc_pass.set_pipeline(rc_pipeline);
+                    rc_pass.set_bind_group(0, rc_bind_group, &[]);
+                    let workgroup_x = (self.render_target_width + 7) / 8;
+                    let workgroup_y = (self.render_target_height + 7) / 8;
+                    rc_pass.dispatch_workgroups(workgroup_x, workgroup_y, 1);
+                }
+
+                // Timestamp fence: mark end of RC
+                {
+                    let mut _fence = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("RC End Timestamp"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: post_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: self.query_set.as_ref().map(|qs| {
+                            wgpu::RenderPassTimestampWrites {
+                                query_set: qs,
+                                beginning_of_pass_write_index: None,
+                                end_of_pass_write_index: Some(21),
+                            }
+                        }),
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    // Pass ends immediately, writing timestamp at index 21
+                }
             }
         }
 
@@ -11610,129 +11664,68 @@ impl App {
 
                         let period_ns = self.timestamp_period_ns;
 
-                        // NOTE: On some hardware (like Apple Silicon), beginning_of_pass_write_index
-                        // may return the start time of the entire command buffer.
-                        // To get reliable isolated pass durations, we calculate the delta between
-                        // a pass's end timestamp and the end timestamp of the pass that executed immediately before it.
-                        // We use a helper that returns 0.0 if any stamp is missing or invalid.
-                        let stamp_to_ms = |s: u64, e: u64| -> f64 {
-                            if s == 0 || e == 0 || e <= s {
-                                0.0
+                        // Robust GPU timing (Metal-friendly):
+                        // Some backends may return a command-buffer-relative value for beginning-of-pass stamps.
+                        // If you use (begin,end) for every pass, you can accidentally measure "time since encoder start",
+                        // making many passes look similarly large/cumulative.
+                        //
+                        // Approach:
+                        // - Use (begin,end) only for the *first* pass in an encoder (to establish baseline).
+                        // - For all subsequent passes, compute isolated duration from successive end timestamps.
+                        // This matches the previous behavior that was stable for Bloom/SSILVB.
+                        let ticks_to_ms = |dt_ticks: u64| -> f64 {
+                            (dt_ticks as f64 * period_ns) / 1_000_000.0
+                        };
+
+                        let iso_first = |begin: u64, end: u64| -> f64 {
+                            if begin != 0 && end != 0 && end > begin {
+                                ticks_to_ms(end - begin)
                             } else {
-                                ((e - s) as f64 * period_ns) / 1_000_000.0
+                                0.0
                             }
                         };
 
-                        let scene_ms = stamp_to_ms(stamps[0], stamps[1]);
-                        let hzb_copy_ms = stamp_to_ms(stamps[2], stamps[3]);
-                        let dof_ms = stamp_to_ms(stamps[4], stamps[5]);
-                        let gpu_cull_ms = stamp_to_ms(stamps[6], stamps[7]);
-                        let ssr_ms = stamp_to_ms(stamps[8], stamps[9]);
-                        let water_ms = stamp_to_ms(stamps[10], stamps[11]);
-                        let ssilvb_ms = stamp_to_ms(stamps[12], stamps[13]);
-                        let shadow_ms = stamp_to_ms(stamps[14], stamps[15]);
-                        let bloom_ms = stamp_to_ms(stamps[16], stamps[17]);
-                        let post_ms = stamp_to_ms(stamps[18], stamps[19]);
-                        let rc_ms = stamp_to_ms(stamps[20], stamps[21]);
-
-                        // Determine the absolute order of execution to calculate non-cumulative durations.
-                        // Execution order in render():
-                        // 0. Shadows (15)
-                        // 1. Scene (1)
-                        // 2. SSR (9)
-                        // 3. Water (11)
-                        // 4. DoF CoC+Kawase+Combine (5)
-                        // 5. Radiance Cascades (21)
-                        // 6. SSILVB (13)
-                        // 7. Bloom (17)
-                        // 8. Post (19)
-                        // Cull (7) and HZB (3) are in a separate encoder submitted earlier.
-
-                        let mut last_end_ms = 0.0;
-
-                        let iso_shadow = if shadow_ms > 0.0 {
-                            let d = (shadow_ms - last_end_ms).max(0.0);
-                            last_end_ms = shadow_ms;
-                            d
-                        } else {
-                            0.0
+                        let iso_next = |prev_end_tick: &mut Option<u64>, end: u64| -> f64 {
+                            if end == 0 {
+                                return 0.0;
+                            }
+                            let dt_ticks = if let Some(prev) = *prev_end_tick {
+                                if end > prev { end - prev } else { 0 }
+                            } else {
+                                0
+                            };
+                            *prev_end_tick = Some(end);
+                            ticks_to_ms(dt_ticks)
                         };
 
-                        let iso_scene = if scene_ms > 0.0 {
-                            let d = (scene_ms - last_end_ms).max(0.0);
-                            last_end_ms = scene_ms;
-                            d
+                        // Main encoder execution order in render():
+                        // Shadows -> Scene -> SSR -> Water -> DoF -> Radiance Cascades -> SSILVB -> Bloom -> Composite
+                        let mut prev_end_tick_main: Option<u64> = None;
+                        let iso_shadow = iso_first(stamps[14], stamps[15]);
+                        prev_end_tick_main = if stamps[15] != 0 {
+                            Some(stamps[15])
                         } else {
-                            0.0
+                            prev_end_tick_main
                         };
 
-                        let iso_ssr = if ssr_ms > 0.0 {
-                            let d = (ssr_ms - last_end_ms).max(0.0);
-                            last_end_ms = ssr_ms;
-                            d
-                        } else {
-                            0.0
-                        };
+                        let iso_scene = iso_next(&mut prev_end_tick_main, stamps[1]);
+                        let iso_ssr = iso_next(&mut prev_end_tick_main, stamps[9]);
+                        let iso_water = iso_next(&mut prev_end_tick_main, stamps[11]);
+                        let iso_dof = iso_next(&mut prev_end_tick_main, stamps[5]);
+                        let iso_rc = iso_next(&mut prev_end_tick_main, stamps[21]);
+                        let iso_ssilvb = iso_next(&mut prev_end_tick_main, stamps[13]);
+                        let iso_bloom = iso_next(&mut prev_end_tick_main, stamps[17]);
+                        let iso_post = iso_next(&mut prev_end_tick_main, stamps[19]);
 
-                        let iso_water = if water_ms > 0.0 {
-                            let d = (water_ms - last_end_ms).max(0.0);
-                            last_end_ms = water_ms;
-                            d
+                        // Pre-encoder (submitted earlier): HZB + cull
+                        let mut prev_end_tick_pre: Option<u64> = None;
+                        let hzb_iso = iso_first(stamps[2], stamps[3]);
+                        prev_end_tick_pre = if stamps[3] != 0 {
+                            Some(stamps[3])
                         } else {
-                            0.0
+                            prev_end_tick_pre
                         };
-
-                        let iso_dof = if dof_ms > 0.0 {
-                            let d = (dof_ms - last_end_ms).max(0.0);
-                            last_end_ms = dof_ms;
-                            d
-                        } else {
-                            0.0
-                        };
-
-                        let iso_rc = if rc_ms > 0.0 {
-                            let d = (rc_ms - last_end_ms).max(0.0);
-                            last_end_ms = rc_ms;
-                            d
-                        } else {
-                            0.0
-                        };
-
-                        let iso_ssilvb = if ssilvb_ms > 0.0 {
-                            let d = (ssilvb_ms - last_end_ms).max(0.0);
-                            last_end_ms = ssilvb_ms;
-                            d
-                        } else {
-                            0.0
-                        };
-
-                        let iso_bloom = if bloom_ms > 0.0 {
-                            let d = (bloom_ms - last_end_ms).max(0.0);
-                            last_end_ms = bloom_ms;
-                            d
-                        } else {
-                            0.0
-                        };
-
-                        let iso_post = if post_ms > 0.0 {
-                            (post_ms - last_end_ms).max(0.0)
-                        } else {
-                            0.0
-                        };
-
-                        let mut last_pre_ms = 0.0;
-                        let hzb_iso = if hzb_copy_ms > 0.0 {
-                            let d = (hzb_copy_ms - last_pre_ms).max(0.0);
-                            last_pre_ms = hzb_copy_ms;
-                            d
-                        } else {
-                            0.0
-                        };
-                        let cull_iso = if gpu_cull_ms > 0.0 {
-                            (gpu_cull_ms - last_pre_ms).max(0.0)
-                        } else {
-                            0.0
-                        };
+                        let cull_iso = iso_next(&mut prev_end_tick_pre, stamps[7]);
 
                         // Accumulate isolated timings for averaging
                         self.gpu_timing_accum_scene_ms += iso_scene;

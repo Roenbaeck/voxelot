@@ -73,6 +73,9 @@ strength = 1.0
 blur_enabled = true
 blur_radius = 2.0
 
+[effects.radiance_cascades]
+enabled = true
+
 [effects.gi]
 enabled = true
 indirect_scale = 0.003
