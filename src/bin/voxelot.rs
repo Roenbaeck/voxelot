@@ -5811,14 +5811,17 @@ impl App {
                     };
                     queue.write_buffer(params_buf, 0, bytemuck::bytes_of(&params));
 
-                    let ts_writes =
+                    let ts_writes = if self.gui_visible {
                         self.query_set
                             .as_ref()
                             .map(|qs| wgpu::ComputePassTimestampWrites {
                                 query_set: qs,
                                 beginning_of_pass_write_index: Some(2),
                                 end_of_pass_write_index: Some(3),
-                            });
+                            })
+                    } else {
+                        None
+                    };
 
                     let mut hzb_copy_pass =
                         encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -5862,14 +5865,17 @@ impl App {
             }
         }
 
-        let ts_writes = self
-            .query_set
-            .as_ref()
-            .map(|qs| wgpu::ComputePassTimestampWrites {
-                query_set: qs,
-                beginning_of_pass_write_index: Some(6),
-                end_of_pass_write_index: Some(7),
-            });
+        let ts_writes = if self.gui_visible {
+            self.query_set
+                .as_ref()
+                .map(|qs| wgpu::ComputePassTimestampWrites {
+                    query_set: qs,
+                    beginning_of_pass_write_index: Some(6),
+                    end_of_pass_write_index: Some(7),
+                })
+        } else {
+            None
+        };
         let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("GPU Cull Pass"),
             timestamp_writes: ts_writes,
@@ -10567,13 +10573,17 @@ impl App {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: self.query_set.as_ref().map(|qs| {
-                    wgpu::RenderPassTimestampWrites {
-                        query_set: qs,
-                        beginning_of_pass_write_index: Some(14),
-                        end_of_pass_write_index: Some(15),
-                    }
-                }),
+                timestamp_writes: if self.gui_visible {
+                    self.query_set.as_ref().map(|qs| {
+                        wgpu::RenderPassTimestampWrites {
+                            query_set: qs,
+                            beginning_of_pass_write_index: Some(14),
+                            end_of_pass_write_index: Some(15),
+                        }
+                    })
+                } else {
+                    None
+                },
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -10691,14 +10701,17 @@ impl App {
             .expect("offscreen depth view missing");
 
         {
-            let rp_ts = self
-                .query_set
-                .as_ref()
-                .map(|qs| wgpu::RenderPassTimestampWrites {
-                    query_set: qs,
-                    beginning_of_pass_write_index: Some(0),
-                    end_of_pass_write_index: Some(1),
-                });
+            let rp_ts = if self.gui_visible {
+                self.query_set
+                    .as_ref()
+                    .map(|qs| wgpu::RenderPassTimestampWrites {
+                        query_set: qs,
+                        beginning_of_pass_write_index: Some(0),
+                        end_of_pass_write_index: Some(1),
+                    })
+            } else {
+                None
+            };
 
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Scene Pass"),
@@ -10881,14 +10894,17 @@ impl App {
                 self.ssr_bind_group.as_ref(),
                 self.ssr_texture_view.as_ref(),
             ) {
-                let ssr_ts = self
-                    .query_set
-                    .as_ref()
-                    .map(|qs| wgpu::RenderPassTimestampWrites {
-                        query_set: qs,
-                        beginning_of_pass_write_index: Some(8),
-                        end_of_pass_write_index: Some(9),
-                    });
+                let ssr_ts = if self.gui_visible {
+                    self.query_set
+                        .as_ref()
+                        .map(|qs| wgpu::RenderPassTimestampWrites {
+                            query_set: qs,
+                            beginning_of_pass_write_index: Some(8),
+                            end_of_pass_write_index: Some(9),
+                        })
+                } else {
+                    None
+                };
                 let mut ssr_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("SSR Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -10944,14 +10960,17 @@ impl App {
         // Water Pass (Transparent, reads depth buffer)
         let _water_scope = self.profiler.scope("water_cpu");
         {
-            let water_ts = self
-                .query_set
-                .as_ref()
-                .map(|qs| wgpu::RenderPassTimestampWrites {
-                    query_set: qs,
-                    beginning_of_pass_write_index: Some(10),
-                    end_of_pass_write_index: Some(11),
-                });
+            let water_ts = if self.gui_visible {
+                self.query_set
+                    .as_ref()
+                    .map(|qs| wgpu::RenderPassTimestampWrites {
+                        query_set: qs,
+                        beginning_of_pass_write_index: Some(10),
+                        end_of_pass_write_index: Some(11),
+                    })
+            } else {
+                None
+            };
 
             let mut water_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Water Pass"),
@@ -11017,14 +11036,17 @@ impl App {
                 let blur_strength = self.dof_settings.blur_strength;
                 let gpu_uniforms = self.pack_dof_uniforms(blur_strength);
                 queue.write_buffer(dof_buffer, 0, bytemuck::cast_slice(&gpu_uniforms));
-                let post_ts = self
-                    .query_set
-                    .as_ref()
-                    .map(|qs| wgpu::RenderPassTimestampWrites {
-                        query_set: qs,
-                        beginning_of_pass_write_index: Some(4),
-                        end_of_pass_write_index: None,
-                    });
+                let post_ts = if self.gui_visible {
+                    self.query_set
+                        .as_ref()
+                        .map(|qs| wgpu::RenderPassTimestampWrites {
+                            query_set: qs,
+                            beginning_of_pass_write_index: Some(4),
+                            end_of_pass_write_index: None,
+                        })
+                } else {
+                    None
+                };
                 let mut post_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("DoF CoC Copy Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -11165,14 +11187,17 @@ impl App {
                 self.dof_combine_bind_group.as_ref(),
                 self.post_color_view.as_ref(),
             ) {
-                let combine_ts =
+                let combine_ts = if self.gui_visible {
                     self.query_set
                         .as_ref()
                         .map(|qs| wgpu::RenderPassTimestampWrites {
                             query_set: qs,
                             beginning_of_pass_write_index: None,
                             end_of_pass_write_index: Some(5),
-                        });
+                        })
+                } else {
+                    None
+                };
                 let mut combine_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("DoF Combine Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -11214,14 +11239,15 @@ impl App {
         // Radiance Cascades Pass
         // Compute timestamps don't work reliably on all backends, so we use empty render passes
         // as timestamp "fences" before and after the compute work.
+        // Only capture timestamps when GUI is visible.
         if self.rc_enabled {
             if let (Some(rc_pipeline), Some(rc_bind_group), Some(post_view)) = (
                 self.rc_pipeline.as_ref(),
                 self.rc_bind_group.as_ref(),
                 self.post_color_view.as_ref(),
             ) {
-                // Timestamp fence: mark start of RC
-                {
+                // Timestamp fence: mark start of RC (only when GUI visible)
+                if self.gui_visible {
                     let mut _fence = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("RC Start Timestamp"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -11260,8 +11286,8 @@ impl App {
                     rc_pass.dispatch_workgroups(workgroup_x, workgroup_y, 1);
                 }
 
-                // Timestamp fence: mark end of RC
-                {
+                // Timestamp fence: mark end of RC (only when GUI visible)
+                if self.gui_visible {
                     let mut _fence = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("RC End Timestamp"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -11319,18 +11345,22 @@ impl App {
                                     depth_slice: None,
                                 })],
                                 depth_stencil_attachment: None,
-                                timestamp_writes: self.query_set.as_ref().map(|qs| {
-                                    wgpu::RenderPassTimestampWrites {
-                                        query_set: qs,
-                                        beginning_of_pass_write_index: Some(12),
-                                        end_of_pass_write_index: if self.ssao_settings.blur_enabled
-                                        {
-                                            None
-                                        } else {
-                                            Some(13)
-                                        },
-                                    }
-                                }),
+                                timestamp_writes: if self.gui_visible {
+                                    self.query_set.as_ref().map(|qs| {
+                                        wgpu::RenderPassTimestampWrites {
+                                            query_set: qs,
+                                            beginning_of_pass_write_index: Some(12),
+                                            end_of_pass_write_index: if self.ssao_settings.blur_enabled
+                                            {
+                                                None
+                                            } else {
+                                                Some(13)
+                                            },
+                                        }
+                                    })
+                                } else {
+                                    None
+                                },
                                 occlusion_query_set: None,
                                 multiview_mask: None,
                             });
@@ -11388,13 +11418,17 @@ impl App {
                                         depth_slice: None,
                                     })],
                                     depth_stencil_attachment: None,
-                                    timestamp_writes: self.query_set.as_ref().map(|qs| {
-                                        wgpu::RenderPassTimestampWrites {
-                                            query_set: qs,
-                                            beginning_of_pass_write_index: None,
-                                            end_of_pass_write_index: Some(13),
-                                        }
-                                    }),
+                                    timestamp_writes: if self.gui_visible {
+                                        self.query_set.as_ref().map(|qs| {
+                                            wgpu::RenderPassTimestampWrites {
+                                                query_set: qs,
+                                                beginning_of_pass_write_index: None,
+                                                end_of_pass_write_index: Some(13),
+                                            }
+                                        })
+                                    } else {
+                                        None
+                                    },
                                     occlusion_query_set: None,
                                     multiview_mask: None,
                                 });
@@ -11404,14 +11438,17 @@ impl App {
                         }
                     }
                 }
-                let bloom_extract_ts =
+                let bloom_extract_ts = if self.gui_visible {
                     self.query_set
                         .as_ref()
                         .map(|qs| wgpu::RenderPassTimestampWrites {
                             query_set: qs,
                             beginning_of_pass_write_index: Some(16),
                             end_of_pass_write_index: None,
-                        });
+                        })
+                } else {
+                    None
+                };
                 let mut extract_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Bloom Extract Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -11468,7 +11505,7 @@ impl App {
                                     depth_slice: None,
                                 })],
                                 depth_stencil_attachment: None,
-                                timestamp_writes: if level == (iterations - 1) {
+                                timestamp_writes: if self.gui_visible && level == (iterations - 1) {
                                     self.query_set.as_ref().map(|qs| {
                                         wgpu::RenderPassTimestampWrites {
                                             query_set: qs,
@@ -11558,14 +11595,17 @@ impl App {
             self.composite_pipeline.as_ref(),
             self.composite_bind_group.as_ref(),
         ) {
-            let composite_ts = self
-                .query_set
-                .as_ref()
-                .map(|qs| wgpu::RenderPassTimestampWrites {
-                    query_set: qs,
-                    beginning_of_pass_write_index: Some(18),
-                    end_of_pass_write_index: Some(19),
-                });
+            let composite_ts = if self.gui_visible {
+                self.query_set
+                    .as_ref()
+                    .map(|qs| wgpu::RenderPassTimestampWrites {
+                        query_set: qs,
+                        beginning_of_pass_write_index: Some(18),
+                        end_of_pass_write_index: Some(19),
+                    })
+            } else {
+                None
+            };
             let mut composite_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Composite Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -11606,8 +11646,8 @@ impl App {
             eprintln!("Composite resources unavailable; skipping final pass!");
         }
 
-        // All GPU timestamp queries are resolved at end-of-frame
-        {
+        // All GPU timestamp queries are resolved at end-of-frame (only when GUI is visible)
+        if self.gui_visible {
             if let (Some(qs), Some(resolve_buf), Some(readback_buf)) = (
                 self.query_set.as_ref(),
                 self.query_resolve_buffer.as_ref(),
@@ -11630,7 +11670,7 @@ impl App {
         output.present();
         log::debug!("presented output for frame {}", self.frame_count);
 
-        {
+        if self.gui_visible {
             if let Some(readback_buf) = self.query_readback_buffer.as_ref() {
                 let slice = readback_buf.slice(..((22 * 8) as u64));
                 if !self.query_readback_in_flight {
