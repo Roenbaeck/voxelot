@@ -77,48 +77,6 @@ fn fetch_depth(coord: vec2<i32>) -> f32 {
     return textureLoad(depth_tex, coord, 0);
 }
 
-// Reconstruct normal from depth buffer using central differences
-fn compute_normal_from_depth(uv: vec2<f32>) -> vec3<f32> {
-    let size = vec2<f32>(ssao.screen_width, ssao.screen_height);
-    let p = vec2<i32>(uv * size);
-    
-    let c0 = fetch_depth(p);
-    
-    // Check for edge cases
-    if (c0 >= 1.0) { return vec3<f32>(0.0, 0.0, 1.0); }
-
-    let l1 = fetch_depth(p - vec2<i32>(1, 0));
-    let r1 = fetch_depth(p + vec2<i32>(1, 0));
-    let b1 = fetch_depth(p - vec2<i32>(0, 1));
-    let t1 = fetch_depth(p + vec2<i32>(0, 1));
-    
-    let l2 = fetch_depth(p - vec2<i32>(2, 0));
-    let r2 = fetch_depth(p + vec2<i32>(2, 0));
-    let b2 = fetch_depth(p - vec2<i32>(0, 2));
-    let t2 = fetch_depth(p + vec2<i32>(0, 2));
-    
-    let dl = abs((2.0 * l1 - l2) - c0);
-    let dr = abs((2.0 * r1 - r2) - c0);
-    let db = abs((2.0 * b1 - b2) - c0);
-    let dt = abs((2.0 * t1 - t2) - c0);
-    
-    let ce = reconstruct_position(uv, c0);
-    
-    let dpdx = select(
-        -ce + reconstruct_position(uv + vec2<f32>(1.0 / size.x, 0.0), r1),
-        ce - reconstruct_position(uv - vec2<f32>(1.0 / size.x, 0.0), l1),
-        dl < dr
-    );
-    
-    let dpdy = select(
-        -ce + reconstruct_position(uv + vec2<f32>(0.0, 1.0 / size.y), t1),
-        ce - reconstruct_position(uv - vec2<f32>(0.0, 1.0 / size.y), b1),
-        db < dt
-    );
-
-    return normalize(cross(dpdx, dpdy));
-}
-
 // Interleaved Gradient Noise
 fn ign(uv: vec2<f32>) -> f32 {
     return fract(52.9829189 * fract(dot(uv, vec2<f32>(0.06711056, 0.00583715))));

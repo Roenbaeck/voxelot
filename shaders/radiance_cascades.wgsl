@@ -30,6 +30,7 @@ struct LightProbe {
 @group(0) @binding(2) var scene_color: texture_2d<f32>;
 @group(0) @binding(3) var scene_depth: texture_depth_2d;
 @group(0) @binding(4) var hzb_texture: texture_2d<f32>;
+@group(0) @binding(5) var normal_gbuffer: texture_2d<f32>;
 @group(0) @binding(6) var post_sampler: sampler;
 
 // Output texture for the radiance
@@ -56,7 +57,12 @@ fn reconstruct_world_pos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     return world_pos.xyz / world_pos.w;
 }
 
-fn sample_dynamic_lights_avg(world_pos: vec3<f32>, max_dist: f32) -> vec3<f32> {
+fn decode_world_normal(encoded: vec3<f32>) -> vec3<f32> {
+    let n = encoded * 2.0 - 1.0;
+    return normalize(select(n, vec3<f32>(0.0, 1.0, 0.0), dot(n, n) < 1e-8));
+}
+
+fn sample_dynamic_lights_avg(world_pos: vec3<f32>, normal: vec3<f32>, max_dist: f32) -> vec3<f32> {
     var light_acc = vec3<f32>(0.0);
     for (var i = 0u; i < params.light_probe_count; i++) {
         let probe = light_probes[i];
@@ -64,10 +70,19 @@ fn sample_dynamic_lights_avg(world_pos: vec3<f32>, max_dist: f32) -> vec3<f32> {
         let dist_sq = dot(to_light, to_light);
         
         if (dist_sq > 0.001 && dist_sq < max_dist * max_dist) {
-            // Deterministic replacement for the previous Monte Carlo alignment sampling.
-            // Using an analytically averaged alignment term removes visible black/colored speckle.
-            let attenuation = (probe.color_power.a * 0.1) / (dist_sq + 1.0);
-            light_acc += probe.color_power.rgb * attenuation * AVG_SMOOTH_ALIGNMENT;
+            let dist = sqrt(dist_sq);
+            let dir_to_light = to_light / dist;
+            
+            // Lambertian term: dot(normal, dir_to_light)
+            // We use max(0, dot) to only light surfaces facing the light.
+            let lambert = max(0.0, dot(normal, dir_to_light));
+            
+            if (lambert > 0.0) {
+                let attenuation = (probe.color_power.a * 0.1) / (dist_sq + 1.0);
+                // We still use AVG_SMOOTH_ALIGNMENT as a base factor for the RC integration,
+                // but now weighted by the actual surface normal.
+                light_acc += probe.color_power.rgb * attenuation * lambert * 0.5;
+            }
         }
     }
     return light_acc;
@@ -89,6 +104,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     let world_pos = reconstruct_world_pos(uv, depth);
+    
+    // Sample normal from G-buffer
+    let gbuf = textureLoad(normal_gbuffer, vec2<i32>(id.xy), 0);
+    let world_normal = decode_world_normal(gbuf.rgb);
     
     // Distance culling + smooth fade for dynamic lights.
     // We fade in near the probe influence edge to avoid abrupt popping.
@@ -118,7 +137,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         // Each cascade covers a larger area. (Ray count no longer applies: we use a deterministic integral.)
         let cascade_dist = params.max_dist * f32(c + 1u) / f32(cascade_count);
 
-        let cascade_radiance = sample_dynamic_lights_avg(world_pos, cascade_dist);
+        let cascade_radiance = sample_dynamic_lights_avg(world_pos, world_normal, cascade_dist);
         total_radiance += cascade_radiance / f32(cascade_count);
     }
     

@@ -2,9 +2,9 @@
 file = "worlds/flat_city_test.vhc"
 palette = "worlds/palette.txt"
 camera_position = [
-    173.71587,
-    47.4047,
-    417.15747,
+    283.34683,
+    47.42579,
+    445.6834,
 ]
 water_level = 45.0
 water_visibility = 15.0

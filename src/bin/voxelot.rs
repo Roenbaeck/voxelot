@@ -4514,6 +4514,7 @@ impl App {
             Some(sampler),
             Some(rc_view),
             Some(rc_layout),
+            Some(normal_view),
         ) = (
             self.rc_params_buffer.as_ref(),
             self.rc_camera_buffer.as_ref(),
@@ -4524,6 +4525,7 @@ impl App {
             self.post_sampler.as_ref(),
             self.rc_texture_view.as_ref(),
             self.rc_bind_group_layout.as_ref(),
+            self.normal_view.as_ref(),
         ) {
             self.rc_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Radiance Cascades Bind Group"),
@@ -4548,6 +4550,10 @@ impl App {
                     wgpu::BindGroupEntry {
                         binding: 4,
                         resource: wgpu::BindingResource::TextureView(hzb_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(normal_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 6,
@@ -5405,6 +5411,24 @@ impl App {
                     },
                     count: None,
                 },
+                // HZB texture for accelerated SSR
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // HZB sampler
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
 
@@ -5491,6 +5515,7 @@ impl App {
             Some(scene_color_view),
             Some(post_sampler),
             Some(normal_view),
+            Some(hzb_view),
         ) = (
             self.device.as_ref(),
             self.water_bind_group_layout.as_ref(),
@@ -5501,6 +5526,7 @@ impl App {
             self.scene_copy_view.as_ref(), // Use scene copy texture for reflection sampling
             self.post_sampler.as_ref(),
             self.normal_view.as_ref(),
+            self.hzb_view.as_ref(),
         ) {
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Water Bind Group"),
@@ -5536,6 +5562,16 @@ impl App {
                     wgpu::BindGroupEntry {
                         binding: 6,
                         resource: wgpu::BindingResource::TextureView(normal_view),
+                    },
+                    // HZB texture
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: wgpu::BindingResource::TextureView(hzb_view),
+                    },
+                    // HZB sampler
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: wgpu::BindingResource::Sampler(post_sampler),
                     },
                 ],
             });
@@ -7079,6 +7115,17 @@ impl App {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Normal G-buffer for Lambertian weighting
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },

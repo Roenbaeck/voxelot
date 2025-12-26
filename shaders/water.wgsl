@@ -143,6 +143,12 @@ var scene_sampler: sampler;
 @group(1) @binding(6)
 var normal_gbuffer: texture_2d<f32>;
 
+// HZB texture for accelerated SSR
+@group(1) @binding(7)
+var hzb_texture: texture_2d<f32>;
+@group(1) @binding(8)
+var hzb_sampler: sampler;
+
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
@@ -389,14 +395,22 @@ fn reconstruct_world_pos_uv(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     return (camera.inverse_view * vec4<f32>(view_pos, 1.0)).xyz;
 }
 
-// Screen-space reflection ray marching
+// Calculate max mip level for HZB
+fn get_max_mip_level() -> f32 {
+    let dims = vec2<f32>(textureDimensions(hzb_texture, 0));
+    let max_dim = max(dims.x, dims.y);
+    return floor(log2(max_dim));
+}
+
+// Screen-space reflection ray marching with HZB acceleration
 fn trace_water_reflection(start_pos: vec3<f32>, ray_dir: vec3<f32>, cam_pos: vec3<f32>, pixel_uv: vec2<f32>) -> vec3<f32> {
-    // More steps + smaller stride reduces banding; jitter breaks up remaining lines.
-    let max_steps = 200u;
-    let step_size = 2.0;
+    // HZB acceleration allows for fewer steps while covering more ground.
+    let max_steps = 80u;
     let thickness_base = 5.0;
+    let max_binary_steps = 5u;
     
-    let max_dist = f32(max_steps) * step_size;
+    // Calculate end position in world space
+    let max_dist = 400.0; // Limit water SSR distance for performance
     let end_pos = start_pos + ray_dir * max_dist;
     
     let start_screen = world_to_screen_uv(start_pos);
@@ -409,13 +423,13 @@ fn trace_water_reflection(start_pos: vec3<f32>, ray_dir: vec3<f32>, cam_pos: vec
     let screen_delta_length = length(delta.xy * vec2<f32>(f32(dim.x), f32(dim.y)));
 
     // Jitter the start along the ray in screen-space to avoid visible marching bands.
-    // Deterministic per-pixel so it doesn't shimmer frame-to-frame.
     let jitter = hash2(pixel_uv * vec2<f32>(f32(dim.x), f32(dim.y)));
     var current_screen = start_screen + delta * jitter;
-    var prev_screen = current_screen;
+    
+    let max_mip = get_max_mip_level();
+    var current_mip = min(3.0, max_mip); // Start at a coarse mip for speed
     
     for (var i = 0u; i < max_steps; i++) {
-        prev_screen = current_screen;
         current_screen += delta;
         
         let uv = current_screen.xy;
@@ -424,61 +438,62 @@ fn trace_water_reflection(start_pos: vec3<f32>, ray_dir: vec3<f32>, cam_pos: vec
             break;
         }
         
-        let coords = vec2<i32>(vec2<f32>(dim) * uv);
-        if (coords.x < 0 || coords.x >= i32(dim.x) || coords.y < 0 || coords.y >= i32(dim.y)) {
-            break;
-        }
-        let scene_depth = textureLoad(depth_texture, coords, 0);
-        
-        if (scene_depth >= 0.9999) {
-            continue;
-        }
-        
+        // Sample HZB at current mip level
+        let hzb_depth = textureSampleLevel(hzb_texture, hzb_sampler, uv, current_mip).r;
         let ray_depth = current_screen.z;
         
-        if (ray_depth > scene_depth) {
-            let surface_pos = reconstruct_world_pos_uv(uv, scene_depth);
-            let ray_world_pos = reconstruct_world_pos_uv(uv, ray_depth);
-            let dist_diff = distance(ray_world_pos, surface_pos);
-            let dist_to_hit = distance(cam_pos, ray_world_pos);
-            
-            // Adaptive thickness: increase for distance and screen-space step size (elongation)
-            let screen_space_factor = max(1.0, screen_delta_length * 0.5);
-            let dynamic_thickness = (thickness_base + dist_to_hit * 0.05) * screen_space_factor;
-            
-            if (dist_diff < dynamic_thickness) {
-                // Refine hit with a few binary-search steps between prev and current.
-                var a = prev_screen;
-                var b = current_screen;
-                for (var j = 0u; j < 5u; j++) {
-                    let mid = (a + b) * 0.5;
-                    let mid_uv = mid.xy;
-                    let mid_coords = vec2<i32>(vec2<f32>(dim) * mid_uv);
-                    if (mid_uv.x < 0.0 || mid_uv.x > 1.0 || mid_uv.y < 0.0 || mid_uv.y > 1.0) {
-                        break;
+        // Adaptive thickness: increase for distance and screen-space step size
+        let dist_to_ray = distance(cam_pos, start_pos + ray_dir * (f32(i) / f32(max_steps)) * max_dist);
+        let dynamic_thickness = (thickness_base + dist_to_ray * 0.05) * screen_space_factor_calc(screen_delta_length);
+        
+        // Check if ray is behind surface (potential intersection)
+        if (ray_depth > hzb_depth) {
+            if (current_mip <= 0.5) {
+                // At finest detail, check thickness to avoid hitting backfaces or distant geometry
+                if (ray_depth - hzb_depth < dynamic_thickness / 1000.0) { // thickness is in world units, depth is [0,1]
+                    // Refine hit with binary search
+                    var refined_screen = current_screen - delta;
+                    var refined_delta = delta;
+                    
+                    for (var j = 0u; j < max_binary_steps; j++) {
+                        refined_delta *= 0.5;
+                        refined_screen += refined_delta;
+                        
+                        let refined_uv = refined_screen.xy;
+                        let refined_depth_sample = textureSampleLevel(hzb_texture, hzb_sampler, refined_uv, 0.0).r;
+                        
+                        if (refined_screen.z > refined_depth_sample) {
+                            refined_screen -= refined_delta;
+                        }
                     }
-                    if (mid_coords.x < 0 || mid_coords.x >= i32(dim.x) || mid_coords.y < 0 || mid_coords.y >= i32(dim.y)) {
-                        break;
-                    }
-                    let mid_scene_depth = textureLoad(depth_texture, mid_coords, 0);
-                    if (mid.z > mid_scene_depth) {
-                        b = mid;
-                    } else {
-                        a = mid;
-                    }
+                    
+                    let hit_uv = refined_screen.xy;
+                    let edge_fade = min(
+                        min(hit_uv.x, 1.0 - hit_uv.x),
+                        min(hit_uv.y, 1.0 - hit_uv.y)
+                    );
+                    let edge_factor = smoothstep(0.0, 0.1, edge_fade);
+                    return vec3<f32>(hit_uv, edge_factor);
                 }
-                let hit_uv = b.xy;
-                let edge_fade = min(
-                    min(hit_uv.x, 1.0 - hit_uv.x),
-                    min(hit_uv.y, 1.0 - hit_uv.y)
-                );
-                let edge_factor = smoothstep(0.0, 0.1, edge_fade);
-                return vec3<f32>(hit_uv, edge_factor);
+            } else {
+                // Descend to finer mip level
+                current_mip = max(0.0, current_mip - 1.0);
+                // Backtrack slightly to re-check at finer level
+                current_screen -= delta;
+            }
+        } else {
+            // No intersection, optionally ascend
+            if (current_mip < 3.0) {
+                current_mip += 1.0;
             }
         }
     }
     
     return vec3<f32>(0.0, 0.0, 0.0);
+}
+
+fn screen_space_factor_calc(screen_delta_length: f32) -> f32 {
+    return max(1.0, screen_delta_length * 0.5);
 }
 
 // ============================================================================
