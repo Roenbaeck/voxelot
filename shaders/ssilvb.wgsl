@@ -19,16 +19,18 @@ struct SsaoUniforms {
     _pad4: i32,
 };
 
-struct GiProbe {
-    position: vec4<f32>,
-    light_data: array<vec4<f32>, 6>,
-};
-
 @group(0) @binding(0) var<uniform> ssao: SsaoUniforms;
 @group(0) @binding(1) var depth_tex: texture_depth_2d;
 @group(0) @binding(2) var post_sampler: sampler;
-@group(0) @binding(3) var<storage, read> gi_probes: array<GiProbe>;
-@group(0) @binding(4) var normal_tex: texture_2d<f32>;
+// GI probe 3D volumes (Rgba16Float) with hardware trilinear filtering.
+// Faces are stored separately: +X, -X, +Y, -Y, +Z, -Z
+@group(0) @binding(3) var gi_probe_px: texture_3d<f32>;
+@group(0) @binding(4) var gi_probe_nx: texture_3d<f32>;
+@group(0) @binding(5) var gi_probe_py: texture_3d<f32>;
+@group(0) @binding(6) var gi_probe_ny: texture_3d<f32>;
+@group(0) @binding(7) var gi_probe_pz: texture_3d<f32>;
+@group(0) @binding(8) var gi_probe_nz: texture_3d<f32>;
+@group(0) @binding(9) var normal_tex: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -135,65 +137,47 @@ fn count_bits(value: u32) -> u32 {
     return (((v + (v >> 4u)) & 0x0F0F0F0Fu) * 0x01010101u) >> 24u;
 }
 
-fn get_probe_irradiance(probe_idx: u32, normal: vec3<f32>) -> vec3<f32> {
-    let probe = gi_probes[probe_idx];
-    
-    let w_x = normal.x * normal.x;
-    let w_y = normal.y * normal.y;
-    let w_z = normal.z * normal.z;
-    
-    let idx_x = select(0u, 1u, normal.x > 0.0);
-    let idx_y = select(2u, 3u, normal.y > 0.0);
-    let idx_z = select(4u, 5u, normal.z > 0.0);
-    
-    return probe.light_data[idx_x].rgb * w_x + 
-           probe.light_data[idx_y].rgb * w_y + 
-           probe.light_data[idx_z].rgb * w_z;
-}
-
 fn sample_grid_irradiance(world_pos: vec3<f32>, normal: vec3<f32>, camera_pos: vec3<f32>) -> vec3<f32> {
     // Bias position against normal to sample from same probe but opposite bin
     let biased_pos = world_pos - normal * 0.5;
 
     // Convert world pos to grid coords
-    // Grid origin is in chunks (16 units)
-    // Probe is at center of chunk (+8.0)
-    // grid_coord = (biased_pos - (grid_origin * 16.0 + 8.0)) / 16.0
-    //            = biased_pos / 16.0 - grid_origin - 0.5
-    
     let grid_coord = biased_pos / 16.0 - vec3<f32>(ssao.grid_origin) - 0.5;
     
-    let base = floor(grid_coord);
-    let frac = grid_coord - base;
-    
-    let dims = ssao.grid_dims;
-    
-    var total_irradiance = vec3<f32>(0.0);
-    var total_weight = 0.0;
-    
-    // Trilinear interpolation
-    for (var z = 0; z < 2; z = z + 1) {
-        for (var y = 0; y < 2; y = y + 1) {
-            for (var x = 0; x < 2; x = x + 1) {
-                let offset = vec3<f32>(f32(x), f32(y), f32(z));
-                let coord = vec3<i32>(base + offset);
-                
-                // Check bounds
-                if (coord.x >= 0 && coord.x < dims.x &&
-                    coord.y >= 0 && coord.y < dims.y &&
-                    coord.z >= 0 && coord.z < dims.z) {
-                    
-                    let idx = u32(coord.x + coord.y * dims.x + coord.z * dims.x * dims.y);
-                    let weight = (select(1.0 - frac.x, frac.x, x == 1) *
-                                  select(1.0 - frac.y, frac.y, y == 1) *
-                                  select(1.0 - frac.z, frac.z, z == 1));
-                                  
-                    total_irradiance += get_probe_irradiance(idx, normal) * weight;
-                    total_weight += weight;
-                }
-            }
-        }
+    let dims_i = ssao.grid_dims;
+    let dims = vec3<f32>(f32(dims_i.x), f32(dims_i.y), f32(dims_i.z));
+
+    // Outside the probe volume: no GI.
+    // We check against (dims - 1) because probes are defined at integer texel coordinates.
+    if (grid_coord.x < 0.0 || grid_coord.y < 0.0 || grid_coord.z < 0.0 ||
+        grid_coord.x > (dims.x - 1.0) || grid_coord.y > (dims.y - 1.0) || grid_coord.z > (dims.z - 1.0)) {
+        return vec3<f32>(0.0);
     }
+
+    // Map grid_coord (0..dims-1) to normalized UVW for texel-center sampling.
+    let uvw = clamp((grid_coord + vec3<f32>(0.5)) / dims, vec3<f32>(0.0), vec3<f32>(1.0));
+
+    let w_x = normal.x * normal.x;
+    let w_y = normal.y * normal.y;
+    let w_z = normal.z * normal.z;
+
+    let ir_x = select(
+        textureSample(gi_probe_nx, post_sampler, uvw).rgb,
+        textureSample(gi_probe_px, post_sampler, uvw).rgb,
+        normal.x > 0.0
+    );
+    let ir_y = select(
+        textureSample(gi_probe_ny, post_sampler, uvw).rgb,
+        textureSample(gi_probe_py, post_sampler, uvw).rgb,
+        normal.y > 0.0
+    );
+    let ir_z = select(
+        textureSample(gi_probe_nz, post_sampler, uvw).rgb,
+        textureSample(gi_probe_pz, post_sampler, uvw).rgb,
+        normal.z > 0.0
+    );
+
+    let total_irradiance = ir_x * w_x + ir_y * w_y + ir_z * w_z;
     
     // Calculate distance to edge of grid for smooth fading
     // grid_coord is in chunk units (0..dims)
@@ -215,11 +199,7 @@ fn sample_grid_irradiance(world_pos: vec3<f32>, normal: vec3<f32>, camera_pos: v
     // Combine both fades
     let total_fade = fade * distance_fade;
 
-    if (total_weight > 0.0) {
-        return (total_irradiance / total_weight) * total_fade;
-    } else {
-        return vec3<f32>(0.0);
-    }
+    return total_irradiance * total_fade;
 }
 
 @fragment
@@ -233,15 +213,14 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
 
-    let view_pos = reconstruct_position_linear(uv, linear_depth);
+    let inv_proj_00 = ssao.inverse_projection[0][0];
+    let inv_proj_11 = ssao.inverse_projection[1][1];
+    let ndc_xy_pixel = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    let view_pos = vec3<f32>(ndc_xy_pixel.x * linear_depth * inv_proj_00, ndc_xy_pixel.y * linear_depth * inv_proj_11, -linear_depth);
+
     // Sample world-space normal from G-buffer and decode from [0,1] to [-1,1]
     let world_normal = normalize(normal_sample.rgb * 2.0 - 1.0);
     // Transform world normal to view-space for GTAO calculations
-    // For orthogonal matrices: view_matrix = transpose(inverse_view)
-    // So view_space_normal = transpose(inverse_view) * world_normal
-    // But we can use inverse_view directly as columns form an orthonormal basis
-    // Actually: for rotation R, R^-1 = R^T, so (R^-1)^T = R
-    // inverse_view stores view->world, so transpose gives world->view
     let view_mat_rot = transpose(mat3x3<f32>(
         ssao.inverse_view[0].xyz,
         ssao.inverse_view[1].xyz,
@@ -254,9 +233,8 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let world_pos_4 = ssao.inverse_view * vec4<f32>(view_pos, 1.0);
     let world_pos = world_pos_4.xyz / world_pos_4.w;
     
-    // world_normal is already available from G-buffer (sampled at line 227)
-
     let screen_size = vec2<f32>(ssao.screen_width, ssao.screen_height);
+    let inv_screen_size = 1.0 / screen_size;
     let frag_coord = uv * screen_size;
     
     // Random rotation
@@ -268,6 +246,11 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     
     var visibility = 0.0;
     
+    let proj_scale = inv_proj_11 * ssao.screen_height;
+    let screen_radius = (radius * proj_scale) / -view_pos.z;
+    let step_ratio = pow(screen_radius, 1.0 / sample_count);
+    let hit_thickness_sq = ssao.hit_thickness * ssao.hit_thickness;
+
     for (var slice = 0u; slice < ssao.slice_count; slice = slice + 1u) {
         let phi = (2.0 * PI / slice_count) * (f32(slice) + noise);
         let slice_dir = vec2<f32>(cos(phi), sin(phi));
@@ -292,19 +275,16 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
         var occlusion_bits = 0u;
         
         for (var side = 0u; side < 2u; side = side + 1u) {
+            if (occlusion_bits == 0xFFFFFFFFu) { break; }
+
             let direction = select(-1.0, 1.0, side == 0u);
             let ray_dir = search_dir * direction;
-            let step_factor = pow(radius, 1.0 / sample_count);
-            let proj_scale = ssao.inverse_projection[1][1] * ssao.screen_height;
-            let screen_radius = (radius * proj_scale) / -view_pos.z;
-            let step_ratio = pow(screen_radius, 1.0 / sample_count);
-            var current_step = 1.0;
-            current_step = pow(step_ratio, select(noise, 1.0 - noise, side == 1u));
+            var current_step = pow(step_ratio, select(noise, 1.0 - noise, side == 1u));
             
             for (var s = 0u; s < 64u; s = s + 1u) {
                 if (s >= ssao.sample_count) { break; } 
 
-                let sample_uv = uv + (ray_dir * current_step) / screen_size;
+                let sample_uv = uv + (ray_dir * current_step) * inv_screen_size;
                 current_step *= step_ratio;
                 
                 if (sample_uv.x < 0.0 || sample_uv.x > 1.0 || sample_uv.y < 0.0 || sample_uv.y > 1.0) { break; }
@@ -314,17 +294,20 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
                 
                 if (sample_linear_depth <= 0.0) { continue; }
                 
-                let sample_pos = reconstruct_position_linear(sample_uv, sample_linear_depth);
+                let sample_ndc_xy = vec2<f32>(sample_uv.x * 2.0 - 1.0, 1.0 - sample_uv.y * 2.0);
+                let sample_pos = vec3<f32>(sample_ndc_xy.x * sample_linear_depth * inv_proj_00, sample_ndc_xy.y * sample_linear_depth * inv_proj_11, -sample_linear_depth);
                 
                 let delta = sample_pos - view_pos;
                 let dist_sq = dot(delta, delta);
-                let dist = sqrt(dist_sq);
-                let dist_vec = delta / dist;
                 
-                let horizon_cos = dot(dist_vec, view_vec);
+                let d_dot_v = dot(delta, view_vec);
+                let inv_dist = inverseSqrt(max(dist_sq, 1e-8));
+                let horizon_cos = d_dot_v * inv_dist;
                 let horizon_angle_rel = fast_acos(horizon_cos) * direction;
                 
-                let back_horizon_cos = dot(normalize(delta - view_vec * ssao.hit_thickness), view_vec);
+                let back_horizon_num = d_dot_v - ssao.hit_thickness;
+                let back_horizon_den_sq = dist_sq - 2.0 * d_dot_v * ssao.hit_thickness + hit_thickness_sq;
+                let back_horizon_cos = back_horizon_num * inverseSqrt(back_horizon_den_sq);
                 let back_horizon_angle = fast_acos(back_horizon_cos) * direction;
                 
                 let h1 = clamp((horizon_angle_rel + n_angle) / PI + 0.5, 0.0, 1.0);
@@ -343,7 +326,11 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
                         occlusion_bits = occlusion_bits | mask;
                     }
                 }
+
+                if (occlusion_bits == 0xFFFFFFFFu) { break; }
             }
+
+            if (occlusion_bits == 0xFFFFFFFFu) { break; }
         }
         
         let occluded_fraction = f32(count_bits(occlusion_bits)) / 32.0;

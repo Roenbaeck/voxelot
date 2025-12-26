@@ -12,6 +12,7 @@
 use clap::Parser;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use glam::{Mat4, Vec3};
+use half::f16;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -1255,6 +1256,20 @@ struct App {
     gi_grid_origin: glam::IVec3,
     gi_grid_dims: glam::IVec3,
     gi_probe_buffer: Option<wgpu::Buffer>,
+
+    // SSILVB GI probe 3D textures (6 faces: +X, -X, +Y, -Y, +Z, -Z)
+    gi_probe_tex_px: Option<wgpu::Texture>,
+    gi_probe_tex_nx: Option<wgpu::Texture>,
+    gi_probe_tex_py: Option<wgpu::Texture>,
+    gi_probe_tex_ny: Option<wgpu::Texture>,
+    gi_probe_tex_pz: Option<wgpu::Texture>,
+    gi_probe_tex_nz: Option<wgpu::Texture>,
+    gi_probe_view_px: Option<wgpu::TextureView>,
+    gi_probe_view_nx: Option<wgpu::TextureView>,
+    gi_probe_view_py: Option<wgpu::TextureView>,
+    gi_probe_view_ny: Option<wgpu::TextureView>,
+    gi_probe_view_pz: Option<wgpu::TextureView>,
+    gi_probe_view_nz: Option<wgpu::TextureView>,
     camera_controller: CameraController,
     pending_chunk_meshes: VecDeque<(i64, i64, i64)>,
     pending_chunk_set: FxHashSet<(i64, i64, i64)>,
@@ -1550,6 +1565,121 @@ impl App {
         }
         *agg = agg.saturating_add(new);
         *old = new;
+    }
+
+    fn gi_probe_padded_bytes_per_row(width: u32, bytes_per_texel: u32) -> u32 {
+        let bytes_per_row = width * bytes_per_texel;
+        ((bytes_per_row + 255) / 256) * 256
+    }
+
+    fn pack_gi_probe_face_volume_f16(
+        &self,
+        face_idx: usize,
+    ) -> Option<(Vec<u8>, u32, wgpu::Extent3d)> {
+        let extent = wgpu::Extent3d {
+            width: self.gi_grid_dims.x.max(0) as u32,
+            height: self.gi_grid_dims.y.max(0) as u32,
+            depth_or_array_layers: self.gi_grid_dims.z.max(0) as u32,
+        };
+
+        if extent.width == 0 || extent.height == 0 || extent.depth_or_array_layers == 0 {
+            return None;
+        }
+
+        // Rgba16Float
+        let bytes_per_texel = 8u32;
+        let padded_bpr = Self::gi_probe_padded_bytes_per_row(extent.width, bytes_per_texel);
+        let bytes_per_image = padded_bpr * extent.height;
+        let total_bytes = bytes_per_image as usize * extent.depth_or_array_layers as usize;
+
+        let probe_count = (extent.width * extent.height * extent.depth_or_array_layers) as usize;
+        if self.gi_probes.len() != probe_count {
+            // Shouldn't happen unless config/grid dims mismatch; avoid panic.
+            return None;
+        }
+
+        let mut out = vec![0u8; total_bytes];
+        let row_stride = padded_bpr as usize;
+        let image_stride = bytes_per_image as usize;
+        let texel_stride = bytes_per_texel as usize;
+
+        let wh = (extent.width as usize) * (extent.height as usize);
+        for z in 0..extent.depth_or_array_layers as usize {
+            let z_base = z * image_stride;
+            for y in 0..extent.height as usize {
+                let row_base = z_base + y * row_stride;
+                for x in 0..extent.width as usize {
+                    let idx = x + y * extent.width as usize + z * wh;
+                    let rgba = self.gi_probes[idx].light_data[face_idx];
+                    let dst = row_base + x * texel_stride;
+
+                    let r = f16::from_f32(rgba[0]).to_le_bytes();
+                    let g = f16::from_f32(rgba[1]).to_le_bytes();
+                    let b = f16::from_f32(rgba[2]).to_le_bytes();
+                    let a = f16::from_f32(rgba[3]).to_le_bytes();
+
+                    out[dst..dst + 2].copy_from_slice(&r);
+                    out[dst + 2..dst + 4].copy_from_slice(&g);
+                    out[dst + 4..dst + 6].copy_from_slice(&b);
+                    out[dst + 6..dst + 8].copy_from_slice(&a);
+                }
+            }
+        }
+
+        Some((out, padded_bpr, extent))
+    }
+
+    fn upload_gi_probe_textures(&self, queue: &wgpu::Queue) {
+        let Some(tex_px) = self.gi_probe_tex_px.as_ref() else {
+            return;
+        };
+        let Some(tex_nx) = self.gi_probe_tex_nx.as_ref() else {
+            return;
+        };
+        let Some(tex_py) = self.gi_probe_tex_py.as_ref() else {
+            return;
+        };
+        let Some(tex_ny) = self.gi_probe_tex_ny.as_ref() else {
+            return;
+        };
+        let Some(tex_pz) = self.gi_probe_tex_pz.as_ref() else {
+            return;
+        };
+        let Some(tex_nz) = self.gi_probe_tex_nz.as_ref() else {
+            return;
+        };
+
+        let textures: [(&wgpu::Texture, usize); 6] = [
+            (tex_px, 0),
+            (tex_nx, 1),
+            (tex_py, 2),
+            (tex_ny, 3),
+            (tex_pz, 4),
+            (tex_nz, 5),
+        ];
+
+        for (texture, face_idx) in textures {
+            let Some((data, padded_bpr, extent)) = self.pack_gi_probe_face_volume_f16(face_idx)
+            else {
+                continue;
+            };
+
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bpr),
+                    rows_per_image: Some(extent.height),
+                },
+                extent,
+            );
+        }
     }
 
     fn render_overscan_factor(&self) -> f32 {
@@ -2044,6 +2174,19 @@ impl App {
             gi_grid_origin: glam::IVec3::ZERO,
             gi_grid_dims: glam::IVec3::from_array(cfg.effects.gi.grid_dims),
             gi_probe_buffer: None,
+
+            gi_probe_tex_px: None,
+            gi_probe_tex_nx: None,
+            gi_probe_tex_py: None,
+            gi_probe_tex_ny: None,
+            gi_probe_tex_pz: None,
+            gi_probe_tex_nz: None,
+            gi_probe_view_px: None,
+            gi_probe_view_nx: None,
+            gi_probe_view_py: None,
+            gi_probe_view_ny: None,
+            gi_probe_view_pz: None,
+            gi_probe_view_nz: None,
 
             camera_controller: CameraController::new(initial_camera, &cfg.rendering),
             pending_chunk_meshes: VecDeque::new(),
@@ -4072,13 +4215,23 @@ impl App {
                 Some(ssao_ubo),
                 Some(depth_view),
                 Some(psampler),
-                Some(gi_probe_buf),
+                Some(gi_view_px),
+                Some(gi_view_nx),
+                Some(gi_view_py),
+                Some(gi_view_ny),
+                Some(gi_view_pz),
+                Some(gi_view_nz),
                 Some(normal_view),
             ) = (
                 self.ssilvb_uniform_buffer.as_ref(),
                 self.offscreen_depth_view.as_ref(),
                 self.post_sampler.as_ref(),
-                self.gi_probe_buffer.as_ref(),
+                self.gi_probe_view_px.as_ref(),
+                self.gi_probe_view_nx.as_ref(),
+                self.gi_probe_view_py.as_ref(),
+                self.gi_probe_view_ny.as_ref(),
+                self.gi_probe_view_pz.as_ref(),
+                self.gi_probe_view_nz.as_ref(),
                 self.normal_view.as_ref(),
             ) {
                 self.ssilvb_bind_group =
@@ -4100,10 +4253,30 @@ impl App {
                             },
                             wgpu::BindGroupEntry {
                                 binding: 3,
-                                resource: gi_probe_buf.as_entire_binding(),
+                                resource: wgpu::BindingResource::TextureView(gi_view_px),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 4,
+                                resource: wgpu::BindingResource::TextureView(gi_view_nx),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: wgpu::BindingResource::TextureView(gi_view_py),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 6,
+                                resource: wgpu::BindingResource::TextureView(gi_view_ny),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 7,
+                                resource: wgpu::BindingResource::TextureView(gi_view_pz),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 8,
+                                resource: wgpu::BindingResource::TextureView(gi_view_nz),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 9,
                                 resource: wgpu::BindingResource::TextureView(normal_view),
                             },
                         ],
@@ -6953,19 +7126,70 @@ impl App {
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
+                    // GI probe volumes (+X, -X, +Y, -Y, +Z, -Z)
                     wgpu::BindGroupLayoutEntry {
                         binding: 3,
                         visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 8,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
                         },
                         count: None,
                     },
                     // G-Buffer normal texture
                     wgpu::BindGroupLayoutEntry {
-                        binding: 4,
+                        binding: 9,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
                             sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -7324,6 +7548,78 @@ impl App {
             contents: bytemuck::cast_slice(&self.gi_probes),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
+
+        // Create GI probe 3D textures (6 faces) for SSILVB hardware trilinear filtering.
+        let gi_extent = wgpu::Extent3d {
+            width: self.gi_grid_dims.x.max(1) as u32,
+            height: self.gi_grid_dims.y.max(1) as u32,
+            depth_or_array_layers: self.gi_grid_dims.z.max(1) as u32,
+        };
+
+        let gi_tex_desc = |label: &'static str| wgpu::TextureDescriptor {
+            label: Some(label),
+            size: gi_extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        };
+
+        let gi_tex_px = device.create_texture(&gi_tex_desc("GI Probe +X 3D"));
+        let gi_tex_nx = device.create_texture(&gi_tex_desc("GI Probe -X 3D"));
+        let gi_tex_py = device.create_texture(&gi_tex_desc("GI Probe +Y 3D"));
+        let gi_tex_ny = device.create_texture(&gi_tex_desc("GI Probe -Y 3D"));
+        let gi_tex_pz = device.create_texture(&gi_tex_desc("GI Probe +Z 3D"));
+        let gi_tex_nz = device.create_texture(&gi_tex_desc("GI Probe -Z 3D"));
+
+        let gi_view_px = gi_tex_px.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            ..Default::default()
+        });
+        let gi_view_nx = gi_tex_nx.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            ..Default::default()
+        });
+        let gi_view_py = gi_tex_py.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            ..Default::default()
+        });
+        let gi_view_ny = gi_tex_ny.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            ..Default::default()
+        });
+        let gi_view_pz = gi_tex_pz.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            ..Default::default()
+        });
+        let gi_view_nz = gi_tex_nz.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            ..Default::default()
+        });
+
+        // Initialize volumes to zero so early frames don't sample uninitialized memory.
+        let padded_bpr = App::gi_probe_padded_bytes_per_row(gi_extent.width, 8);
+        let bytes_per_image = padded_bpr * gi_extent.height;
+        let zero_bytes = vec![0u8; (bytes_per_image as usize) * (gi_extent.depth_or_array_layers as usize)];
+        for texture in [&gi_tex_px, &gi_tex_nx, &gi_tex_py, &gi_tex_ny, &gi_tex_pz, &gi_tex_nz] {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &zero_bytes,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bpr),
+                    rows_per_image: Some(gi_extent.height),
+                },
+                gi_extent,
+            );
+        }
 
         let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Shadow Sampler"),
@@ -7813,6 +8109,19 @@ impl App {
         self.palette_buffer = Some(palette_buffer);
 
         self.gi_probe_buffer = Some(gi_probe_buffer);
+
+        self.gi_probe_tex_px = Some(gi_tex_px);
+        self.gi_probe_tex_nx = Some(gi_tex_nx);
+        self.gi_probe_tex_py = Some(gi_tex_py);
+        self.gi_probe_tex_ny = Some(gi_tex_ny);
+        self.gi_probe_tex_pz = Some(gi_tex_pz);
+        self.gi_probe_tex_nz = Some(gi_tex_nz);
+        self.gi_probe_view_px = Some(gi_view_px);
+        self.gi_probe_view_nx = Some(gi_view_nx);
+        self.gi_probe_view_py = Some(gi_view_py);
+        self.gi_probe_view_ny = Some(gi_view_ny);
+        self.gi_probe_view_pz = Some(gi_view_pz);
+        self.gi_probe_view_nz = Some(gi_view_nz);
         self.main_bind_group_layout = Some(main_bind_group_layout);
         self.shadow_bind_group_layout = Some(shadow_bind_group_layout);
         self.shadow_sampler = Some(shadow_sampler);
@@ -8215,6 +8524,9 @@ impl App {
             if let Some(buffer) = &self.gi_probe_buffer {
                 queue.write_buffer(buffer, 0, bytemuck::cast_slice(&*self.gi_probes));
             }
+
+            // Upload new probes to SSILVB 3D textures (hardware trilinear filtering)
+            self.upload_gi_probe_textures(&queue);
         }
 
         // Reset accumulator for GPU buffer item counting this frame

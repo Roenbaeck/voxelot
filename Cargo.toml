@@ -37,6 +37,7 @@ toml = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 zstd = "0.13.3"
 image = { version = "0.25", features = ["hdr"] }
+half = "2"
 
 
 [dev-dependencies]
