@@ -14,10 +14,26 @@ pub struct GiUpdateRequest {
 }
 
 /// Result from async GI update
-pub struct GiUpdateResult {
-    pub probes: Arc<Vec<GiProbe>>,
-    pub grid_origin: IVec3,
-    pub probes_calculated: usize,
+pub enum GiUpdateResult {
+    /// Full probe volume for the current `grid_origin` (sent on grid shifts and initial update).
+    Full {
+        probes: Vec<GiProbe>,
+        grid_origin: IVec3,
+        probes_calculated: usize,
+    },
+    /// Sparse probe updates (sent when grid origin is unchanged).
+    Partial {
+        updates: Vec<GiProbeUpdate>,
+        grid_origin: IVec3,
+        probes_calculated: usize,
+    },
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct GiProbeUpdate {
+    /// Flat index into the local probe grid (x + y*dims.x + z*dims.x*dims.y)
+    pub index: u32,
+    pub probe: GiProbe,
 }
 
 /// Compact representation of an emissive voxel within a chunk
@@ -49,7 +65,6 @@ impl Default for GiProbe {
 }
 
 pub struct GiSystem {
-    pub probes: Vec<GiProbe>,
     pub grid_origin: IVec3, // In chunks (chunk_coord)
     pub grid_dims: IVec3,   // Dimensions in chunks
 
@@ -67,9 +82,7 @@ pub struct GiSystem {
 
 impl GiSystem {
     pub fn new(dims: IVec3) -> Self {
-        let count = (dims.x * dims.y * dims.z) as usize;
         Self {
-            probes: vec![GiProbe::default(); count],
             grid_origin: IVec3::new(0, 0, 0),
             grid_dims: dims,
             probe_cache: HashMap::new(),
@@ -80,8 +93,58 @@ impl GiSystem {
         }
     }
 
+    fn local_index_for_coord(&self, chunk_coord: IVec3) -> Option<u32> {
+        let rel = chunk_coord - self.grid_origin;
+        if rel.x < 0
+            || rel.y < 0
+            || rel.z < 0
+            || rel.x >= self.grid_dims.x
+            || rel.y >= self.grid_dims.y
+            || rel.z >= self.grid_dims.z
+        {
+            return None;
+        }
+        let x = rel.x as u32;
+        let y = rel.y as u32;
+        let z = rel.z as u32;
+        let dx = self.grid_dims.x as u32;
+        let dy = self.grid_dims.y as u32;
+        Some(x + y * dx + z * dx * dy)
+    }
+
+    pub fn build_flat_probes(&self) -> Vec<GiProbe> {
+        let dims = self.grid_dims;
+        let origin = self.grid_origin;
+        let total_probes = (dims.x * dims.y * dims.z).max(0) as usize;
+        let mut probes = vec![GiProbe::default(); total_probes];
+
+        if dims.x <= 0 || dims.y <= 0 || dims.z <= 0 {
+            return probes;
+        }
+
+        for z in 0..dims.z {
+            for y in 0..dims.y {
+                for x in 0..dims.x {
+                    let coord = origin + IVec3::new(x, y, z);
+                    let idx = (x + y * dims.x + z * dims.x * dims.y) as usize;
+                    if let Some(p) = self.probe_cache.get(&coord) {
+                        probes[idx] = *p;
+                    }
+                }
+            }
+        }
+
+        probes
+    }
+
     /// Update probes based on camera position and visible chunks from culling
-    pub fn update(&mut self, world: &World, palette: &Palette, camera_pos: Vec3, visible_chunks: &[IVec3]) -> usize {
+    pub fn update(
+        &mut self,
+        world: &World,
+        palette: &Palette,
+        camera_pos: Vec3,
+        visible_chunks: &[IVec3],
+    ) -> (bool, Vec<GiProbeUpdate>, usize) {
         // 1. Determine new grid origin (centered on camera, snapped to chunk size)
         let chunk_size = 16.0;
         let cam_chunk = (camera_pos / chunk_size).floor().as_ivec3();
@@ -133,6 +196,7 @@ impl GiSystem {
         // For simplicity, we drive light loading by probe requirements.
         
         let mut probes_calculated = 0;
+        let mut updates: Vec<GiProbeUpdate> = Vec::new();
         if !self.missing_probes.is_empty() {
             // Throttle: only process up to 64 probes per update to prevent frame drops
             // Since GI runs async on background thread, this won't impact frame rate
@@ -380,32 +444,9 @@ impl GiSystem {
             // Update probe cache
             for (coord, probe) in new_probes {
                 self.probe_cache.insert(coord, probe);
-            }
-        }
-
-        // 6. Fill the flat buffer for GPU
-        // We iterate the grid dimensions and fetch from cache
-        // This is fast enough to do on main thread
-        let dims = self.grid_dims;
-        let origin = self.grid_origin;
-        
-        // Resize if needed (shouldn't be if dims constant)
-        let total_probes = (dims.x * dims.y * dims.z) as usize;
-        if self.probes.len() != total_probes {
-            self.probes.resize(total_probes, GiProbe::default());
-        }
-
-        // Sequential copy
-        for z in 0..dims.z {
-            for y in 0..dims.y {
-                for x in 0..dims.x {
-                    let coord = origin + IVec3::new(x, y, z);
-                    let idx = (x + y * dims.x + z * dims.x * dims.y) as usize;
-                    if let Some(p) = self.probe_cache.get(&coord) {
-                        self.probes[idx] = *p;
-                    } else {
-                        // Should not happen if logic above is correct
-                        self.probes[idx] = GiProbe::default();
+                if !grid_moved {
+                    if let Some(index) = self.local_index_for_coord(coord) {
+                        updates.push(GiProbeUpdate { index, probe });
                     }
                 }
             }
@@ -421,7 +462,7 @@ impl GiSystem {
         // self.probe_cache.retain(|k, _| (*k - center).abs().max_element() < prune_dist);
         // self.light_cache.retain(|k, _| (*k - center).abs().max_element() < prune_dist + 4);
 
-        probes_calculated
+        (grid_moved, updates, probes_calculated)
     }
 }
 
@@ -442,13 +483,22 @@ pub fn spawn_gi_worker(
         
         while let Ok(request) = request_rx.recv() {
             // Update GI system - world is already Arc, no lock needed (World is Sync)
-            let probes_calculated = gi_system.update(&world, &palette, request.camera_pos, &request.visible_chunks);
-            
-            // Send result back to main thread (Arc clone is cheap)
-            let result = GiUpdateResult {
-                probes: Arc::new(gi_system.probes.clone()),
-                grid_origin: gi_system.grid_origin,
-                probes_calculated,
+            let (grid_moved, updates, probes_calculated) =
+                gi_system.update(&world, &palette, request.camera_pos, &request.visible_chunks);
+
+            let grid_origin = gi_system.grid_origin;
+            let result = if grid_moved {
+                GiUpdateResult::Full {
+                    probes: gi_system.build_flat_probes(),
+                    grid_origin,
+                    probes_calculated,
+                }
+            } else {
+                GiUpdateResult::Partial {
+                    updates,
+                    grid_origin,
+                    probes_calculated,
+                }
             };
             
             // If send fails, main thread has dropped the receiver (shutdown)

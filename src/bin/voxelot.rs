@@ -1252,10 +1252,9 @@ struct App {
     // Async GI system: worker thread communicates via channels (like mesh workers)
     gi_request_tx: Sender<voxelot::gi::GiUpdateRequest>,
     gi_result_rx: Receiver<voxelot::gi::GiUpdateResult>,
-    gi_probes: Arc<Vec<voxelot::gi::GiProbe>>,
+    gi_probes: Vec<voxelot::gi::GiProbe>,
     gi_grid_origin: glam::IVec3,
     gi_grid_dims: glam::IVec3,
-    gi_probe_buffer: Option<wgpu::Buffer>,
 
     // SSILVB GI probe 3D textures (6 faces: +X, -X, +Y, -Y, +Z, -Z)
     gi_probe_tex_px: Option<wgpu::Texture>,
@@ -1627,6 +1626,105 @@ impl App {
         }
 
         Some((out, padded_bpr, extent))
+    }
+
+    fn pack_rgba16f_padded_256(rgba: [f32; 4]) -> [u8; 256] {
+        let mut out = [0u8; 256];
+
+        // Rgba16Float texel: 8 bytes
+        let r = f16::from_f32(rgba[0]).to_le_bytes();
+        let g = f16::from_f32(rgba[1]).to_le_bytes();
+        let b = f16::from_f32(rgba[2]).to_le_bytes();
+        let a = f16::from_f32(rgba[3]).to_le_bytes();
+
+        out[0..2].copy_from_slice(&r);
+        out[2..4].copy_from_slice(&g);
+        out[4..6].copy_from_slice(&b);
+        out[6..8].copy_from_slice(&a);
+
+        out
+    }
+
+    fn upload_gi_probe_texture_updates(
+        &self,
+        queue: &wgpu::Queue,
+        updates: &[voxelot::gi::GiProbeUpdate],
+    ) {
+        let Some(tex_px) = self.gi_probe_tex_px.as_ref() else {
+            return;
+        };
+        let Some(tex_nx) = self.gi_probe_tex_nx.as_ref() else {
+            return;
+        };
+        let Some(tex_py) = self.gi_probe_tex_py.as_ref() else {
+            return;
+        };
+        let Some(tex_ny) = self.gi_probe_tex_ny.as_ref() else {
+            return;
+        };
+        let Some(tex_pz) = self.gi_probe_tex_pz.as_ref() else {
+            return;
+        };
+        let Some(tex_nz) = self.gi_probe_tex_nz.as_ref() else {
+            return;
+        };
+
+        let dx = self.gi_grid_dims.x.max(0) as u32;
+        let dy = self.gi_grid_dims.y.max(0) as u32;
+        let dz = self.gi_grid_dims.z.max(0) as u32;
+        if dx == 0 || dy == 0 || dz == 0 {
+            return;
+        }
+        let wh = dx * dy;
+
+        let textures: [(&wgpu::Texture, usize); 6] = [
+            (tex_px, 0),
+            (tex_nx, 1),
+            (tex_py, 2),
+            (tex_ny, 3),
+            (tex_pz, 4),
+            (tex_nz, 5),
+        ];
+
+        let extent = wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        };
+
+        for update in updates {
+            let idx = update.index;
+            let z = idx / wh;
+            let rem = idx - z * wh;
+            let y = rem / dx;
+            let x = rem - y * dx;
+
+            if x >= dx || y >= dy || z >= dz {
+                continue;
+            }
+
+            let origin = wgpu::Origin3d { x, y, z };
+
+            for (texture, face_idx) in textures {
+                let rgba = update.probe.light_data[face_idx];
+                let data = Self::pack_rgba16f_padded_256(rgba);
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture,
+                        mip_level: 0,
+                        origin,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &data,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(256),
+                        rows_per_image: Some(1),
+                    },
+                    extent,
+                );
+            }
+        }
     }
 
     fn upload_gi_probe_textures(&self, queue: &wgpu::Queue) {
@@ -2164,16 +2262,15 @@ impl App {
             // Spawn async GI worker (like mesh workers)
             gi_request_tx,
             gi_result_rx,
-            gi_probes: Arc::new(vec![
+            gi_probes: vec![
                 voxelot::gi::GiProbe::default();
                 (cfg.effects.gi.grid_dims[0]
                     * cfg.effects.gi.grid_dims[1]
                     * cfg.effects.gi.grid_dims[2])
                     as usize
-            ]),
+            ],
             gi_grid_origin: glam::IVec3::ZERO,
             gi_grid_dims: glam::IVec3::from_array(cfg.effects.gi.grid_dims),
-            gi_probe_buffer: None,
 
             gi_probe_tex_px: None,
             gi_probe_tex_nx: None,
@@ -3923,7 +4020,7 @@ impl App {
             Some(uniform_buffer),
             Some(shadow_view),
             Some(shadow_sampler),
-            Some(gi_probe_buffer),
+            Some(light_probe_buffer),
             Some(palette_buffer),
         ) = (
             self.device.as_ref(),
@@ -3931,7 +4028,7 @@ impl App {
             self.uniform_buffer.as_ref(),
             self.shadow_view.as_ref(),
             self.shadow_sampler.as_ref(),
-            self.gi_probe_buffer.as_ref(),
+            self.light_probe_buffer.as_ref(),
             self.palette_buffer.as_ref(),
         )
         else {
@@ -3956,7 +4053,7 @@ impl App {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: gi_probe_buffer.as_entire_binding(),
+                    resource: light_probe_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -4413,7 +4510,6 @@ impl App {
             Some(offscreen_view),
             Some(depth_view),
             Some(hzb_view),
-            Some(gi_probe_buf),
             Some(light_probe_buf),
             Some(sampler),
             Some(rc_view),
@@ -4424,7 +4520,6 @@ impl App {
             self.offscreen_color_view.as_ref(),
             self.offscreen_depth_view.as_ref(),
             self.hzb_view.as_ref(),
-            self.gi_probe_buffer.as_ref(),
             self.light_probe_buffer.as_ref(),
             self.post_sampler.as_ref(),
             self.rc_texture_view.as_ref(),
@@ -4453,10 +4548,6 @@ impl App {
                     wgpu::BindGroupEntry {
                         binding: 4,
                         resource: wgpu::BindingResource::TextureView(hzb_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: gi_probe_buf.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 6,
@@ -6991,16 +7082,6 @@ impl App {
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
                     binding: 6,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
@@ -7542,12 +7623,23 @@ impl App {
             &mut self.gpu_buffer_bytes,
         );
 
-        // Create GI probe buffer
-        let gi_probe_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("GI Probe Buffer"),
-            contents: bytemuck::cast_slice(&self.gi_probes),
+        // Create light probe buffer (used by voxel.wgsl and radiance_cascades.wgsl)
+        // Allocate a small initial capacity so the main bind group can be created immediately.
+        self.light_probe_capacity = 64;
+        let light_probe_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Light Probe Buffer"),
+            size: (self.light_probe_capacity * std::mem::size_of::<LightProbe>())
+                as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
+        let initial_light_probe_bytes =
+            (self.light_probe_capacity * std::mem::size_of::<LightProbe>()) as u64;
+        App::replace_buffer_bytes_static(
+            &mut self.light_probe_buffer_bytes,
+            initial_light_probe_bytes,
+            &mut self.gpu_buffer_bytes,
+        );
 
         // Create GI probe 3D textures (6 faces) for SSILVB hardware trilinear filtering.
         let gi_extent = wgpu::Extent3d {
@@ -8108,7 +8200,7 @@ impl App {
         self.uniform_buffer = Some(uniform_buffer);
         self.palette_buffer = Some(palette_buffer);
 
-        self.gi_probe_buffer = Some(gi_probe_buffer);
+        self.light_probe_buffer = Some(light_probe_buffer);
 
         self.gi_probe_tex_px = Some(gi_tex_px);
         self.gi_probe_tex_nx = Some(gi_tex_nx);
@@ -8516,17 +8608,38 @@ impl App {
 
         // Check for GI results (non-blocking, like mesh result polling)
         while let Ok(result) = self.gi_result_rx.try_recv() {
-            self.gi_probes = result.probes; // Arc clone is cheap
-            self.gi_grid_origin = result.grid_origin;
-            self.gi_jobs_executed_counter += result.probes_calculated;
+            match result {
+                voxelot::gi::GiUpdateResult::Full {
+                    probes,
+                    grid_origin,
+                    probes_calculated,
+                } => {
+                    self.gi_probes = probes;
+                    self.gi_grid_origin = grid_origin;
+                    self.gi_jobs_executed_counter += probes_calculated;
 
-            // Upload new probes to GPU
-            if let Some(buffer) = &self.gi_probe_buffer {
-                queue.write_buffer(buffer, 0, bytemuck::cast_slice(&*self.gi_probes));
+                    // Full upload to SSILVB 3D textures (grid moved / initial)
+                    self.upload_gi_probe_textures(&queue);
+                }
+                voxelot::gi::GiUpdateResult::Partial {
+                    updates,
+                    grid_origin,
+                    probes_calculated,
+                } => {
+                    self.gi_grid_origin = grid_origin;
+                    self.gi_jobs_executed_counter += probes_calculated;
+
+                    // Apply updates to CPU cache
+                    for update in &updates {
+                        if let Some(slot) = self.gi_probes.get_mut(update.index as usize) {
+                            *slot = update.probe;
+                        }
+                    }
+
+                    // Sparse upload only changed texels to 3D textures
+                    self.upload_gi_probe_texture_updates(&queue, &updates);
+                }
             }
-
-            // Upload new probes to SSILVB 3D textures (hardware trilinear filtering)
-            self.upload_gi_probe_textures(&queue);
         }
 
         // Reset accumulator for GPU buffer item counting this frame
