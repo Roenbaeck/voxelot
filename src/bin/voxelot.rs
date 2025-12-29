@@ -3912,10 +3912,25 @@ impl App {
                     let target_width = self.render_target_width.max(1);
                     let target_height = self.render_target_height.max(1);
                     for dst_mip in 1..(self.hzb_mip_levels as usize) {
-                        if let (Some(dst_view), Some(src_view)) = (
-                            self.hzb_temp_mip_views.get(dst_mip), // Write to TEMP
-                            self.hzb_mip_views.get(dst_mip - 1),  // Read from MAIN
-                        ) {
+                        // Ping-pong between MAIN and TEMP to avoid intermediate copies
+                        // Mip 0 is in MAIN.
+                        // Mip 1: MAIN[0] -> TEMP[1]
+                        // Mip 2: TEMP[1] -> MAIN[2]
+                        // Mip 3: MAIN[2] -> TEMP[3]
+                        // ...
+                        let (dst_view, src_view) = if dst_mip % 2 == 1 {
+                            (
+                                self.hzb_temp_mip_views.get(dst_mip), // Write to TEMP
+                                self.hzb_mip_views.get(dst_mip - 1),  // Read from MAIN
+                            )
+                        } else {
+                            (
+                                self.hzb_mip_views.get(dst_mip),      // Write to MAIN
+                                self.hzb_temp_mip_views.get(dst_mip - 1), // Read from TEMP
+                            )
+                        };
+
+                        if let (Some(dst_view), Some(src_view)) = (dst_view, src_view) {
                             // Calculate mip dimensions
                             let mip_width = (target_width >> dst_mip).max(1);
                             let mip_height = (target_height >> dst_mip).max(1);
@@ -5938,21 +5953,29 @@ impl App {
                     let dispatch_y = ((mip_height + 7) / 8) as u32;
                     hzb_downsample_pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
                     drop(hzb_downsample_pass);
+                }
+            }
 
-                    // Copy Mip N from TEMP back to MAIN so it can be read by next pass (N+1)
-                    if let (Some(src_tex), Some(dst_tex)) =
-                        (self.hzb_temp_texture.as_ref(), self.hzb_texture.as_ref())
-                    {
+            // Final step: Copy all mips that were generated in TEMP back to MAIN
+            // Mips 1, 3, 5, 7, 9... are in TEMP.
+            // Mips 0, 2, 4, 6, 8, 10... are already in MAIN.
+            if let (Some(src_tex), Some(dst_tex)) =
+                (self.hzb_temp_texture.as_ref(), self.hzb_texture.as_ref())
+            {
+                for mip in 1..(self.hzb_mip_levels as u32) {
+                    if mip % 2 == 1 {
+                        let mip_width = (target_width >> mip).max(1);
+                        let mip_height = (target_height >> mip).max(1);
                         encoder.copy_texture_to_texture(
                             wgpu::TexelCopyTextureInfo {
                                 texture: src_tex,
-                                mip_level: dst_mip,
+                                mip_level: mip,
                                 origin: wgpu::Origin3d::ZERO,
                                 aspect: wgpu::TextureAspect::All,
                             },
                             wgpu::TexelCopyTextureInfo {
                                 texture: dst_tex,
-                                mip_level: dst_mip,
+                                mip_level: mip,
                                 origin: wgpu::Origin3d::ZERO,
                                 aspect: wgpu::TextureAspect::All,
                             },

@@ -39,7 +39,9 @@ fn downsample(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     
     let src_coords = coords * 2;
-    let src_dims = textureDimensions(hzb_src);
+    // We read from the previous mip level (src_mip) of the source texture
+    let src_mip = params.src_mip;
+    let src_dims = textureDimensions(hzb_src, i32(src_mip));
     
     // MAX reduction (furthest depth) to conservatively detect occlusion
     var max_d = 0.0;
@@ -47,7 +49,8 @@ fn downsample(@builtin(global_invocation_id) id: vec3<u32>) {
         for (var x = 0; x < 2; x++) {
             let s = src_coords + vec2<i32>(x, y);
             if (s.x < i32(src_dims.x) && s.y < i32(src_dims.y)) {
-                let d = textureLoad(hzb_src, s, 0).r;
+                // textureLoad with explicit mip level
+                let d = textureLoad(hzb_src, s, i32(src_mip)).r;
                 max_d = max(max_d, d);
             }
         }
