@@ -3033,18 +3033,12 @@ impl App {
                 }
             }
             KeyCode::KeyJ => {
-                // Cycle: off -> enabled -> debug view -> off
-                if !self.hzb_enabled {
-                    self.hzb_enabled = true;
-                    self.hzb_debug = false;
-                    log::info!("HZB enabled");
-                } else if !self.hzb_debug {
+                if !self.hzb_debug {
                     self.hzb_debug = true;
                     log::info!("HZB debug view enabled");
                 } else {
                     self.hzb_debug = false;
-                    self.hzb_enabled = false;
-                    log::info!("HZB disabled");
+                    log::info!("HZB debug view disabled");
                 }
                 // Note: HZB texture recreation happens automatically on next frame via existing logic
             }
