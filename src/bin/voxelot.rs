@@ -631,7 +631,10 @@ struct CompositeUniforms {
     hdr_highlight_compression: f32,
     hzb_debug: f32,
     hzb_mips: f32,
-    _pad2: f32,
+    near: f32,
+    far: f32,
+    _pad_align: f32,
+    _pad: [f32; 2],
     uv_scale: [f32; 2],
     uv_offset: [f32; 2],
 }
@@ -2794,7 +2797,10 @@ impl App {
             hdr_highlight_compression: if self.hdr_active { 1.0 } else { 0.0 },
             hzb_debug: if self.hzb_debug { 1.0 } else { 0.0 },
             hzb_mips: self.hzb_mip_levels as f32,
-            _pad2: 0.0,
+            near: self.camera_controller.camera.near,
+            far: self.camera_controller.camera.far,
+            _pad_align: 0.0,
+            _pad: [0.0; 2],
             uv_scale: [crop_scale, crop_scale],
             uv_offset: [crop_offset, crop_offset],
         }

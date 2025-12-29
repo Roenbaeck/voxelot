@@ -3,15 +3,17 @@ struct CompositeUniforms {
     saturation_boost: f32,
     exposure: f32,
     ssao_enabled: f32,
-    // Reserve a full vec4 for other per-pass state (debug and padding)
     ssao_debug: f32,
     ssao_strength: f32,
     ssr_debug: f32,
-    indirect_light_scale: f32, // Modulates emissive bounce light by ambient darkness (0=day, 1=night)
+    indirect_light_scale: f32,
     hdr_highlight_compression: f32,
-    hzb_debug: f32, // >0.5 => show HZB mip grid
-    hzb_mips: f32,  // number of mip levels in HZB texture
-    _pad2: f32,
+    hzb_debug: f32,
+    hzb_mips: f32,
+    near: f32,
+    far: f32,
+    _pad_align: f32,
+    _pad: vec2<f32>,
     uv_scale: vec2<f32>,
     uv_offset: vec2<f32>,
 };
@@ -117,9 +119,16 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
                 let edge = step(local_uv.x, border) + step(local_uv.y, border) + step(1.0 - local_uv.x, border) + step(1.0 - local_uv.y, border);
                 let border_col = vec3<f32>(0.0, 0.0, 0.0);
                 
-                // Visualization: use a non-linear ramp to see more detail in typical depth ranges
-                // Also near is black, far is white.
-                let fill = vec3<f32>(pow(depth_sample, 4.0)); 
+                // Linearize depth for better visualization
+                // Standard depth: d = f/(f-n) - (f*n)/((f-n)*z)
+                // z = (f*n) / (f - d*(f-n))
+                let n = composite.near;
+                let f = composite.far;
+                let z_linear = (f * n) / (f - depth_sample * (f - n));
+                
+                // Logarithmic mapping to see detail across the whole range [near, far]
+                let fill_val = (log2(z_linear) - log2(n)) / (log2(f) - log2(n));
+                let fill = vec3<f32>(fill_val);
                 
                 let col = mix(fill, border_col, clamp(edge, 0.0, 1.0));
                 return vec4<f32>(col, 1.0);
