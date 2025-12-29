@@ -93,25 +93,38 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     if (composite.hzb_debug > 0.5) {
         let tiles: f32 = 4.0;
         let tiles_i: u32 = 4u;
-        let grid_uv = sample_uv; // already has uv_scale/offset applied
-        let cell = vec2<u32>(u32(floor(grid_uv.x * tiles)), u32(floor(grid_uv.y * tiles)));
-        let mip_idx = cell.x + cell.y * tiles_i;
-        let mip_f = f32(mip_idx);
-        // local uv inside cell
-        let local_uv = fract(grid_uv * tiles);
-        // clamp mip to available mips
-        if (mip_f >= composite.hzb_mips) {
-            return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        
+        // Map sample_uv (0..1 over whole texture) to viewport_uv (0..1 over viewport)
+        let viewport_uv = (sample_uv - composite.uv_offset) / composite.uv_scale;
+        
+        if (viewport_uv.x >= 0.0 && viewport_uv.x <= 1.0 && viewport_uv.y >= 0.0 && viewport_uv.y <= 1.0) {
+            let cell = vec2<u32>(u32(floor(viewport_uv.x * tiles)), u32(floor(viewport_uv.y * tiles)));
+            let mip_idx = cell.x + cell.y * tiles_i;
+            let mip_f = f32(mip_idx);
+            
+            // local uv inside cell
+            let local_uv = fract(viewport_uv * tiles);
+            
+            // clamp mip to available mips
+            if (mip_f < composite.hzb_mips) {
+                // Sample HZB at specified mip
+                // We sample the viewport part of the HZB mip for each cell
+                let hzb_uv = local_uv * composite.uv_scale + composite.uv_offset;
+                let depth_sample = textureSampleLevel(hzb_texture, post_sampler, hzb_uv, mip_f).r;
+                
+                // Draw thin borders for cells
+                let border = 0.02;
+                let edge = step(local_uv.x, border) + step(local_uv.y, border) + step(1.0 - local_uv.x, border) + step(1.0 - local_uv.y, border);
+                let border_col = vec3<f32>(0.0, 0.0, 0.0);
+                
+                // Visualization: use a non-linear ramp to see more detail in typical depth ranges
+                // Also near is black, far is white.
+                let fill = vec3<f32>(pow(depth_sample, 4.0)); 
+                
+                let col = mix(fill, border_col, clamp(edge, 0.0, 1.0));
+                return vec4<f32>(col, 1.0);
+            }
         }
-        // Sample HZB at specified mip
-        let depth_sample = textureSampleLevel(hzb_texture, post_sampler, local_uv, mip_f).r;
-        // Draw thin borders for cells
-        let border = 0.02;
-        let edge = step(local_uv.x, border) + step(local_uv.y, border) + step(1.0 - local_uv.x, border) + step(1.0 - local_uv.y, border);
-        let border_col = vec3<f32>(0.0, 0.0, 0.0);
-        let fill = vec3<f32>(depth_sample);
-        let col = mix(fill, border_col, clamp(edge, 0.0, 1.0));
-        return vec4<f32>(col, 1.0);
     }
 
     let luma = dot(base, vec3<f32>(0.299, 0.587, 0.114));

@@ -2940,6 +2940,18 @@ impl App {
                 log::info!("SSAO radius: {}", self.ssao_settings.radius);
             }
             KeyCode::KeyH => {
+                self.hzb_enabled = !self.hzb_enabled;
+                log::info!(
+                    "HZB occlusion culling {}",
+                    if self.hzb_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+                self.pending_recreate_offscreen = true;
+            }
+            KeyCode::F6 => {
                 self.ssao_debug = !self.ssao_debug;
                 log::info!(
                     "SSAO debug {}",
@@ -2949,10 +2961,6 @@ impl App {
                         "disabled"
                     }
                 );
-                if self.ssao_debug {
-                    // schedule immediate readback of SSAO ping texture to print stats
-                    // readback currently disabled, visual debug still active
-                }
             }
             KeyCode::KeyK => {
                 // Decrease LOD distance (more detail at distance)
@@ -3040,7 +3048,7 @@ impl App {
                     self.hzb_debug = false;
                     log::info!("HZB debug view disabled");
                 }
-                // Note: HZB texture recreation happens automatically on next frame via existing logic
+                self.pending_recreate_offscreen = true;
             }
             KeyCode::KeyU => {
                 self.dof_settings.kawase_offset =
@@ -3702,7 +3710,8 @@ impl App {
         // Kawase registrations (UBOs/BindGroups per level)
         self.update_kawase_bind_groups();
         self.update_bloom_uniforms();
-        self.update_bloom_bind_groups();
+        self.update_water_uniforms();
+        self.update_ssr_bind_group();
 
         // Create HZB texture (after we dropped the device/config borrow from the local closure)
         if let Some(device) = self.device.as_ref() {
@@ -3715,7 +3724,7 @@ impl App {
             let mut hzb_temp_view_opt: Option<wgpu::TextureView> = None;
             let mut hzb_temp_texture_opt: Option<wgpu::Texture> = None;
 
-            if self.hzb_enabled {
+            if self.hzb_enabled || self.hzb_debug {
                 let target_width = self.render_target_width.max(1);
                 let target_height = self.render_target_height.max(1);
                 let max_dim = target_width.max(target_height);
@@ -3979,6 +3988,8 @@ impl App {
                 }
             }
         }
+        self.update_bloom_bind_groups();
+        self.cull_bind_group = None;
     }
 
     fn recreate_shadow_map(&mut self) {
@@ -5827,6 +5838,130 @@ impl App {
         Ok((vertex_offset, index_offset))
     }
 
+    fn generate_hzb(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        if !(self.hzb_enabled || self.hzb_debug) {
+            return;
+        }
+
+        let target_width = self.render_target_width.max(1);
+        let target_height = self.render_target_height.max(1);
+
+        // Pass 1: Copy depth -> HZB mip 0
+        if let (Some(copy_pipeline), Some(copy_bg), Some(params_buf), Some(queue)) = (
+            self.hzb_gen_copy_pipeline.as_ref(),
+            self.hzb_copy_bind_group.as_ref(),
+            self.hzb_params_buffer.as_ref(),
+            self.queue.as_ref(),
+        ) {
+            // Update params for mip 0
+            let params = HzbParams {
+                width: target_width,
+                height: target_height,
+                src_mip: 0,
+                dst_mip: 0,
+            };
+            queue.write_buffer(params_buf, 0, bytemuck::bytes_of(&params));
+
+            let ts_writes = if self.gui_visible {
+                self.query_set
+                    .as_ref()
+                    .map(|qs| wgpu::ComputePassTimestampWrites {
+                        query_set: qs,
+                        beginning_of_pass_write_index: Some(2),
+                        end_of_pass_write_index: Some(3),
+                    })
+            } else {
+                None
+            };
+
+            let mut hzb_copy_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("HZB Copy Pass"),
+                timestamp_writes: ts_writes,
+            });
+            hzb_copy_pass.set_pipeline(copy_pipeline);
+            hzb_copy_pass.set_bind_group(0, copy_bg, &[]);
+            let dispatch_x = ((target_width + 7) / 8) as u32;
+            let dispatch_y = ((target_height + 7) / 8) as u32;
+            hzb_copy_pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+            drop(hzb_copy_pass);
+
+            // Copy Mip 0 from TEMP back to MAIN
+            if let (Some(src_tex), Some(dst_tex)) =
+                (self.hzb_temp_texture.as_ref(), self.hzb_texture.as_ref())
+            {
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: src_tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: dst_tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: target_width,
+                        height: target_height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
+
+        // Pass 2-N: Downsample mip chain
+        if let Some(downsample_pipeline) = self.hzb_gen_downsample_pipeline.as_ref() {
+            for dst_mip in 1..(self.hzb_mip_levels as u32) {
+                if let Some(downsample_bg) =
+                    self.hzb_downsample_bind_groups.get((dst_mip - 1) as usize)
+                {
+                    // Calculate mip dimensions for dispatch count
+                    let mip_width = (target_width >> dst_mip).max(1);
+                    let mip_height = (target_height >> dst_mip).max(1);
+
+                    let mut hzb_downsample_pass =
+                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some(&format!("HZB Downsample Pass Mip {}", dst_mip)),
+                            timestamp_writes: None,
+                        });
+                    hzb_downsample_pass.set_pipeline(downsample_pipeline);
+                    hzb_downsample_pass.set_bind_group(0, downsample_bg, &[]);
+                    let dispatch_x = ((mip_width + 7) / 8) as u32;
+                    let dispatch_y = ((mip_height + 7) / 8) as u32;
+                    hzb_downsample_pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+                    drop(hzb_downsample_pass);
+
+                    // Copy Mip N from TEMP back to MAIN so it can be read by next pass (N+1)
+                    if let (Some(src_tex), Some(dst_tex)) =
+                        (self.hzb_temp_texture.as_ref(), self.hzb_texture.as_ref())
+                    {
+                        encoder.copy_texture_to_texture(
+                            wgpu::TexelCopyTextureInfo {
+                                texture: src_tex,
+                                mip_level: dst_mip,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            wgpu::TexelCopyTextureInfo {
+                                texture: dst_tex,
+                                mip_level: dst_mip,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            wgpu::Extent3d {
+                                width: mip_width,
+                                height: mip_height,
+                                depth_or_array_layers: 1,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn run_gpu_culling(
         &mut self,
         device: &wgpu::Device,
@@ -5854,132 +5989,6 @@ impl App {
             label: Some("GPU Cull Encoder"),
         });
 
-        // Generate HZB mip chain if enabled
-        if self.hzb_enabled {
-            // cfg not needed in this function; check presence only
-            if self.config.is_some() {
-                let target_width = self.render_target_width.max(1);
-                let target_height = self.render_target_height.max(1);
-                // Pass 1: Copy depth -> HZB mip 0
-                if let (Some(copy_pipeline), Some(copy_bg), Some(params_buf), Some(queue)) = (
-                    self.hzb_gen_copy_pipeline.as_ref(),
-                    self.hzb_copy_bind_group.as_ref(),
-                    self.hzb_params_buffer.as_ref(),
-                    self.queue.as_ref(),
-                ) {
-                    // Update params for mip 0
-                    let params = HzbParams {
-                        width: target_width,
-                        height: target_height,
-                        src_mip: 0,
-                        dst_mip: 0,
-                    };
-                    queue.write_buffer(params_buf, 0, bytemuck::bytes_of(&params));
-
-                    let ts_writes = if self.gui_visible {
-                        self.query_set
-                            .as_ref()
-                            .map(|qs| wgpu::ComputePassTimestampWrites {
-                                query_set: qs,
-                                beginning_of_pass_write_index: Some(2),
-                                end_of_pass_write_index: Some(3),
-                            })
-                    } else {
-                        None
-                    };
-
-                    let mut hzb_copy_pass =
-                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                            label: Some("HZB Copy Pass"),
-                            timestamp_writes: ts_writes,
-                        });
-                    hzb_copy_pass.set_pipeline(copy_pipeline);
-                    hzb_copy_pass.set_bind_group(0, copy_bg, &[]);
-                    let dispatch_x = ((target_width + 7) / 8) as u32;
-                    let dispatch_y = ((target_height + 7) / 8) as u32;
-                    hzb_copy_pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
-                    drop(hzb_copy_pass);
-
-                    // Copy Mip 0 from TEMP back to MAIN
-                    if let (Some(src_tex), Some(dst_tex)) =
-                        (self.hzb_temp_texture.as_ref(), self.hzb_texture.as_ref())
-                    {
-                        encoder.copy_texture_to_texture(
-                            wgpu::TexelCopyTextureInfo {
-                                texture: src_tex,
-                                mip_level: 0,
-                                origin: wgpu::Origin3d::ZERO,
-                                aspect: wgpu::TextureAspect::All,
-                            },
-                            wgpu::TexelCopyTextureInfo {
-                                texture: dst_tex,
-                                mip_level: 0,
-                                origin: wgpu::Origin3d::ZERO,
-                                aspect: wgpu::TextureAspect::All,
-                            },
-                            wgpu::Extent3d {
-                                width: target_width,
-                                height: target_height,
-                                depth_or_array_layers: 1,
-                            },
-                        );
-                    }
-                }
-
-                // Pass 2-N: Downsample mip chain
-                if let Some(downsample_pipeline) = self.hzb_gen_downsample_pipeline.as_ref() {
-                    for dst_mip in 1..(self.hzb_mip_levels as u32) {
-                        if let Some(downsample_bg) =
-                            self.hzb_downsample_bind_groups.get((dst_mip - 1) as usize)
-                        {
-                            // Calculate mip dimensions for dispatch count
-                            let mip_width = (target_width >> dst_mip).max(1);
-                            let mip_height = (target_height >> dst_mip).max(1);
-
-                            // Params are baked into the bind group, no need to update buffer!
-
-                            let mut hzb_downsample_pass =
-                                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                                    label: Some(&format!("HZB Downsample Pass Mip {}", dst_mip)),
-                                    timestamp_writes: None,
-                                });
-                            hzb_downsample_pass.set_pipeline(downsample_pipeline);
-                            hzb_downsample_pass.set_bind_group(0, downsample_bg, &[]);
-                            let dispatch_x = ((mip_width + 7) / 8) as u32;
-                            let dispatch_y = ((mip_height + 7) / 8) as u32;
-                            hzb_downsample_pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
-                            drop(hzb_downsample_pass);
-
-                            // Copy Mip N from TEMP back to MAIN so it can be read by next pass (N+1)
-                            if let (Some(src_tex), Some(dst_tex)) =
-                                (self.hzb_temp_texture.as_ref(), self.hzb_texture.as_ref())
-                            {
-                                encoder.copy_texture_to_texture(
-                                    wgpu::TexelCopyTextureInfo {
-                                        texture: src_tex,
-                                        mip_level: dst_mip,
-                                        origin: wgpu::Origin3d::ZERO,
-                                        aspect: wgpu::TextureAspect::All,
-                                    },
-                                    wgpu::TexelCopyTextureInfo {
-                                        texture: dst_tex,
-                                        mip_level: dst_mip,
-                                        origin: wgpu::Origin3d::ZERO,
-                                        aspect: wgpu::TextureAspect::All,
-                                    },
-                                    wgpu::Extent3d {
-                                        width: mip_width,
-                                        height: mip_height,
-                                        depth_or_array_layers: 1,
-                                    },
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
         let ts_writes = if self.gui_visible {
             self.query_set
                 .as_ref()
@@ -6002,11 +6011,6 @@ impl App {
         compute_pass.dispatch_workgroups(dispatch_x, 1, 1);
         drop(compute_pass);
 
-        // If we requested a deferred offscreen target recreation, do it now (safe point)
-        if self.pending_recreate_offscreen {
-            self.pending_recreate_offscreen = false;
-            self.recreate_offscreen_targets();
-        }
         // resolve + copy moved to the end of render() to capture all passes correctly.
         queue.submit(std::iter::once(encoder.finish()));
     }
@@ -10680,6 +10684,12 @@ impl App {
 
         self.draw_debug_voxels();
 
+        // If we requested a deferred offscreen target recreation, do it now (safe point)
+        if self.pending_recreate_offscreen {
+            self.pending_recreate_offscreen = false;
+            self.recreate_offscreen_targets();
+        }
+
         // Create command encoder
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Render Encoder"),
@@ -10827,16 +10837,16 @@ impl App {
             }
         }
 
-        let offscreen_color_view = self
-            .offscreen_color_view
-            .as_ref()
-            .expect("offscreen color view missing");
-        let offscreen_depth_view = self
-            .offscreen_depth_view
-            .as_ref()
-            .expect("offscreen depth view missing");
-
         {
+            let offscreen_color_view = self
+                .offscreen_color_view
+                .as_ref()
+                .expect("offscreen color view missing");
+            let offscreen_depth_view = self
+                .offscreen_depth_view
+                .as_ref()
+                .expect("offscreen depth view missing");
+
             let rp_ts = if self.gui_visible {
                 self.query_set
                     .as_ref()
@@ -11022,6 +11032,9 @@ impl App {
             }
         }
 
+        // Generate HZB mip chain from the depth buffer we just populated
+        self.generate_hzb(&mut encoder);
+
         // SSR Pass (if enabled) -> writes SSR texture
         let _ssr_scope = self.profiler.scope("ssr_cpu");
         if self.ssr_settings.enabled {
@@ -11107,6 +11120,11 @@ impl App {
             } else {
                 None
             };
+
+            let offscreen_color_view = self
+                .offscreen_color_view
+                .as_ref()
+                .expect("offscreen color view missing");
 
             let mut water_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Water Pass"),

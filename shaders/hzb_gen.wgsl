@@ -41,7 +41,7 @@ fn downsample(@builtin(global_invocation_id) id: vec3<u32>) {
     let src_coords = coords * 2;
     let src_dims = textureDimensions(hzb_src);
     
-    // MAX reduction (furthest depth) to conservatively detect occluders in the region
+    // MAX reduction (furthest depth) to conservatively detect occlusion
     var max_d = 0.0;
     for (var y = 0; y < 2; y++) {
         for (var x = 0; x < 2; x++) {
