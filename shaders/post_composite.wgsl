@@ -9,6 +9,8 @@ struct CompositeUniforms {
     ssr_debug: f32,
     indirect_light_scale: f32, // Modulates emissive bounce light by ambient darkness (0=day, 1=night)
     hdr_highlight_compression: f32,
+    hzb_debug: f32, // >0.5 => show HZB mip grid
+    hzb_mips: f32,  // number of mip levels in HZB texture
     _pad2: f32,
     uv_scale: vec2<f32>,
     uv_offset: vec2<f32>,
@@ -39,6 +41,7 @@ struct VertexOutput {
 @group(0) @binding(4) var ssao_texture: texture_2d<f32>;
 @group(0) @binding(5) var ssr_debug_texture: texture_2d<f32>;
 @group(0) @binding(6) var rc_texture: texture_2d<f32>;
+@group(0) @binding(7) var hzb_texture: texture_2d<f32>;
 @group(0) @binding(3) var post_sampler: sampler;
 
 @vertex
@@ -84,6 +87,31 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     if (composite.ssr_debug > 0.5) {
         let ssr_col = textureSample(ssr_debug_texture, post_sampler, sample_uv);
         return vec4<f32>(ssr_col.rgb, 1.0);
+    }
+
+    // HZB debug grid: splits screen into 4x4 tiles showing mip 0..15
+    if (composite.hzb_debug > 0.5) {
+        let tiles: f32 = 4.0;
+        let tiles_i: u32 = 4u;
+        let grid_uv = sample_uv; // already has uv_scale/offset applied
+        let cell = vec2<u32>(u32(floor(grid_uv.x * tiles)), u32(floor(grid_uv.y * tiles)));
+        let mip_idx = cell.x + cell.y * tiles_i;
+        let mip_f = f32(mip_idx);
+        // local uv inside cell
+        let local_uv = fract(grid_uv * tiles);
+        // clamp mip to available mips
+        if (mip_f >= composite.hzb_mips) {
+            return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        }
+        // Sample HZB at specified mip
+        let depth_sample = textureSampleLevel(hzb_texture, post_sampler, local_uv, mip_f).r;
+        // Draw thin borders for cells
+        let border = 0.02;
+        let edge = step(local_uv.x, border) + step(local_uv.y, border) + step(1.0 - local_uv.x, border) + step(1.0 - local_uv.y, border);
+        let border_col = vec3<f32>(0.0, 0.0, 0.0);
+        let fill = vec3<f32>(depth_sample);
+        let col = mix(fill, border_col, clamp(edge, 0.0, 1.0));
+        return vec4<f32>(col, 1.0);
     }
 
     let luma = dot(base, vec3<f32>(0.299, 0.587, 0.114));

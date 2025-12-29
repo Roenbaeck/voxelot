@@ -629,6 +629,8 @@ struct CompositeUniforms {
     ssr_debug: f32,
     indirect_light_scale: f32, // Modulates emissive bounce light by ambient darkness (0=day, 1=night)
     hdr_highlight_compression: f32,
+    hzb_debug: f32,
+    hzb_mips: f32,
     _pad2: f32,
     uv_scale: [f32; 2],
     uv_offset: [f32; 2],
@@ -1408,6 +1410,7 @@ struct App {
     hzb_bind_group_layout: Option<wgpu::BindGroupLayout>,
     _hzb_gen_downsample_bind_groups: Vec<Option<wgpu::BindGroup>>,
     hzb_enabled: bool,
+    hzb_debug: bool,
     // Frame timing
     _frame_times: VecDeque<f32>,
 
@@ -2425,6 +2428,7 @@ impl App {
             _hzb_gen_downsample_bind_groups: Vec::new(),
             hzb_params_buffer: None,
             hzb_enabled: cfg.performance.hzb_enabled,
+            hzb_debug: false,
             _frame_times: VecDeque::with_capacity(60),
             dof_combine_pipeline: None,
             dof_combine_bind_group_layout: None,
@@ -2788,6 +2792,8 @@ impl App {
             ssr_debug: if self.ssr_debug { 1.0 } else { 0.0 },
             indirect_light_scale,
             hdr_highlight_compression: if self.hdr_active { 1.0 } else { 0.0 },
+            hzb_debug: if self.hzb_debug { 1.0 } else { 0.0 },
+            hzb_mips: self.hzb_mip_levels as f32,
             _pad2: 0.0,
             uv_scale: [crop_scale, crop_scale],
             uv_offset: [crop_offset, crop_offset],
@@ -3027,15 +3033,19 @@ impl App {
                 }
             }
             KeyCode::KeyJ => {
-                self.hzb_enabled = !self.hzb_enabled;
-                log::info!(
-                    "HZB {}",
-                    if self.hzb_enabled {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    }
-                );
+                // Cycle: off -> enabled -> debug view -> off
+                if !self.hzb_enabled {
+                    self.hzb_enabled = true;
+                    self.hzb_debug = false;
+                    log::info!("HZB enabled");
+                } else if !self.hzb_debug {
+                    self.hzb_debug = true;
+                    log::info!("HZB debug view enabled");
+                } else {
+                    self.hzb_debug = false;
+                    self.hzb_enabled = false;
+                    log::info!("HZB disabled");
+                }
                 // Note: HZB texture recreation happens automatically on next frame via existing logic
             }
             KeyCode::KeyU => {
@@ -4474,12 +4484,14 @@ impl App {
             Some(ssao_ping_view),
             Some(post_view_ref),
             Some(rc_view),
+            Some(hzb_view),
         ) = (
             self.composite_uniform_buffer.as_ref(),
             self.post_sampler.as_ref(),
             self.ssao_ping_view.as_ref(),
             self.post_color_view.as_ref(),
             self.rc_texture_view.as_ref(),
+            self.hzb_view.as_ref(),
         ) {
             let ssr_view = self.ssr_texture_view.as_ref().unwrap_or(post_view_ref);
             self.composite_bind_group =
@@ -4510,6 +4522,10 @@ impl App {
                         wgpu::BindGroupEntry {
                             binding: 6,
                             resource: wgpu::BindingResource::TextureView(rc_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 7,
+                            resource: wgpu::BindingResource::TextureView(hzb_view),
                         },
                         wgpu::BindGroupEntry {
                             binding: 3,
@@ -5846,7 +5862,8 @@ impl App {
 
         // Generate HZB mip chain if enabled
         if self.hzb_enabled {
-            if let Some(cfg) = self.config.as_ref() {
+            // cfg not needed in this function; check presence only
+            if self.config.is_some() {
                 let target_width = self.render_target_width.max(1);
                 let target_height = self.render_target_height.max(1);
                 // Pass 1: Copy depth -> HZB mip 0
@@ -7492,6 +7509,16 @@ impl App {
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 6,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
                             sample_type: wgpu::TextureSampleType::Float { filterable: true },
