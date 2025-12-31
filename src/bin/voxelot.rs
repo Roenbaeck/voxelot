@@ -4067,6 +4067,7 @@ impl App {
             }
         }
         self.update_bloom_bind_groups();
+        self.update_ssr_bind_group(); // SSR needs HZB, bloom, SSAO, etc.
         self.cull_bind_group = None;
     }
 
@@ -4783,8 +4784,23 @@ impl App {
 
     fn update_ssr_bind_group(&mut self) {
         let Some(device) = self.device.as_ref() else {
+            log::warn!("SSR bind group: no device");
             return;
         };
+        
+        // Debug: check which resources are missing
+        if self.ssr_bind_group_layout.is_none() { log::warn!("SSR bind group: missing ssr_bind_group_layout"); }
+        if self.ssr_uniform_buffer.is_none() { log::warn!("SSR bind group: missing ssr_uniform_buffer"); }
+        if self.ssr_camera_uniform_buffer.is_none() { log::warn!("SSR bind group: missing ssr_camera_uniform_buffer"); }
+        if self.offscreen_color_view.is_none() { log::warn!("SSR bind group: missing offscreen_color_view"); }
+        if self.offscreen_depth_view.is_none() { log::warn!("SSR bind group: missing offscreen_depth_view"); }
+        if self.post_sampler.is_none() { log::warn!("SSR bind group: missing post_sampler"); }
+        if self.hzb_view.is_none() { log::warn!("SSR bind group: missing hzb_view"); }
+        if self.normal_view.is_none() { log::warn!("SSR bind group: missing normal_view"); }
+        if self.material_view.is_none() { log::warn!("SSR bind group: missing material_view"); }
+        if self.ssao_ping_view.is_none() { log::warn!("SSR bind group: missing ssao_ping_view"); }
+        if self.bloom_ping_view.is_none() { log::warn!("SSR bind group: missing bloom_ping_view"); }
+        
         let (
             Some(layout),
             Some(ssr_ubo),
@@ -4795,6 +4811,8 @@ impl App {
             Some(hzb_view),
             Some(normal_view),
             Some(material_view),
+            Some(ssao_view),
+            Some(bloom_view),
         ) = (
             self.ssr_bind_group_layout.as_ref(),
             self.ssr_uniform_buffer.as_ref(),
@@ -4805,10 +4823,14 @@ impl App {
             self.hzb_view.as_ref(),
             self.normal_view.as_ref(),
             self.material_view.as_ref(),
+            self.ssao_ping_view.as_ref(),  // Use ping buffer (final SSAO result after blur)
+            self.bloom_ping_view.as_ref(), // Bloom texture for reflections with glow
         )
         else {
             return;
         };
+        
+        log::info!("SSR bind group: creating successfully");
 
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("SSR Bind Group"),
@@ -4853,6 +4875,16 @@ impl App {
                 wgpu::BindGroupEntry {
                     binding: 8,
                     resource: wgpu::BindingResource::TextureView(material_view),
+                },
+                // SSAO texture for reflected surfaces
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(ssao_view),
+                },
+                // Bloom texture for reflections with glow
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::TextureView(bloom_view),
                 },
             ],
         });
@@ -5808,6 +5840,28 @@ impl App {
                     },
                     count: None,
                 },
+                // SSAO texture for applying AO to reflected surfaces
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Bloom texture for including glow in reflections
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -5845,6 +5899,7 @@ impl App {
 
         use wgpu::util::DeviceExt;
         let overscan = self.user_config.rendering.render_overscan.max(0.0);
+        let bloom_strength = self.bloom_settings.bloom_strength;
         let ssr_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("SSR Uniform Buffer"),
             contents: bytemuck::bytes_of(&[
@@ -5853,8 +5908,8 @@ impl App {
                 self.ssr_settings.step_size.to_bits(),
                 self.ssr_settings.thickness.to_bits(),
                 overscan.to_bits(),
-                0u32, 0u32, 0u32, // padding to 32 bytes
-                0u32, 0u32, 0u32, 0u32, // padding to 48 bytes (vec3 alignment)
+                bloom_strength.to_bits(),
+                0u32, 0u32, // padding to 32 bytes (vec2 alignment)
             ]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -10791,14 +10846,15 @@ impl App {
         // Update SSR params uniform (in case settings changed)
         if let Some(ssr_params_buf) = self.ssr_uniform_buffer.as_ref() {
             let overscan = self.user_config.rendering.render_overscan.max(0.0);
-            let params_arr: [u32; 12] = [
+            let bloom_strength = self.bloom_settings.bloom_strength;
+            let params_arr: [u32; 8] = [
                 self.ssr_settings.max_steps,
                 self.ssr_settings.max_binary_steps,
                 self.ssr_settings.step_size.to_bits(),
                 self.ssr_settings.thickness.to_bits(),
                 overscan.to_bits(),
-                0, 0, 0, // padding to 32 bytes
-                0, 0, 0, 0, // padding to 48 bytes (vec3 alignment)
+                bloom_strength.to_bits(),
+                0, 0, // padding to 32 bytes (vec2 alignment)
             ];
             queue.write_buffer(ssr_params_buf, 0, bytemuck::bytes_of(&params_arr));
         }
@@ -11202,49 +11258,6 @@ impl App {
 
         // Generate HZB mip chain from the depth buffer we just populated
         self.generate_hzb(&mut encoder);
-
-        // SSR Pass (if enabled) -> writes SSR texture
-        let _ssr_scope = self.profiler.scope("ssr_cpu");
-        if self.ssr_settings.enabled {
-            if let (Some(pipeline), Some(bind_group), Some(ssr_view)) = (
-                self.ssr_pipeline.as_ref(),
-                self.ssr_bind_group.as_ref(),
-                self.ssr_texture_view.as_ref(),
-            ) {
-                let ssr_ts = if self.gui_visible {
-                    self.query_set
-                        .as_ref()
-                        .map(|qs| wgpu::RenderPassTimestampWrites {
-                            query_set: qs,
-                            beginning_of_pass_write_index: Some(8),
-                            end_of_pass_write_index: Some(9),
-                        })
-                } else {
-                    None
-                };
-                let mut ssr_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("SSR Pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: ssr_view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::DontCare(unsafe {
-                                wgpu::LoadOpDontCare::enabled()
-                            }),
-                            store: wgpu::StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: ssr_ts,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                ssr_pass.set_pipeline(pipeline);
-                ssr_pass.set_bind_group(0, bind_group, &[]);
-                ssr_pass.draw(0..3, 0..1);
-            }
-        }
 
         // Copy offscreen color to scene_copy_texture for water reflection sampling
         // Water pass writes to offscreen_color but needs to read scene color for reflections
@@ -11760,6 +11773,7 @@ impl App {
                         }
                     }
                 }
+
                 let bloom_extract_ts = if self.gui_visible {
                     self.query_set
                         .as_ref()
@@ -11910,6 +11924,49 @@ impl App {
                         }
                     }
                 }
+            }
+        }
+
+        // SSR Pass (if enabled) -> writes SSR texture
+        // Placed AFTER bloom so reflected surfaces include glow effects
+        if self.ssr_settings.enabled {
+            if let (Some(pipeline), Some(bind_group), Some(ssr_view)) = (
+                self.ssr_pipeline.as_ref(),
+                self.ssr_bind_group.as_ref(),
+                self.ssr_texture_view.as_ref(),
+            ) {
+                let ssr_ts = if self.gui_visible {
+                    self.query_set
+                        .as_ref()
+                        .map(|qs| wgpu::RenderPassTimestampWrites {
+                            query_set: qs,
+                            beginning_of_pass_write_index: Some(8),
+                            end_of_pass_write_index: Some(9),
+                        })
+                } else {
+                    None
+                };
+                let mut ssr_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("SSR Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: ssr_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::DontCare(unsafe {
+                                wgpu::LoadOpDontCare::enabled()
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: ssr_ts,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                ssr_pass.set_pipeline(pipeline);
+                ssr_pass.set_bind_group(0, bind_group, &[]);
+                ssr_pass.draw(0..3, 0..1);
             }
         }
 

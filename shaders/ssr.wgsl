@@ -14,7 +14,8 @@ struct SSRParams {
     step_size: f32,
     thickness: f32,
     overscan: f32,  // How much extra UV space we can sample (e.g., 0.2 = 20% overscan)
-    _pad: vec3<f32>,
+    bloom_strength: f32,  // How much bloom to add to reflected colors
+    _pad: vec2<f32>,
 }
 
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
@@ -26,6 +27,8 @@ struct SSRParams {
 @group(0) @binding(6) var hzb_sampler: sampler;
 @group(0) @binding(7) var normal_gbuffer: texture_2d<f32>;
 @group(0) @binding(8) var material_gbuffer: texture_2d<f32>;  // R=reflectivity
+@group(0) @binding(9) var ssao_texture: texture_2d<f32>;  // SSAO for reflected surfaces
+@group(0) @binding(10) var bloom_texture: texture_2d<f32>;  // Bloom for reflected surfaces
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -236,6 +239,15 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         // Sample color at hit point
         let reflection_color = textureSample(scene_color, linear_sampler, hit_result.xy);
         
+        // Sample bloom at hit point to include glow in reflections
+        let bloom_sample = textureSample(bloom_texture, linear_sampler, hit_result.xy);
+        let bloomed_reflection = reflection_color.rgb + bloom_sample.rgb * params.bloom_strength;
+        
+        // Sample SSAO at hit point and apply to reflected color
+        let ssao_sample = textureSample(ssao_texture, linear_sampler, hit_result.xy);
+        let ao = ssao_sample.a;  // SSAO visibility is in alpha channel
+        let reflection_with_ao = bloomed_reflection * ao;
+        
         // Fade based on distance from screen edges
         let edge_fade = min(
             min(hit_result.x, 1.0 - hit_result.x),
@@ -249,7 +261,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         // Modulate reflection strength by material reflectivity
         let final_alpha = edge_factor * distance_fade * reflectivity;
         
-        return vec4<f32>(reflection_color.rgb, final_alpha);
+        return vec4<f32>(reflection_with_ao, final_alpha);
     }
     
     return vec4<f32>(0.0, 0.0, 0.0, 0.0);
