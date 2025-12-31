@@ -591,7 +591,13 @@ struct SsrCameraUniforms {
     inverse_view: [[f32; 4]; 4],
     inverse_proj: [[f32; 4]; 4],
     view_proj: [[f32; 4]; 4],
-    camera_pos: [f32; 4],
+    camera_pos: [f32; 3],
+    skybox_rotation: f32,
+    skybox_brightness: f32,
+    skybox_saturation: f32,
+    _pad1: [f32; 2],
+    skybox_tint: [f32; 3],
+    skybox_tint_strength: f32,
 }
 
 /// Depth-of-field runtime settings (CPU-side convenience)
@@ -4800,6 +4806,7 @@ impl App {
         if self.material_view.is_none() { log::warn!("SSR bind group: missing material_view"); }
         if self.ssao_ping_view.is_none() { log::warn!("SSR bind group: missing ssao_ping_view"); }
         if self.bloom_ping_view.is_none() { log::warn!("SSR bind group: missing bloom_ping_view"); }
+        if self.skybox_view.is_none() { log::warn!("SSR bind group: missing skybox_view"); }
         
         let (
             Some(layout),
@@ -4813,6 +4820,7 @@ impl App {
             Some(material_view),
             Some(ssao_view),
             Some(bloom_view),
+            Some(skybox_view),
         ) = (
             self.ssr_bind_group_layout.as_ref(),
             self.ssr_uniform_buffer.as_ref(),
@@ -4825,6 +4833,7 @@ impl App {
             self.material_view.as_ref(),
             self.ssao_ping_view.as_ref(),  // Use ping buffer (final SSAO result after blur)
             self.bloom_ping_view.as_ref(), // Bloom texture for reflections with glow
+            self.skybox_view.as_ref(),     // Skybox for reflections when ray misses geometry
         )
         else {
             return;
@@ -4885,6 +4894,11 @@ impl App {
                 wgpu::BindGroupEntry {
                     binding: 10,
                     resource: wgpu::BindingResource::TextureView(bloom_view),
+                },
+                // Skybox texture for reflections when ray misses geometry
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: wgpu::BindingResource::TextureView(skybox_view),
                 },
             ],
         });
@@ -5854,6 +5868,17 @@ impl App {
                 // Bloom texture for including glow in reflections
                 wgpu::BindGroupLayoutEntry {
                     binding: 10,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Skybox texture for reflections when ray misses geometry
+                wgpu::BindGroupLayoutEntry {
+                    binding: 11,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -10838,7 +10863,13 @@ impl App {
                 inverse_view: inverse_view_cols,
                 inverse_proj: inverse_proj_cols,
                 view_proj,
-                camera_pos: [camera_pos[0], camera_pos[1], camera_pos[2], 0.0],
+                camera_pos: [camera_pos[0], camera_pos[1], camera_pos[2]],
+                skybox_rotation: self.skybox_angle,
+                skybox_brightness,
+                skybox_saturation: self.skybox_min_saturation,
+                _pad1: [0.0, 0.0],
+                skybox_tint: self.skybox_night_tint,
+                skybox_tint_strength: self.skybox_tint_strength,
             };
             queue.write_buffer(ssr_cam_buf, 0, bytemuck::bytes_of(&ssr_cam));
         }

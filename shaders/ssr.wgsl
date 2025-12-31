@@ -5,7 +5,12 @@ struct CameraUniforms {
     inverse_proj: mat4x4<f32>,
     view_proj: mat4x4<f32>,
     camera_pos: vec3<f32>,
-    _pad0: f32,
+    skybox_rotation: f32,  // Skybox rotation angle in radians
+    skybox_brightness: f32,
+    skybox_saturation: f32,
+    _pad1: vec2<f32>,
+    skybox_tint: vec3<f32>,
+    skybox_tint_strength: f32,
 }
 
 struct SSRParams {
@@ -29,6 +34,7 @@ struct SSRParams {
 @group(0) @binding(8) var material_gbuffer: texture_2d<f32>;  // R=reflectivity
 @group(0) @binding(9) var ssao_texture: texture_2d<f32>;  // SSAO for reflected surfaces
 @group(0) @binding(10) var bloom_texture: texture_2d<f32>;  // Bloom for reflected surfaces
+@group(0) @binding(11) var skybox_texture: texture_2d<f32>;  // Skybox for missed rays
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -264,5 +270,36 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(reflection_with_ao, final_alpha);
     }
     
-    return vec4<f32>(0.0, 0.0, 0.0, 0.0);
-}
+    // No geometry hit - sample skybox for reflection
+    // Apply skybox rotation to match the scene
+    let angle = camera.skybox_rotation;
+    let c = cos(angle);
+    let s = sin(angle);
+    let rotated_dir = vec3<f32>(
+        reflect_dir.x * c + reflect_dir.z * s,
+        reflect_dir.y,
+        reflect_dir.x * -s + reflect_dir.z * c
+    );
+    
+    // Convert reflection direction to equirectangular UV
+    let PI = 3.14159265359;
+    let TWO_PI = 6.28318530718;
+    let u = 0.5 + atan2(rotated_dir.z, rotated_dir.x) / TWO_PI;
+    let v = 0.5 - asin(clamp(rotated_dir.y, -1.0, 1.0)) / PI;
+    
+    let sky_sample = textureSample(skybox_texture, linear_sampler, vec2<f32>(u, v)).rgb;
+    
+    // Apply brightness and saturation adjustments to match skybox pass
+    let brightness = camera.skybox_brightness;
+    let min_sat = camera.skybox_saturation;
+    let sat = clamp(min_sat + (1.0 - min_sat) * brightness, 0.0, 1.0);
+    let luminance = dot(sky_sample, vec3<f32>(0.299, 0.587, 0.114));
+    let desaturated = mix(vec3<f32>(luminance), sky_sample, sat);
+    let tint = camera.skybox_tint;
+    let tint_strength = camera.skybox_tint_strength;
+    let effect_strength = (1.0 - brightness) * tint_strength;
+    let tinted = mix(desaturated, desaturated * tint, effect_strength);
+    let sky_color = tinted * brightness;
+    
+    // Return skybox reflection with material reflectivity
+    return vec4<f32>(sky_color, reflectivity);}
