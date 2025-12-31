@@ -59,12 +59,17 @@ fn reconstruct_world_pos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
 }
 
 // Project world position to screen space
-fn world_to_screen(world_pos: vec3<f32>) -> vec3<f32> {
+// Returns vec4: xy = UV, z = depth, w = 1.0 if valid, 0.0 if behind camera
+fn world_to_screen(world_pos: vec3<f32>) -> vec4<f32> {
     let clip_pos = camera.view_proj * vec4<f32>(world_pos, 1.0);
+    // If w <= 0, point is behind camera - projection is invalid
+    if (clip_pos.w <= 0.0) {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);  // Invalid
+    }
     let ndc = clip_pos.xyz / clip_pos.w;
     // Convert to UV coordinates
     let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-    return vec3<f32>(uv, ndc.z);
+    return vec4<f32>(uv, ndc.z, 1.0);  // Valid
 }
 
 fn decode_world_normal(encoded: vec3<f32>) -> vec3<f32> {
@@ -87,18 +92,24 @@ fn get_max_mip_level() -> f32 {
 fn hzb_ray_march(start_pos: vec3<f32>, ray_dir: vec3<f32>, start_uv: vec2<f32>, start_depth: f32) -> vec4<f32> {
     var hit_result = vec4<f32>(-1.0, -1.0, -1.0, 0.0);
     
-    // Calculate end position in world space
-    let max_dist = f32(params.max_steps) * params.step_size;
-    let end_pos = start_pos + ray_dir * max_dist;
-    
-    // Project start and end to screen space
-    let start_screen = world_to_screen(start_pos);
-    let end_screen = world_to_screen(end_pos);
-    
-    // Calculate delta in screen space
-    let delta = (end_screen - start_screen) / f32(params.max_steps);
     // World space step size
-    let world_step = max_dist / f32(params.max_steps);
+    let world_step = params.step_size;
+    
+    // Project start to screen space
+    let start_screen_raw = world_to_screen(start_pos);
+    if (start_screen_raw.w < 0.5) {
+        return hit_result;  // Start is behind camera
+    }
+    
+    // Project one step ahead to get the screen-space direction
+    let next_pos = start_pos + ray_dir * world_step;
+    let next_screen_raw = world_to_screen(next_pos);
+    if (next_screen_raw.w < 0.5) {
+        return hit_result;  // First step goes behind camera
+    }
+    
+    let start_screen = start_screen_raw.xyz;
+    let delta = next_screen_raw.xyz - start_screen;
     
     var current_screen = start_screen;
     let max_mip = get_max_mip_level();
@@ -216,7 +227,6 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let reflect_dir = reflect(view_dir, normal);
     
     // Offset start position along normal to avoid self-intersection
-    // Use a larger offset (voxels are 1 unit, so offset by more than 1 to clear)
     let ray_start = world_pos + normal * 1.5;
     
     // Trace ray using HZB acceleration, pass start UV and depth for self-intersection rejection
