@@ -5844,6 +5844,7 @@ impl App {
         });
 
         use wgpu::util::DeviceExt;
+        let overscan = self.user_config.rendering.render_overscan.max(0.0);
         let ssr_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("SSR Uniform Buffer"),
             contents: bytemuck::bytes_of(&[
@@ -5851,6 +5852,9 @@ impl App {
                 self.ssr_settings.max_binary_steps,
                 self.ssr_settings.step_size.to_bits(),
                 self.ssr_settings.thickness.to_bits(),
+                overscan.to_bits(),
+                0u32, 0u32, 0u32, // padding to 32 bytes
+                0u32, 0u32, 0u32, 0u32, // padding to 48 bytes (vec3 alignment)
             ]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -10786,11 +10790,15 @@ impl App {
 
         // Update SSR params uniform (in case settings changed)
         if let Some(ssr_params_buf) = self.ssr_uniform_buffer.as_ref() {
-            let params_arr: [u32; 4] = [
+            let overscan = self.user_config.rendering.render_overscan.max(0.0);
+            let params_arr: [u32; 12] = [
                 self.ssr_settings.max_steps,
                 self.ssr_settings.max_binary_steps,
                 self.ssr_settings.step_size.to_bits(),
                 self.ssr_settings.thickness.to_bits(),
+                overscan.to_bits(),
+                0, 0, 0, // padding to 32 bytes
+                0, 0, 0, 0, // padding to 48 bytes (vec3 alignment)
             ];
             queue.write_buffer(ssr_params_buf, 0, bytemuck::bytes_of(&params_arr));
         }

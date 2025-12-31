@@ -13,6 +13,8 @@ struct SSRParams {
     max_binary_steps: u32,
     step_size: f32,
     thickness: f32,
+    overscan: f32,  // How much extra UV space we can sample (e.g., 0.2 = 20% overscan)
+    _pad: vec3<f32>,
 }
 
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
@@ -43,11 +45,12 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 
 // Reconstruct world position from depth
 fn reconstruct_world_pos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
-    // Convert UV and depth to NDC
-    let ndc = vec3<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth);
+    // Convert UV and depth to NDC (depth is [0,1], convert to NDC z)
+    let z_ndc = depth * 2.0 - 1.0;
+    let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - 2.0 * uv.y, z_ndc, 1.0);
     
     // Unproject to view space
-    let view_pos = camera.inverse_proj * vec4<f32>(ndc, 1.0);
+    let view_pos = camera.inverse_proj * ndc;
     let view_pos_3d = view_pos.xyz / view_pos.w;
     
     // Transform to world space
@@ -80,8 +83,9 @@ fn get_max_mip_level() -> f32 {
 
 // HZB-Accelerated Ray Marching
 // HZB-Accelerated Ray Marching (Screen Space)
-fn hzb_ray_march(start_pos: vec3<f32>, ray_dir: vec3<f32>) -> vec3<f32> {
-    var hit_uv = vec3<f32>(-1.0);
+// Returns vec4: xy = hit UV, z = hit confidence (0 or 1), w = world distance traveled
+fn hzb_ray_march(start_pos: vec3<f32>, ray_dir: vec3<f32>, start_uv: vec2<f32>, start_depth: f32) -> vec4<f32> {
+    var hit_result = vec4<f32>(-1.0, -1.0, -1.0, 0.0);
     
     // Calculate end position in world space
     let max_dist = f32(params.max_steps) * params.step_size;
@@ -92,30 +96,56 @@ fn hzb_ray_march(start_pos: vec3<f32>, ray_dir: vec3<f32>) -> vec3<f32> {
     let end_screen = world_to_screen(end_pos);
     
     // Calculate delta in screen space
-    // Note: This assumes the ray doesn't cross the camera plane (z=0 in view space)
-    // For a robust implementation, we should clip the ray to the near plane.
-    // However, for reflections, rays usually go away from the camera.
-    
     let delta = (end_screen - start_screen) / f32(params.max_steps);
+    // World space step size
+    let world_step = max_dist / f32(params.max_steps);
     
     var current_screen = start_screen;
     let max_mip = get_max_mip_level();
     var current_mip = min(4.0, max_mip);
     
+    // Minimum world distance before accepting any hit (in world units/voxels)
+    // Building walls are often adjacent, so we need a decent distance
+    let min_world_distance = 10.0;
+    
+    // Track if ray is going toward or away from camera (in depth)
+    // Positive delta.z means ray goes further from camera, negative means closer
+    let ray_goes_further = delta.z > 0.0;
+    
+    // Calculate UV bounds with overscan
+    // Overscan allows sampling off-screen geometry that was rendered
+    let os = params.overscan;
+    let uv_min = -os / (1.0 + os);  // Maps to start of overscan region
+    let uv_max = 1.0 + os / (1.0 + os);  // Maps to end of overscan region
+    
     // Hierarchical ray march
     for (var i = 0u; i < params.max_steps; i++) {
         current_screen += delta;
         
+        // Current world distance traveled
+        let world_dist = f32(i + 1u) * world_step;
+        
         let uv = current_screen.xy;
         
-        // Check if out of screen bounds
-        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+        // Check if out of screen bounds (with overscan)
+        if (uv.x < uv_min || uv.x > uv_max || uv.y < uv_min || uv.y > uv_max) {
             break;
+        }
+        
+        // Skip hits that are too close in world space (avoid hitting adjacent building surfaces)
+        if (world_dist < min_world_distance) {
+            continue;
+        }
+        
+        // For rays going further from camera: reject hits at depth less than start (behind us)
+        // For rays going toward camera: reject hits at depth greater than start
+        let ray_depth = current_screen.z;
+        if (ray_goes_further && ray_depth < start_depth - 0.001) {
+            continue;  // Hit is behind the starting surface
         }
         
         // Sample HZB at current mip level
         let hzb_depth = textureSampleLevel(hzb_texture, hzb_sampler, uv, current_mip).r;
-        let ray_depth = current_screen.z;
         
         // Check if ray is behind surface (potential intersection)
         if (ray_depth > hzb_depth && ray_depth - hzb_depth < params.thickness) {
@@ -137,21 +167,11 @@ fn hzb_ray_march(start_pos: vec3<f32>, ray_dir: vec3<f32>) -> vec3<f32> {
                     }
                 }
                 
-                hit_uv = vec3<f32>(refined_screen.xy, 1.0);
+                hit_result = vec4<f32>(refined_screen.xy, 1.0, world_dist);
                 break;
             } else {
                 // Descend to finer mip level
                 current_mip = max(0.0, current_mip - 1.0);
-                // Backtrack one step to re-check at finer level? 
-                // In this simple linear march, we just stay here and check next iteration with finer mip?
-                // Or we should ideally backtrack. 
-                // For this optimization (removing matrix mul), let's keep the flow simple:
-                // If we hit something at coarse level, we stay at this position but reduce mip for next check?
-                // Actually, if we hit, we should probably check THIS position again with finer mip.
-                // But the loop increments every time.
-                // Let's just decrement i to retry this position?
-                // i--; // Not allowed in WGSL for loops usually?
-                // Let's just continue, effectively checking next point with finer mip.
             }
         } else {
             // No intersection at this point
@@ -163,7 +183,7 @@ fn hzb_ray_march(start_pos: vec3<f32>, ray_dir: vec3<f32>) -> vec3<f32> {
         }
     }
     
-    return hit_uv;
+    return hit_result;
 }
 
 @fragment
@@ -195,22 +215,29 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Reflect view direction around normal
     let reflect_dir = reflect(view_dir, normal);
     
-    // Trace ray using HZB acceleration
-    let hit_uv = hzb_ray_march(world_pos, reflect_dir);
+    // Offset start position along normal to avoid self-intersection
+    // Use a larger offset (voxels are 1 unit, so offset by more than 1 to clear)
+    let ray_start = world_pos + normal * 1.5;
     
-    if (hit_uv.z > 0.0) {
+    // Trace ray using HZB acceleration, pass start UV and depth for self-intersection rejection
+    let hit_result = hzb_ray_march(ray_start, reflect_dir, input.uv, depth);
+    
+    if (hit_result.z > 0.0) {
         // Sample color at hit point
-        let reflection_color = textureSample(scene_color, linear_sampler, hit_uv.xy);
+        let reflection_color = textureSample(scene_color, linear_sampler, hit_result.xy);
         
         // Fade based on distance from screen edges
         let edge_fade = min(
-            min(hit_uv.x, 1.0 - hit_uv.x),
-            min(hit_uv.y, 1.0 - hit_uv.y)
+            min(hit_result.x, 1.0 - hit_result.x),
+            min(hit_result.y, 1.0 - hit_result.y)
         );
         let edge_factor = smoothstep(0.0, 0.1, edge_fade);
         
+        // Fade reflections at very long distances (less accurate)
+        let distance_fade = 1.0 - smoothstep(50.0, 100.0, hit_result.w);
+        
         // Modulate reflection strength by material reflectivity
-        let final_alpha = edge_factor * reflectivity;
+        let final_alpha = edge_factor * distance_fade * reflectivity;
         
         return vec4<f32>(reflection_color.rgb, final_alpha);
     }
