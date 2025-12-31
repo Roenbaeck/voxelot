@@ -86,6 +86,7 @@ struct FragmentOutput {
     @location(0) color: vec4<f32>,
     @location(1) emissive: vec4<f32>,
     @location(2) normal: vec4<f32>,
+    @location(3) material: vec4<f32>,  // R=reflectivity, GBA=reserved
 }
 
 @fragment
@@ -119,5 +120,6 @@ fn fs_main(in: VertexOutput) -> FragmentOutput {
     out.color = vec4<f32>(tinted * brightness, color.a);
     out.emissive = vec4<f32>(0.0, 0.0, 0.0, 0.0); // Skybox is not emissive in the G-Buffer sense
     out.normal = vec4<f32>(0.0, 0.0, 0.0, 0.0); // Sky has no valid normal (detected by depth >= 1.0)
+    out.material = vec4<f32>(0.0, 0.0, 0.0, 0.0); // Sky has no reflectivity
     return out;
 }

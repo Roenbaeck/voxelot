@@ -7,21 +7,24 @@ pub struct Material {
     pub albedo: [f32; 4],
     pub emissive: [f32; 3],
     pub emissive_intensity: f32,
+    /// Reflectivity coefficient (0.0 = matte, 1.0 = fully reflective)
+    pub reflectivity: f32,
 }
 
 impl Material {
-    const fn new(albedo: [f32; 4], emissive: [f32; 3], emissive_intensity: f32) -> Self {
+    const fn new(albedo: [f32; 4], emissive: [f32; 3], emissive_intensity: f32, reflectivity: f32) -> Self {
         Self {
             albedo,
             emissive,
             emissive_intensity,
+            reflectivity,
         }
     }
 }
 
 impl Default for Material {
     fn default() -> Self {
-        Self::new([1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0], 0.0)
+        Self::new([1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0], 0.0, 0.0)
     }
 }
 
@@ -59,6 +62,7 @@ impl Palette {
     /// Parse palette from string. Supported formats per line:
     /// - `index baseR baseG baseB baseA`
     /// - `index baseR baseG baseB baseA emitR emitG emitB emitStrength`
+    /// - `index baseR baseG baseB baseA emitR emitG emitB emitStrength reflectivity`
     /// Values are 0-255 integers.
     pub fn from_string(contents: &str) -> Option<Self> {
         let mut map: HashMap<usize, Material> = HashMap::default();
@@ -69,9 +73,9 @@ impl Palette {
             }
 
             let parts: Vec<_> = trimmed.split_whitespace().collect();
-            if parts.len() != 5 && parts.len() != 9 {
+            if parts.len() != 5 && parts.len() != 9 && parts.len() != 10 {
                 eprintln!(
-                    "palette: skipping line {} (expected 5 or 9 columns, got {})",
+                    "palette: skipping line {} (expected 5, 9, or 10 columns, got {})",
                     line_idx + 1,
                     parts.len()
                 );
@@ -96,7 +100,7 @@ impl Palette {
 
             let base = Self::normalize_rgba(base_bytes.unwrap());
 
-            let (emissive, intensity) = if parts.len() == 9 {
+            let (emissive, intensity, reflectivity) = if parts.len() >= 9 {
                 let emissive_bytes: Option<[u8; 3]> = parts[5..8]
                     .iter()
                     .map(|p| p.parse::<u8>().ok())
@@ -104,24 +108,32 @@ impl Palette {
                     .and_then(|v| v.try_into().ok());
 
                 let strength = parts[8].parse::<u8>().ok();
+                
+                // Parse optional reflectivity (10th column, index 9)
+                let reflect = if parts.len() == 10 {
+                    parts[9].parse::<u8>().ok()
+                } else {
+                    Some(0)
+                };
 
-                if let (Some(em_bytes), Some(strength_byte)) = (emissive_bytes, strength) {
+                if let (Some(em_bytes), Some(strength_byte), Some(reflect_byte)) = (emissive_bytes, strength, reflect) {
                     (
                         Self::normalize_rgb(em_bytes),
                         (strength_byte as f32 / 255.0).clamp(0.0, 1.0),
+                        (reflect_byte as f32 / 255.0).clamp(0.0, 1.0),
                     )
                 } else {
                     eprintln!(
-                        "palette: skipping emissive data on line {} (invalid values)",
+                        "palette: skipping emissive/reflectivity data on line {} (invalid values)",
                         line_idx + 1
                     );
-                    ([0.0, 0.0, 0.0], 0.0)
+                    ([0.0, 0.0, 0.0], 0.0, 0.0)
                 }
             } else {
-                ([0.0, 0.0, 0.0], 0.0)
+                ([0.0, 0.0, 0.0], 0.0, 0.0)
             };
 
-            map.insert(index, Material::new(base, emissive, intensity));
+            map.insert(index, Material::new(base, emissive, intensity, reflectivity));
         }
 
         if map.is_empty() {
@@ -177,6 +189,28 @@ impl Palette {
         } else {
             ([0.0, 0.0, 0.0], 0.0)
         }
+    }
+
+    /// Get reflectivity coefficient for a voxel type (0.0 = matte, 1.0 = fully reflective)
+    pub fn reflectivity(&self, index: u32) -> f32 {
+        let idx = index as usize;
+        if let Some(material) = self.materials.get(idx) {
+            material.reflectivity
+        } else {
+            0.0
+        }
+    }
+
+    /// Get material properties buffer for GPU (256 entries of vec4: R=reflectivity, G=reserved, B=reserved, A=reserved)
+    /// This is separate from the color palette and contains additional material properties.
+    pub fn material_properties_gpu(&self) -> Vec<[f32; 4]> {
+        let mut props = vec![[0.0f32, 0.0, 0.0, 0.0]; 256];
+        for (i, material) in self.materials.iter().enumerate() {
+            if i < 256 {
+                props[i] = [material.reflectivity, 0.0, 0.0, 0.0];
+            }
+        }
+        props
     }
 
     pub fn material(&self, index: u32) -> Material {

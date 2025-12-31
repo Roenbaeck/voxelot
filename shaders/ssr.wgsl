@@ -23,6 +23,7 @@ struct SSRParams {
 @group(0) @binding(5) var hzb_texture: texture_2d<f32>;
 @group(0) @binding(6) var hzb_sampler: sampler;
 @group(0) @binding(7) var normal_gbuffer: texture_2d<f32>;
+@group(0) @binding(8) var material_gbuffer: texture_2d<f32>;  // R=reflectivity
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -175,6 +176,15 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
     
+    // Sample material reflectivity from G-buffer
+    let material = textureSample(material_gbuffer, linear_sampler, input.uv);
+    let reflectivity = material.r;
+    
+    // Early out for non-reflective materials
+    if (reflectivity < 0.01) {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+    
     let world_pos = reconstruct_world_pos(input.uv, depth);
     // Use the G-buffer world normal instead of estimating from depth.
     // This is cheaper and much more stable near edges.
@@ -199,7 +209,10 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         );
         let edge_factor = smoothstep(0.0, 0.1, edge_fade);
         
-        return vec4<f32>(reflection_color.rgb, edge_factor);
+        // Modulate reflection strength by material reflectivity
+        let final_alpha = edge_factor * reflectivity;
+        
+        return vec4<f32>(reflection_color.rgb, final_alpha);
     }
     
     return vec4<f32>(0.0, 0.0, 0.0, 0.0);

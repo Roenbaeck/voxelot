@@ -37,6 +37,8 @@ struct LightProbe {
 @group(0) @binding(2) var shadow_sampler: sampler_comparison;
 @group(0) @binding(3) var<storage, read> light_probes: array<LightProbe>;
 @group(0) @binding(4) var<storage, read> palette: array<vec4<f32>>;
+// Material properties buffer: [reflectivity, reserved, reserved, reserved] per voxel type
+@group(0) @binding(5) var<storage, read> material_props: array<vec4<f32>>;
 
 
 struct VertexOutputInstanced {
@@ -48,6 +50,7 @@ struct VertexOutputInstanced {
     @location(4) world_pos: vec3<f32>,
     @location(5) ao: f32,
     @location(6) view_z: f32,  // Linear depth for G-buffer
+    @location(7) @interpolate(flat) voxel_type: u32,  // For material property lookup
 }
 
 struct VertexOutputMesh {
@@ -58,6 +61,7 @@ struct VertexOutputMesh {
     @location(3) light_space_pos: vec4<f32>,
     @location(4) world_pos: vec3<f32>,
     @location(5) view_z: f32,  // Linear depth for G-buffer
+    @location(6) material: vec4<f32>,  // R=reflectivity, GBA=reserved
 }
 
 struct ShadowVertexOutput {
@@ -141,6 +145,8 @@ fn vs_main(
     output.emissive = instance_emissive;
     // For perspective projection, clip.w = -view_z, so clip.w is positive view distance
     output.view_z = output.position.w;
+    // Pass voxel type to fragment shader for material property lookup
+    output.voxel_type = instance_voxel_type;
     
     return output;
 }
@@ -149,6 +155,7 @@ struct FragmentOutput {
     @location(0) color: vec4<f32>,
     @location(1) emissive: vec4<f32>,
     @location(2) normal: vec4<f32>,
+    @location(3) material: vec4<f32>,  // R=reflectivity, GBA=reserved
 }
 
 @fragment
@@ -320,6 +327,10 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     // Encode world-space normal: map [-1,1] to [0,1] for storage
     // Store linear depth in W channel for SSILVB/GTAO
     out.normal = vec4<f32>(input.normal * 0.5 + 0.5, input.view_z);
+    // Look up material reflectivity from material_props buffer
+    let mat_idx = min(input.voxel_type, 255u);
+    let reflectivity = material_props[mat_idx].r;
+    out.material = vec4<f32>(reflectivity, 0.0, 0.0, 0.0);
     return out;
 }
 
@@ -330,6 +341,7 @@ fn vs_mesh(
     @location(1) normal: vec3<f32>,
     @location(2) color: vec4<f32>,
     @location(3) emissive: vec4<f32>,
+    @location(4) material: vec4<f32>,
 ) -> VertexOutputMesh {
     var out: VertexOutputMesh;
     let world_pos = vec4<f32>(position, 1.0);
@@ -339,6 +351,7 @@ fn vs_mesh(
     out.normal = normal;
     out.color = color;
     out.emissive = emissive;
+    out.material = material;
     // For perspective projection, clip.w = -view_z, so clip.w is positive view distance
     out.view_z = out.position.w;
     return out;
@@ -503,6 +516,8 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     // Encode world-space normal: map [-1,1] to [0,1] for storage
     // Store linear depth in W channel for SSILVB/GTAO
     out.normal = vec4<f32>(input.normal * 0.5 + 0.5, input.view_z);
+    // Use material reflectivity from vertex attribute
+    out.material = input.material;
     return out;
 }
 

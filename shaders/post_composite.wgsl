@@ -12,7 +12,7 @@ struct CompositeUniforms {
     hzb_mips: f32,
     near: f32,
     far: f32,
-    _pad_align: f32,
+    ssr_enabled: f32,  // Whether to apply SSR reflections
     _pad: vec2<f32>,
     uv_scale: vec2<f32>,
     uv_offset: vec2<f32>,
@@ -147,6 +147,18 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     // Apply AO to all lighting (direct + bloom + GI)
     // AO represents how much ambient light reaches a surface, affecting both direct and indirect
     var color = (saturated + bloom * composite.bloom_strength + (indirect_light + rc_light) * composite.indirect_light_scale) * ao;
+    
+    // Apply SSR reflections if enabled
+    // The SSR texture contains (reflection_color.rgb, reflectivity * edge_fade)
+    if (composite.ssr_enabled > 0.5) {
+        let ssr_sample = textureSample(ssr_debug_texture, post_sampler, sample_uv);
+        let ssr_reflection = ssr_sample.rgb;
+        let ssr_strength = ssr_sample.a;
+        // Blend reflections on top of the base color
+        // Use a simple lerp: higher ssr_strength means more reflection visible
+        color = mix(color, color + ssr_reflection * 0.5, ssr_strength);
+    }
+    
     color = color * composite.exposure;
     color = max(color, vec3<f32>(0.0));
 

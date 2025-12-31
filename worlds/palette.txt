@@ -1,94 +1,96 @@
-# voxel_type baseR baseG baseB baseA emitR emitG emitB emitStrength (0-255)
+# voxel_type baseR baseG baseB baseA emitR emitG emitB emitStrength reflectivity (0-255)
+# Columns: index R G B A emitR emitG emitB emitStrength [reflectivity]
+# reflectivity is optional (defaults to 0 if omitted)
 # 0-7: Legacy / Basic
-0 255 255 255 255 0 0 0 0
-1 26 230 77 255 0 0 0 0
-2 255 89 89 255 0 0 0 0
-3 89 128 255 255 0 0 0 0
-4 242 230 89 255 0 0 0 0
-5 242 102 255 255 255 120 255 180
-6 77 242 255 255 0 0 0 0
-7 217 217 217 255 0 0 0 0
+0 255 255 255 255 0 0 0 0 0
+1 26 230 77 255 0 0 0 0 0
+2 255 89 89 255 0 0 0 0 0
+3 89 128 255 255 0 0 0 0 0
+4 242 230 89 255 0 0 0 0 0
+5 242 102 255 255 255 120 255 180 0
+6 77 242 255 255 0 0 0 0 0
+7 217 217 217 255 0 0 0 0 0
 
 # 8-15: Nature
 # Grass Dark
-8 50 120 50 255 0 0 0 0
+8 50 120 50 255 0 0 0 0 0
 # Grass Light
-9 70 150 60 255 0 0 0 0
+9 70 150 60 255 0 0 0 0 0
 # Dirt
-10 100 80 60 255 0 0 0 0
+10 100 80 60 255 0 0 0 0 0
 # Stone
-11 120 120 120 255 0 0 0 0
+11 120 120 120 255 0 0 0 0 0
 # Sand
-12 200 190 150 255 0 0 0 0
-# Snow
-13 240 240 250 255 0 0 0 0
+12 200 190 150 255 0 0 0 0 0
+# Snow (slightly reflective)
+13 240 240 250 255 0 0 0 0 30
 # Water Deep
-14 60 100 200 200 0 0 0 0
+14 60 100 200 200 0 0 0 0 0
 # Water Shallow
-15 80 140 220 200 0 0 0 0
+15 80 140 220 200 0 0 0 0 0
 
 # 16-23: City Infrastructure
-# Asphalt
-16 50 50 50 255 0 0 0 0
+# Asphalt (slightly reflective when wet-looking)
+16 50 50 50 255 0 0 0 0 15
 # Concrete
-17 180 180 180 255 0 0 0 0
+17 180 180 180 255 0 0 0 0 0
 # Pavement
-18 160 160 150 255 0 0 0 0
+18 160 160 150 255 0 0 0 0 0
 # Dark Stone/Cobble
-19 80 80 80 255 0 0 0 0
+19 80 80 80 255 0 0 0 0 0
 
 # 24-31: Building Materials
 # Brick Red
-20 180 100 80 255 0 0 0 0
+20 180 100 80 255 0 0 0 0 0
 # Plaster White/Beige
-21 200 180 160 255 0 0 0 0
-# Glass Blueish
-22 100 120 140 255 0 0 0 0
-# Steel/Dark Metal
-23 50 50 60 255 0 0 0 0
+21 200 180 160 255 0 0 0 0 0
+# Glass Blueish (highly reflective)
+22 100 120 140 255 0 0 0 0 200
+# Steel/Dark Metal (highly reflective)
+23 50 50 60 255 0 0 0 0 220
 # Roof Terracotta
-24 160 80 60 255 0 0 0 0
+24 160 80 60 255 0 0 0 0 0
 # Roof Slate/Dark
-25 60 60 70 255 0 0 0 0
-# Marble/White Stone
-26 220 220 220 255 0 0 0 0
+25 60 60 70 255 0 0 0 0 0
+# Marble/White Stone (moderately reflective)
+26 220 220 220 255 0 0 0 0 100
 
 # 32-39: Vegetation
 # Trunk Dark
-32 80 60 40 255 0 0 0 0
+32 80 60 40 255 0 0 0 0 0
 # Trunk Light
-33 100 80 60 255 0 0 0 0
+33 100 80 60 255 0 0 0 0 0
 # Leaves Dark
-34 40 100 40 255 0 0 0 0
+34 40 100 40 255 0 0 0 0 0
 # Leaves Medium
-35 60 140 60 255 0 0 0 0
+35 60 140 60 255 0 0 0 0 0
 # Leaves Light
-36 100 180 80 255 0 0 0 0
+36 100 180 80 255 0 0 0 0 0
 # Leaves Autumn
-37 180 160 40 255 0 0 0 0
+37 180 160 40 255 0 0 0 0 0
 # Palm Frond Dark (deep tropical green) - stored as 39 due to +1 offset
-39 20 70 35 255 0 0 0 0
+39 20 70 35 255 0 0 0 0 0
 # Palm Frond Mid (tropical green) - stored as 40 due to +1 offset
-40 35 95 45 255 0 0 0 0
+40 35 95 45 255 0 0 0 0 0
 
 # 41-47: Emissive / Special
 # Streetlight Warm
-41 255 240 200 255 255 240 200 200
+41 255 240 200 255 255 240 200 200 0
 # Streetlight Cool
-42 200 240 255 255 200 240 255 200
-# Window Warm
-43 255 200 100 255 255 200 100 150
-# Window Cool
-44 200 200 255 255 200 200 255 150
-# Neon Red
-45 255 50 50 255 255 50 50 200
-# Neon Green
-46 50 255 50 255 50 255 50 200
-# Neon Blue
-47 50 50 255 255 50 50 255 200
+42 200 240 255 255 200 240 255 200 0
+# Window Warm (glass is reflective)
+43 255 200 100 255 255 200 100 150 150
+# Window Cool (glass is reflective)
+44 200 200 255 255 200 200 255 150 150
+# Neon Red (glossy)
+45 255 50 50 255 255 50 50 200 80
+# Neon Green (glossy)
+46 50 255 50 255 50 255 50 200 80
+# Neon Blue (glossy)
+47 50 50 255 255 50 50 255 200 80
 
 # 48-55: Coastal / Beach
 # Dune Grass (yellowish-green coastal grass)
-48 140 160 80 255 0 0 0 0
+48 140 160 80 255 0 0 0 0 0
 # Coastal Hill Grass (muted olive green)
-49 100 135 70 255 0 0 0 0
+49 100 135 70 255 0 0 0 0 0

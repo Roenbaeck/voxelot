@@ -246,6 +246,7 @@ struct MeshVertexRaw {
     normal: [f32; 3],
     color: [f32; 4],
     emissive: [f32; 4],
+    material: [f32; 4],  // R=reflectivity, GBA=reserved
 }
 
 // -----------------------------------------------------------------------------
@@ -273,23 +274,27 @@ fn boat_push_tri(
     // Make it double-sided so we don't have to perfectly manage winding while iterating on the model.
     // This also avoids "invisible hull" if the camera is inside/near the mesh.
     let emissive = [0.0, 0.0, 0.0, 0.0];
+    let material = [0.0, 0.0, 0.0, 0.0]; // Boat is not reflective
     out.push(MeshVertexRaw {
         position: a,
         normal,
         color,
         emissive,
+        material,
     });
     out.push(MeshVertexRaw {
         position: b,
         normal,
         color,
         emissive,
+        material,
     });
     out.push(MeshVertexRaw {
         position: c,
         normal,
         color,
         emissive,
+        material,
     });
 
     let normal_back = [-normal[0], -normal[1], -normal[2]];
@@ -298,18 +303,21 @@ fn boat_push_tri(
         normal: normal_back,
         color,
         emissive,
+        material,
     });
     out.push(MeshVertexRaw {
         position: b,
         normal: normal_back,
         color,
         emissive,
+        material,
     });
     out.push(MeshVertexRaw {
         position: a,
         normal: normal_back,
         color,
         emissive,
+        material,
     });
 }
 
@@ -471,6 +479,7 @@ fn boat_transform_into_world(
             normal: [nx, ny, nz],
             color: v.color,
             emissive: v.emissive,
+            material: v.material,
         });
     }
 }
@@ -633,7 +642,7 @@ struct CompositeUniforms {
     hzb_mips: f32,
     near: f32,
     far: f32,
-    _pad_align: f32,
+    ssr_enabled: f32, // Whether to apply SSR reflections (1.0 = enabled)
     _pad: [f32; 2],
     uv_scale: [f32; 2],
     uv_offset: [f32; 2],
@@ -1140,6 +1149,7 @@ struct App {
     shadow_mesh_pipeline: Option<wgpu::RenderPipeline>,
     uniform_buffer: Option<wgpu::Buffer>,
     palette_buffer: Option<wgpu::Buffer>,
+    material_props_buffer: Option<wgpu::Buffer>,
     bind_group: Option<wgpu::BindGroup>,
     shadow_bind_group: Option<wgpu::BindGroup>,
     main_bind_group_layout: Option<wgpu::BindGroupLayout>,
@@ -1529,6 +1539,10 @@ struct App {
     normal_texture: Option<wgpu::Texture>,
     normal_view: Option<wgpu::TextureView>,
     normal_texture_bytes: u64,
+    // G-Buffer material texture (reflectivity for SSR)
+    material_texture: Option<wgpu::Texture>,
+    material_view: Option<wgpu::TextureView>,
+    material_texture_bytes: u64,
     // Path to loaded config file (user provided or default)
     config_path: String,
     // Profiling helper (CPU scopes). No-op if compiled without `cpu-profiling` feature.
@@ -2149,6 +2163,7 @@ impl App {
             shadow_mesh_pipeline: None,
             uniform_buffer: None,
             palette_buffer: None,
+            material_props_buffer: None,
             bind_group: None,
             shadow_bind_group: None,
             main_bind_group_layout: None,
@@ -2343,6 +2358,9 @@ impl App {
             normal_texture: None,
             normal_view: None,
             normal_texture_bytes: 0,
+            material_texture: None,
+            material_view: None,
+            material_texture_bytes: 0,
             config_path: config_path.to_string(),
             profiler: voxelot::profiling::Profiler::new(),
             timestamp_period_ns: 0.0,
@@ -2799,7 +2817,7 @@ impl App {
             hzb_mips: self.hzb_mip_levels as f32,
             near: self.camera_controller.camera.near,
             far: self.camera_controller.camera.far,
-            _pad_align: 0.0,
+            ssr_enabled: if self.ssr_settings.enabled { 1.0 } else { 0.0 },
             _pad: [0.0; 2],
             uv_scale: [crop_scale, crop_scale],
             uv_offset: [crop_offset, crop_offset],
@@ -3164,6 +3182,9 @@ impl App {
             normal_texture_loc,
             normal_view_loc,
             normal_bytes,
+            material_texture_loc,
+            material_view_loc,
+            material_bytes,
             rc_texture_loc,
             rc_view_loc,
             rc_bytes,
@@ -3530,6 +3551,32 @@ impl App {
                     1,
                 );
 
+                // G-Buffer material texture (reflectivity for SSR)
+                let material_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("Material G-Buffer Texture"),
+                    size: wgpu::Extent3d {
+                        width: target_width,
+                        height: target_height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                });
+                let material_view_loc =
+                    material_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
+                let material_bytes = App::compute_texture_bytes(
+                    wgpu::TextureFormat::Rgba16Float,
+                    target_width,
+                    target_height,
+                    1,
+                    1,
+                );
+
                 // Radiance Cascades Output Texture
                 let rc_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("Radiance Cascades Texture"),
@@ -3596,6 +3643,9 @@ impl App {
                     normal_texture_loc,
                     normal_view_loc,
                     normal_bytes,
+                    material_texture_loc,
+                    material_view_loc,
+                    material_bytes,
                     rc_texture_loc,
                     rc_view_loc,
                     rc_bytes,
@@ -3634,6 +3684,13 @@ impl App {
         App::replace_texture_bytes_static(
             &mut self.normal_texture_bytes,
             normal_bytes,
+            &mut self.gpu_texture_bytes,
+        );
+        self.material_texture = Some(material_texture_loc);
+        self.material_view = Some(material_view_loc);
+        App::replace_texture_bytes_static(
+            &mut self.material_texture_bytes,
+            material_bytes,
             &mut self.gpu_texture_bytes,
         );
         // Assign and track other created textures
@@ -4074,6 +4131,7 @@ impl App {
             Some(shadow_sampler),
             Some(light_probe_buffer),
             Some(palette_buffer),
+            Some(material_props_buffer),
         ) = (
             self.device.as_ref(),
             self.main_bind_group_layout.as_ref(),
@@ -4082,6 +4140,7 @@ impl App {
             self.shadow_sampler.as_ref(),
             self.light_probe_buffer.as_ref(),
             self.palette_buffer.as_ref(),
+            self.material_props_buffer.as_ref(),
         )
         else {
             return;
@@ -4110,6 +4169,10 @@ impl App {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: palette_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: material_props_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -4731,6 +4794,7 @@ impl App {
             Some(sampler),
             Some(hzb_view),
             Some(normal_view),
+            Some(material_view),
         ) = (
             self.ssr_bind_group_layout.as_ref(),
             self.ssr_uniform_buffer.as_ref(),
@@ -4740,6 +4804,7 @@ impl App {
             self.post_sampler.as_ref(),
             self.hzb_view.as_ref(),
             self.normal_view.as_ref(),
+            self.material_view.as_ref(),
         )
         else {
             return;
@@ -4783,6 +4848,11 @@ impl App {
                 wgpu::BindGroupEntry {
                     binding: 7,
                     resource: wgpu::BindingResource::TextureView(normal_view),
+                },
+                // Material G-buffer (reflectivity)
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(material_view),
                 },
             ],
         });
@@ -5339,6 +5409,12 @@ impl App {
                         blend: None,
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
+                    // Material G-buffer (reflectivity in R channel)
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
                 ],
                 compilation_options: Default::default(),
             }),
@@ -5713,6 +5789,17 @@ impl App {
                 // Normal G-buffer (world-space normals encoded in RGB)
                 wgpu::BindGroupLayoutEntry {
                     binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Material G-buffer (reflectivity in R channel)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -6548,6 +6635,17 @@ impl App {
                         },
                         count: None,
                     },
+                    // Material properties buffer (reflectivity per voxel type)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -6625,6 +6723,12 @@ impl App {
                         blend: Some(wgpu::BlendState::REPLACE),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    // Material G-buffer (reflectivity in R channel)
                     Some(wgpu::ColorTargetState {
                         format: wgpu::TextureFormat::Rgba16Float,
                         blend: Some(wgpu::BlendState::REPLACE),
@@ -6732,7 +6836,8 @@ impl App {
                         0 => Float32x3,
                         1 => Float32x3,
                         2 => Float32x4,
-                        3 => Float32x4
+                        3 => Float32x4,
+                        4 => Float32x4  // material (reflectivity in R)
                     ],
                 }],
                 compilation_options: Default::default(),
@@ -6751,6 +6856,12 @@ impl App {
                         blend: Some(wgpu::BlendState::REPLACE),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    // Material G-buffer (reflectivity in R channel)
                     Some(wgpu::ColorTargetState {
                         format: wgpu::TextureFormat::Rgba16Float,
                         blend: Some(wgpu::BlendState::REPLACE),
@@ -7765,6 +7876,14 @@ impl App {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
+        // Create material properties buffer for reflectivity (max 256 entries)
+        let material_props_data = self.palette.material_properties_gpu();
+        let material_props_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Material Properties Buffer"),
+            contents: bytemuck::cast_slice(&material_props_data),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
         // SSAO blur uniforms (half-resolution like SSao textures)
         let ssao_width = (self.render_target_width / 2).max(1);
         let ssao_height = (self.render_target_height / 2).max(1);
@@ -8374,6 +8493,7 @@ impl App {
         self.shadow_mesh_pipeline = Some(shadow_mesh_pipeline);
         self.uniform_buffer = Some(uniform_buffer);
         self.palette_buffer = Some(palette_buffer);
+        self.material_props_buffer = Some(material_props_buffer);
 
         self.light_probe_buffer = Some(light_probe_buffer);
 
@@ -9925,6 +10045,7 @@ impl App {
                 normal: v.normal,
                 color: v.color,
                 emissive: v.emissive,
+                material: v.material,
             }));
             mesh_build_vb_time += vb_build_start.elapsed();
             let vbuf_start = std::time::Instant::now();
@@ -10917,6 +11038,16 @@ impl App {
                     // G-Buffer normal texture (world-space normals)
                     Some(wgpu::RenderPassColorAttachment {
                         view: self.normal_view.as_ref().unwrap(),
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    }),
+                    // G-Buffer material texture (reflectivity in R channel)
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: self.material_view.as_ref().unwrap(),
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
