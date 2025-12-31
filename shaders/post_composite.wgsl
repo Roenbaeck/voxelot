@@ -154,9 +154,9 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
         let ssr_sample = textureSample(ssr_debug_texture, post_sampler, sample_uv);
         let ssr_reflection = ssr_sample.rgb;
         let ssr_strength = ssr_sample.a;
-        // Blend reflections on top of the base color
-        // Use a simple lerp: higher ssr_strength means more reflection visible
-        color = mix(color, color + ssr_reflection * 0.5, ssr_strength);
+        // Add reflections on top of the base color, scaled by strength
+        // This gives partial reflections for lower reflectivity materials
+        color = color + ssr_reflection * ssr_strength;
     }
     
     color = color * composite.exposure;
