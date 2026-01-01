@@ -8,54 +8,53 @@ struct HzbParams {
     height: u32,
     src_mip: u32,
     dst_mip: u32,
-};
+}
 
-// Mip 0: Copy depth buffer to HZB
-@group(0) @binding(0)
-var depth_tex: texture_depth_2d;
+@group(0) @binding(0) var depth_tex: texture_depth_2d;
+@group(0) @binding(1) var hzb_out: texture_storage_2d<r32float, write>;
+@group(0) @binding(2) var<uniform> params: HzbParams;
+@group(0) @binding(3) var hzb_src: texture_2d<f32>;
 
-@group(0) @binding(1)
-var hzb_out: texture_storage_2d<r32float, write>;
-
-@group(0) @binding(2)
-var<uniform> params: HzbParams;
-
-@compute @workgroup_size(8, 8, 1)
-fn copy_depth(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let x = i32(gid.x);
-    let y = i32(gid.y);
-    
-    if (x >= i32(params.width) || y >= i32(params.height)) {
+// Mip 0: Copy and convert depth to float
+@compute @workgroup_size(8, 8)
+fn copy_depth(@builtin(global_invocation_id) id: vec3<u32>) {
+    let coords = vec2<i32>(id.xy);
+    let dims = textureDimensions(hzb_out);
+    if (coords.x >= i32(dims.x) || coords.y >= i32(dims.y)) {
         return;
     }
     
-    // Read depth as scalar
-    let d = textureLoad(depth_tex, vec2<i32>(x, y), 0);
-    textureStore(hzb_out, vec2<i32>(x, y), vec4<f32>(d, 0.0, 0.0, 0.0));
+    // Real depth sampling
+    let depth = textureLoad(depth_tex, coords, 0);
+    textureStore(hzb_out, coords, vec4<f32>(depth, 0.0, 0.0, 1.0));
 }
 
 // Mip 1-N: Downsample with MAX reduction
-@group(0) @binding(3)
-var hzb_src: texture_2d<f32>;
-
-@compute @workgroup_size(8, 8, 1)
-fn downsample(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let x = i32(gid.x);
-    let y = i32(gid.y);
-    
-    if (x >= i32(params.width) || y >= i32(params.height)) {
+@compute @workgroup_size(8, 8)
+fn downsample(@builtin(global_invocation_id) id: vec3<u32>) {
+    let coords = vec2<i32>(id.xy);
+    let dims = textureDimensions(hzb_out);
+    if (coords.x >= i32(dims.x) || coords.y >= i32(dims.y)) {
         return;
     }
     
-    // Sample 2x2 region from previous mip
-    let base = vec2<i32>(x * 2, y * 2);
-    let d00 = textureLoad(hzb_src, base + vec2<i32>(0, 0), i32(params.src_mip)).r;
-    let d01 = textureLoad(hzb_src, base + vec2<i32>(0, 1), i32(params.src_mip)).r;
-    let d10 = textureLoad(hzb_src, base + vec2<i32>(1, 0), i32(params.src_mip)).r;
-    let d11 = textureLoad(hzb_src, base + vec2<i32>(1, 1), i32(params.src_mip)).r;
+    let src_coords = coords * 2;
+    // We read from the previous mip level (src_mip) of the source texture
+    let src_mip = params.src_mip;
+    let src_dims = textureDimensions(hzb_src, i32(src_mip));
     
-    // MAX reduction (furthest depth) for conservative occlusion
-    let max_depth = max(max(d00, d01), max(d10, d11));
+    // MAX reduction (furthest depth) to conservatively detect occlusion
+    var max_d = 0.0;
+    for (var y = 0; y < 2; y++) {
+        for (var x = 0; x < 2; x++) {
+            let s = src_coords + vec2<i32>(x, y);
+            if (s.x < i32(src_dims.x) && s.y < i32(src_dims.y)) {
+                // textureLoad with explicit mip level
+                let d = textureLoad(hzb_src, s, i32(src_mip)).r;
+                max_d = max(max_d, d);
+            }
+        }
+    }
     
-    textureStore(hzb_out, vec2<i32>(x, y), vec4<f32>(max_depth, 0.0, 0.0, 0.0));
+    textureStore(hzb_out, coords, vec4<f32>(max_d, 0.0, 0.0, 1.0));
 }

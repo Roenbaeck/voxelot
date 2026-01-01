@@ -5,7 +5,12 @@ struct CameraUniforms {
     inverse_proj: mat4x4<f32>,
     view_proj: mat4x4<f32>,
     camera_pos: vec3<f32>,
-    _pad0: f32,
+    skybox_rotation: f32,  // Skybox rotation angle in radians
+    skybox_brightness: f32,
+    skybox_saturation: f32,
+    _pad1: vec2<f32>,
+    skybox_tint: vec3<f32>,
+    skybox_tint_strength: f32,
 }
 
 struct SSRParams {
@@ -13,6 +18,9 @@ struct SSRParams {
     max_binary_steps: u32,
     step_size: f32,
     thickness: f32,
+    overscan: f32,  // How much extra UV space we can sample (e.g., 0.2 = 20% overscan)
+    bloom_strength: f32,  // How much bloom to add to reflected colors
+    _pad: vec2<f32>,
 }
 
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
@@ -23,6 +31,11 @@ struct SSRParams {
 @group(0) @binding(5) var hzb_texture: texture_2d<f32>;
 @group(0) @binding(6) var hzb_sampler: sampler;
 @group(0) @binding(7) var normal_gbuffer: texture_2d<f32>;
+@group(0) @binding(8) var material_gbuffer: texture_2d<f32>;  // R=reflectivity
+@group(0) @binding(9) var ssao_texture: texture_2d<f32>;  // SSAO for reflected surfaces
+@group(0) @binding(10) var bloom_texture: texture_2d<f32>;  // Bloom for reflected surfaces
+@group(0) @binding(11) var skybox_texture: texture_2d<f32>;  // Skybox for missed rays
+@group(0) @binding(12) var skybox_sampler: sampler;  // Skybox sampler with Repeat on U
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -42,11 +55,12 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 
 // Reconstruct world position from depth
 fn reconstruct_world_pos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
-    // Convert UV and depth to NDC
-    let ndc = vec3<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth);
+    // Convert UV and depth to NDC (depth is [0,1], convert to NDC z)
+    let z_ndc = depth * 2.0 - 1.0;
+    let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - 2.0 * uv.y, z_ndc, 1.0);
     
     // Unproject to view space
-    let view_pos = camera.inverse_proj * vec4<f32>(ndc, 1.0);
+    let view_pos = camera.inverse_proj * ndc;
     let view_pos_3d = view_pos.xyz / view_pos.w;
     
     // Transform to world space
@@ -55,12 +69,21 @@ fn reconstruct_world_pos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
 }
 
 // Project world position to screen space
-fn world_to_screen(world_pos: vec3<f32>) -> vec3<f32> {
+// Returns vec4: xyz = screen pos (xy in UV, z in NDC depth), w = 1 if valid (in front of camera), 0 if behind
+fn world_to_screen(world_pos: vec3<f32>) -> vec4<f32> {
     let clip_pos = camera.view_proj * vec4<f32>(world_pos, 1.0);
+    
+    // Check if behind camera (w <= 0 means behind near plane)
+    if (clip_pos.w <= 0.001) {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);  // Invalid
+    }
+    
     let ndc = clip_pos.xyz / clip_pos.w;
-    // Convert to UV coordinates
+    // Convert NDC to UV space (flip Y for texture coords)
     let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-    return vec3<f32>(uv, ndc.z);
+    
+    // Use linear depth (clip.w) normalized, for more uniform stepping
+    return vec4<f32>(uv, ndc.z, 1.0);  // Valid
 }
 
 fn decode_world_normal(encoded: vec3<f32>) -> vec3<f32> {
@@ -77,29 +100,81 @@ fn get_max_mip_level() -> f32 {
     return floor(log2(max_dim));
 }
 
-// HZB-Accelerated Ray Marching
 // HZB-Accelerated Ray Marching (Screen Space)
-fn hzb_ray_march(start_pos: vec3<f32>, ray_dir: vec3<f32>) -> vec3<f32> {
-    var hit_uv = vec3<f32>(-1.0);
+// Returns vec4: xy = hit UV, z = hit confidence (0 or 1), w = world distance traveled
+fn hzb_ray_march(start_pos: vec3<f32>, ray_dir: vec3<f32>, start_uv: vec2<f32>, start_depth: f32) -> vec4<f32> {
+    var hit_result = vec4<f32>(-1.0, -1.0, -1.0, 0.0);
     
-    // Calculate end position in world space
-    let max_dist = f32(params.max_steps) * params.step_size;
-    let end_pos = start_pos + ray_dir * max_dist;
+    // Maximum world distance for SSR
+    let max_dist = 200.0;
+    let thickness_base = 0.01;  // Base thickness in NDC units
     
     // Project start and end to screen space
-    let start_screen = world_to_screen(start_pos);
-    let end_screen = world_to_screen(end_pos);
+    let start_screen_raw = world_to_screen(start_pos);
+    if (start_screen_raw.w < 0.5) {
+        return hit_result;  // Start is behind camera
+    }
     
-    // Calculate delta in screen space
-    // Note: This assumes the ray doesn't cross the camera plane (z=0 in view space)
-    // For a robust implementation, we should clip the ray to the near plane.
-    // However, for reflections, rays usually go away from the camera.
+    let end_pos = start_pos + ray_dir * max_dist;
+    let end_screen_raw = world_to_screen(end_pos);
     
+    let start_screen = start_screen_raw.xyz;
+    var end_screen = end_screen_raw.xyz;
+    
+    // If end is behind camera, we need to find where ray crosses near plane
+    if (end_screen_raw.w < 0.5) {
+        // Binary search to find the point where ray crosses behind camera
+        var t_min = 0.0;
+        var t_max = 1.0;
+        for (var i = 0; i < 8; i++) {
+            let t_mid = (t_min + t_max) * 0.5;
+            let mid_pos = start_pos + ray_dir * max_dist * t_mid;
+            let mid_screen = world_to_screen(mid_pos);
+            if (mid_screen.w > 0.5) {
+                t_min = t_mid;
+            } else {
+                t_max = t_mid;
+            }
+        }
+        // Use the last valid point
+        let valid_pos = start_pos + ray_dir * max_dist * t_min;
+        let valid_screen = world_to_screen(valid_pos);
+        end_screen = valid_screen.xyz;
+    }
+    
+    // Check if screen-space movement is too small (ray going toward camera)
+    let dim = vec2<f32>(textureDimensions(scene_color));
+    let screen_dist = length((end_screen.xy - start_screen.xy) * dim);
+    if (screen_dist < 2.0) {
+        // Ray has minimal screen-space movement, skip geometry trace but allow skybox
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+    
+    // Compute screen-space delta - divide total distance by max_steps for uniform stepping
     let delta = (end_screen - start_screen) / f32(params.max_steps);
     
-    var current_screen = start_screen;
+    // Jitter start position to reduce banding artifacts
+    let jitter_seed = start_uv * dim;
+    let jitter = fract(sin(dot(jitter_seed, vec2<f32>(12.9898, 78.233))) * 43758.5453);
+    var current_screen = start_screen + delta * jitter;
+    
     let max_mip = get_max_mip_level();
-    var current_mip = min(4.0, max_mip);
+    var current_mip = min(3.0, max_mip);  // Start at coarse mip
+    
+    // Calculate adaptive thickness based on screen-space step size
+    let screen_delta_length = length(delta.xy * dim);
+    let adaptive_thickness = thickness_base * max(1.0, screen_delta_length * 0.1);
+    
+    // Minimum distance before accepting hits (in terms of steps)
+    let min_steps = 3u;
+    
+    // Calculate UV bounds with overscan
+    let os = params.overscan;
+    let uv_min = -os / (1.0 + os);
+    let uv_max = 1.0 + os / (1.0 + os);
+    
+    // Track if ray is going toward or away from camera (in depth)
+    let ray_goes_further = delta.z > 0.0;
     
     // Hierarchical ray march
     for (var i = 0u; i < params.max_steps; i++) {
@@ -107,20 +182,34 @@ fn hzb_ray_march(start_pos: vec3<f32>, ray_dir: vec3<f32>) -> vec3<f32> {
         
         let uv = current_screen.xy;
         
-        // Check if out of screen bounds
-        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+        // Check if out of screen bounds (with overscan)
+        if (uv.x < uv_min || uv.x > uv_max || uv.y < uv_min || uv.y > uv_max) {
             break;
+        }
+        
+        // Skip first few steps to avoid self-intersection
+        if (i < min_steps) {
+            continue;
+        }
+        
+        // For rays going further from camera: reject hits at depth less than start (behind us)
+        let ray_depth = current_screen.z;
+        if (ray_goes_further && ray_depth < start_depth - 0.001) {
+            continue;
         }
         
         // Sample HZB at current mip level
         let hzb_depth = textureSampleLevel(hzb_texture, hzb_sampler, uv, current_mip).r;
-        let ray_depth = current_screen.z;
+        
+        // Skip if we're hitting sky (depth >= 0.9999) - let the skybox path handle it
+        if (hzb_depth >= 0.9999) {
+            continue;
+        }
         
         // Check if ray is behind surface (potential intersection)
-        if (ray_depth > hzb_depth && ray_depth - hzb_depth < params.thickness) {
+        if (ray_depth > hzb_depth && ray_depth - hzb_depth < adaptive_thickness) {
             if (current_mip <= 0.5) {
                 // At finest detail, perform binary refinement
-                // We can refine in screen space too!
                 var refined_screen = current_screen - delta;
                 var refined_delta = delta;
                 
@@ -136,33 +225,25 @@ fn hzb_ray_march(start_pos: vec3<f32>, ray_dir: vec3<f32>) -> vec3<f32> {
                     }
                 }
                 
-                hit_uv = vec3<f32>(refined_screen.xy, 1.0);
+                // Estimate world distance from step count
+                let world_dist = (f32(i) / f32(params.max_steps)) * max_dist;
+                hit_result = vec4<f32>(refined_screen.xy, 1.0, world_dist);
                 break;
             } else {
                 // Descend to finer mip level
                 current_mip = max(0.0, current_mip - 1.0);
-                // Backtrack one step to re-check at finer level? 
-                // In this simple linear march, we just stay here and check next iteration with finer mip?
-                // Or we should ideally backtrack. 
-                // For this optimization (removing matrix mul), let's keep the flow simple:
-                // If we hit something at coarse level, we stay at this position but reduce mip for next check?
-                // Actually, if we hit, we should probably check THIS position again with finer mip.
-                // But the loop increments every time.
-                // Let's just decrement i to retry this position?
-                // i--; // Not allowed in WGSL for loops usually?
-                // Let's just continue, effectively checking next point with finer mip.
             }
         } else {
             // No intersection at this point
-            // Optionally ascend to coarser mip if we're far from surfaces
+            // Ascend to coarser mip if we're far from surfaces
             let depth_diff = abs(ray_depth - hzb_depth);
-            if (depth_diff > params.thickness * 4.0 && current_mip < max_mip) {
+            if (depth_diff > adaptive_thickness * 4.0 && current_mip < max_mip) {
                 current_mip = min(max_mip, current_mip + 1.0);
             }
         }
     }
     
-    return hit_uv;
+    return hit_result;
 }
 
 @fragment
@@ -172,6 +253,15 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     
     // Early out for sky (depth = 1.0)
     if (depth >= 0.9999) {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+    
+    // Sample material reflectivity from G-buffer
+    let material = textureSample(material_gbuffer, linear_sampler, input.uv);
+    let reflectivity = material.r;
+    
+    // Early out for non-reflective materials
+    if (reflectivity < 0.01) {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
     
@@ -185,22 +275,143 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Reflect view direction around normal
     let reflect_dir = reflect(view_dir, normal);
     
-    // Trace ray using HZB acceleration
-    let hit_uv = hzb_ray_march(world_pos, reflect_dir);
+    // Calculate grazing angle factor - reflections at steep angles are less stable
+    // View dir and normal are normalized, dot gives cosine of angle
+    let grazing = 1.0 - abs(dot(view_dir, normal));  // 0 = head-on, 1 = grazing
+    let grazing_fade = smoothstep(0.85, 0.95, grazing);  // Fade out at very grazing angles
     
-    if (hit_uv.z > 0.0) {
-        // Sample color at hit point
-        let reflection_color = textureSample(scene_color, linear_sampler, hit_uv.xy);
+    // Combined fade factor
+    let angle_fade = grazing_fade;
+    
+    // Early out for extremely grazing angles
+    if (angle_fade > 0.99) {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+    
+    // Offset start position along normal to avoid self-intersection
+    let ray_start = world_pos + normal * 1.5;
+    
+    // Check if ray passes too close to camera - this causes projection singularities
+    // that appear as "black holes" in cardinal directions
+    // Calculate closest distance from ray to camera position using point-to-line distance
+    let to_camera = camera.camera_pos - ray_start;
+    let ray_proj = dot(to_camera, reflect_dir);
+    let closest_point_on_ray = ray_start + reflect_dir * max(0.0, ray_proj);
+    let dist_to_camera = length(camera.camera_pos - closest_point_on_ray);
+    
+    // If ray passes within 2 units of camera, skip geometry tracing (use skybox only)
+    var hit_result = vec4<f32>(-1.0, -1.0, -1.0, 0.0);
+    if (dist_to_camera >= 2.0 || ray_proj <= 0.0) {
+        // Ray doesn't pass close to camera, trace normally
+        hit_result = hzb_ray_march(ray_start, reflect_dir, input.uv, depth);
+    }
+    // Otherwise hit_result stays as "no hit" and we fall through to skybox
+        
+    if (hit_result.z > 0.0) {
+        let hit_uv = hit_result.xy;
+        let dim = vec2<f32>(textureDimensions(scene_color));
+        let texel = 1.0 / dim;
+        
+        // Distance-based blur: further reflections get more blur to hide instability
+        // Similar to water's DoF-aware gather
+        let reflection_distance = hit_result.w;
+        let distance_blur_start = 5.0;   // Start blurring after this distance
+        let distance_blur_end = 80.0;    // Full blur at this distance
+        let distance_blur_factor = smoothstep(distance_blur_start, distance_blur_end, reflection_distance);
+        
+        // Combine with roughness (less reflective = more blur)
+        let roughness = 1.0 - reflectivity;
+        
+        // Final blur spread: distance-based + roughness-based
+        // Max spread of 4 texels at far distance or high roughness
+        let blur_spread = max(distance_blur_factor * 4.0, roughness * 2.0);
+        
+        var reflection_color = vec3<f32>(0.0);
+        var bloom_accum = vec3<f32>(0.0);
+        var ao_accum = 0.0;
+        var valid_samples = 0.0;
+        
+        if (blur_spread > 0.5) {
+            // Apply 3x3 gather blur
+            for (var oy = -1; oy <= 1; oy = oy + 1) {
+                for (var ox = -1; ox <= 1; ox = ox + 1) {
+                    let offset_uv = hit_uv + vec2<f32>(f32(ox), f32(oy)) * texel * blur_spread;
+                    if (offset_uv.x < 0.0 || offset_uv.x > 1.0 || offset_uv.y < 0.0 || offset_uv.y > 1.0) {
+                        continue;
+                    }
+                    let sample_color = textureSample(scene_color, linear_sampler, offset_uv);
+                    let sample_bloom = textureSample(bloom_texture, linear_sampler, offset_uv);
+                    let sample_ssao = textureSample(ssao_texture, linear_sampler, offset_uv);
+                    reflection_color += sample_color.rgb;
+                    bloom_accum += sample_bloom.rgb;
+                    ao_accum += sample_ssao.a;
+                    valid_samples += 1.0;
+                }
+            }
+            if (valid_samples > 0.0) {
+                reflection_color /= valid_samples;
+                bloom_accum /= valid_samples;
+                ao_accum /= valid_samples;
+            }
+        } else {
+            // Sharp reflection for close, mirror-like surfaces
+            reflection_color = textureSample(scene_color, linear_sampler, hit_uv).rgb;
+            bloom_accum = textureSample(bloom_texture, linear_sampler, hit_uv).rgb;
+            ao_accum = textureSample(ssao_texture, linear_sampler, hit_uv).a;
+        }
+        
+        // Apply bloom and SSAO
+        let bloomed_reflection = reflection_color + bloom_accum * params.bloom_strength;
+        let reflection_with_ao = bloomed_reflection * ao_accum;
         
         // Fade based on distance from screen edges
         let edge_fade = min(
-            min(hit_uv.x, 1.0 - hit_uv.x),
-            min(hit_uv.y, 1.0 - hit_uv.y)
+            min(hit_result.x, 1.0 - hit_result.x),
+            min(hit_result.y, 1.0 - hit_result.y)
         );
         let edge_factor = smoothstep(0.0, 0.1, edge_fade);
         
-        return vec4<f32>(reflection_color.rgb, edge_factor);
+        // Fade reflections at very long distances (less accurate)
+        let distance_fade = 1.0 - smoothstep(50.0, 100.0, hit_result.w);
+        
+        // Modulate reflection strength by material reflectivity and angle stability
+        let final_alpha = edge_factor * distance_fade * reflectivity * (1.0 - angle_fade);
+        
+        return vec4<f32>(reflection_with_ao, final_alpha);
     }
     
-    return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    // No geometry hit - sample skybox for reflection
+    // Apply skybox rotation to match the scene
+    let angle = camera.skybox_rotation;
+    let c = cos(angle);
+    let s = sin(angle);
+    let rotated_dir = vec3<f32>(
+        reflect_dir.x * c + reflect_dir.z * s,
+        reflect_dir.y,
+        reflect_dir.x * -s + reflect_dir.z * c
+    );
+    
+    // Convert reflection direction to equirectangular UV (matching skybox and water shaders)
+    let PI = 3.14159265359;
+    let TWO_PI = 6.28318530718;
+    let u = 0.5 + atan2(rotated_dir.z, rotated_dir.x) / TWO_PI;
+    let v = 0.5 - asin(clamp(rotated_dir.y, -1.0, 1.0)) / PI;
+    
+    // Use skybox_sampler which has Repeat on U for proper equirectangular wrapping
+    let sky_sample = textureSample(skybox_texture, skybox_sampler, vec2<f32>(u, v)).rgb;
+    
+    // Apply brightness and saturation adjustments to match skybox pass
+    let brightness = camera.skybox_brightness;
+    let min_sat = camera.skybox_saturation;
+    let sat = clamp(min_sat + (1.0 - min_sat) * brightness, 0.0, 1.0);
+    let luminance = dot(sky_sample, vec3<f32>(0.299, 0.587, 0.114));
+    let desaturated = mix(vec3<f32>(luminance), sky_sample, sat);
+    let tint = camera.skybox_tint;
+    let tint_strength = camera.skybox_tint_strength;
+    let effect_strength = (1.0 - brightness) * tint_strength;
+    let tinted = mix(desaturated, desaturated * tint, effect_strength);
+    let sky_color = tinted * brightness;
+    
+    // Return skybox reflection with material reflectivity and angle fade
+    return vec4<f32>(sky_color, reflectivity * (1.0 - angle_fade));
 }

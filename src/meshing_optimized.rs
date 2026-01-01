@@ -12,6 +12,7 @@ pub struct MeshVertex {
     pub normal: [f32; 3],
     pub color: [f32; 4],
     pub emissive: [f32; 4],
+    pub material: [f32; 4],  // R=reflectivity, GBA=reserved
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -316,6 +317,7 @@ pub fn generate_chunk_mesh_optimized(
                 material.emissive[2],
                 material.emissive_intensity,
             ];
+            let material_props = [material.reflectivity, 0.0, 0.0, 0.0];
 
             for (depth, plane) in depth_map {
                 let quads = greedy_mesh_binary_plane(*plane);
@@ -397,24 +399,28 @@ pub fn generate_chunk_mesh_optimized(
                         normal,
                         color: apply_ao(base_color, ao0),
                         emissive,
+                        material: material_props,
                     });
                     mesh.vertices.push(MeshVertex {
                         position: p1,
                         normal,
                         color: apply_ao(base_color, ao1),
                         emissive,
+                        material: material_props,
                     });
                     mesh.vertices.push(MeshVertex {
                         position: p2,
                         normal,
                         color: apply_ao(base_color, ao2),
                         emissive,
+                        material: material_props,
                     });
                     mesh.vertices.push(MeshVertex {
                         position: p3,
                         normal,
                         color: apply_ao(base_color, ao3),
                         emissive,
+                        material: material_props,
                     });
 
                     // Add indices

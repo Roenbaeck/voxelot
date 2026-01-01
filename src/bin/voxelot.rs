@@ -246,6 +246,7 @@ struct MeshVertexRaw {
     normal: [f32; 3],
     color: [f32; 4],
     emissive: [f32; 4],
+    material: [f32; 4],  // R=reflectivity, GBA=reserved
 }
 
 // -----------------------------------------------------------------------------
@@ -273,23 +274,27 @@ fn boat_push_tri(
     // Make it double-sided so we don't have to perfectly manage winding while iterating on the model.
     // This also avoids "invisible hull" if the camera is inside/near the mesh.
     let emissive = [0.0, 0.0, 0.0, 0.0];
+    let material = [0.0, 0.0, 0.0, 0.0]; // Boat is not reflective
     out.push(MeshVertexRaw {
         position: a,
         normal,
         color,
         emissive,
+        material,
     });
     out.push(MeshVertexRaw {
         position: b,
         normal,
         color,
         emissive,
+        material,
     });
     out.push(MeshVertexRaw {
         position: c,
         normal,
         color,
         emissive,
+        material,
     });
 
     let normal_back = [-normal[0], -normal[1], -normal[2]];
@@ -298,18 +303,21 @@ fn boat_push_tri(
         normal: normal_back,
         color,
         emissive,
+        material,
     });
     out.push(MeshVertexRaw {
         position: b,
         normal: normal_back,
         color,
         emissive,
+        material,
     });
     out.push(MeshVertexRaw {
         position: a,
         normal: normal_back,
         color,
         emissive,
+        material,
     });
 }
 
@@ -471,6 +479,7 @@ fn boat_transform_into_world(
             normal: [nx, ny, nz],
             color: v.color,
             emissive: v.emissive,
+            material: v.material,
         });
     }
 }
@@ -582,7 +591,13 @@ struct SsrCameraUniforms {
     inverse_view: [[f32; 4]; 4],
     inverse_proj: [[f32; 4]; 4],
     view_proj: [[f32; 4]; 4],
-    camera_pos: [f32; 4],
+    camera_pos: [f32; 3],
+    skybox_rotation: f32,
+    skybox_brightness: f32,
+    skybox_saturation: f32,
+    _pad1: [f32; 2],
+    skybox_tint: [f32; 3],
+    skybox_tint_strength: f32,
 }
 
 /// Depth-of-field runtime settings (CPU-side convenience)
@@ -629,7 +644,12 @@ struct CompositeUniforms {
     ssr_debug: f32,
     indirect_light_scale: f32, // Modulates emissive bounce light by ambient darkness (0=day, 1=night)
     hdr_highlight_compression: f32,
-    _pad2: f32,
+    hzb_debug: f32,
+    hzb_mips: f32,
+    near: f32,
+    far: f32,
+    ssr_enabled: f32, // Whether to apply SSR reflections (1.0 = enabled)
+    _pad: [f32; 2],
     uv_scale: [f32; 2],
     uv_offset: [f32; 2],
 }
@@ -1135,6 +1155,7 @@ struct App {
     shadow_mesh_pipeline: Option<wgpu::RenderPipeline>,
     uniform_buffer: Option<wgpu::Buffer>,
     palette_buffer: Option<wgpu::Buffer>,
+    material_props_buffer: Option<wgpu::Buffer>,
     bind_group: Option<wgpu::BindGroup>,
     shadow_bind_group: Option<wgpu::BindGroup>,
     main_bind_group_layout: Option<wgpu::BindGroupLayout>,
@@ -1396,6 +1417,9 @@ struct App {
     hzb_texture: Option<wgpu::Texture>,
     hzb_view: Option<wgpu::TextureView>,
     hzb_mip_views: Vec<wgpu::TextureView>, // Per-mip views for storage
+    hzb_temp_texture: Option<wgpu::Texture>,
+    hzb_temp_view: Option<wgpu::TextureView>,
+    hzb_temp_mip_views: Vec<wgpu::TextureView>,
     hzb_mip_levels: u32,
     hzb_gen_copy_pipeline: Option<wgpu::ComputePipeline>,
     hzb_gen_downsample_pipeline: Option<wgpu::ComputePipeline>,
@@ -1405,6 +1429,7 @@ struct App {
     hzb_bind_group_layout: Option<wgpu::BindGroupLayout>,
     _hzb_gen_downsample_bind_groups: Vec<Option<wgpu::BindGroup>>,
     hzb_enabled: bool,
+    hzb_debug: bool,
     // Frame timing
     _frame_times: VecDeque<f32>,
 
@@ -1520,6 +1545,10 @@ struct App {
     normal_texture: Option<wgpu::Texture>,
     normal_view: Option<wgpu::TextureView>,
     normal_texture_bytes: u64,
+    // G-Buffer material texture (reflectivity for SSR)
+    material_texture: Option<wgpu::Texture>,
+    material_view: Option<wgpu::TextureView>,
+    material_texture_bytes: u64,
     // Path to loaded config file (user provided or default)
     config_path: String,
     // Profiling helper (CPU scopes). No-op if compiled without `cpu-profiling` feature.
@@ -2140,6 +2169,7 @@ impl App {
             shadow_mesh_pipeline: None,
             uniform_buffer: None,
             palette_buffer: None,
+            material_props_buffer: None,
             bind_group: None,
             shadow_bind_group: None,
             main_bind_group_layout: None,
@@ -2334,6 +2364,9 @@ impl App {
             normal_texture: None,
             normal_view: None,
             normal_texture_bytes: 0,
+            material_texture: None,
+            material_view: None,
+            material_texture_bytes: 0,
             config_path: config_path.to_string(),
             profiler: voxelot::profiling::Profiler::new(),
             timestamp_period_ns: 0.0,
@@ -2409,6 +2442,9 @@ impl App {
             hzb_texture: None,
             hzb_view: None,
             hzb_mip_views: Vec::new(),
+            hzb_temp_texture: None,
+            hzb_temp_view: None,
+            hzb_temp_mip_views: Vec::new(),
             hzb_mip_levels: 0,
             hzb_gen_copy_pipeline: None,
             hzb_gen_downsample_pipeline: None,
@@ -2419,6 +2455,7 @@ impl App {
             _hzb_gen_downsample_bind_groups: Vec::new(),
             hzb_params_buffer: None,
             hzb_enabled: cfg.performance.hzb_enabled,
+            hzb_debug: false,
             _frame_times: VecDeque::with_capacity(60),
             dof_combine_pipeline: None,
             dof_combine_bind_group_layout: None,
@@ -2782,7 +2819,12 @@ impl App {
             ssr_debug: if self.ssr_debug { 1.0 } else { 0.0 },
             indirect_light_scale,
             hdr_highlight_compression: if self.hdr_active { 1.0 } else { 0.0 },
-            _pad2: 0.0,
+            hzb_debug: if self.hzb_debug { 1.0 } else { 0.0 },
+            hzb_mips: self.hzb_mip_levels as f32,
+            near: self.camera_controller.camera.near,
+            far: self.camera_controller.camera.far,
+            ssr_enabled: if self.ssr_settings.enabled { 1.0 } else { 0.0 },
+            _pad: [0.0; 2],
             uv_scale: [crop_scale, crop_scale],
             uv_offset: [crop_offset, crop_offset],
         }
@@ -2928,6 +2970,18 @@ impl App {
                 log::info!("SSAO radius: {}", self.ssao_settings.radius);
             }
             KeyCode::KeyH => {
+                self.hzb_enabled = !self.hzb_enabled;
+                log::info!(
+                    "HZB occlusion culling {}",
+                    if self.hzb_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+                self.pending_recreate_offscreen = true;
+            }
+            KeyCode::F6 => {
                 self.ssao_debug = !self.ssao_debug;
                 log::info!(
                     "SSAO debug {}",
@@ -2937,10 +2991,6 @@ impl App {
                         "disabled"
                     }
                 );
-                if self.ssao_debug {
-                    // schedule immediate readback of SSAO ping texture to print stats
-                    // readback currently disabled, visual debug still active
-                }
             }
             KeyCode::KeyK => {
                 // Decrease LOD distance (more detail at distance)
@@ -3021,16 +3071,14 @@ impl App {
                 }
             }
             KeyCode::KeyJ => {
-                self.hzb_enabled = !self.hzb_enabled;
-                log::info!(
-                    "HZB {}",
-                    if self.hzb_enabled {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    }
-                );
-                // Note: HZB texture recreation happens automatically on next frame via existing logic
+                if !self.hzb_debug {
+                    self.hzb_debug = true;
+                    log::info!("HZB debug view enabled");
+                } else {
+                    self.hzb_debug = false;
+                    log::info!("HZB debug view disabled");
+                }
+                self.pending_recreate_offscreen = true;
             }
             KeyCode::KeyU => {
                 self.dof_settings.kawase_offset =
@@ -3140,6 +3188,9 @@ impl App {
             normal_texture_loc,
             normal_view_loc,
             normal_bytes,
+            material_texture_loc,
+            material_view_loc,
+            material_bytes,
             rc_texture_loc,
             rc_view_loc,
             rc_bytes,
@@ -3506,6 +3557,32 @@ impl App {
                     1,
                 );
 
+                // G-Buffer material texture (reflectivity for SSR)
+                let material_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("Material G-Buffer Texture"),
+                    size: wgpu::Extent3d {
+                        width: target_width,
+                        height: target_height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                });
+                let material_view_loc =
+                    material_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
+                let material_bytes = App::compute_texture_bytes(
+                    wgpu::TextureFormat::Rgba16Float,
+                    target_width,
+                    target_height,
+                    1,
+                    1,
+                );
+
                 // Radiance Cascades Output Texture
                 let rc_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("Radiance Cascades Texture"),
@@ -3572,6 +3649,9 @@ impl App {
                     normal_texture_loc,
                     normal_view_loc,
                     normal_bytes,
+                    material_texture_loc,
+                    material_view_loc,
+                    material_bytes,
                     rc_texture_loc,
                     rc_view_loc,
                     rc_bytes,
@@ -3610,6 +3690,13 @@ impl App {
         App::replace_texture_bytes_static(
             &mut self.normal_texture_bytes,
             normal_bytes,
+            &mut self.gpu_texture_bytes,
+        );
+        self.material_texture = Some(material_texture_loc);
+        self.material_view = Some(material_view_loc);
+        App::replace_texture_bytes_static(
+            &mut self.material_texture_bytes,
+            material_bytes,
             &mut self.gpu_texture_bytes,
         );
         // Assign and track other created textures
@@ -3692,7 +3779,8 @@ impl App {
         // Kawase registrations (UBOs/BindGroups per level)
         self.update_kawase_bind_groups();
         self.update_bloom_uniforms();
-        self.update_bloom_bind_groups();
+        self.update_water_uniforms();
+        self.update_ssr_bind_group();
 
         // Create HZB texture (after we dropped the device/config borrow from the local closure)
         if let Some(device) = self.device.as_ref() {
@@ -3701,16 +3789,23 @@ impl App {
             let mut hzb_texture_opt: Option<wgpu::Texture> = None;
             let mut hzb_view_opt: Option<wgpu::TextureView> = None;
             let mut hzb_mip_views_local: Vec<wgpu::TextureView> = Vec::new();
+            let mut hzb_temp_mip_views_local: Vec<wgpu::TextureView> = Vec::new();
+            let mut hzb_temp_view_opt: Option<wgpu::TextureView> = None;
+            let mut hzb_temp_texture_opt: Option<wgpu::Texture> = None;
 
-            if self.hzb_enabled {
-                if let Some(cfg) = self.config.as_ref() {
-                    let max_dim = cfg.width.max(cfg.height);
-                    let mip_levels = 32 - (max_dim.saturating_sub(1)).leading_zeros();
+            if self.hzb_enabled || self.hzb_debug {
+                let target_width = self.render_target_width.max(1);
+                let target_height = self.render_target_height.max(1);
+                let max_dim = target_width.max(target_height);
+                let mip_levels = 32 - (max_dim.saturating_sub(1)).leading_zeros();
+
+                for i in 0..2 {
+                    let label = if i == 0 { "HZB Texture" } else { "HZB Temp Texture" };
                     let tex = device.create_texture(&wgpu::TextureDescriptor {
-                        label: Some("HZB Texture"),
+                        label: Some(label),
                         size: wgpu::Extent3d {
-                            width: cfg.width,
-                            height: cfg.height,
+                            width: target_width,
+                            height: target_height,
                             depth_or_array_layers: 1,
                         },
                         mip_level_count: mip_levels,
@@ -3719,15 +3814,17 @@ impl App {
                         format: wgpu::TextureFormat::R32Float,
                         usage: wgpu::TextureUsages::TEXTURE_BINDING
                             | wgpu::TextureUsages::STORAGE_BINDING
+                            | wgpu::TextureUsages::COPY_SRC
                             | wgpu::TextureUsages::COPY_DST,
                         view_formats: &[],
                     });
                     let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
 
+                    let mut views = Vec::new();
                     // Create per-mip views for storage binding
                     for mip in 0..mip_levels {
                         let mip_view = tex.create_view(&wgpu::TextureViewDescriptor {
-                            label: Some(&format!("HZB Mip {} View", mip)),
+                            label: Some(&format!("{} Mip {} View", label, mip)),
                             format: Some(wgpu::TextureFormat::R32Float),
                             dimension: Some(wgpu::TextureViewDimension::D2),
                             aspect: wgpu::TextureAspect::All,
@@ -3737,48 +3834,33 @@ impl App {
                             array_layer_count: Some(1),
                             usage: None,
                         });
-                        hzb_mip_views_local.push(mip_view);
+                        views.push(mip_view);
                     }
 
-                    hzb_texture_opt = Some(tex);
-                    hzb_view_opt = Some(view);
-                    hzb_mips = mip_levels;
-                    hzb_bytes = App::compute_texture_bytes(
-                        wgpu::TextureFormat::R32Float,
-                        cfg.width,
-                        cfg.height,
-                        mip_levels,
-                        1,
-                    );
-                } else {
-                    // Should not happen; fallback to 1x1 dummy
-                    let tex = device.create_texture(&wgpu::TextureDescriptor {
-                        label: Some("HZB Dummy Texture"),
-                        size: wgpu::Extent3d {
-                            width: 1,
-                            height: 1,
-                            depth_or_array_layers: 1,
-                        },
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: wgpu::TextureFormat::R32Float,
-                        usage: wgpu::TextureUsages::TEXTURE_BINDING
-                            | wgpu::TextureUsages::STORAGE_BINDING
-                            | wgpu::TextureUsages::COPY_DST,
-                        view_formats: &[],
-                    });
-                    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-                    hzb_mip_views_local.push(view.clone());
-                    hzb_texture_opt = Some(tex);
-                    hzb_view_opt = Some(view);
-                    hzb_mips = 1;
-                    hzb_bytes =
-                        App::compute_texture_bytes(wgpu::TextureFormat::R32Float, 1, 1, 1, 1);
+                    if i == 0 {
+                        hzb_texture_opt = Some(tex);
+                        hzb_view_opt = Some(view);
+                        hzb_mip_views_local = views;
+                    } else {
+                        hzb_temp_texture_opt = Some(tex);
+                        hzb_temp_view_opt = Some(view);
+                        hzb_temp_mip_views_local = views;
+                    }
                 }
+
+                hzb_mips = mip_levels;
+                hzb_bytes = App::compute_texture_bytes(
+                    wgpu::TextureFormat::R32Float,
+                    target_width,
+                    target_height,
+                    mip_levels,
+                    1,
+                ) * 2; // Two textures
+
+
             } else {
-                // Create a dummy 1x1 R32 texture
-                let tex = device.create_texture(&wgpu::TextureDescriptor {
+                // Create dummy 1x1 R32 textures (main + temp)
+                let tex_main = device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("HZB Dummy Texture"),
                     size: wgpu::Extent3d {
                         width: 1,
@@ -3794,12 +3876,32 @@ impl App {
                         | wgpu::TextureUsages::COPY_DST,
                     view_formats: &[],
                 });
-                let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-                hzb_mip_views_local.push(view.clone());
-                hzb_texture_opt = Some(tex);
-                hzb_view_opt = Some(view);
+                let tex_temp = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("HZB Dummy Temp Texture"),
+                    size: wgpu::Extent3d {
+                        width: 1,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::R32Float,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::STORAGE_BINDING
+                        | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let view_main = tex_main.create_view(&wgpu::TextureViewDescriptor::default());
+                let view_temp = tex_temp.create_view(&wgpu::TextureViewDescriptor::default());
+                hzb_mip_views_local.push(view_main.clone());
+                hzb_temp_mip_views_local.push(view_temp.clone());
+                hzb_texture_opt = Some(tex_main);
+                hzb_view_opt = Some(view_main.clone());
+                hzb_temp_view_opt = Some(view_temp);
+                hzb_temp_texture_opt = Some(tex_temp);
                 hzb_mips = 1;
-                hzb_bytes = App::compute_texture_bytes(wgpu::TextureFormat::R32Float, 1, 1, 1, 1);
+                hzb_bytes = App::compute_texture_bytes(wgpu::TextureFormat::R32Float, 1, 1, 1, 1) * 2;
             }
             App::replace_texture_bytes_static(
                 &mut self.hzb_texture_bytes,
@@ -3809,126 +3911,137 @@ impl App {
             self.hzb_texture = hzb_texture_opt;
             self.hzb_view = hzb_view_opt;
             self.hzb_mip_views = hzb_mip_views_local;
+            self.hzb_temp_texture = hzb_temp_texture_opt;
+            self.hzb_temp_view = hzb_temp_view_opt;
+            self.hzb_temp_mip_views = hzb_temp_mip_views_local;
             self.hzb_mip_levels = hzb_mips;
 
             // Create HZB Generation bind groups
             if let Some(gen_layout) = self.hzb_gen_bind_group_layout.as_ref() {
-                if let Some(cfg) = self.config.as_ref() {
-                    let params = HzbParams {
-                        width: cfg.width,
-                        height: cfg.height,
-                        src_mip: 0,
-                        dst_mip: 0,
-                    };
-                    let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("HZB Params Buffer"),
-                        contents: bytemuck::bytes_of(&params),
-                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                let target_width = self.render_target_width.max(1);
+                let target_height = self.render_target_height.max(1);
+                let params = HzbParams {
+                    width: target_width,
+                    height: target_height,
+                    src_mip: 0,
+                    dst_mip: 0,
+                };
+                let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("HZB Params Buffer"),
+                    contents: bytemuck::bytes_of(&params),
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                });
+                let params_size = std::mem::size_of::<HzbParams>() as u64;
+                App::replace_buffer_bytes_static(
+                    &mut self.hzb_params_buffer_bytes,
+                    params_size,
+                    &mut self.gpu_buffer_bytes,
+                );
+                self.hzb_params_buffer = Some(params_buf.clone());
+
+                // Create copy bind group (depth -> TEMP mip 0)
+                if let (Some(depth_view), Some(mip0_view), Some(main_mip0_view)) = (
+                    self.offscreen_depth_view.as_ref(),
+                    self.hzb_temp_mip_views.get(0), // Write to TEMP
+                    self.hzb_mip_views.get(0),      // Read from MAIN (dummy)
+                ) {
+                    let copy_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("HZB Copy Bind Group"),
+                        layout: gen_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(depth_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(mip0_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: params_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: wgpu::BindingResource::TextureView(main_mip0_view), // Use MAIN as dummy to avoid conflict
+                            },
+                        ],
                     });
-                    let params_size = std::mem::size_of::<HzbParams>() as u64;
-                    App::replace_buffer_bytes_static(
-                        &mut self.hzb_params_buffer_bytes,
-                        params_size,
-                        &mut self.gpu_buffer_bytes,
-                    );
-                    self.hzb_params_buffer = Some(params_buf.clone());
+                    self.hzb_copy_bind_group = Some(copy_bg);
+                }
 
-                    // Create copy bind group (depth -> mip 0)
-                    if let (Some(depth_view), Some(mip0_view)) = (
-                        self.offscreen_depth_view.as_ref(),
-                        self.hzb_mip_views.get(0),
-                    ) {
-                        let copy_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                            label: Some("HZB Copy Bind Group"),
-                            layout: gen_layout,
-                            entries: &[
-                                wgpu::BindGroupEntry {
-                                    binding: 0,
-                                    resource: wgpu::BindingResource::TextureView(depth_view),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 1,
-                                    resource: wgpu::BindingResource::TextureView(mip0_view),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 2,
-                                    resource: params_buf.as_entire_binding(),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 3,
-                                    resource: wgpu::BindingResource::TextureView(depth_view), // Unused in copy
-                                },
-                            ],
-                        });
-                        self.hzb_copy_bind_group = Some(copy_bg);
-                    }
+                let mut downsample_bgs = Vec::new();
+                if let Some(depth_view) = self.offscreen_depth_view.as_ref() {
+                    let target_width = self.render_target_width.max(1);
+                    let target_height = self.render_target_height.max(1);
+                    for dst_mip in 1..(self.hzb_mip_levels as usize) {
+                        // Ping-pong between MAIN and TEMP to avoid intermediate copies
+                        // Mip 0 is in MAIN.
+                        // Mip 1: MAIN[0] -> TEMP[1]
+                        // Mip 2: TEMP[1] -> MAIN[2]
+                        // Mip 3: MAIN[2] -> TEMP[3]
+                        // ...
+                        let (dst_view, src_view) = if dst_mip % 2 == 1 {
+                            (
+                                self.hzb_temp_mip_views.get(dst_mip), // Write to TEMP
+                                self.hzb_mip_views.get(dst_mip - 1),  // Read from MAIN
+                            )
+                        } else {
+                            (
+                                self.hzb_mip_views.get(dst_mip),      // Write to MAIN
+                                self.hzb_temp_mip_views.get(dst_mip - 1), // Read from TEMP
+                            )
+                        };
 
-                    // Create downsample bind groups (mip N-1 -> mip N)
-                    let mut downsample_bgs = Vec::new();
-                    if let (Some(depth_view), Some(cfg)) =
-                        (self.offscreen_depth_view.as_ref(), self.config.as_ref())
-                    {
-                        for dst_mip in 1..(self.hzb_mip_levels as usize) {
-                            if let (Some(dst_view), Some(src_view)) = (
-                                self.hzb_mip_views.get(dst_mip),
-                                self.hzb_mip_views.get(dst_mip - 1),
-                            ) {
-                                // Calculate mip dimensions
-                                let mip_width = (cfg.width >> dst_mip).max(1);
-                                let mip_height = (cfg.height >> dst_mip).max(1);
+                        if let (Some(dst_view), Some(src_view)) = (dst_view, src_view) {
+                            // Calculate mip dimensions
+                            let mip_width = (target_width >> dst_mip).max(1);
+                            let mip_height = (target_height >> dst_mip).max(1);
 
-                                // Create per-mip params buffer (immutable)
-                                // src_mip is ALWAYS 0 because we bind the specific source mip view
-                                let params = HzbParams {
-                                    width: mip_width,
-                                    height: mip_height,
-                                    src_mip: 0,
-                                    dst_mip: dst_mip as u32,
-                                };
+                            // Create per-mip params buffer (immutable)
+                            let params = HzbParams {
+                                width: mip_width,
+                                height: mip_height,
+                                src_mip: 0,
+                                dst_mip: dst_mip as u32,
+                            };
 
-                                use wgpu::util::DeviceExt;
-                                let params_buf =
-                                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                        label: Some(&format!("HZB Params Mip {}", dst_mip)),
-                                        contents: bytemuck::bytes_of(&params),
-                                        usage: wgpu::BufferUsages::UNIFORM,
-                                    });
-
-                                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                                    label: Some(&format!(
-                                        "HZB Downsample Bind Group Mip {}",
-                                        dst_mip
-                                    )),
-                                    layout: gen_layout,
-                                    entries: &[
-                                        wgpu::BindGroupEntry {
-                                            binding: 0,
-                                            // Bind depth texture to satisfy layout (unused in downsample shader)
-                                            resource: wgpu::BindingResource::TextureView(
-                                                depth_view,
-                                            ),
-                                        },
-                                        wgpu::BindGroupEntry {
-                                            binding: 1,
-                                            resource: wgpu::BindingResource::TextureView(dst_view),
-                                        },
-                                        wgpu::BindGroupEntry {
-                                            binding: 2,
-                                            resource: params_buf.as_entire_binding(),
-                                        },
-                                        wgpu::BindGroupEntry {
-                                            binding: 3,
-                                            // Bind SPECIFIC source mip view (avoids usage conflict)
-                                            resource: wgpu::BindingResource::TextureView(src_view),
-                                        },
-                                    ],
+                            use wgpu::util::DeviceExt;
+                            let params_buf =
+                                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                    label: Some(&format!("HZB Params Mip {}", dst_mip)),
+                                    contents: bytemuck::bytes_of(&params),
+                                    usage: wgpu::BufferUsages::UNIFORM,
                                 });
-                                downsample_bgs.push(bg);
-                            }
+
+                            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some(&format!("HZB Downsample Bind Group Mip {}", dst_mip)),
+                                layout: gen_layout,
+                                entries: &[
+                                    wgpu::BindGroupEntry {
+                                        binding: 0,
+                                        resource: wgpu::BindingResource::TextureView(depth_view),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 1,
+                                        resource: wgpu::BindingResource::TextureView(dst_view),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 2,
+                                        resource: params_buf.as_entire_binding(),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 3,
+                                        // Bind SPECIFIC source mip view (avoids usage conflict)
+                                        resource: wgpu::BindingResource::TextureView(src_view),
+                                    },
+                                ],
+                            });
+                            downsample_bgs.push(bg);
                         }
                     }
-                    self.hzb_downsample_bind_groups = downsample_bgs;
                 }
+                self.hzb_downsample_bind_groups = downsample_bgs;
             }
 
             // Build HZB cull bind group (for GPU culling shader)
@@ -3959,6 +4072,9 @@ impl App {
                 }
             }
         }
+        self.update_bloom_bind_groups();
+        self.update_ssr_bind_group(); // SSR needs HZB, bloom, SSAO, etc.
+        self.cull_bind_group = None;
     }
 
     fn recreate_shadow_map(&mut self) {
@@ -4022,6 +4138,7 @@ impl App {
             Some(shadow_sampler),
             Some(light_probe_buffer),
             Some(palette_buffer),
+            Some(material_props_buffer),
         ) = (
             self.device.as_ref(),
             self.main_bind_group_layout.as_ref(),
@@ -4030,6 +4147,7 @@ impl App {
             self.shadow_sampler.as_ref(),
             self.light_probe_buffer.as_ref(),
             self.palette_buffer.as_ref(),
+            self.material_props_buffer.as_ref(),
         )
         else {
             return;
@@ -4058,6 +4176,10 @@ impl App {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: palette_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: material_props_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -4458,12 +4580,14 @@ impl App {
             Some(ssao_ping_view),
             Some(post_view_ref),
             Some(rc_view),
+            Some(hzb_view),
         ) = (
             self.composite_uniform_buffer.as_ref(),
             self.post_sampler.as_ref(),
             self.ssao_ping_view.as_ref(),
             self.post_color_view.as_ref(),
             self.rc_texture_view.as_ref(),
+            self.hzb_view.as_ref(),
         ) {
             let ssr_view = self.ssr_texture_view.as_ref().unwrap_or(post_view_ref);
             self.composite_bind_group =
@@ -4494,6 +4618,10 @@ impl App {
                         wgpu::BindGroupEntry {
                             binding: 6,
                             resource: wgpu::BindingResource::TextureView(rc_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 7,
+                            resource: wgpu::BindingResource::TextureView(hzb_view),
                         },
                         wgpu::BindGroupEntry {
                             binding: 3,
@@ -4662,8 +4790,24 @@ impl App {
 
     fn update_ssr_bind_group(&mut self) {
         let Some(device) = self.device.as_ref() else {
+            log::warn!("SSR bind group: no device");
             return;
         };
+        
+        // Debug: check which resources are missing
+        if self.ssr_bind_group_layout.is_none() { log::warn!("SSR bind group: missing ssr_bind_group_layout"); }
+        if self.ssr_uniform_buffer.is_none() { log::warn!("SSR bind group: missing ssr_uniform_buffer"); }
+        if self.ssr_camera_uniform_buffer.is_none() { log::warn!("SSR bind group: missing ssr_camera_uniform_buffer"); }
+        if self.offscreen_color_view.is_none() { log::warn!("SSR bind group: missing offscreen_color_view"); }
+        if self.offscreen_depth_view.is_none() { log::warn!("SSR bind group: missing offscreen_depth_view"); }
+        if self.post_sampler.is_none() { log::warn!("SSR bind group: missing post_sampler"); }
+        if self.hzb_view.is_none() { log::warn!("SSR bind group: missing hzb_view"); }
+        if self.normal_view.is_none() { log::warn!("SSR bind group: missing normal_view"); }
+        if self.material_view.is_none() { log::warn!("SSR bind group: missing material_view"); }
+        if self.ssao_ping_view.is_none() { log::warn!("SSR bind group: missing ssao_ping_view"); }
+        if self.bloom_ping_view.is_none() { log::warn!("SSR bind group: missing bloom_ping_view"); }
+        if self.skybox_view.is_none() { log::warn!("SSR bind group: missing skybox_view"); }
+        
         let (
             Some(layout),
             Some(ssr_ubo),
@@ -4673,6 +4817,11 @@ impl App {
             Some(sampler),
             Some(hzb_view),
             Some(normal_view),
+            Some(material_view),
+            Some(ssao_view),
+            Some(bloom_view),
+            Some(skybox_view),
+            Some(skybox_sampler),
         ) = (
             self.ssr_bind_group_layout.as_ref(),
             self.ssr_uniform_buffer.as_ref(),
@@ -4682,10 +4831,17 @@ impl App {
             self.post_sampler.as_ref(),
             self.hzb_view.as_ref(),
             self.normal_view.as_ref(),
+            self.material_view.as_ref(),
+            self.ssao_ping_view.as_ref(),  // Use ping buffer (final SSAO result after blur)
+            self.bloom_ping_view.as_ref(), // Bloom texture for reflections with glow
+            self.skybox_view.as_ref(),     // Skybox for reflections when ray misses geometry
+            self.skybox_sampler.as_ref(),  // Skybox sampler with Repeat on U
         )
         else {
             return;
         };
+        
+        log::info!("SSR bind group: creating successfully");
 
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("SSR Bind Group"),
@@ -4725,6 +4881,31 @@ impl App {
                 wgpu::BindGroupEntry {
                     binding: 7,
                     resource: wgpu::BindingResource::TextureView(normal_view),
+                },
+                // Material G-buffer (reflectivity)
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(material_view),
+                },
+                // SSAO texture for reflected surfaces
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(ssao_view),
+                },
+                // Bloom texture for reflections with glow
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::TextureView(bloom_view),
+                },
+                // Skybox texture for reflections when ray misses geometry
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: wgpu::BindingResource::TextureView(skybox_view),
+                },
+                // Skybox sampler with Repeat on U for equirectangular wrapping
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: wgpu::BindingResource::Sampler(skybox_sampler),
                 },
             ],
         });
@@ -5281,6 +5462,12 @@ impl App {
                         blend: None,
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
+                    // Material G-buffer (reflectivity in R channel)
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
                 ],
                 compilation_options: Default::default(),
             }),
@@ -5429,6 +5616,17 @@ impl App {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // Real SSR texture (from SSR pass)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -5516,6 +5714,7 @@ impl App {
             Some(post_sampler),
             Some(normal_view),
             Some(hzb_view),
+            Some(ssr_view),
         ) = (
             self.device.as_ref(),
             self.water_bind_group_layout.as_ref(),
@@ -5527,6 +5726,7 @@ impl App {
             self.post_sampler.as_ref(),
             self.normal_view.as_ref(),
             self.hzb_view.as_ref(),
+            self.ssr_texture_view.as_ref(),
         ) {
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Water Bind Group"),
@@ -5572,6 +5772,11 @@ impl App {
                     wgpu::BindGroupEntry {
                         binding: 8,
                         resource: wgpu::BindingResource::Sampler(post_sampler),
+                    },
+                    // SSR texture
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: wgpu::BindingResource::TextureView(ssr_view),
                     },
                 ],
             });
@@ -5663,6 +5868,57 @@ impl App {
                     },
                     count: None,
                 },
+                // Material G-buffer (reflectivity in R channel)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // SSAO texture for applying AO to reflected surfaces
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Bloom texture for including glow in reflections
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Skybox texture for reflections when ray misses geometry
+                wgpu::BindGroupLayoutEntry {
+                    binding: 11,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Skybox sampler with Repeat on U for equirectangular wrapping
+                wgpu::BindGroupLayoutEntry {
+                    binding: 12,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
 
@@ -5699,6 +5955,8 @@ impl App {
         });
 
         use wgpu::util::DeviceExt;
+        let overscan = self.user_config.rendering.render_overscan.max(0.0);
+        let bloom_strength = self.bloom_settings.bloom_strength;
         let ssr_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("SSR Uniform Buffer"),
             contents: bytemuck::bytes_of(&[
@@ -5706,6 +5964,9 @@ impl App {
                 self.ssr_settings.max_binary_steps,
                 self.ssr_settings.step_size.to_bits(),
                 self.ssr_settings.thickness.to_bits(),
+                overscan.to_bits(),
+                bloom_strength.to_bits(),
+                0u32, 0u32, // padding to 32 bytes (vec2 alignment)
             ]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -5801,6 +6062,138 @@ impl App {
         Ok((vertex_offset, index_offset))
     }
 
+    fn generate_hzb(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        if !(self.hzb_enabled || self.hzb_debug) {
+            return;
+        }
+
+        let target_width = self.render_target_width.max(1);
+        let target_height = self.render_target_height.max(1);
+
+        // Pass 1: Copy depth -> HZB mip 0
+        if let (Some(copy_pipeline), Some(copy_bg), Some(params_buf), Some(queue)) = (
+            self.hzb_gen_copy_pipeline.as_ref(),
+            self.hzb_copy_bind_group.as_ref(),
+            self.hzb_params_buffer.as_ref(),
+            self.queue.as_ref(),
+        ) {
+            // Update params for mip 0
+            let params = HzbParams {
+                width: target_width,
+                height: target_height,
+                src_mip: 0,
+                dst_mip: 0,
+            };
+            queue.write_buffer(params_buf, 0, bytemuck::bytes_of(&params));
+
+            let ts_writes = if self.gui_visible {
+                self.query_set
+                    .as_ref()
+                    .map(|qs| wgpu::ComputePassTimestampWrites {
+                        query_set: qs,
+                        beginning_of_pass_write_index: Some(2),
+                        end_of_pass_write_index: Some(3),
+                    })
+            } else {
+                None
+            };
+
+            let mut hzb_copy_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("HZB Copy Pass"),
+                timestamp_writes: ts_writes,
+            });
+            hzb_copy_pass.set_pipeline(copy_pipeline);
+            hzb_copy_pass.set_bind_group(0, copy_bg, &[]);
+            let dispatch_x = ((target_width + 7) / 8) as u32;
+            let dispatch_y = ((target_height + 7) / 8) as u32;
+            hzb_copy_pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+            drop(hzb_copy_pass);
+
+            // Copy Mip 0 from TEMP back to MAIN
+            if let (Some(src_tex), Some(dst_tex)) =
+                (self.hzb_temp_texture.as_ref(), self.hzb_texture.as_ref())
+            {
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: src_tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: dst_tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: target_width,
+                        height: target_height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
+
+        // Pass 2-N: Downsample mip chain
+        if let Some(downsample_pipeline) = self.hzb_gen_downsample_pipeline.as_ref() {
+            for dst_mip in 1..(self.hzb_mip_levels as u32) {
+                if let Some(downsample_bg) =
+                    self.hzb_downsample_bind_groups.get((dst_mip - 1) as usize)
+                {
+                    // Calculate mip dimensions for dispatch count
+                    let mip_width = (target_width >> dst_mip).max(1);
+                    let mip_height = (target_height >> dst_mip).max(1);
+
+                    let mut hzb_downsample_pass =
+                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some(&format!("HZB Downsample Pass Mip {}", dst_mip)),
+                            timestamp_writes: None,
+                        });
+                    hzb_downsample_pass.set_pipeline(downsample_pipeline);
+                    hzb_downsample_pass.set_bind_group(0, downsample_bg, &[]);
+                    let dispatch_x = ((mip_width + 7) / 8) as u32;
+                    let dispatch_y = ((mip_height + 7) / 8) as u32;
+                    hzb_downsample_pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+                    drop(hzb_downsample_pass);
+                }
+            }
+
+            // Final step: Copy all mips that were generated in TEMP back to MAIN
+            // Mips 1, 3, 5, 7, 9... are in TEMP.
+            // Mips 0, 2, 4, 6, 8, 10... are already in MAIN.
+            if let (Some(src_tex), Some(dst_tex)) =
+                (self.hzb_temp_texture.as_ref(), self.hzb_texture.as_ref())
+            {
+                for mip in 1..(self.hzb_mip_levels as u32) {
+                    if mip % 2 == 1 {
+                        let mip_width = (target_width >> mip).max(1);
+                        let mip_height = (target_height >> mip).max(1);
+                        encoder.copy_texture_to_texture(
+                            wgpu::TexelCopyTextureInfo {
+                                texture: src_tex,
+                                mip_level: mip,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            wgpu::TexelCopyTextureInfo {
+                                texture: dst_tex,
+                                mip_level: mip,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            wgpu::Extent3d {
+                                width: mip_width,
+                                height: mip_height,
+                                depth_or_array_layers: 1,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn run_gpu_culling(
         &mut self,
         device: &wgpu::Device,
@@ -5828,79 +6221,6 @@ impl App {
             label: Some("GPU Cull Encoder"),
         });
 
-        // Generate HZB mip chain if enabled
-        if self.hzb_enabled {
-            if let Some(cfg) = self.config.as_ref() {
-                // Pass 1: Copy depth -> HZB mip 0
-                if let (Some(copy_pipeline), Some(copy_bg), Some(params_buf), Some(queue)) = (
-                    self.hzb_gen_copy_pipeline.as_ref(),
-                    self.hzb_copy_bind_group.as_ref(),
-                    self.hzb_params_buffer.as_ref(),
-                    self.queue.as_ref(),
-                ) {
-                    // Update params for mip 0
-                    let params = HzbParams {
-                        width: cfg.width,
-                        height: cfg.height,
-                        src_mip: 0,
-                        dst_mip: 0,
-                    };
-                    queue.write_buffer(params_buf, 0, bytemuck::bytes_of(&params));
-
-                    let ts_writes = if self.gui_visible {
-                        self.query_set
-                            .as_ref()
-                            .map(|qs| wgpu::ComputePassTimestampWrites {
-                                query_set: qs,
-                                beginning_of_pass_write_index: Some(2),
-                                end_of_pass_write_index: Some(3),
-                            })
-                    } else {
-                        None
-                    };
-
-                    let mut hzb_copy_pass =
-                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                            label: Some("HZB Copy Pass"),
-                            timestamp_writes: ts_writes,
-                        });
-                    hzb_copy_pass.set_pipeline(copy_pipeline);
-                    hzb_copy_pass.set_bind_group(0, copy_bg, &[]);
-                    let dispatch_x = ((cfg.width + 7) / 8) as u32;
-                    let dispatch_y = ((cfg.height + 7) / 8) as u32;
-                    hzb_copy_pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
-                    drop(hzb_copy_pass);
-                }
-
-                // Pass 2-N: Downsample mip chain
-                if let Some(downsample_pipeline) = self.hzb_gen_downsample_pipeline.as_ref() {
-                    for dst_mip in 1..(self.hzb_mip_levels as u32) {
-                        if let Some(downsample_bg) =
-                            self.hzb_downsample_bind_groups.get((dst_mip - 1) as usize)
-                        {
-                            // Calculate mip dimensions for dispatch count
-                            let mip_width = (cfg.width >> dst_mip).max(1);
-                            let mip_height = (cfg.height >> dst_mip).max(1);
-
-                            // Params are baked into the bind group, no need to update buffer!
-
-                            let mut hzb_downsample_pass =
-                                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                                    label: Some(&format!("HZB Downsample Pass Mip {}", dst_mip)),
-                                    timestamp_writes: None,
-                                });
-                            hzb_downsample_pass.set_pipeline(downsample_pipeline);
-                            hzb_downsample_pass.set_bind_group(0, downsample_bg, &[]);
-                            let dispatch_x = ((mip_width + 7) / 8) as u32;
-                            let dispatch_y = ((mip_height + 7) / 8) as u32;
-                            hzb_downsample_pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
-                            drop(hzb_downsample_pass);
-                        }
-                    }
-                }
-            }
-        }
-
         let ts_writes = if self.gui_visible {
             self.query_set
                 .as_ref()
@@ -5923,11 +6243,6 @@ impl App {
         compute_pass.dispatch_workgroups(dispatch_x, 1, 1);
         drop(compute_pass);
 
-        // If we requested a deferred offscreen target recreation, do it now (safe point)
-        if self.pending_recreate_offscreen {
-            self.pending_recreate_offscreen = false;
-            self.recreate_offscreen_targets();
-        }
         // resolve + copy moved to the end of render() to capture all passes correctly.
         queue.submit(std::iter::once(encoder.finish()));
     }
@@ -6436,6 +6751,17 @@ impl App {
                         },
                         count: None,
                     },
+                    // Material properties buffer (reflectivity per voxel type)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -6513,6 +6839,12 @@ impl App {
                         blend: Some(wgpu::BlendState::REPLACE),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    // Material G-buffer (reflectivity in R channel)
                     Some(wgpu::ColorTargetState {
                         format: wgpu::TextureFormat::Rgba16Float,
                         blend: Some(wgpu::BlendState::REPLACE),
@@ -6620,7 +6952,8 @@ impl App {
                         0 => Float32x3,
                         1 => Float32x3,
                         2 => Float32x4,
-                        3 => Float32x4
+                        3 => Float32x4,
+                        4 => Float32x4  // material (reflectivity in R)
                     ],
                 }],
                 compilation_options: Default::default(),
@@ -6639,6 +6972,12 @@ impl App {
                         blend: Some(wgpu::BlendState::REPLACE),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    // Material G-buffer (reflectivity in R channel)
                     Some(wgpu::ColorTargetState {
                         format: wgpu::TextureFormat::Rgba16Float,
                         blend: Some(wgpu::BlendState::REPLACE),
@@ -7433,6 +7772,16 @@ impl App {
                         count: None,
                     },
                     wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
                         binding: 3,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
@@ -7640,6 +7989,14 @@ impl App {
         let palette_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Palette Buffer"),
             contents: bytemuck::cast_slice(&palette_padded),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Create material properties buffer for reflectivity (max 256 entries)
+        let material_props_data = self.palette.material_properties_gpu();
+        let material_props_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Material Properties Buffer"),
+            contents: bytemuck::cast_slice(&material_props_data),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -8252,6 +8609,7 @@ impl App {
         self.shadow_mesh_pipeline = Some(shadow_mesh_pipeline);
         self.uniform_buffer = Some(uniform_buffer);
         self.palette_buffer = Some(palette_buffer);
+        self.material_props_buffer = Some(material_props_buffer);
 
         self.light_probe_buffer = Some(light_probe_buffer);
 
@@ -9803,6 +10161,7 @@ impl App {
                 normal: v.normal,
                 color: v.color,
                 emissive: v.emissive,
+                material: v.material,
             }));
             mesh_build_vb_time += vb_build_start.elapsed();
             let vbuf_start = std::time::Instant::now();
@@ -10536,18 +10895,29 @@ impl App {
                 inverse_view: inverse_view_cols,
                 inverse_proj: inverse_proj_cols,
                 view_proj,
-                camera_pos: [camera_pos[0], camera_pos[1], camera_pos[2], 0.0],
+                camera_pos: [camera_pos[0], camera_pos[1], camera_pos[2]],
+                skybox_rotation: self.skybox_angle,
+                skybox_brightness,
+                skybox_saturation: self.skybox_min_saturation,
+                _pad1: [0.0, 0.0],
+                skybox_tint: self.skybox_night_tint,
+                skybox_tint_strength: self.skybox_tint_strength,
             };
             queue.write_buffer(ssr_cam_buf, 0, bytemuck::bytes_of(&ssr_cam));
         }
 
         // Update SSR params uniform (in case settings changed)
         if let Some(ssr_params_buf) = self.ssr_uniform_buffer.as_ref() {
-            let params_arr: [u32; 4] = [
+            let overscan = self.user_config.rendering.render_overscan.max(0.0);
+            let bloom_strength = self.bloom_settings.bloom_strength;
+            let params_arr: [u32; 8] = [
                 self.ssr_settings.max_steps,
                 self.ssr_settings.max_binary_steps,
                 self.ssr_settings.step_size.to_bits(),
                 self.ssr_settings.thickness.to_bits(),
+                overscan.to_bits(),
+                bloom_strength.to_bits(),
+                0, 0, // padding to 32 bytes (vec2 alignment)
             ];
             queue.write_buffer(ssr_params_buf, 0, bytemuck::bytes_of(&params_arr));
         }
@@ -10590,6 +10960,12 @@ impl App {
         }
 
         self.draw_debug_voxels();
+
+        // If we requested a deferred offscreen target recreation, do it now (safe point)
+        if self.pending_recreate_offscreen {
+            self.pending_recreate_offscreen = false;
+            self.recreate_offscreen_targets();
+        }
 
         // Create command encoder
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -10738,16 +11114,16 @@ impl App {
             }
         }
 
-        let offscreen_color_view = self
-            .offscreen_color_view
-            .as_ref()
-            .expect("offscreen color view missing");
-        let offscreen_depth_view = self
-            .offscreen_depth_view
-            .as_ref()
-            .expect("offscreen depth view missing");
-
         {
+            let offscreen_color_view = self
+                .offscreen_color_view
+                .as_ref()
+                .expect("offscreen color view missing");
+            let offscreen_depth_view = self
+                .offscreen_depth_view
+                .as_ref()
+                .expect("offscreen depth view missing");
+
             let rp_ts = if self.gui_visible {
                 self.query_set
                     .as_ref()
@@ -10789,6 +11165,16 @@ impl App {
                     // G-Buffer normal texture (world-space normals)
                     Some(wgpu::RenderPassColorAttachment {
                         view: self.normal_view.as_ref().unwrap(),
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    }),
+                    // G-Buffer material texture (reflectivity in R channel)
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: self.material_view.as_ref().unwrap(),
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -10933,8 +11319,117 @@ impl App {
             }
         }
 
+        // Generate HZB mip chain from the depth buffer we just populated
+        self.generate_hzb(&mut encoder);
+
+        // SSILVB/SSAO: run before SSR so reflections can use AO
+        if self.ssao_enabled {
+            if let (Some(ssilvb_pipeline), Some(ssilvb_bind_group), Some(ssao_ping_view)) = (
+                self.ssilvb_pipeline.as_ref(),
+                self.ssilvb_bind_group.as_ref(),
+                self.ssao_ping_view.as_ref(),
+            ) {
+                let mut ssao_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("SSILVB Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: ssao_ping_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: if self.gui_visible {
+                        self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
+                            query_set: qs,
+                            beginning_of_pass_write_index: Some(12),
+                            end_of_pass_write_index: if self.ssao_settings.blur_enabled {
+                                None
+                            } else {
+                                Some(13)
+                            },
+                        })
+                    } else {
+                        None
+                    },
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                ssao_pass.set_pipeline(ssilvb_pipeline);
+                ssao_pass.set_bind_group(0, ssilvb_bind_group, &[]);
+                ssao_pass.draw(0..3, 0..1);
+            }
+
+            // Optional SSAO blur (reduce speckle): horizontal then vertical
+            if self.ssao_settings.blur_enabled {
+                if let (Some(ssao_blur_pipeline), Some(ssao_blur_h), Some(ssao_pong_view)) = (
+                    self.ssao_blur_pipeline.as_ref(),
+                    self.ssao_blur_horizontal_bind_group.as_ref(),
+                    self.ssao_pong_view.as_ref(),
+                ) {
+                    let mut blur_pass_h = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("SSAO Blur Horizontal Pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: ssao_pong_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    blur_pass_h.set_pipeline(ssao_blur_pipeline);
+                    blur_pass_h.set_bind_group(0, ssao_blur_h, &[]);
+                    blur_pass_h.draw(0..3, 0..1);
+                }
+            }
+
+            if self.ssao_settings.blur_enabled {
+                if let (Some(ssao_blur_pipeline), Some(ssao_blur_v), Some(ssao_ping_view)) = (
+                    self.ssao_blur_pipeline.as_ref(),
+                    self.ssao_blur_vertical_bind_group.as_ref(),
+                    self.ssao_ping_view.as_ref(),
+                ) {
+                    let mut blur_pass_v = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("SSAO Blur Vertical Pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: ssao_ping_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: if self.gui_visible {
+                            self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
+                                query_set: qs,
+                                beginning_of_pass_write_index: None,
+                                end_of_pass_write_index: Some(13),
+                            })
+                        } else {
+                            None
+                        },
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    blur_pass_v.set_pipeline(ssao_blur_pipeline);
+                    blur_pass_v.set_bind_group(0, ssao_blur_v, &[]);
+                    blur_pass_v.draw(0..3, 0..1);
+                }
+            }
+        }
+
         // SSR Pass (if enabled) -> writes SSR texture
-        let _ssr_scope = self.profiler.scope("ssr_cpu");
+        // Placed BEFORE Water so water can sample SSR reflections
         if self.ssr_settings.enabled {
             if let (Some(pipeline), Some(bind_group), Some(ssr_view)) = (
                 self.ssr_pipeline.as_ref(),
@@ -11018,6 +11513,11 @@ impl App {
             } else {
                 None
             };
+
+            let offscreen_color_view = self
+                .offscreen_color_view
+                .as_ref()
+                .expect("offscreen color view missing");
 
             let mut water_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Water Pass"),
@@ -11372,119 +11872,8 @@ impl App {
                 self.bloom_extract_bind_group.as_ref(),
                 self.bloom_ping_view.as_ref(),
             ) {
-                // SSILVB/SSAO: run before bloom so AO can affect later passes
-                if self.ssao_enabled {
-                    if let (Some(ssilvb_pipeline), Some(ssilvb_bind_group), Some(ssao_ping_view)) = (
-                        self.ssilvb_pipeline.as_ref(),
-                        self.ssilvb_bind_group.as_ref(),
-                        self.ssao_ping_view.as_ref(),
-                    ) {
-                        let mut ssao_pass =
-                            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                label: Some("SSILVB Pass"),
-                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                    view: ssao_ping_view,
-                                    resolve_target: None,
-                                    ops: wgpu::Operations {
-                                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                        store: wgpu::StoreOp::Store,
-                                    },
-                                    depth_slice: None,
-                                })],
-                                depth_stencil_attachment: None,
-                                timestamp_writes: if self.gui_visible {
-                                    self.query_set.as_ref().map(|qs| {
-                                        wgpu::RenderPassTimestampWrites {
-                                            query_set: qs,
-                                            beginning_of_pass_write_index: Some(12),
-                                            end_of_pass_write_index: if self.ssao_settings.blur_enabled
-                                            {
-                                                None
-                                            } else {
-                                                Some(13)
-                                            },
-                                        }
-                                    })
-                                } else {
-                                    None
-                                },
-                                occlusion_query_set: None,
-                                multiview_mask: None,
-                            });
-                        ssao_pass.set_pipeline(ssilvb_pipeline);
-                        ssao_pass.set_bind_group(0, ssilvb_bind_group, &[]);
-                        ssao_pass.draw(0..3, 0..1);
-                    }
 
-                    // Optional SSAO blur (reduce speckle): horizontal then vertical
-                    if self.ssao_settings.blur_enabled {
-                        if let (Some(ssao_blur_pipeline), Some(ssao_blur_h), Some(ssao_pong_view)) = (
-                            self.ssao_blur_pipeline.as_ref(),
-                            self.ssao_blur_horizontal_bind_group.as_ref(),
-                            self.ssao_pong_view.as_ref(),
-                        ) {
-                            let mut blur_pass_h =
-                                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                    label: Some("SSAO Blur Horizontal Pass"),
-                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                        view: ssao_pong_view,
-                                        resolve_target: None,
-                                        ops: wgpu::Operations {
-                                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                            store: wgpu::StoreOp::Store,
-                                        },
-                                        depth_slice: None,
-                                    })],
-                                    depth_stencil_attachment: None,
-                                    timestamp_writes: None,
-                                    occlusion_query_set: None,
-                                    multiview_mask: None,
-                                });
-                            blur_pass_h.set_pipeline(ssao_blur_pipeline);
-                            blur_pass_h.set_bind_group(0, ssao_blur_h, &[]);
-                            blur_pass_h.draw(0..3, 0..1);
-                        }
-                    }
 
-                    if self.ssao_settings.blur_enabled {
-                        if let (Some(ssao_blur_pipeline), Some(ssao_blur_v), Some(ssao_ping_view)) = (
-                            self.ssao_blur_pipeline.as_ref(),
-                            self.ssao_blur_vertical_bind_group.as_ref(),
-                            self.ssao_ping_view.as_ref(),
-                        ) {
-                            let mut blur_pass_v =
-                                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                    label: Some("SSAO Blur Vertical Pass"),
-                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                        view: ssao_ping_view,
-                                        resolve_target: None,
-                                        ops: wgpu::Operations {
-                                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                            store: wgpu::StoreOp::Store,
-                                        },
-                                        depth_slice: None,
-                                    })],
-                                    depth_stencil_attachment: None,
-                                    timestamp_writes: if self.gui_visible {
-                                        self.query_set.as_ref().map(|qs| {
-                                            wgpu::RenderPassTimestampWrites {
-                                                query_set: qs,
-                                                beginning_of_pass_write_index: None,
-                                                end_of_pass_write_index: Some(13),
-                                            }
-                                        })
-                                    } else {
-                                        None
-                                    },
-                                    occlusion_query_set: None,
-                                    multiview_mask: None,
-                                });
-                            blur_pass_v.set_pipeline(ssao_blur_pipeline);
-                            blur_pass_v.set_bind_group(0, ssao_blur_v, &[]);
-                            blur_pass_v.draw(0..3, 0..1);
-                        }
-                    }
-                }
                 let bloom_extract_ts = if self.gui_visible {
                     self.query_set
                         .as_ref()
@@ -11637,6 +12026,8 @@ impl App {
                 }
             }
         }
+
+
 
         if let (Some(composite_pipeline), Some(composite_bind_group)) = (
             self.composite_pipeline.as_ref(),

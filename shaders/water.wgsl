@@ -149,6 +149,9 @@ var hzb_texture: texture_2d<f32>;
 @group(1) @binding(8)
 var hzb_sampler: sampler;
 
+@group(1) @binding(9)
+var ssr_texture: texture_2d<f32>;
+
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
@@ -693,7 +696,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     if (ssr_hit_valid > 0.0) {
         let scene_sample = textureSample(scene_color_texture, scene_sampler, ssr_hit.xy);
-        ssr_color = scene_sample.rgb;
+        let ssr_add = textureSample(ssr_texture, scene_sampler, ssr_hit.xy).rgb;
+        ssr_color = scene_sample.rgb + ssr_add;
         sample_center = ssr_hit.xy;
 
         // Use the G-buffer at the hit point:
@@ -722,7 +726,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 let fallback_depth = textureLoad(depth_texture, fallback_coords, 0);
                 if (fallback_depth < 0.9999) {
                     let fallback_sample = textureSample(scene_color_texture, scene_sampler, fallback_scr.xy);
-                    ssr_color = fallback_sample.rgb;
+                    let fallback_ssr = textureSample(ssr_texture, scene_sampler, fallback_scr.xy).rgb;
+                    ssr_color = fallback_sample.rgb + fallback_ssr;
                     sample_center = fallback_scr.xy;
                     // Approximate distance to the reflected point using the fallback projection
                     reflection_distance = distance(cam_pos, fallback_point);
@@ -760,7 +765,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                     let s_depth = textureLoad(depth_texture, s_coords, 0);
                     if (s_depth >= 0.9999) { continue; }
                     let s_sample = textureSample(scene_color_texture, scene_sampler, offset_uv);
-                    accum += s_sample.rgb;
+                    let s_ssr = textureSample(ssr_texture, scene_sampler, offset_uv).rgb;
+                    accum += s_sample.rgb + s_ssr;
                     valid_count += 1.0;
                 }
             }
