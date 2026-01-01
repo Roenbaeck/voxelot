@@ -16,3 +16,5 @@
 - ✅ The underwater dissolve looks different for the individual voxel fallback, creating a visual discontinuity when they get meshed. 
 
 - 🛑 Trees are generated under water level.
+- 🛑 We lost `H` to toggle the SSAO debug view, since it was overwritten by HZB.
+- 🛑 Mip levels from 5 or 6 and higher are not stable and have increasingly large blinking spots.

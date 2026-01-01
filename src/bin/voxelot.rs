@@ -4841,8 +4841,6 @@ impl App {
             return;
         };
         
-        log::info!("SSR bind group: creating successfully");
-
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("SSR Bind Group"),
             layout,

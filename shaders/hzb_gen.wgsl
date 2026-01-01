@@ -1,7 +1,7 @@
 // HZB Mip Chain Generator
-// Generates a hierarchical depth pyramid for occlusion culling
+// Generates a hierarchical depth pyramid.
 // Mip 0: Copy from depth buffer
-// Mip 1-N: Downsample with MAX reduction (furthest depth)
+// Mip 1-N: Downsample with MIN reduction (nearest depth)
 
 struct HzbParams {
     width: u32,
@@ -29,7 +29,7 @@ fn copy_depth(@builtin(global_invocation_id) id: vec3<u32>) {
     textureStore(hzb_out, coords, vec4<f32>(depth, 0.0, 0.0, 1.0));
 }
 
-// Mip 1-N: Downsample with MAX reduction
+// Mip 1-N: Downsample with MIN reduction
 @compute @workgroup_size(8, 8)
 fn downsample(@builtin(global_invocation_id) id: vec3<u32>) {
     let coords = vec2<i32>(id.xy);
@@ -43,18 +43,19 @@ fn downsample(@builtin(global_invocation_id) id: vec3<u32>) {
     let src_mip = params.src_mip;
     let src_dims = textureDimensions(hzb_src, i32(src_mip));
     
-    // MAX reduction (furthest depth) to conservatively detect occlusion
-    var max_d = 0.0;
+    // MIN reduction (nearest depth). This is the standard HZB form and is also
+    // compatible with SSR depth comparisons.
+    var min_d = 1.0;
     for (var y = 0; y < 2; y++) {
         for (var x = 0; x < 2; x++) {
             let s = src_coords + vec2<i32>(x, y);
             if (s.x < i32(src_dims.x) && s.y < i32(src_dims.y)) {
                 // textureLoad with explicit mip level
                 let d = textureLoad(hzb_src, s, i32(src_mip)).r;
-                max_d = max(max_d, d);
+                min_d = min(min_d, d);
             }
         }
     }
     
-    textureStore(hzb_out, coords, vec4<f32>(max_d, 0.0, 0.0, 1.0));
+    textureStore(hzb_out, coords, vec4<f32>(min_d, 0.0, 0.0, 1.0));
 }

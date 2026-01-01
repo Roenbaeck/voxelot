@@ -243,13 +243,9 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     let fade_end = uniforms.lod_distance * 0.95;
     let fade_factor = smoothstep(fade_start, fade_end, distance);
     
-    // Use improved noise for stable, deterministic alpha testing with less moiré
-    let noise_pos = relative_pos * 7.3 + vec3<f32>(input.world_pos.x * 0.1, input.world_pos.y * 0.1, input.world_pos.z * 0.1);
-    let hash_val = fract(sin(dot(floor(noise_pos), vec3<f32>(127.1, 311.7, 74.7))) * 43758.5453);
-    
-    if fade_factor > hash_val {
-        discard;
-    }
+    // NOTE: Dither-based discard removed. The stipple pattern was visible in SSR and
+    // water reflections as "black noise". We now rely solely on alpha-based fading
+    // which is smoother but may show slight pop-in at LOD boundaries.
     
     // Brighten colors as they approach fade region for fog-like appearance; reduce
     // the brightening factor to avoid extreme brightening near the horizon.
@@ -433,13 +429,9 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     let fade_end = uniforms.lod_distance * 0.95;
     let fade_factor = smoothstep(fade_start, fade_end, distance);
     
-    // Use improved noise function - lower frequency reduces moiré patterns
-    let hash_pos2 = floor(input.world_pos * 7.3);  // Lower frequency
-    let hash_val2 = fract(sin(dot(hash_pos2, vec3<f32>(17.0, 59.4, 113.0))) * 1e4);
-    
-    if fade_factor > hash_val2 {
-        discard;
-    }
+    // NOTE: Dither-based discard removed. The stipple pattern was visible in SSR and
+    // water reflections as "black noise". We now rely solely on alpha-based fading
+    // which is smoother but may show slight pop-in at LOD boundaries.
     
     // Brighten colors as they approach fade region for fog-like appearance
     var brightened = mix(final_color, fog_color, fade_factor * 0.18);
