@@ -4821,6 +4821,7 @@ impl App {
             Some(ssao_view),
             Some(bloom_view),
             Some(skybox_view),
+            Some(skybox_sampler),
         ) = (
             self.ssr_bind_group_layout.as_ref(),
             self.ssr_uniform_buffer.as_ref(),
@@ -4834,6 +4835,7 @@ impl App {
             self.ssao_ping_view.as_ref(),  // Use ping buffer (final SSAO result after blur)
             self.bloom_ping_view.as_ref(), // Bloom texture for reflections with glow
             self.skybox_view.as_ref(),     // Skybox for reflections when ray misses geometry
+            self.skybox_sampler.as_ref(),  // Skybox sampler with Repeat on U
         )
         else {
             return;
@@ -4899,6 +4901,11 @@ impl App {
                 wgpu::BindGroupEntry {
                     binding: 11,
                     resource: wgpu::BindingResource::TextureView(skybox_view),
+                },
+                // Skybox sampler with Repeat on U for equirectangular wrapping
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: wgpu::BindingResource::Sampler(skybox_sampler),
                 },
             ],
         });
@@ -5885,6 +5892,13 @@ impl App {
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
+                    count: None,
+                },
+                // Skybox sampler with Repeat on U for equirectangular wrapping
+                wgpu::BindGroupLayoutEntry {
+                    binding: 12,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
             ],
