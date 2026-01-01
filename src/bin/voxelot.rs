@@ -5616,6 +5616,17 @@ impl App {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // Real SSR texture (from SSR pass)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -5703,6 +5714,7 @@ impl App {
             Some(post_sampler),
             Some(normal_view),
             Some(hzb_view),
+            Some(ssr_view),
         ) = (
             self.device.as_ref(),
             self.water_bind_group_layout.as_ref(),
@@ -5714,6 +5726,7 @@ impl App {
             self.post_sampler.as_ref(),
             self.normal_view.as_ref(),
             self.hzb_view.as_ref(),
+            self.ssr_texture_view.as_ref(),
         ) {
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Water Bind Group"),
@@ -5759,6 +5772,11 @@ impl App {
                     wgpu::BindGroupEntry {
                         binding: 8,
                         resource: wgpu::BindingResource::Sampler(post_sampler),
+                    },
+                    // SSR texture
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: wgpu::BindingResource::TextureView(ssr_view),
                     },
                 ],
             });
@@ -11304,6 +11322,155 @@ impl App {
         // Generate HZB mip chain from the depth buffer we just populated
         self.generate_hzb(&mut encoder);
 
+        // SSILVB/SSAO: run before SSR so reflections can use AO
+        if self.ssao_enabled {
+            if let (Some(ssilvb_pipeline), Some(ssilvb_bind_group), Some(ssao_ping_view)) = (
+                self.ssilvb_pipeline.as_ref(),
+                self.ssilvb_bind_group.as_ref(),
+                self.ssao_ping_view.as_ref(),
+            ) {
+                let mut ssao_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("SSILVB Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: ssao_ping_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: if self.gui_visible {
+                        self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
+                            query_set: qs,
+                            beginning_of_pass_write_index: Some(12),
+                            end_of_pass_write_index: if self.ssao_settings.blur_enabled {
+                                None
+                            } else {
+                                Some(13)
+                            },
+                        })
+                    } else {
+                        None
+                    },
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                ssao_pass.set_pipeline(ssilvb_pipeline);
+                ssao_pass.set_bind_group(0, ssilvb_bind_group, &[]);
+                ssao_pass.draw(0..3, 0..1);
+            }
+
+            // Optional SSAO blur (reduce speckle): horizontal then vertical
+            if self.ssao_settings.blur_enabled {
+                if let (Some(ssao_blur_pipeline), Some(ssao_blur_h), Some(ssao_pong_view)) = (
+                    self.ssao_blur_pipeline.as_ref(),
+                    self.ssao_blur_horizontal_bind_group.as_ref(),
+                    self.ssao_pong_view.as_ref(),
+                ) {
+                    let mut blur_pass_h = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("SSAO Blur Horizontal Pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: ssao_pong_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    blur_pass_h.set_pipeline(ssao_blur_pipeline);
+                    blur_pass_h.set_bind_group(0, ssao_blur_h, &[]);
+                    blur_pass_h.draw(0..3, 0..1);
+                }
+            }
+
+            if self.ssao_settings.blur_enabled {
+                if let (Some(ssao_blur_pipeline), Some(ssao_blur_v), Some(ssao_ping_view)) = (
+                    self.ssao_blur_pipeline.as_ref(),
+                    self.ssao_blur_vertical_bind_group.as_ref(),
+                    self.ssao_ping_view.as_ref(),
+                ) {
+                    let mut blur_pass_v = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("SSAO Blur Vertical Pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: ssao_ping_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: if self.gui_visible {
+                            self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
+                                query_set: qs,
+                                beginning_of_pass_write_index: None,
+                                end_of_pass_write_index: Some(13),
+                            })
+                        } else {
+                            None
+                        },
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    blur_pass_v.set_pipeline(ssao_blur_pipeline);
+                    blur_pass_v.set_bind_group(0, ssao_blur_v, &[]);
+                    blur_pass_v.draw(0..3, 0..1);
+                }
+            }
+        }
+
+        // SSR Pass (if enabled) -> writes SSR texture
+        // Placed BEFORE Water so water can sample SSR reflections
+        if self.ssr_settings.enabled {
+            if let (Some(pipeline), Some(bind_group), Some(ssr_view)) = (
+                self.ssr_pipeline.as_ref(),
+                self.ssr_bind_group.as_ref(),
+                self.ssr_texture_view.as_ref(),
+            ) {
+                let ssr_ts = if self.gui_visible {
+                    self.query_set
+                        .as_ref()
+                        .map(|qs| wgpu::RenderPassTimestampWrites {
+                            query_set: qs,
+                            beginning_of_pass_write_index: Some(8),
+                            end_of_pass_write_index: Some(9),
+                        })
+                } else {
+                    None
+                };
+                let mut ssr_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("SSR Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: ssr_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::DontCare(unsafe {
+                                wgpu::LoadOpDontCare::enabled()
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: ssr_ts,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                ssr_pass.set_pipeline(pipeline);
+                ssr_pass.set_bind_group(0, bind_group, &[]);
+                ssr_pass.draw(0..3, 0..1);
+            }
+        }
+
         // Copy offscreen color to scene_copy_texture for water reflection sampling
         // Water pass writes to offscreen_color but needs to read scene color for reflections
         if let (Some(offscreen_color), Some(scene_copy), Some(_config)) = (
@@ -11705,119 +11872,7 @@ impl App {
                 self.bloom_extract_bind_group.as_ref(),
                 self.bloom_ping_view.as_ref(),
             ) {
-                // SSILVB/SSAO: run before bloom so AO can affect later passes
-                if self.ssao_enabled {
-                    if let (Some(ssilvb_pipeline), Some(ssilvb_bind_group), Some(ssao_ping_view)) = (
-                        self.ssilvb_pipeline.as_ref(),
-                        self.ssilvb_bind_group.as_ref(),
-                        self.ssao_ping_view.as_ref(),
-                    ) {
-                        let mut ssao_pass =
-                            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                label: Some("SSILVB Pass"),
-                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                    view: ssao_ping_view,
-                                    resolve_target: None,
-                                    ops: wgpu::Operations {
-                                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                        store: wgpu::StoreOp::Store,
-                                    },
-                                    depth_slice: None,
-                                })],
-                                depth_stencil_attachment: None,
-                                timestamp_writes: if self.gui_visible {
-                                    self.query_set.as_ref().map(|qs| {
-                                        wgpu::RenderPassTimestampWrites {
-                                            query_set: qs,
-                                            beginning_of_pass_write_index: Some(12),
-                                            end_of_pass_write_index: if self.ssao_settings.blur_enabled
-                                            {
-                                                None
-                                            } else {
-                                                Some(13)
-                                            },
-                                        }
-                                    })
-                                } else {
-                                    None
-                                },
-                                occlusion_query_set: None,
-                                multiview_mask: None,
-                            });
-                        ssao_pass.set_pipeline(ssilvb_pipeline);
-                        ssao_pass.set_bind_group(0, ssilvb_bind_group, &[]);
-                        ssao_pass.draw(0..3, 0..1);
-                    }
 
-                    // Optional SSAO blur (reduce speckle): horizontal then vertical
-                    if self.ssao_settings.blur_enabled {
-                        if let (Some(ssao_blur_pipeline), Some(ssao_blur_h), Some(ssao_pong_view)) = (
-                            self.ssao_blur_pipeline.as_ref(),
-                            self.ssao_blur_horizontal_bind_group.as_ref(),
-                            self.ssao_pong_view.as_ref(),
-                        ) {
-                            let mut blur_pass_h =
-                                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                    label: Some("SSAO Blur Horizontal Pass"),
-                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                        view: ssao_pong_view,
-                                        resolve_target: None,
-                                        ops: wgpu::Operations {
-                                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                            store: wgpu::StoreOp::Store,
-                                        },
-                                        depth_slice: None,
-                                    })],
-                                    depth_stencil_attachment: None,
-                                    timestamp_writes: None,
-                                    occlusion_query_set: None,
-                                    multiview_mask: None,
-                                });
-                            blur_pass_h.set_pipeline(ssao_blur_pipeline);
-                            blur_pass_h.set_bind_group(0, ssao_blur_h, &[]);
-                            blur_pass_h.draw(0..3, 0..1);
-                        }
-                    }
-
-                    if self.ssao_settings.blur_enabled {
-                        if let (Some(ssao_blur_pipeline), Some(ssao_blur_v), Some(ssao_ping_view)) = (
-                            self.ssao_blur_pipeline.as_ref(),
-                            self.ssao_blur_vertical_bind_group.as_ref(),
-                            self.ssao_ping_view.as_ref(),
-                        ) {
-                            let mut blur_pass_v =
-                                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                    label: Some("SSAO Blur Vertical Pass"),
-                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                        view: ssao_ping_view,
-                                        resolve_target: None,
-                                        ops: wgpu::Operations {
-                                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                            store: wgpu::StoreOp::Store,
-                                        },
-                                        depth_slice: None,
-                                    })],
-                                    depth_stencil_attachment: None,
-                                    timestamp_writes: if self.gui_visible {
-                                        self.query_set.as_ref().map(|qs| {
-                                            wgpu::RenderPassTimestampWrites {
-                                                query_set: qs,
-                                                beginning_of_pass_write_index: None,
-                                                end_of_pass_write_index: Some(13),
-                                            }
-                                        })
-                                    } else {
-                                        None
-                                    },
-                                    occlusion_query_set: None,
-                                    multiview_mask: None,
-                                });
-                            blur_pass_v.set_pipeline(ssao_blur_pipeline);
-                            blur_pass_v.set_bind_group(0, ssao_blur_v, &[]);
-                            blur_pass_v.draw(0..3, 0..1);
-                        }
-                    }
-                }
 
                 let bloom_extract_ts = if self.gui_visible {
                     self.query_set
@@ -11972,48 +12027,7 @@ impl App {
             }
         }
 
-        // SSR Pass (if enabled) -> writes SSR texture
-        // Placed AFTER bloom so reflected surfaces include glow effects
-        if self.ssr_settings.enabled {
-            if let (Some(pipeline), Some(bind_group), Some(ssr_view)) = (
-                self.ssr_pipeline.as_ref(),
-                self.ssr_bind_group.as_ref(),
-                self.ssr_texture_view.as_ref(),
-            ) {
-                let ssr_ts = if self.gui_visible {
-                    self.query_set
-                        .as_ref()
-                        .map(|qs| wgpu::RenderPassTimestampWrites {
-                            query_set: qs,
-                            beginning_of_pass_write_index: Some(8),
-                            end_of_pass_write_index: Some(9),
-                        })
-                } else {
-                    None
-                };
-                let mut ssr_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("SSR Pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: ssr_view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::DontCare(unsafe {
-                                wgpu::LoadOpDontCare::enabled()
-                            }),
-                            store: wgpu::StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: ssr_ts,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                ssr_pass.set_pipeline(pipeline);
-                ssr_pass.set_bind_group(0, bind_group, &[]);
-                ssr_pass.draw(0..3, 0..1);
-            }
-        }
+
 
         if let (Some(composite_pipeline), Some(composite_bind_group)) = (
             self.composite_pipeline.as_ref(),
