@@ -144,6 +144,11 @@ fn vs_main(
 
     output.emissive = instance_emissive;
     // For perspective projection, clip.w = -view_z, so clip.w is positive view distance
+    // NOTE: This value (`output.view_z`) is the *view-space distance* (clip.w) and is NOT the
+    //       normalized depth in [0..1] that the depth buffer provides. Do NOT pass this value
+    //       into functions that expect a normalized depth (e.g., `reconstruct_world_pos(uv, depth)`).
+    //       To reconstruct world-space positions use the sampled depth texture (scene_depth)
+    //       and then unproject to world space — see other shaders for examples.
     output.view_z = output.position.w;
     // Pass voxel type to fragment shader for material property lookup
     output.voxel_type = instance_voxel_type;
