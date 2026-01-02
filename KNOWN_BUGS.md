@@ -17,4 +17,3 @@
 
 - 🛑 Trees are generated under water level.
 - 🛑 We lost `H` to toggle the SSAO debug view, since it was overwritten by HZB.
-- 🛑 Mip levels from 5 or 6 and higher are not stable and have increasingly large blinking spots.
