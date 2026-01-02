@@ -68,6 +68,12 @@ fn reconstruct_world_pos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     return world_pos.xyz;
 }
 
+fn get_linear_depth(ndc_z: f32) -> f32 {
+    let z_opengl = ndc_z * 2.0 - 1.0;
+    let view_pos = camera.inverse_proj * vec4<f32>(0.0, 0.0, z_opengl, 1.0);
+    return -view_pos.z / view_pos.w;
+}
+
 // Project world position to screen space
 // Returns vec4: xyz = screen pos (xy in UV, z in NDC depth), w = 1 if valid (in front of camera), 0 if behind
 fn world_to_screen(world_pos: vec3<f32>) -> vec4<f32> {
@@ -93,167 +99,135 @@ fn decode_world_normal(encoded: vec3<f32>) -> vec3<f32> {
     return normalize(select(n, vec3<f32>(0.0, 1.0, 0.0), dot(n, n) < 1e-8));
 }
 
-// Calculate max mip level for HZB
-fn get_max_mip_level() -> f32 {
-    let dims = vec2<f32>(textureDimensions(hzb_texture, 0));
-    let max_dim = max(dims.x, dims.y);
-    return floor(log2(max_dim));
-}
-
 fn luminance(rgb: vec3<f32>) -> f32 {
     return dot(rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
 }
 
-// HZB-Accelerated Ray Marching (Screen Space)
-// Returns vec4: xy = hit UV, z = hit confidence (0 or 1), w = world distance traveled
-fn hzb_ray_march(start_pos: vec3<f32>, ray_dir: vec3<f32>, start_uv: vec2<f32>, start_depth: f32) -> vec4<f32> {
-    var hit_result = vec4<f32>(-1.0, -1.0, -1.0, 0.0);
+// Clip a ray in clip space against the frustum
+fn frustum_clip(start: vec4<f32>, end: vec4<f32>) -> vec4<f32> {
+    var t = 1.0;
+    let dir = end - start;
     
-    // Maximum world distance for SSR
+    // Near plane (w = 0.001)
+    if (end.w < 0.001) {
+        let t_near = (0.001 - start.w) / (end.w - start.w);
+        t = min(t, t_near);
+    }
+    
+    // Screen edges (x = +/-w, y = +/-w)
+    if (abs(dir.x - dir.w) > 1e-6) {
+        let t_x_pos = (start.w - start.x) / (dir.x - dir.w);
+        if (t_x_pos > 0.0 && t_x_pos < 1.0) { t = min(t, t_x_pos); }
+    }
+    if (abs(dir.x + dir.w) > 1e-6) {
+        let t_x_neg = (-start.w - start.x) / (dir.x + dir.w);
+        if (t_x_neg > 0.0 && t_x_neg < 1.0) { t = min(t, t_x_neg); }
+    }
+    if (abs(dir.y - dir.w) > 1e-6) {
+        let t_y_pos = (start.w - start.y) / (dir.y - dir.w);
+        if (t_y_pos > 0.0 && t_y_pos < 1.0) { t = min(t, t_y_pos); }
+    }
+    if (abs(dir.y + dir.w) > 1e-6) {
+        let t_y_neg = (-start.w - start.y) / (dir.y + dir.w);
+        if (t_y_neg > 0.0 && t_y_neg < 1.0) { t = min(t, t_y_neg); }
+    }
+    
+    // Far plane (z = w)
+    if (abs(dir.z - dir.w) > 1e-6) {
+        let t_z_pos = (start.w - start.z) / (dir.z - dir.w);
+        if (t_z_pos > 0.0 && t_z_pos < 1.0) { t = min(t, t_z_pos); }
+    }
+    // WGPU depth range [0, w]
+    if (abs(dir.z) > 1e-6) {
+        let t_z_neg = -start.z / dir.z;
+        if (t_z_neg > 0.0 && t_z_neg < 1.0) { t = min(t, t_z_neg); }
+    }
+    
+    return start + dir * t;
+}
+
+// New SSR implementation based on zznewclear13's article
+// Returns vec4: xy = hit UV, z = hit confidence (0 or 1), w = unused
+fn ssr_ray_march(start_world: vec3<f32>, reflect_dir: vec3<f32>, start_uv: vec2<f32>) -> vec4<f32> {
     let max_dist = 200.0;
-    let thickness_base = 0.01;  // Slightly increased base thickness to fill holes
+    let end_world = start_world + reflect_dir * max_dist;
     
-    // Project start and end to screen space
-    let start_screen_raw = world_to_screen(start_pos);
-    if (start_screen_raw.w < 0.5) {
-        return hit_result;  // Start is behind camera
-    }
+    let start_clip = camera.view_proj * vec4<f32>(start_world, 1.0);
+    var end_clip = camera.view_proj * vec4<f32>(end_world, 1.0);
     
-    let end_pos = start_pos + ray_dir * max_dist;
-    let end_screen_raw = world_to_screen(end_pos);
+    // Clip the ray to the frustum
+    end_clip = frustum_clip(start_clip, end_clip);
     
-    let start_screen = start_screen_raw.xyz;
-    var end_screen = end_screen_raw.xyz;
+    let k0 = 1.0 / start_clip.w;
+    let k1 = 1.0 / end_clip.w;
     
-    // If end is behind camera, we need to find where ray crosses near plane
-    if (end_screen_raw.w < 0.5) {
-        // Binary search to find the point where ray crosses behind camera
-        var t_min = 0.0;
-        var t_max = 1.0;
-        for (var i = 0; i < 8; i++) {
-            let t_mid = (t_min + t_max) * 0.5;
-            let mid_pos = start_pos + ray_dir * max_dist * t_mid;
-            let mid_screen = world_to_screen(mid_pos);
-            if (mid_screen.w > 0.5) {
-                t_min = t_mid;
-            } else {
-                t_max = t_mid;
-            }
-        }
-        // Use the last valid point
-        let valid_pos = start_pos + ray_dir * max_dist * t_min;
-        let valid_screen = world_to_screen(valid_pos);
-        end_screen = valid_screen.xyz;
-    }
+    let q0 = start_clip.xyz * k0;
+    let q1 = end_clip.xyz * k1;
     
-    // Check if screen-space movement is too small (ray going toward camera)
+    var hit = false;
+    var t_hit = 0.0;
+    
+    let num_steps = params.max_steps;
+    
+    // Jitter start position to reduce banding
     let dim = vec2<f32>(textureDimensions(scene_color));
-    let screen_dist = length((end_screen.xy - start_screen.xy) * dim);
-    if (screen_dist < 2.0) {
-        // Ray has minimal screen-space movement, skip geometry trace but allow skybox
-        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
-    }
-    
-    // Compute screen-space delta - divide total distance by max_steps for uniform stepping
-    let delta = (end_screen - start_screen) / f32(params.max_steps);
-    
-    // Jitter start position to reduce banding artifacts
     let jitter_seed = start_uv * dim;
     let jitter = fract(sin(dot(jitter_seed, vec2<f32>(12.9898, 78.233))) * 43758.5453);
-    var current_screen = start_screen + delta * jitter;
     
-    let max_mip = get_max_mip_level();
-    // Cap the effective maximum mip used by SSR to avoid relying on highly-coarsened mips
-    // that can contain noisy/unstable reductions. Mips above ~4 are too coarse for accurate
-    // binary refinement and tend to blink as HZB generation races or produces holes.
-    let effective_max_mip = min(max_mip, 3.0);
-    var current_mip = min(1.0, effective_max_mip);  // Start at a fine mip to avoid skipping thin geometry
-    
-    // Calculate adaptive thickness based on screen-space step size and distance
-    let screen_delta_length = length(delta.xy * dim);
-    
-    // Minimum distance before accepting hits (in terms of steps)
-    let min_steps = 3u;
-    
-    // Calculate UV bounds with overscan
-    let os = params.overscan;
-    let uv_min = -os / (1.0 + os);
-    let uv_max = 1.0 + os / (1.0 + os);
-    
-    // Track if ray is going toward or away from camera (in depth)
-    let ray_goes_further = delta.z > 0.0;
-    
-    // Hierarchical ray march
-    for (var i = 0u; i < params.max_steps; i++) {
-        current_screen += delta;
+    for (var i = 1u; i <= num_steps; i++) {
+        // Use jittered t
+        let t = (f32(i) - jitter) / f32(num_steps);
+        let inv_w = mix(k0, k1, t);
+        let w = 1.0 / inv_w;
+        let p = mix(q0, q1, t); // NDC position
         
-        let uv = current_screen.xy;
+        let uv = vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
         
-        // Check if out of screen bounds (with overscan)
-        if (uv.x < uv_min || uv.x > uv_max || uv.y < uv_min || uv.y > uv_max) {
-            break;
-        }
+        // Sample depth
+        let sampled_depth = textureSampleLevel(scene_depth, linear_sampler, uv, 0);
         
-        // Skip first few steps to avoid self-intersection
-        if (i < min_steps) {
-            continue;
-        }
-        
-        // For rays going further from camera: reject hits at depth less than start (behind us)
-        let ray_depth = current_screen.z;
-        if (ray_goes_further && ray_depth < start_depth - 0.001) {
-            continue;
-        }
-        
-        // Sample HZB at current mip level
-        let hzb_depth = textureSampleLevel(hzb_texture, hzb_sampler, uv, current_mip).r;
-        
-        // Skip if we're hitting sky (depth >= 0.9999) - let the skybox path handle it
-        if (hzb_depth >= 0.9999) {
-            continue;
-        }
-        
-        // Adaptive thickness: increase for distance and screen-space step size
-        // Using ray_depth as a proxy for distance (0 to 1)
-        let adaptive_thickness = (thickness_base + ray_depth * 0.02) * max(1.0, screen_delta_length * 0.05);
-        
-        // Check if ray is behind surface (potential intersection)
-        if (ray_depth > hzb_depth && ray_depth - hzb_depth < adaptive_thickness) {
-            if (current_mip <= 0.5) {
-                // At finest detail, perform binary refinement
-                var refined_screen = current_screen - delta;
-                var refined_delta = delta;
-                
-                for (var j = 0u; j < params.max_binary_steps; j++) {
-                    refined_delta *= 0.5;
-                    refined_screen += refined_delta;
-                    
-                    let refined_uv = refined_screen.xy;
-                    let refined_depth_sample = textureSampleLevel(hzb_texture, hzb_sampler, refined_uv, 0.0).r;
-                    
-                    if (refined_screen.z > refined_depth_sample) {
-                        refined_screen -= refined_delta;
-                    }
-                }
-                
-                hit_result = vec4<f32>(refined_screen.xy, 1.0, 0.0); // Distance will be filled from G-buffer
+        if (p.z > sampled_depth) {
+            // Thickness test in linear depth
+            let ray_linear_depth = w; // w is the linear depth (positive)
+            let sampled_linear_depth = get_linear_depth(sampled_depth);
+            
+            // Adaptive thickness: base + factor * depth
+            let thickness = params.thickness + 0.02 * sampled_linear_depth;
+            
+            if (ray_linear_depth - sampled_linear_depth < thickness) {
+                hit = true;
+                t_hit = t;
                 break;
-            } else {
-                // Descend to finer mip level
-                current_mip = max(0.0, current_mip - 1.0);
-            }
-        } else {
-            // No intersection at this point
-            // Ascend to coarser mip if we're far from surfaces
-            let depth_diff = abs(ray_depth - hzb_depth);
-            if (depth_diff > adaptive_thickness * 4.0 && current_mip < effective_max_mip) {
-                current_mip = min(effective_max_mip, current_mip + 1.0);
             }
         }
     }
     
-    return hit_result;
+    if (hit) {
+        // Binary search
+        var t_min = t_hit - (1.0 / f32(num_steps));
+        var t_max = t_hit;
+        
+        for (var j = 0u; j < params.max_binary_steps; j++) {
+            let t_mid = (t_min + t_max) * 0.5;
+            let p = mix(q0, q1, t_mid);
+            let uv = vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
+            let sampled_depth = textureSampleLevel(scene_depth, linear_sampler, uv, 0);
+            
+            if (p.z > sampled_depth) {
+                t_max = t_mid;
+            } else {
+                t_min = t_mid;
+            }
+        }
+        
+        let final_p = mix(q0, q1, t_max);
+        let final_uv = vec2<f32>(final_p.x * 0.5 + 0.5, 0.5 - final_p.y * 0.5);
+        return vec4<f32>(final_uv, 1.0, 0.0);
+    }
+    
+    return vec4<f32>(-1.0, -1.0, -1.0, 0.0);
 }
+
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
@@ -307,7 +281,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     var hit_result = vec4<f32>(-1.0, -1.0, -1.0, 0.0);
     if (dist_to_camera >= 2.0 || ray_proj <= 0.0) {
         // Ray doesn't pass close to camera, trace normally
-        hit_result = hzb_ray_march(ray_start, reflect_dir, input.uv, depth);
+        hit_result = ssr_ray_march(ray_start, reflect_dir, input.uv);
     }
     // Otherwise hit_result stays as "no hit" and we fall through to skybox
 
