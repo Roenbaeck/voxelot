@@ -591,6 +591,7 @@ struct SsrCameraUniforms {
     inverse_view: [[f32; 4]; 4],
     inverse_proj: [[f32; 4]; 4],
     view_proj: [[f32; 4]; 4],
+    prev_view_proj: [[f32; 4]; 4],
     camera_pos: [f32; 3],
     skybox_rotation: f32,
     skybox_brightness: f32,
@@ -1442,6 +1443,10 @@ struct App {
     ssr_camera_uniform_buffer: Option<wgpu::Buffer>,
     ssr_texture: Option<wgpu::Texture>,
     ssr_texture_view: Option<wgpu::TextureView>,
+    ssr_history_texture: Option<wgpu::Texture>,
+    ssr_history_view: Option<wgpu::TextureView>,
+    ssr_history_valid: bool,
+    ssr_prev_view_proj: [[f32; 4]; 4],
     ssr_debug: bool,
 
     // Scene color copy for water reflections (avoids read-while-write conflict)
@@ -2536,6 +2541,15 @@ impl App {
             ssr_camera_uniform_buffer: None,
             ssr_texture: None,
             ssr_texture_view: None,
+            ssr_history_texture: None,
+            ssr_history_view: None,
+            ssr_history_valid: false,
+            ssr_prev_view_proj: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
             ssr_debug: false,
             scene_copy_texture: None,
             scene_copy_view: None,
@@ -3180,6 +3194,8 @@ impl App {
             ssao_bytes,
             ssr_texture_loc,
             ssr_texture_view_loc,
+            ssr_history_texture_loc,
+            ssr_history_view_loc,
             scene_copy_texture_loc,
             scene_copy_view_loc,
             emissive_texture_loc,
@@ -3462,8 +3478,8 @@ impl App {
                 let ssao_bytes =
                     App::compute_texture_bytes(config.format, target_width, target_height, 1, 1);
 
-                // SSR texture (also used as scene color copy for water reflections)
-                let (ssr_texture_loc, ssr_texture_view_loc) =
+                // SSR output + history textures (history is used for temporal accumulation)
+                let (ssr_texture_loc, ssr_texture_view_loc, ssr_history_texture_loc, ssr_history_view_loc) =
                     if self.user_config.effects.ssr.enabled {
                         let ssr_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
                             label: Some("SSR Texture"),
@@ -3477,14 +3493,38 @@ impl App {
                             dimension: wgpu::TextureDimension::D2,
                             format: wgpu::TextureFormat::Rgba16Float,
                             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                                | wgpu::TextureUsages::TEXTURE_BINDING,
+                                | wgpu::TextureUsages::TEXTURE_BINDING
+                                | wgpu::TextureUsages::COPY_SRC,
                             view_formats: &[],
                         });
                         let ssr_texture_view_loc =
                             ssr_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
-                        (Some(ssr_texture_loc), Some(ssr_texture_view_loc))
+
+                        let ssr_history_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
+                            label: Some("SSR History Texture"),
+                            size: wgpu::Extent3d {
+                                width: target_width,
+                                height: target_height,
+                                depth_or_array_layers: 1,
+                            },
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: wgpu::TextureFormat::Rgba16Float,
+                            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                            view_formats: &[],
+                        });
+                        let ssr_history_view_loc =
+                            ssr_history_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
+
+                        (
+                            Some(ssr_texture_loc),
+                            Some(ssr_texture_view_loc),
+                            Some(ssr_history_texture_loc),
+                            Some(ssr_history_view_loc),
+                        )
                     } else {
-                        (None, None)
+                        (None, None, None, None)
                     };
 
                 // Scene color copy texture (for water reflections - same format as offscreen)
@@ -3641,6 +3681,8 @@ impl App {
                     ssao_bytes,
                     ssr_texture_loc,
                     ssr_texture_view_loc,
+                    ssr_history_texture_loc,
+                    ssr_history_view_loc,
                     scene_copy_texture_loc,
                     scene_copy_view_loc,
                     emissive_texture_loc,
@@ -3676,6 +3718,9 @@ impl App {
         self.offscreen_color_texture = Some(color_texture);
         self.ssr_texture = ssr_texture_loc;
         self.ssr_texture_view = ssr_texture_view_loc;
+        self.ssr_history_texture = ssr_history_texture_loc;
+        self.ssr_history_view = ssr_history_view_loc;
+        self.ssr_history_valid = false;
         self.scene_copy_texture = Some(scene_copy_texture_loc);
         self.scene_copy_view = Some(scene_copy_view_loc);
         self.emissive_texture = Some(emissive_texture_loc);
@@ -3780,7 +3825,6 @@ impl App {
         self.update_kawase_bind_groups();
         self.update_bloom_uniforms();
         self.update_water_uniforms();
-        self.update_ssr_bind_group();
 
         // Create HZB texture (after we dropped the device/config borrow from the local closure)
         if let Some(device) = self.device.as_ref() {
@@ -4807,6 +4851,7 @@ impl App {
         if self.ssao_ping_view.is_none() { log::warn!("SSR bind group: missing ssao_ping_view"); }
         if self.bloom_ping_view.is_none() { log::warn!("SSR bind group: missing bloom_ping_view"); }
         if self.skybox_view.is_none() { log::warn!("SSR bind group: missing skybox_view"); }
+        if self.ssr_history_view.is_none() { log::warn!("SSR bind group: missing ssr_history_view"); }
         
         let (
             Some(layout),
@@ -4822,6 +4867,7 @@ impl App {
             Some(bloom_view),
             Some(skybox_view),
             Some(skybox_sampler),
+            Some(ssr_history_view),
         ) = (
             self.ssr_bind_group_layout.as_ref(),
             self.ssr_uniform_buffer.as_ref(),
@@ -4836,6 +4882,7 @@ impl App {
             self.bloom_ping_view.as_ref(), // Bloom texture for reflections with glow
             self.skybox_view.as_ref(),     // Skybox for reflections when ray misses geometry
             self.skybox_sampler.as_ref(),  // Skybox sampler with Repeat on U
+            self.ssr_history_view.as_ref(), // Previous SSR output for temporal accumulation
         )
         else {
             return;
@@ -4904,6 +4951,11 @@ impl App {
                 wgpu::BindGroupEntry {
                     binding: 12,
                     resource: wgpu::BindingResource::Sampler(skybox_sampler),
+                },
+                // SSR history texture (previous frame)
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: wgpu::BindingResource::TextureView(ssr_history_view),
                 },
             ],
         });
@@ -5917,6 +5969,17 @@ impl App {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // SSR history texture (previous frame)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 13,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -5964,7 +6027,8 @@ impl App {
                 self.ssr_settings.thickness.to_bits(),
                 overscan.to_bits(),
                 bloom_strength.to_bits(),
-                0u32, 0u32, // padding to 32 bytes (vec2 alignment)
+                0u32, // frame_index (f32 bits)
+                0u32, // history_valid (f32 bits)
             ]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -5972,7 +6036,7 @@ impl App {
         let ssr_camera_uniform_buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("SSR Camera Uniform Buffer"),
-                contents: &[0u8; 256],
+                contents: &[0u8; 320],
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
 
@@ -10893,6 +10957,7 @@ impl App {
                 inverse_view: inverse_view_cols,
                 inverse_proj: inverse_proj_cols,
                 view_proj,
+                prev_view_proj: self.ssr_prev_view_proj,
                 camera_pos: [camera_pos[0], camera_pos[1], camera_pos[2]],
                 skybox_rotation: self.skybox_angle,
                 skybox_brightness,
@@ -10902,12 +10967,17 @@ impl App {
                 skybox_tint_strength: self.skybox_tint_strength,
             };
             queue.write_buffer(ssr_cam_buf, 0, bytemuck::bytes_of(&ssr_cam));
+
+            // Advance for next frame's reprojection.
+            self.ssr_prev_view_proj = view_proj;
         }
 
         // Update SSR params uniform (in case settings changed)
         if let Some(ssr_params_buf) = self.ssr_uniform_buffer.as_ref() {
             let overscan = self.user_config.rendering.render_overscan.max(0.0);
             let bloom_strength = self.bloom_settings.bloom_strength;
+            let frame_index = self.frame_count as f32;
+            let history_valid: f32 = if self.ssr_history_valid { 1.0 } else { 0.0 };
             let params_arr: [u32; 8] = [
                 self.ssr_settings.max_steps,
                 self.ssr_settings.max_binary_steps,
@@ -10915,7 +10985,8 @@ impl App {
                 self.ssr_settings.thickness.to_bits(),
                 overscan.to_bits(),
                 bloom_strength.to_bits(),
-                0, 0, // padding to 32 bytes (vec2 alignment)
+                frame_index.to_bits(),
+                history_valid.to_bits(),
             ];
             queue.write_buffer(ssr_params_buf, 0, bytemuck::bytes_of(&params_arr));
         }
@@ -11466,6 +11537,32 @@ impl App {
                 ssr_pass.set_pipeline(pipeline);
                 ssr_pass.set_bind_group(0, bind_group, &[]);
                 ssr_pass.draw(0..3, 0..1);
+            }
+
+            // Update SSR history for temporal accumulation (next frame).
+            if let (Some(ssr_tex), Some(ssr_hist_tex)) =
+                (self.ssr_texture.as_ref(), self.ssr_history_texture.as_ref())
+            {
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: ssr_tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: ssr_hist_tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: self.render_target_width.max(1),
+                        height: self.render_target_height.max(1),
+                        depth_or_array_layers: 1,
+                    },
+                );
+                self.ssr_history_valid = true;
             }
         }
 

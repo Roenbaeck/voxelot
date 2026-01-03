@@ -4,6 +4,7 @@ struct CameraUniforms {
     inverse_view: mat4x4<f32>,
     inverse_proj: mat4x4<f32>,
     view_proj: mat4x4<f32>,
+    prev_view_proj: mat4x4<f32>,
     camera_pos: vec3<f32>,
     skybox_rotation: f32,  // Skybox rotation angle in radians
     skybox_brightness: f32,
@@ -20,7 +21,8 @@ struct SSRParams {
     thickness: f32,
     overscan: f32,  // How much extra UV space we can sample (e.g., 0.2 = 20% overscan)
     bloom_strength: f32,  // How much bloom to add to reflected colors
-    _pad: vec2<f32>,
+    frame_index: f32,
+    history_valid: f32,
 }
 
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
@@ -36,6 +38,7 @@ struct SSRParams {
 @group(0) @binding(10) var bloom_texture: texture_2d<f32>;  // Bloom for reflected surfaces
 @group(0) @binding(11) var skybox_texture: texture_2d<f32>;  // Skybox for missed rays
 @group(0) @binding(12) var skybox_sampler: sampler;  // Skybox sampler with Repeat on U
+@group(0) @binding(13) var ssr_history: texture_2d<f32>;  // Previous SSR result for temporal accumulation
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -101,6 +104,25 @@ fn decode_world_normal(encoded: vec3<f32>) -> vec3<f32> {
 
 fn luminance(rgb: vec3<f32>) -> f32 {
     return dot(rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
+
+fn uv_to_pixel(uv: vec2<f32>, dim: vec2<u32>) -> vec2<i32> {
+    // Clamp to valid pixel coordinates (avoids out-of-bounds textureLoad).
+    let x = clamp(i32(uv.x * f32(dim.x)), 0, i32(dim.x) - 1);
+    let y = clamp(i32(uv.y * f32(dim.y)), 0, i32(dim.y) - 1);
+    return vec2<i32>(x, y);
+}
+
+fn load_depth_at_uv(uv: vec2<f32>) -> f32 {
+    let dim = textureDimensions(scene_depth);
+    let px = uv_to_pixel(uv, dim);
+    return textureLoad(scene_depth, px, 0);
+}
+
+fn load_hzb_depth_at_uv(uv: vec2<f32>, mip: i32) -> f32 {
+    let dim = textureDimensions(hzb_texture, mip);
+    let px = uv_to_pixel(uv, dim);
+    return textureLoad(hzb_texture, px, mip).r;
 }
 
 // Clip a ray in clip space against the frustum
@@ -171,8 +193,18 @@ fn ssr_ray_march(start_world: vec3<f32>, reflect_dir: vec3<f32>, start_uv: vec2<
     
     // Jitter start position to reduce banding
     let dim = vec2<f32>(textureDimensions(scene_color));
-    let jitter_seed = start_uv * dim;
+    let jitter_seed = start_uv * dim + vec2<f32>(params.frame_index, params.frame_index * 7.0);
     let jitter = fract(sin(dot(jitter_seed, vec2<f32>(12.9898, 78.233))) * 43758.5453);
+
+    // Approximate screen-space step in pixels to pick a conservative HZB mip.
+    let start_uv_ray = vec2<f32>(q0.x * 0.5 + 0.5, 0.5 - q0.y * 0.5);
+    let end_uv_ray = vec2<f32>(q1.x * 0.5 + 0.5, 0.5 - q1.y * 0.5);
+    let duv = abs(end_uv_ray - start_uv_ray) / max(1.0, f32(num_steps));
+    let step_px = duv * dim;
+    let step_px_max = max(step_px.x, step_px.y);
+    let hzb_levels = max(1, textureNumLevels(hzb_texture));
+    let hzb_max_mip = i32(hzb_levels) - 1;
+    let hzb_mip = clamp(i32(floor(log2(max(1.0, step_px_max)))), 0, hzb_max_mip);
     
     for (var i = 1u; i <= num_steps; i++) {
         // Use jittered t
@@ -182,13 +214,25 @@ fn ssr_ray_march(start_world: vec3<f32>, reflect_dir: vec3<f32>, start_uv: vec2<
         let p = mix(q0, q1, t); // NDC position
         
         let uv = vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
+
+        // If we marched out of screen, stop.
+        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+            break;
+        }
         
-        // Sample depth
-        let sampled_depth = textureSampleLevel(scene_depth, linear_sampler, uv, 0);
+        // First test against HZB (MIN-depth pyramid). If the ray point is in front of the
+        // closest depth in the block, it can't hit anything there.
+        let hzb_depth = load_hzb_depth_at_uv(uv, hzb_mip);
+        if (p.z <= hzb_depth) {
+            continue;
+        }
+
+        // Sample full-res depth WITHOUT filtering for stable hit tests.
+        let sampled_depth = load_depth_at_uv(uv);
         
         if (p.z > sampled_depth) {
             // Thickness test in linear depth
-            let ray_linear_depth = w; // w is the linear depth (positive)
+            let ray_linear_depth = get_linear_depth(p.z);
             let sampled_linear_depth = get_linear_depth(sampled_depth);
             
             // Adaptive thickness: base + factor * depth
@@ -211,7 +255,13 @@ fn ssr_ray_march(start_world: vec3<f32>, reflect_dir: vec3<f32>, start_uv: vec2<
             let t_mid = (t_min + t_max) * 0.5;
             let p = mix(q0, q1, t_mid);
             let uv = vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
-            let sampled_depth = textureSampleLevel(scene_depth, linear_sampler, uv, 0);
+
+            if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+                t_min = t_mid;
+                continue;
+            }
+
+            let sampled_depth = load_depth_at_uv(uv);
             
             if (p.z > sampled_depth) {
                 t_max = t_mid;
@@ -232,7 +282,7 @@ fn ssr_ray_march(start_world: vec3<f32>, reflect_dir: vec3<f32>, start_uv: vec2<
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let texel_size = vec2<f32>(1.0) / vec2<f32>(textureDimensions(scene_color));
-    let depth = textureSample(scene_depth, linear_sampler, input.uv);
+    let depth = load_depth_at_uv(input.uv);
     
     // Early out for sky (depth = 1.0)
     if (depth >= 0.9999) {
@@ -323,7 +373,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let texel = 1.0 / dim;
         
         // Sample G-buffer at hit point for stable distance and normal check
-        let hit_gbuf = textureSample(normal_gbuffer, linear_sampler, hit_uv);
+        let hit_dim = textureDimensions(normal_gbuffer);
+        let hit_px = uv_to_pixel(hit_uv, hit_dim);
+        let hit_gbuf = textureLoad(normal_gbuffer, hit_px, 0);
         let hit_normal = decode_world_normal(hit_gbuf.rgb);
         let reflection_distance = hit_gbuf.a; // view_z stored in alpha
         
@@ -365,10 +417,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                     }
 
                     // Depth rejection: don't blur with sky
-                    let s_coords = vec2<i32>(dim * offset_uv);
-                    if (s_coords.x < 0 || s_coords.x >= i32(dim.x) || s_coords.y < 0 || s_coords.y >= i32(dim.y)) {
-                        continue;
-                    }
+                    let s_dim = textureDimensions(scene_depth);
+                    let s_coords = uv_to_pixel(offset_uv, s_dim);
                     let s_depth = textureLoad(scene_depth, s_coords, 0);
                     if (s_depth >= 0.9999) { continue; }
 
@@ -419,8 +469,26 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         
         // Mix geometry reflection with skybox based on confidence
         let final_color = mix(sky_color, reflection_with_ao, confidence);
-        
-        return vec4<f32>(final_color, reflectivity);
+
+            // Temporal accumulation (reproject world position into previous frame)
+            var taa_color = final_color;
+            if (params.history_valid > 0.5) {
+                let prev_clip = camera.prev_view_proj * vec4<f32>(world_pos, 1.0);
+                if (prev_clip.w > 0.001) {
+                    let prev_ndc = prev_clip.xyz / prev_clip.w;
+                    let prev_uv = vec2<f32>(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
+                    if (prev_uv.x >= 0.0 && prev_uv.x <= 1.0 && prev_uv.y >= 0.0 && prev_uv.y <= 1.0) {
+                        let history = textureSample(ssr_history, linear_sampler, prev_uv).rgb;
+                        let d_lum = abs(luminance(history) - luminance(final_color));
+                        let reject = smoothstep(0.15, 0.75, d_lum);
+                        // High history weight reduces noise; reject clamps ghosting on disocclusion.
+                        let history_w = (0.9 * (1.0 - reject));
+                        taa_color = mix(final_color, history, history_w);
+                    }
+                }
+            }
+
+            return vec4<f32>(taa_color, reflectivity);
     }
     
     // No geometry hit - return skybox
