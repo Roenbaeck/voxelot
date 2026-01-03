@@ -173,108 +173,95 @@ fn frustum_clip(start: vec4<f32>, end: vec4<f32>) -> vec4<f32> {
 fn ssr_ray_march(start_world: vec3<f32>, reflect_dir: vec3<f32>, start_uv: vec2<f32>) -> vec4<f32> {
     let max_dist = 200.0;
     let end_world = start_world + reflect_dir * max_dist;
-    
+
     let start_clip = camera.view_proj * vec4<f32>(start_world, 1.0);
     var end_clip = camera.view_proj * vec4<f32>(end_world, 1.0);
-    
+
     // Clip the ray to the frustum
     end_clip = frustum_clip(start_clip, end_clip);
-    
-    let k0 = 1.0 / start_clip.w;
-    let k1 = 1.0 / end_clip.w;
-    
-    let q0 = start_clip.xyz * k0;
-    let q1 = end_clip.xyz * k1;
-    
-    var hit = false;
-    var t_hit = 0.0;
-    
-    let num_steps = params.max_steps;
-    
-    // Jitter start position to reduce banding
-    let dim = vec2<f32>(textureDimensions(scene_color));
-    let jitter_seed = start_uv * dim + vec2<f32>(params.frame_index, params.frame_index * 7.0);
-    let jitter = fract(sin(dot(jitter_seed, vec2<f32>(12.9898, 78.233))) * 43758.5453);
 
-    // Approximate screen-space step in pixels to pick a conservative HZB mip.
-    let start_uv_ray = vec2<f32>(q0.x * 0.5 + 0.5, 0.5 - q0.y * 0.5);
-    let end_uv_ray = vec2<f32>(q1.x * 0.5 + 0.5, 0.5 - q1.y * 0.5);
-    let duv = abs(end_uv_ray - start_uv_ray) / max(1.0, f32(num_steps));
-    let step_px = duv * dim;
-    let step_px_max = max(step_px.x, step_px.y);
+    let q0 = start_clip.xyz / start_clip.w;
+    let q1 = end_clip.xyz / end_clip.w;
+
+    let start_screen = vec3<f32>(q0.x * 0.5 + 0.5, 0.5 - q0.y * 0.5, q0.z);
+    let end_screen = vec3<f32>(q1.x * 0.5 + 0.5, 0.5 - q1.y * 0.5, q1.z);
+
+    let num_steps = max(1u, params.max_steps);
+    let delta = (end_screen - start_screen) / f32(num_steps);
+
+    // Screen-space step magnitude for adaptive thickness
+    let dim_u = textureDimensions(scene_color);
+    let dim = vec2<f32>(f32(dim_u.x), f32(dim_u.y));
+    let screen_delta_length = length(delta.xy * dim);
+    let screen_space_factor = max(1.0, screen_delta_length * 0.5);
+
+    // Jitter the start along the ray in screen-space to avoid visible marching bands.
+    // Keep this stable per-pixel to avoid extra temporal noise on rigid surfaces.
+    let jitter = fract(sin(dot(start_uv * dim, vec2<f32>(127.1, 311.7))) * 43758.5453123);
+    var current_screen = start_screen + delta * jitter;
+
     let hzb_levels = max(1, textureNumLevels(hzb_texture));
-    let hzb_max_mip = i32(hzb_levels) - 1;
-    let hzb_mip = clamp(i32(floor(log2(max(1.0, step_px_max)))), 0, hzb_max_mip);
-    
-    for (var i = 1u; i <= num_steps; i++) {
-        // Use jittered t
-        let t = (f32(i) - jitter) / f32(num_steps);
-        let inv_w = mix(k0, k1, t);
-        let w = 1.0 / inv_w;
-        let p = mix(q0, q1, t); // NDC position
-        
-        let uv = vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
+    let max_mip = i32(hzb_levels) - 1;
+    var current_mip = min(3, max_mip);
 
-        // If we marched out of screen, stop.
+    for (var i = 0u; i < num_steps; i++) {
+        current_screen += delta;
+        let uv = current_screen.xy;
+
         if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
             break;
         }
-        
-        // First test against HZB (MIN-depth pyramid). If the ray point is in front of the
-        // closest depth in the block, it can't hit anything there.
-        let hzb_depth = load_hzb_depth_at_uv(uv, hzb_mip);
-        if (p.z <= hzb_depth) {
-            continue;
-        }
 
-        // Sample full-res depth WITHOUT filtering for stable hit tests.
-        let sampled_depth = load_depth_at_uv(uv);
-        
-        if (p.z > sampled_depth) {
-            // Thickness test in linear depth
-            let ray_linear_depth = get_linear_depth(p.z);
-            let sampled_linear_depth = get_linear_depth(sampled_depth);
-            
-            // Adaptive thickness: base + factor * depth
-            let thickness = params.thickness + 0.02 * sampled_linear_depth;
-            
-            if (ray_linear_depth - sampled_linear_depth < thickness) {
-                hit = true;
-                t_hit = t;
-                break;
-            }
-        }
-    }
-    
-    if (hit) {
-        // Binary search
-        var t_min = t_hit - (1.0 / f32(num_steps));
-        var t_max = t_hit;
-        
-        for (var j = 0u; j < params.max_binary_steps; j++) {
-            let t_mid = (t_min + t_max) * 0.5;
-            let p = mix(q0, q1, t_mid);
-            let uv = vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
+        let ray_depth = current_screen.z;
+        let hzb_depth = load_hzb_depth_at_uv(uv, current_mip);
 
-            if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
-                t_min = t_mid;
+        // Potential intersection when ray is behind the min-depth in this block.
+        if (ray_depth > hzb_depth) {
+            if (current_mip > 0) {
+                // Descend to finer mip and backtrack one step so we re-check at higher detail.
+                current_mip -= 1;
+                current_screen -= delta;
                 continue;
             }
 
+            // Full-res depth hit-test (unfiltered)
             let sampled_depth = load_depth_at_uv(uv);
-            
-            if (p.z > sampled_depth) {
-                t_max = t_mid;
-            } else {
-                t_min = t_mid;
+            if (ray_depth > sampled_depth) {
+                // Thickness test in linear depth
+                let ray_linear_depth = get_linear_depth(ray_depth);
+                let sampled_linear_depth = get_linear_depth(sampled_depth);
+
+                // Adaptive thickness: scale by distance (via depth) and screen-space step size.
+                let thickness = (params.thickness + 0.02 * sampled_linear_depth) * screen_space_factor;
+                if (ray_linear_depth - sampled_linear_depth < thickness) {
+                    // Binary search around the last step interval.
+                    var low = current_screen - delta;
+                    var high = current_screen;
+                    for (var j = 0u; j < params.max_binary_steps; j++) {
+                        let mid = (low + high) * 0.5;
+                        let mid_uv = mid.xy;
+                        if (mid_uv.x < 0.0 || mid_uv.x > 1.0 || mid_uv.y < 0.0 || mid_uv.y > 1.0) {
+                            low = mid;
+                            continue;
+                        }
+                        let mid_depth = load_depth_at_uv(mid_uv);
+                        if (mid.z > mid_depth) {
+                            high = mid;
+                        } else {
+                            low = mid;
+                        }
+                    }
+                    return vec4<f32>(high.xy, 1.0, 0.0);
+                }
+            }
+        } else {
+            // No intersection at this block; optionally ascend to a coarser mip for speed.
+            if (current_mip < min(3, max_mip)) {
+                current_mip += 1;
             }
         }
-        
-        let final_p = mix(q0, q1, t_max);
-        let final_uv = vec2<f32>(final_p.x * 0.5 + 0.5, 0.5 - final_p.y * 0.5);
-        return vec4<f32>(final_uv, 1.0, 0.0);
     }
-    
+
     return vec4<f32>(-1.0, -1.0, -1.0, 0.0);
 }
 
