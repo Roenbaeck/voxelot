@@ -379,13 +379,58 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let roughness = 1.0 - reflectivity;
         
         // Final blur spread: distance-based + roughness-based
-        let blur_factor = max(distance_blur_factor, roughness);
+        var blur_factor = max(distance_blur_factor, roughness);
         let blur_spread = 1.0 + blur_factor * 3.0;
         
         // Start with sharp sample
         var reflection_color = textureSample(scene_color, linear_sampler, hit_uv).rgb;
         var bloom_accum = textureSample(bloom_texture, linear_sampler, hit_uv).rgb;
         var ao_accum = textureSample(ssao_texture, linear_sampler, hit_uv).a;
+
+        // Edge-aware filtering: silhouettes and depth/normal discontinuities are where SSR is
+        // most unstable (sparkle/noise). Water looks better partly because it always applies
+        // a small gather in these cases.
+        // We detect an edge via depth/normal deltas in a 4-neighborhood and enforce a small
+        // bilateral gather even when the material is glossy.
+        let center_depth = load_depth_at_uv(hit_uv);
+        let center_lin = get_linear_depth(center_depth);
+        let n_dim = textureDimensions(normal_gbuffer);
+
+        var max_depth_delta = 0.0;
+        var max_norm_delta = 0.0;
+
+        for (var k = 0; k < 4; k = k + 1) {
+            let o = select(
+                vec2<f32>(texel.x, 0.0),
+                select(vec2<f32>(-texel.x, 0.0), select(vec2<f32>(0.0, texel.y), vec2<f32>(0.0, -texel.y), k == 2), k == 1),
+                k == 0
+            );
+            let uv_n = hit_uv + o;
+            if (uv_n.x < 0.0 || uv_n.x > 1.0 || uv_n.y < 0.0 || uv_n.y > 1.0) {
+                max_depth_delta = max(max_depth_delta, 5.0);
+                max_norm_delta = max(max_norm_delta, 1.0);
+                continue;
+            }
+            let d_n = load_depth_at_uv(uv_n);
+            if (d_n >= 0.9999) {
+                // Neighbor is sky -> strong edge
+                max_depth_delta = max(max_depth_delta, 5.0);
+                max_norm_delta = max(max_norm_delta, 1.0);
+                continue;
+            }
+            let lin_n = get_linear_depth(d_n);
+            max_depth_delta = max(max_depth_delta, abs(lin_n - center_lin));
+
+            let px_n = uv_to_pixel(uv_n, n_dim);
+            let gbuf_n = textureLoad(normal_gbuffer, px_n, 0);
+            let n_n = decode_world_normal(gbuf_n.rgb);
+            max_norm_delta = max(max_norm_delta, 1.0 - clamp(dot(hit_normal, n_n), 0.0, 1.0));
+        }
+
+        let depth_edge = smoothstep(0.20, 1.00, min(max_depth_delta, 5.0));
+        let norm_edge = smoothstep(0.15, 0.45, max_norm_delta);
+        let edge_instability = max(depth_edge, norm_edge);
+        blur_factor = max(blur_factor, edge_instability * 0.35);
         
         if (blur_factor > 0.01) {
             var accum_color = vec3<f32>(0.0);
@@ -409,6 +454,16 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                     let s_depth = textureLoad(scene_depth, s_coords, 0);
                     if (s_depth >= 0.9999) { continue; }
 
+                    // Bilateral rejection: avoid bleeding across silhouettes
+                    let s_lin = get_linear_depth(s_depth);
+                    let depth_gate = 0.25 + 0.02 * center_lin;
+                    if (abs(s_lin - center_lin) > depth_gate) { continue; }
+
+                    let s_n_px = uv_to_pixel(offset_uv, n_dim);
+                    let s_n_gbuf = textureLoad(normal_gbuffer, s_n_px, 0);
+                    let s_n = decode_world_normal(s_n_gbuf.rgb);
+                    if (dot(hit_normal, s_n) < 0.6) { continue; }
+
                     let sample_color = textureSample(scene_color, linear_sampler, offset_uv).rgb;
                     let sample_bloom = textureSample(bloom_texture, linear_sampler, offset_uv).rgb;
                     let sample_ssao = textureSample(ssao_texture, linear_sampler, offset_uv);
@@ -416,7 +471,13 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                     // Improved weighting: suppress HDR fireflies but don't emphasize black holes
                     let lum = luminance(sample_color + sample_bloom * params.bloom_strength);
                     // Only suppress if lum > 1.0 (HDR)
-                    let w = 1.0 / (1.0 + max(0.0, lum - 1.0));
+                    var w = 1.0 / (1.0 + max(0.0, lum - 1.0));
+
+                    // Additional bilateral weighting inside the accepted neighborhood
+                    // (soft falloff rather than hard reject only).
+                    let depth_w = exp(-abs(s_lin - center_lin) * 2.0);
+                    let norm_w = pow(clamp(dot(hit_normal, s_n), 0.0, 1.0), 4.0);
+                    w *= depth_w * norm_w;
                     
                     accum_color += sample_color * w;
                     accum_bloom += sample_bloom * w;
