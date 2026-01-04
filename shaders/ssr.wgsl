@@ -23,6 +23,9 @@ struct SSRParams {
     bloom_strength: f32,  // How much bloom to add to reflected colors
     frame_index: f32,
     history_valid: f32,
+    probe_valid: f32,
+    probe_strength: f32,
+    _pad2: vec2<f32>,
 }
 
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
@@ -39,6 +42,7 @@ struct SSRParams {
 @group(0) @binding(11) var skybox_texture: texture_2d<f32>;  // Skybox for missed rays
 @group(0) @binding(12) var skybox_sampler: sampler;  // Skybox sampler with Repeat on U
 @group(0) @binding(13) var ssr_history: texture_2d<f32>;  // Previous SSR result for temporal accumulation
+@group(0) @binding(14) var reflection_probe: texture_cube<f32>; // Reflection probe fallback
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -354,6 +358,21 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let tinted = mix(desaturated, desaturated * tint, effect_strength);
     let sky_color = tinted * brightness;
 
+    // Reflection probe fallback (contains skybox + cached geometry from probe views).
+    // Debug controls are packed into params._pad2:
+    //   _pad2.x = probe-only debug view (1 = show probe, ignore SSR)
+    //   _pad2.y = flip-Y when sampling the probe (1 = invert direction.y)
+    var probe_dir = reflect_dir;
+    if (params._pad2.y > 0.5) {
+        probe_dir.y = -probe_dir.y;
+    }
+    let probe_color = textureSample(reflection_probe, linear_sampler, probe_dir).rgb;
+    let fallback_color = mix(sky_color, probe_color, params.probe_valid * params.probe_strength);
+
+    if (params._pad2.x > 0.5) {
+        return vec4<f32>(probe_color, 1.0);
+    }
+
     if (hit_result.z > 0.0) {
         let hit_uv = hit_result.xy;
         let dim = vec2<f32>(textureDimensions(scene_color));
@@ -515,8 +534,11 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         // If confidence is low (edge, distance, angle, facing), we mix in the skybox
         let confidence = edge_factor * distance_fade * (1.0 - angle_fade) * facing_factor;
         
-        // Mix geometry reflection with skybox based on confidence
-        let final_color = mix(sky_color, reflection_with_ao, confidence);
+        // Mix geometry reflection with fallback based on confidence.
+        // When SSR is unstable/low-confidence, prefer probe/sky instead of noisy hit.
+        // Always blend in a small amount of probe (for debug visibility when enabled).
+        let probe_blend = mix(0.0, 0.15, params.probe_valid * params.probe_strength);
+        let final_color = mix(fallback_color, reflection_with_ao, confidence - probe_blend);
 
             // Temporal accumulation (reproject world position into previous frame)
             var taa_color = final_color;
@@ -527,10 +549,43 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                     let prev_uv = vec2<f32>(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
                     if (prev_uv.x >= 0.0 && prev_uv.x <= 1.0 && prev_uv.y >= 0.0 && prev_uv.y <= 1.0) {
                         let history = textureSample(ssr_history, linear_sampler, prev_uv).rgb;
+                        // Tightened rejection: luminance + depth + normal + motion
+                        // Luma is good for catching big lighting changes, but disocclusions need geometry tests.
                         let d_lum = abs(luminance(history) - luminance(final_color));
-                        let reject = smoothstep(0.15, 0.75, d_lum);
-                        // High history weight reduces noise; reject clamps ghosting on disocclusion.
-                        let history_w = (0.9 * (1.0 - reject));
+                        let reject_lum = smoothstep(0.15, 0.75, d_lum);
+
+                        // Motion clamp (large velocity -> less history to avoid streaking)
+                        let dim = vec2<f32>(textureDimensions(scene_color));
+                        let vel_px = length((prev_uv - input.uv) * dim);
+                        let reject_vel = smoothstep(6.0, 24.0, vel_px);
+
+                        // Depth consistency: compare the expected depth of this world_pos in the prev frame
+                        // vs the surface currently visible at prev_uv. Mismatch implies disocclusion.
+                        var reject_depth = 1.0;
+                        var reject_norm = 1.0;
+                        let prev_scene_depth = load_depth_at_uv(prev_uv);
+                        if (prev_scene_depth < 0.9999) {
+                            let expected_lin = get_linear_depth(prev_ndc.z);
+                            let prev_lin = get_linear_depth(prev_scene_depth);
+                            let depth_diff = abs(prev_lin - expected_lin);
+                            // Tolerance grows slightly with distance.
+                            let depth_tol0 = 0.12 + 0.004 * expected_lin;
+                            let depth_tol1 = 0.50 + 0.015 * expected_lin;
+                            reject_depth = smoothstep(depth_tol0, depth_tol1, depth_diff);
+
+                            // Normal consistency at the reprojected UV.
+                            let n_dim = textureDimensions(normal_gbuffer);
+                            let prev_px = uv_to_pixel(prev_uv, n_dim);
+                            let prev_gbuf = textureLoad(normal_gbuffer, prev_px, 0);
+                            let prev_n = decode_world_normal(prev_gbuf.rgb);
+                            let nd = clamp(dot(normal, prev_n), 0.0, 1.0);
+                            // Reject when normals diverge (likely different surface).
+                            reject_norm = 1.0 - smoothstep(0.70, 0.92, nd);
+                        }
+
+                        let reject = max(max(reject_lum, reject_vel), max(reject_depth, reject_norm));
+                        // High history weight reduces noise; reject clamps ghosting on disocclusion/edges.
+                        let history_w = 0.9 * (1.0 - reject);
                         taa_color = mix(final_color, history, history_w);
                     }
                 }
@@ -539,6 +594,6 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             return vec4<f32>(taa_color, reflectivity);
     }
     
-    // No geometry hit - return skybox
-    return vec4<f32>(sky_color, reflectivity);
+    // No geometry hit - return probe/sky fallback
+    return vec4<f32>(fallback_color, reflectivity);
 }
