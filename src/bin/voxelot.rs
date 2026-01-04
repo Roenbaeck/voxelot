@@ -13,6 +13,7 @@ use clap::Parser;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use glam::{Mat4, Vec3};
 use half::f16;
+use bytemuck::Zeroable;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -599,6 +600,8 @@ struct SsrCameraUniforms {
     _pad1: [f32; 2],
     skybox_tint: [f32; 3],
     skybox_tint_strength: f32,
+    // xyz = probe center in world space, w = proxy half-extent (for parallax-corrected cubemap sampling)
+    probe_pos_extent: [f32; 4],
 }
 
 /// Depth-of-field runtime settings (CPU-side convenience)
@@ -6705,7 +6708,7 @@ impl App {
         let ssr_camera_uniform_buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("SSR Camera Uniform Buffer"),
-                contents: &[0u8; 320],
+                contents: bytemuck::bytes_of(&SsrCameraUniforms::zeroed()),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
 
@@ -11629,6 +11632,9 @@ impl App {
         // Update SSR camera UBO with inverse/view/proj matrices for SSR pass
         if let Some(ssr_cam_buf) = self.ssr_camera_uniform_buffer.as_ref() {
             let view_proj = (OPENGL_TO_WGPU_MATRIX * projection * view_mat).to_cols_array_2d();
+            // Proxy extents for parallax-corrected cubemap lookup. Larger values behave more like an
+            // infinite environment map; smaller values increase local parallax.
+            let probe_half_extent: f32 = 128.0;
             let ssr_cam = SsrCameraUniforms {
                 inverse_view: inverse_view_cols,
                 inverse_proj: inverse_proj_cols,
@@ -11641,6 +11647,12 @@ impl App {
                 _pad1: [0.0, 0.0],
                 skybox_tint: self.skybox_night_tint,
                 skybox_tint_strength: self.skybox_tint_strength,
+                probe_pos_extent: [
+                    self.reflection_probe_anchor[0],
+                    self.reflection_probe_anchor[1],
+                    self.reflection_probe_anchor[2],
+                    probe_half_extent,
+                ],
             };
             queue.write_buffer(ssr_cam_buf, 0, bytemuck::bytes_of(&ssr_cam));
 

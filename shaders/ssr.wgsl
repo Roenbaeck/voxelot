@@ -12,6 +12,8 @@ struct CameraUniforms {
     _pad1: vec2<f32>,
     skybox_tint: vec3<f32>,
     skybox_tint_strength: f32,
+    // xyz = probe center in world space, w = proxy half-extent for box-projected cubemap sampling
+    probe_pos_extent: vec4<f32>,
 }
 
 struct SSRParams {
@@ -104,6 +106,45 @@ fn decode_world_normal(encoded: vec3<f32>) -> vec3<f32> {
     let n = encoded * 2.0 - 1.0;
     // Guard against zero/denormals
     return normalize(select(n, vec3<f32>(0.0, 1.0, 0.0), dot(n, n) < 1e-8));
+}
+
+fn intersect_ray_aabb(origin: vec3<f32>, dir: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> f32 {
+    // Returns the first positive intersection distance along the ray, or -1 if no hit.
+    let eps = 1e-6;
+    let safe_dir = vec3<f32>(
+        select(dir.x, eps, abs(dir.x) < eps),
+        select(dir.y, eps, abs(dir.y) < eps),
+        select(dir.z, eps, abs(dir.z) < eps),
+    );
+    let inv_dir = 1.0 / safe_dir;
+    let t0 = (bmin - origin) * inv_dir;
+    let t1 = (bmax - origin) * inv_dir;
+    let tmin3 = min(t0, t1);
+    let tmax3 = max(t0, t1);
+    let tmin = max(max(tmin3.x, tmin3.y), tmin3.z);
+    let tmax = min(min(tmax3.x, tmax3.y), tmax3.z);
+    if (tmax < max(tmin, 0.0)) {
+        return -1.0;
+    }
+    // If we're inside the box, tmin < 0, so use the exit intersection.
+    return select(tmin, tmax, tmin < 0.0);
+}
+
+fn parallax_correct_probe_dir(ray_origin: vec3<f32>, reflect_dir: vec3<f32>) -> vec3<f32> {
+    let probe_center = camera.probe_pos_extent.xyz;
+    let half_extent = camera.probe_pos_extent.w;
+    if (half_extent <= 0.0) {
+        return reflect_dir;
+    }
+    let half = vec3<f32>(half_extent);
+    let bmin = probe_center - half;
+    let bmax = probe_center + half;
+    let t = intersect_ray_aabb(ray_origin, reflect_dir, bmin, bmax);
+    if (t <= 0.0) {
+        return reflect_dir;
+    }
+    let hit_pos = ray_origin + reflect_dir * t;
+    return normalize(hit_pos - probe_center);
 }
 
 fn luminance(rgb: vec3<f32>) -> f32 {
@@ -362,7 +403,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Debug controls are packed into params._pad2:
     //   _pad2.x = probe-only debug view (1 = show probe, ignore SSR)
     //   _pad2.y = flip-Y when sampling the probe (1 = invert direction.y)
-    var probe_dir = reflect_dir;
+    var probe_dir = parallax_correct_probe_dir(ray_start, reflect_dir);
     if (params._pad2.y > 0.5) {
         probe_dir.y = -probe_dir.y;
     }
