@@ -1,3 +1,200 @@
+// Cubemap-only reflections pass.
+// This pass outputs a reflected color (RGB) and reflectivity in A.
+// Screen-space ray marching / temporal accumulation are intentionally disabled.
+
+struct CameraUniforms {
+    inverse_view: mat4x4<f32>,
+    inverse_proj: mat4x4<f32>,
+    view_proj: mat4x4<f32>,
+    prev_view_proj: mat4x4<f32>,
+    camera_pos: vec3<f32>,
+    skybox_rotation: f32,
+    skybox_brightness: f32,
+    skybox_saturation: f32,
+    _pad1: vec2<f32>,
+    skybox_tint: vec3<f32>,
+    skybox_tint_strength: f32,
+    // xyz = probe center in world space, w = proxy half-extent for box-projected cubemap sampling
+    probe_pos_extent: vec4<f32>,
+}
+
+struct SSRParams {
+    max_steps: u32,
+    max_binary_steps: u32,
+    step_size: f32,
+    thickness: f32,
+    overscan: f32,
+    bloom_strength: f32,
+    frame_index: f32,
+    history_valid: f32,
+    probe_valid: f32,
+    probe_strength: f32,
+    // Debug controls packed here:
+    //   x = probe-only debug view (1 = show probe, ignore skybox)
+    //   y = flip-Y when sampling probe (1 = invert direction.y)
+    _pad2: vec2<f32>,
+}
+
+@group(0) @binding(0) var<uniform> camera: CameraUniforms;
+@group(0) @binding(1) var<uniform> params: SSRParams;
+@group(0) @binding(2) var scene_color: texture_2d<f32>;
+@group(0) @binding(3) var scene_depth: texture_depth_2d;
+@group(0) @binding(4) var linear_sampler: sampler;
+@group(0) @binding(5) var hzb_texture: texture_2d<f32>;
+@group(0) @binding(6) var hzb_sampler: sampler;
+@group(0) @binding(7) var normal_gbuffer: texture_2d<f32>;
+@group(0) @binding(8) var material_gbuffer: texture_2d<f32>;
+@group(0) @binding(9) var ssao_texture: texture_2d<f32>;
+@group(0) @binding(10) var bloom_texture: texture_2d<f32>;
+@group(0) @binding(11) var skybox_texture: texture_2d<f32>;
+@group(0) @binding(12) var skybox_sampler: sampler;
+@group(0) @binding(13) var ssr_history: texture_2d<f32>;
+@group(0) @binding(14) var reflection_probe: texture_cube<f32>;
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+    var output: VertexOutput;
+    // Fullscreen triangle
+    let x = f32((vertex_index << 1u) & 2u);
+    let y = f32(vertex_index & 2u);
+    output.position = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
+    output.uv = vec2<f32>(x, y);
+    return output;
+}
+
+fn decode_world_normal(encoded: vec3<f32>) -> vec3<f32> {
+    let n = encoded * 2.0 - 1.0;
+    return normalize(select(n, vec3<f32>(0.0, 1.0, 0.0), dot(n, n) < 1e-8));
+}
+
+fn uv_to_pixel(uv: vec2<f32>, dim: vec2<u32>) -> vec2<i32> {
+    let x = clamp(i32(uv.x * f32(dim.x)), 0, i32(dim.x) - 1);
+    let y = clamp(i32(uv.y * f32(dim.y)), 0, i32(dim.y) - 1);
+    return vec2<i32>(x, y);
+}
+
+fn load_depth_at_uv(uv: vec2<f32>) -> f32 {
+    let dim = textureDimensions(scene_depth);
+    let px = uv_to_pixel(uv, dim);
+    return textureLoad(scene_depth, px, 0);
+}
+
+fn reconstruct_world_pos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
+    let z_ndc = depth * 2.0 - 1.0;
+    let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - 2.0 * uv.y, z_ndc, 1.0);
+    let view_pos = camera.inverse_proj * ndc;
+    let view_pos_3d = view_pos.xyz / view_pos.w;
+    let world_pos = camera.inverse_view * vec4<f32>(view_pos_3d, 1.0);
+    return world_pos.xyz;
+}
+
+fn intersect_ray_aabb(origin: vec3<f32>, dir: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> f32 {
+    // Returns the first positive intersection distance along the ray, or -1 if no hit.
+    let eps = 1e-6;
+    let safe_dir = vec3<f32>(
+        select(dir.x, eps, abs(dir.x) < eps),
+        select(dir.y, eps, abs(dir.y) < eps),
+        select(dir.z, eps, abs(dir.z) < eps),
+    );
+    let inv_dir = 1.0 / safe_dir;
+    let t0 = (bmin - origin) * inv_dir;
+    let t1 = (bmax - origin) * inv_dir;
+    let tmin3 = min(t0, t1);
+    let tmax3 = max(t0, t1);
+    let tmin = max(max(tmin3.x, tmin3.y), tmin3.z);
+    let tmax = min(min(tmax3.x, tmax3.y), tmax3.z);
+    if (tmax < max(tmin, 0.0)) {
+        return -1.0;
+    }
+    return select(tmin, tmax, tmin < 0.0);
+}
+
+fn parallax_correct_probe_dir(ray_origin: vec3<f32>, reflect_dir: vec3<f32>) -> vec3<f32> {
+    let probe_center = camera.probe_pos_extent.xyz;
+    let half_extent = camera.probe_pos_extent.w;
+    if (half_extent <= 0.0) {
+        return reflect_dir;
+    }
+    let half = vec3<f32>(half_extent);
+    let bmin = probe_center - half;
+    let bmax = probe_center + half;
+    let t = intersect_ray_aabb(ray_origin, reflect_dir, bmin, bmax);
+    if (t <= 0.0) {
+        return reflect_dir;
+    }
+    let hit_pos = ray_origin + reflect_dir * t;
+    return normalize(hit_pos - probe_center);
+}
+
+fn sample_sky_equirect(reflect_dir: vec3<f32>) -> vec3<f32> {
+    let angle = camera.skybox_rotation;
+    let c = cos(angle);
+    let s = sin(angle);
+    let rotated_dir = vec3<f32>(
+        reflect_dir.x * c + reflect_dir.z * s,
+        reflect_dir.y,
+        reflect_dir.x * -s + reflect_dir.z * c
+    );
+    let PI = 3.14159265359;
+    let TWO_PI = 6.28318530718;
+    let u = 0.5 + atan2(rotated_dir.z, rotated_dir.x) / TWO_PI;
+    let v = 0.5 - asin(clamp(rotated_dir.y, -1.0, 1.0)) / PI;
+    let sky_sample = textureSample(skybox_texture, skybox_sampler, vec2<f32>(u, v)).rgb;
+
+    let min_sat = camera.skybox_saturation;
+    let brightness = camera.skybox_brightness;
+    let sat = clamp(min_sat + (1.0 - min_sat) * brightness, 0.0, 1.0);
+    let lum = dot(sky_sample, vec3<f32>(0.299, 0.587, 0.114));
+    let desaturated = mix(vec3<f32>(lum), sky_sample, sat);
+    let tint = camera.skybox_tint;
+    let tint_strength = camera.skybox_tint_strength;
+    let effect_strength = (1.0 - brightness) * tint_strength;
+    let tinted = mix(desaturated, desaturated * tint, effect_strength);
+    return tinted * brightness;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    let depth = load_depth_at_uv(input.uv);
+    if (depth >= 0.9999) {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+
+    let material = textureSample(material_gbuffer, linear_sampler, input.uv);
+    let reflectivity = material.r;
+    if (reflectivity < 0.01) {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+
+    let world_pos = reconstruct_world_pos(input.uv, depth);
+    let gbuf = textureSample(normal_gbuffer, linear_sampler, input.uv);
+    let normal = decode_world_normal(gbuf.rgb);
+
+    let view_dir = normalize(world_pos - camera.camera_pos);
+    let reflect_dir = reflect(view_dir, normal);
+
+    let sky_color = sample_sky_equirect(reflect_dir);
+
+    var probe_dir = parallax_correct_probe_dir(world_pos, reflect_dir);
+    if (params._pad2.y > 0.5) {
+        probe_dir.y = -probe_dir.y;
+    }
+    let probe_color = textureSample(reflection_probe, linear_sampler, probe_dir).rgb;
+
+    if (params._pad2.x > 0.5) {
+        return vec4<f32>(probe_color, 1.0);
+    }
+
+    let probe_on = (params.probe_valid * params.probe_strength) > 0.5;
+    let out_color = select(sky_color, probe_color, probe_on);
+    return vec4<f32>(out_color, reflectivity);
+}
+/*
 // Screen Space Reflections shader with HZB acceleration
 
 struct CameraUniforms {
@@ -33,153 +230,8 @@ struct SSRParams {
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
 @group(0) @binding(1) var<uniform> params: SSRParams;
 @group(0) @binding(2) var scene_color: texture_2d<f32>;
-@group(0) @binding(3) var scene_depth: texture_depth_2d;
-@group(0) @binding(4) var linear_sampler: sampler;
-@group(0) @binding(5) var hzb_texture: texture_2d<f32>;
-@group(0) @binding(6) var hzb_sampler: sampler;
-@group(0) @binding(7) var normal_gbuffer: texture_2d<f32>;
-@group(0) @binding(8) var material_gbuffer: texture_2d<f32>;  // R=reflectivity
-@group(0) @binding(9) var ssao_texture: texture_2d<f32>;  // SSAO for reflected surfaces
-@group(0) @binding(10) var bloom_texture: texture_2d<f32>;  // Bloom for reflected surfaces
-@group(0) @binding(11) var skybox_texture: texture_2d<f32>;  // Skybox for missed rays
-@group(0) @binding(12) var skybox_sampler: sampler;  // Skybox sampler with Repeat on U
-@group(0) @binding(13) var ssr_history: texture_2d<f32>;  // Previous SSR result for temporal accumulation
-@group(0) @binding(14) var reflection_probe: texture_cube<f32>; // Reflection probe fallback
 
-struct VertexOutput {
-    @builtin(position) position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
-    var output: VertexOutput;
-    // Fullscreen triangle
-    let x = f32((vertex_index << 1u) & 2u);
-    let y = f32(vertex_index & 2u);
-    output.position = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
-    output.uv = vec2<f32>(x, y);
-    return output;
-}
-
-// Reconstruct world position from depth
-fn reconstruct_world_pos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
-    // Convert UV and depth to NDC (depth is [0,1], convert to NDC z)
-    let z_ndc = depth * 2.0 - 1.0;
-    let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - 2.0 * uv.y, z_ndc, 1.0);
-    
-    // Unproject to view space
-    let view_pos = camera.inverse_proj * ndc;
-    let view_pos_3d = view_pos.xyz / view_pos.w;
-    
-    // Transform to world space
-    let world_pos = camera.inverse_view * vec4<f32>(view_pos_3d, 1.0);
-    return world_pos.xyz;
-}
-
-fn get_linear_depth(ndc_z: f32) -> f32 {
-    let z_opengl = ndc_z * 2.0 - 1.0;
-    let view_pos = camera.inverse_proj * vec4<f32>(0.0, 0.0, z_opengl, 1.0);
-    return -view_pos.z / view_pos.w;
-}
-
-// Project world position to screen space
-// Returns vec4: xyz = screen pos (xy in UV, z in NDC depth), w = 1 if valid (in front of camera), 0 if behind
-fn world_to_screen(world_pos: vec3<f32>) -> vec4<f32> {
-    let clip_pos = camera.view_proj * vec4<f32>(world_pos, 1.0);
-    
-    // Check if behind camera (w <= 0 means behind near plane)
-    if (clip_pos.w <= 0.001) {
-        return vec4<f32>(0.0, 0.0, 0.0, 0.0);  // Invalid
-    }
-    
-    let ndc = clip_pos.xyz / clip_pos.w;
-    // Convert NDC to UV space (flip Y for texture coords)
-    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-    
-    // Use linear depth (clip.w) normalized, for more uniform stepping
-    return vec4<f32>(uv, ndc.z, 1.0);  // Valid
-}
-
-fn decode_world_normal(encoded: vec3<f32>) -> vec3<f32> {
-    // Stored as (n * 0.5 + 0.5) in voxel.wgsl
-    let n = encoded * 2.0 - 1.0;
-    // Guard against zero/denormals
-    return normalize(select(n, vec3<f32>(0.0, 1.0, 0.0), dot(n, n) < 1e-8));
-}
-
-fn intersect_ray_aabb(origin: vec3<f32>, dir: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> f32 {
-    // Returns the first positive intersection distance along the ray, or -1 if no hit.
-    let eps = 1e-6;
-    let safe_dir = vec3<f32>(
-        select(dir.x, eps, abs(dir.x) < eps),
-        select(dir.y, eps, abs(dir.y) < eps),
-        select(dir.z, eps, abs(dir.z) < eps),
-    );
-    let inv_dir = 1.0 / safe_dir;
-    let t0 = (bmin - origin) * inv_dir;
-    let t1 = (bmax - origin) * inv_dir;
-    let tmin3 = min(t0, t1);
-    let tmax3 = max(t0, t1);
-    let tmin = max(max(tmin3.x, tmin3.y), tmin3.z);
-    let tmax = min(min(tmax3.x, tmax3.y), tmax3.z);
-    if (tmax < max(tmin, 0.0)) {
-        return -1.0;
-    }
-    // If we're inside the box, tmin < 0, so use the exit intersection.
-    return select(tmin, tmax, tmin < 0.0);
-}
-
-fn parallax_correct_probe_dir(ray_origin: vec3<f32>, reflect_dir: vec3<f32>) -> vec3<f32> {
-    let probe_center = camera.probe_pos_extent.xyz;
-    let half_extent = camera.probe_pos_extent.w;
-    if (half_extent <= 0.0) {
-        return reflect_dir;
-    }
-    let half = vec3<f32>(half_extent);
-    let bmin = probe_center - half;
-    let bmax = probe_center + half;
-    let t = intersect_ray_aabb(ray_origin, reflect_dir, bmin, bmax);
-    if (t <= 0.0) {
-        return reflect_dir;
-    }
-    let hit_pos = ray_origin + reflect_dir * t;
-    return normalize(hit_pos - probe_center);
-}
-
-fn luminance(rgb: vec3<f32>) -> f32 {
-    return dot(rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
-}
-
-fn uv_to_pixel(uv: vec2<f32>, dim: vec2<u32>) -> vec2<i32> {
-    // Clamp to valid pixel coordinates (avoids out-of-bounds textureLoad).
-    let x = clamp(i32(uv.x * f32(dim.x)), 0, i32(dim.x) - 1);
-    let y = clamp(i32(uv.y * f32(dim.y)), 0, i32(dim.y) - 1);
-    return vec2<i32>(x, y);
-}
-
-fn load_depth_at_uv(uv: vec2<f32>) -> f32 {
-    let dim = textureDimensions(scene_depth);
-    let px = uv_to_pixel(uv, dim);
-    return textureLoad(scene_depth, px, 0);
-}
-
-fn load_hzb_depth_at_uv(uv: vec2<f32>, mip: i32) -> f32 {
-    let dim = textureDimensions(hzb_texture, mip);
-    let px = uv_to_pixel(uv, dim);
-    return textureLoad(hzb_texture, px, mip).r;
-}
-
-// Clip a ray in clip space against the frustum
-fn frustum_clip(start: vec4<f32>, end: vec4<f32>) -> vec4<f32> {
-    var t = 1.0;
-    let dir = end - start;
-    
-    // Near plane (w = 0.001)
-    if (end.w < 0.001) {
-        let t_near = (0.001 - start.w) / (end.w - start.w);
-        t = min(t, t_near);
-    }
+    return vec4<f32>(fallback_color, reflectivity);
     
     // Screen edges (x = +/-w, y = +/-w)
     if (abs(dir.x - dir.w) > 1e-6) {
@@ -348,24 +400,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Combined fade factor
     let angle_fade = grazing_fade;
     
-    // Offset start position along normal to avoid self-intersection
-    let ray_start = world_pos + normal * 1.5;
-    
-    // Check if ray passes too close to camera - this causes projection singularities
-    // that appear as "black holes" in cardinal directions
-    // Calculate closest distance from ray to camera position using point-to-line distance
-    let to_camera = camera.camera_pos - ray_start;
-    let ray_proj = dot(to_camera, reflect_dir);
-    let closest_point_on_ray = ray_start + reflect_dir * max(0.0, ray_proj);
-    let dist_to_camera = length(camera.camera_pos - closest_point_on_ray);
-    
-    // If ray passes within 2 units of camera, skip geometry tracing (use skybox only)
-    var hit_result = vec4<f32>(-1.0, -1.0, -1.0, 0.0);
-    if (dist_to_camera >= 2.0 || ray_proj <= 0.0) {
-        // Ray doesn't pass close to camera, trace normally
-        hit_result = ssr_ray_march(ray_start, reflect_dir, input.uv);
-    }
-    // Otherwise hit_result stays as "no hit" and we fall through to skybox
+    // NOTE: Cubemap-only reflections (probe fallback). Screen-space ray marching is disabled.
 
     // Calculate Skybox Reflection (always needed for fallback/mixing)
     // Apply skybox rotation to match the scene
@@ -403,23 +438,14 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Debug controls are packed into params._pad2:
     //   _pad2.x = probe-only debug view (1 = show probe, ignore SSR)
     //   _pad2.y = flip-Y when sampling the probe (1 = invert direction.y)
-    // Probe sampling: for near-horizontal surfaces (water), ignore camera Y movement so
-    // the reflected scene stays level with the geometry it's reflecting.
-    let is_near_horizontal = abs(normal.y) > 0.9;
-    let cam_pos_probe = select(
-        camera.camera_pos,
-        vec3<f32>(camera.camera_pos.x, world_pos.y, camera.camera_pos.z),
-        is_near_horizontal,
-    );
-    let view_dir_probe = normalize(world_pos - cam_pos_probe);
-    let reflect_dir_probe = reflect(view_dir_probe, normal);
-
-    var probe_dir = parallax_correct_probe_dir(world_pos, reflect_dir_probe);
+    var probe_dir = parallax_correct_probe_dir(world_pos, reflect_dir);
     if (params._pad2.y > 0.5) {
         probe_dir.y = -probe_dir.y;
     }
     let probe_color = textureSample(reflection_probe, linear_sampler, probe_dir).rgb;
-    let fallback_color = mix(sky_color, probe_color, params.probe_valid * params.probe_strength);
+    // The probe already includes the skybox, so when valid we prefer it directly.
+    let probe_on = (params.probe_valid * params.probe_strength) > 0.5;
+    let fallback_color = select(sky_color, probe_color, probe_on);
 
     if (params._pad2.x > 0.5) {
         return vec4<f32>(probe_color, 1.0);
@@ -570,82 +596,5 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         
         // Apply bloom and SSAO
         let bloomed_reflection = reflection_color + bloom_accum * params.bloom_strength;
-        let reflection_with_ao = bloomed_reflection * ao_accum;
-        
-        // Fade based on distance from screen edges
-        let edge_fade = min(
-            min(hit_result.x, 1.0 - hit_result.x),
-            min(hit_result.y, 1.0 - hit_result.y)
-        );
-        let edge_factor = smoothstep(0.0, 0.1, edge_fade);
-        
-        // Fade reflections at very long distances (less accurate)
-        let distance_fade = 1.0 - smoothstep(50.0, 100.0, reflection_distance);
-        
-        // Calculate confidence in the screen-space reflection
-        // If confidence is low (edge, distance, angle, facing), we mix in the skybox
-        let confidence = edge_factor * distance_fade * (1.0 - angle_fade) * facing_factor;
-        
-        // Mix geometry reflection with fallback based on confidence.
-        // When SSR is unstable/low-confidence, prefer probe/sky instead of noisy hit.
-        // Always blend in a small amount of probe (for debug visibility when enabled).
-        let probe_blend = mix(0.0, 0.15, params.probe_valid * params.probe_strength);
-        let final_color = mix(fallback_color, reflection_with_ao, confidence - probe_blend);
-
-            // Temporal accumulation (reproject world position into previous frame)
-            var taa_color = final_color;
-            if (params.history_valid > 0.5) {
-                let prev_clip = camera.prev_view_proj * vec4<f32>(world_pos, 1.0);
-                if (prev_clip.w > 0.001) {
-                    let prev_ndc = prev_clip.xyz / prev_clip.w;
-                    let prev_uv = vec2<f32>(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
-                    if (prev_uv.x >= 0.0 && prev_uv.x <= 1.0 && prev_uv.y >= 0.0 && prev_uv.y <= 1.0) {
-                        let history = textureSample(ssr_history, linear_sampler, prev_uv).rgb;
-                        // Tightened rejection: luminance + depth + normal + motion
-                        // Luma is good for catching big lighting changes, but disocclusions need geometry tests.
-                        let d_lum = abs(luminance(history) - luminance(final_color));
-                        let reject_lum = smoothstep(0.15, 0.75, d_lum);
-
-                        // Motion clamp (large velocity -> less history to avoid streaking)
-                        let dim = vec2<f32>(textureDimensions(scene_color));
-                        let vel_px = length((prev_uv - input.uv) * dim);
-                        let reject_vel = smoothstep(6.0, 24.0, vel_px);
-
-                        // Depth consistency: compare the expected depth of this world_pos in the prev frame
-                        // vs the surface currently visible at prev_uv. Mismatch implies disocclusion.
-                        var reject_depth = 1.0;
-                        var reject_norm = 1.0;
-                        let prev_scene_depth = load_depth_at_uv(prev_uv);
-                        if (prev_scene_depth < 0.9999) {
-                            let expected_lin = get_linear_depth(prev_ndc.z);
-                            let prev_lin = get_linear_depth(prev_scene_depth);
-                            let depth_diff = abs(prev_lin - expected_lin);
-                            // Tolerance grows slightly with distance.
-                            let depth_tol0 = 0.12 + 0.004 * expected_lin;
-                            let depth_tol1 = 0.50 + 0.015 * expected_lin;
-                            reject_depth = smoothstep(depth_tol0, depth_tol1, depth_diff);
-
-                            // Normal consistency at the reprojected UV.
-                            let n_dim = textureDimensions(normal_gbuffer);
-                            let prev_px = uv_to_pixel(prev_uv, n_dim);
-                            let prev_gbuf = textureLoad(normal_gbuffer, prev_px, 0);
-                            let prev_n = decode_world_normal(prev_gbuf.rgb);
-                            let nd = clamp(dot(normal, prev_n), 0.0, 1.0);
-                            // Reject when normals diverge (likely different surface).
-                            reject_norm = 1.0 - smoothstep(0.70, 0.92, nd);
-                        }
-
-                        let reject = max(max(reject_lum, reject_vel), max(reject_depth, reject_norm));
-                        // High history weight reduces noise; reject clamps ghosting on disocclusion/edges.
-                        let history_w = 0.9 * (1.0 - reject);
-                        taa_color = mix(final_color, history, history_w);
-                    }
-                }
-            }
-
-            return vec4<f32>(taa_color, reflectivity);
-    }
-    
-    // No geometry hit - return probe/sky fallback
-    return vec4<f32>(fallback_color, reflectivity);
-}
+        return vec4<f32>(fallback_color, reflectivity);
+    */

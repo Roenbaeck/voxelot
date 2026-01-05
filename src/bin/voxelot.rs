@@ -4755,6 +4755,8 @@ impl App {
         u.camera_shadow_strength[0] = pos.x;
         u.camera_shadow_strength[1] = pos.y;
         u.camera_shadow_strength[2] = pos.z;
+        // Probe render flag (voxel.wgsl reads uniforms._water_pad.y; in Rust this is water_elapsed_pad[1]).
+        u.water_elapsed_pad[1] = 1.0;
 
         queue.write_buffer(probe_ubo, 0, bytemuck::cast_slice(&[u]));
 

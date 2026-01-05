@@ -256,6 +256,42 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     // the brightening factor to avoid extreme brightening near the horizon.
     var brightened = mix(final_color, fog_color, fade_factor * 0.18);
 
+    // Probe-only cheap sky reflection for reflective materials.
+    // This is used for the reflection cubemap capture so reflective buildings look
+    // closer to the main-view shading (which adds SSR/sky reflections later).
+    let mat_idx = min(input.voxel_type, 255u);
+    let reflectivity = material_props[mat_idx].r;
+    if (uniforms._water_pad.y > 0.5 && reflectivity > 0.001) {
+        let rdir = reflect(-view_dir, normalize(input.normal));
+        // Simple procedural sky (varies with elevation + azimuth + horizon glow).
+        let t = clamp(rdir.y * 0.5 + 0.5, 0.0, 1.0);
+        let PI = 3.14159265359;
+        let TWO_PI = 6.28318530718;
+        let u = fract(0.5 + atan2(rdir.z, rdir.x) / TWO_PI);
+        let night_a = vec3<f32>(0.02, 0.02, 0.03);
+        let night_b = vec3<f32>(0.04, 0.05, 0.08);
+        let day_a = vec3<f32>(0.45, 0.62, 0.92);
+        let day_b = vec3<f32>(0.62, 0.74, 0.96);
+        let az_blend = 0.5 + 0.5 * sin(u * TWO_PI);
+        let night = mix(night_a, night_b, az_blend);
+        let day = mix(day_a, day_b, az_blend);
+        var env = mix(night, day, t);
+        // Horizon glow makes vertical-face reflections less uniform.
+        let horizon = pow(1.0 - abs(rdir.y), 3.0);
+        env += vec3<f32>(0.35, 0.30, 0.25) * horizon * uniforms.fog_time_pad.w;
+        // Add a small sun highlight in the reflection direction.
+        let sun_lobe = pow(max(dot(rdir, -sun_dir_local), 0.0), 64.0);
+        env += uniforms.sun_color_pad.xyz * (0.35 * sun_lobe) * uniforms.fog_time_pad.w;
+        // Apply night tint similarly to skybox shading.
+        let tint = uniforms.skybox_tint_pad.xyz;
+        let tint_strength = uniforms.skybox_tint_pad.w;
+        let brightness = uniforms.fog_time_pad.w;
+        let effect_strength = (1.0 - brightness) * tint_strength;
+        env = mix(env, env * tint, effect_strength);
+        let env_strength = clamp(reflectivity * 0.75, 0.0, 0.9);
+        brightened = mix(brightened, env, env_strength);
+    }
+
     // Envelope fade: if we are approaching the envelope distance, fade towards the envelope color (Type 0)
     // This helps blend the detailed mesh into the simplified envelope mesh.
     let env_dist = uniforms.envelope_distance;
@@ -329,8 +365,6 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     // Store linear depth in W channel for SSILVB/GTAO
     out.normal = vec4<f32>(input.normal * 0.5 + 0.5, input.view_z);
     // Look up material reflectivity from material_props buffer
-    let mat_idx = min(input.voxel_type, 255u);
-    let reflectivity = material_props[mat_idx].r;
     out.material = vec4<f32>(reflectivity, 0.0, 0.0, 0.0);
     return out;
 }
@@ -440,6 +474,35 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     
     // Brighten colors as they approach fade region for fog-like appearance
     var brightened = mix(final_color, fog_color, fade_factor * 0.18);
+
+    // Probe-only cheap sky reflection for reflective materials.
+    let reflectivity = input.material.r;
+    if (uniforms._water_pad.y > 0.5 && reflectivity > 0.001) {
+        let rdir = reflect(-view_dir, normalize(input.normal));
+        let t = clamp(rdir.y * 0.5 + 0.5, 0.0, 1.0);
+        let PI = 3.14159265359;
+        let TWO_PI = 6.28318530718;
+        let u = fract(0.5 + atan2(rdir.z, rdir.x) / TWO_PI);
+        let night_a = vec3<f32>(0.02, 0.02, 0.03);
+        let night_b = vec3<f32>(0.04, 0.05, 0.08);
+        let day_a = vec3<f32>(0.45, 0.62, 0.92);
+        let day_b = vec3<f32>(0.62, 0.74, 0.96);
+        let az_blend = 0.5 + 0.5 * sin(u * TWO_PI);
+        let night = mix(night_a, night_b, az_blend);
+        let day = mix(day_a, day_b, az_blend);
+        var env = mix(night, day, t);
+        let horizon = pow(1.0 - abs(rdir.y), 3.0);
+        env += vec3<f32>(0.35, 0.30, 0.25) * horizon * uniforms.fog_time_pad.w;
+        let sun_lobe = pow(max(dot(rdir, -sun_dir_local), 0.0), 64.0);
+        env += uniforms.sun_color_pad.xyz * (0.35 * sun_lobe) * uniforms.fog_time_pad.w;
+        let tint = uniforms.skybox_tint_pad.xyz;
+        let tint_strength = uniforms.skybox_tint_pad.w;
+        let brightness = uniforms.fog_time_pad.w;
+        let effect_strength = (1.0 - brightness) * tint_strength;
+        env = mix(env, env * tint, effect_strength);
+        let env_strength = clamp(reflectivity * 0.75, 0.0, 0.9);
+        brightened = mix(brightened, env, env_strength);
+    }
 
     // Envelope fade: if we are approaching the envelope distance, fade towards the envelope color (Type 0)
     // This helps blend the detailed mesh into the simplified envelope mesh.
