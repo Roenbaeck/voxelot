@@ -403,7 +403,18 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Debug controls are packed into params._pad2:
     //   _pad2.x = probe-only debug view (1 = show probe, ignore SSR)
     //   _pad2.y = flip-Y when sampling the probe (1 = invert direction.y)
-    var probe_dir = parallax_correct_probe_dir(ray_start, reflect_dir);
+    // Probe sampling: for near-horizontal surfaces (water), ignore camera Y movement so
+    // the reflected scene stays level with the geometry it's reflecting.
+    let is_near_horizontal = abs(normal.y) > 0.9;
+    let cam_pos_probe = select(
+        camera.camera_pos,
+        vec3<f32>(camera.camera_pos.x, world_pos.y, camera.camera_pos.z),
+        is_near_horizontal,
+    );
+    let view_dir_probe = normalize(world_pos - cam_pos_probe);
+    let reflect_dir_probe = reflect(view_dir_probe, normal);
+
+    var probe_dir = parallax_correct_probe_dir(world_pos, reflect_dir_probe);
     if (params._pad2.y > 0.5) {
         probe_dir.y = -probe_dir.y;
     }

@@ -2594,7 +2594,12 @@ impl App {
             reflection_probe_depth_face_views: Vec::new(),
             reflection_probe_face_index: 0,
             reflection_probe_valid: false,
-            reflection_probe_anchor: cam_pos,
+            // Start snapped to a coarse world grid so reflections don't “zoom” with small camera moves.
+            reflection_probe_anchor: [
+                (cam_pos[0] / 128.0).floor() * 128.0 + 64.0,
+                (cam_pos[1] / 128.0).floor() * 128.0 + 64.0,
+                (cam_pos[2] / 128.0).floor() * 128.0 + 64.0,
+            ],
             reflection_probe_debug: false,
             reflection_probe_probe_only: false,
             reflection_probe_flip_y: true,
@@ -4036,7 +4041,13 @@ impl App {
         self.reflection_probe_depth_face_views = probe_depth_face_views_loc;
         self.reflection_probe_face_index = 0;
         self.reflection_probe_valid = false;
-        self.reflection_probe_anchor = self.camera_controller.camera.position;
+        // Anchor snapped to a coarse world grid for stability.
+        let cam = self.camera_controller.camera.position;
+        self.reflection_probe_anchor = [
+            (cam[0] / 128.0).floor() * 128.0 + 64.0,
+            (cam[1] / 128.0).floor() * 128.0 + 64.0,
+            (cam[2] / 128.0).floor() * 128.0 + 64.0,
+        ];
 
         App::replace_texture_bytes_static(
             &mut self.reflection_probe_color_bytes,
@@ -4696,9 +4707,14 @@ impl App {
         // a significant distance from the probe anchor.
         let camera_pos = Vec3::from_array(self.camera_controller.camera.position);
         let anchor = Vec3::from_array(self.reflection_probe_anchor);
-        const ANCHOR_MOVE_THRESHOLD: f32 = 8.0;
-        if (camera_pos - anchor).length() > ANCHOR_MOVE_THRESHOLD {
-            self.reflection_probe_anchor = self.camera_controller.camera.position;
+        const PROBE_SNAP_SIZE: f32 = 128.0;
+        let desired_anchor = Vec3::new(
+            (camera_pos.x / PROBE_SNAP_SIZE).floor() * PROBE_SNAP_SIZE + PROBE_SNAP_SIZE * 0.5,
+            (camera_pos.y / PROBE_SNAP_SIZE).floor() * PROBE_SNAP_SIZE + PROBE_SNAP_SIZE * 0.5,
+            (camera_pos.z / PROBE_SNAP_SIZE).floor() * PROBE_SNAP_SIZE + PROBE_SNAP_SIZE * 0.5,
+        );
+        if (desired_anchor - anchor).length() > 0.01 {
+            self.reflection_probe_anchor = desired_anchor.to_array();
             // Keep the previous probe valid while we refresh faces.
             // This avoids a single-frame fallback-to-skybox "flash".
             self.reflection_probe_face_index = 0;
@@ -11634,7 +11650,7 @@ impl App {
             let view_proj = (OPENGL_TO_WGPU_MATRIX * projection * view_mat).to_cols_array_2d();
             // Proxy extents for parallax-corrected cubemap lookup. Larger values behave more like an
             // infinite environment map; smaller values increase local parallax.
-            let probe_half_extent: f32 = 128.0;
+            let probe_half_extent: f32 = 512.0;
             let ssr_cam = SsrCameraUniforms {
                 inverse_view: inverse_view_cols,
                 inverse_proj: inverse_proj_cols,
