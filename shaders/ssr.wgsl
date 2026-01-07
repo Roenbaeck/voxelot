@@ -20,7 +20,8 @@ struct CameraUniforms {
     sun_direction: vec3<f32>,
     sun_intensity: f32,
     sun_color: vec3<f32>,
-    _pad_sun: f32,
+    water_level: f32,
+    water_color: vec4<f32>,
 }
 
 struct SSRParams {
@@ -176,8 +177,31 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>) -> vec4<f32> {
     var accumulated_color = vec3<f32>(0.0);
     var remaining_alpha = 1.0;
 
+    // Water plane intersection: t = (water_y - pos_y) / dir_y
+    var t_water = -1.0;
+    if (abs(reflect_dir.y) > 0.001) {
+        t_water = (camera.water_level - world_pos.y) / reflect_dir.y;
+    }
+
+    // Water base color synthesized from sun and ambient
+    // We use skybox_brightness + a small offset to ensure it doesn't go pitch black
+    // and matches the "deep water" tone in water.wgsl.
+    let water_base = camera.water_color.rgb * (camera.skybox_brightness + 0.1);
+    let sky_on_water = sample_sky_equirect(reflect(reflect_dir, vec3<f32>(0.0, 1.0, 0.0)));
+    let water_color = mix(water_base, sky_on_water, 0.5);
+    let sun_dir = normalize(camera.sun_direction);
+
     for (var i = 0u; i < 32u; i++) {
-        current_pos = world_pos + reflect_dir * (f32(i) * step_size);
+        let t_ray = f32(i) * step_size;
+        
+        // If we reached the water plane before any geometry, stop and return water color
+        if (t_water > 0.0 && t_ray >= t_water) {
+            accumulated_color += water_color * remaining_alpha;
+            remaining_alpha = 0.0;
+            break;
+        }
+
+        current_pos = world_pos + reflect_dir * t_ray;
         
         let grid_f_coord = (current_pos - grid_origin) / 16.0;
         let grid_i_coord = vec3<i32>(floor(grid_f_coord));
@@ -206,15 +230,24 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>) -> vec4<f32> {
                 let aabb_min = chunk_world_origin + vec3<f32>(xmin, ymin, zmin);
                 let aabb_max = chunk_world_origin + vec3<f32>(xmax + 1.0, ymax + 1.0, zmax + 1.0);
                 
+                // IGNORE SUBMERGED GEOMETRY: if the entire chunk is below water, skip it
+                if (aabb_max.y < camera.water_level) {
+                   continue;
+                }
+
                 let hit = ray_aabb_intersection(world_pos, reflect_dir, aabb_min, aabb_max);
                 
                 // SURFACE CLIPPING: 
-                // Any valid intersection (t_far > 0) counts as hitting the opaque facade.
-                // We verify t_near > 0.1 to avoid "self-intersection" where we are inside the bbox.
                 if (hit.t_near <= hit.t_far && hit.t_far > 0.0 && hit.t_near > 0.1) {
+                    // If the specific hit point is below water level, treat it as hitting water
+                    let hit_point_y = world_pos.y + reflect_dir.y * hit.t_near;
+                    if (hit_point_y < camera.water_level) {
+                        accumulated_color += water_color * remaining_alpha;
+                        remaining_alpha = 0.0;
+                        break;
+                    }
+
                     let rad = sample_radiance(uvw, reflect_dir);
-                    
-                    let sun_dir = normalize(camera.sun_direction);
                     let dot_sun = saturate(dot(hit.normal, sun_dir));
                     let sun_lit = camera.sun_color * camera.sun_intensity * dot_sun * 1.5;
                     
@@ -226,6 +259,11 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>) -> vec4<f32> {
                 }
             } else {
                 // Fallback for chunks without bbox: treat as semi-transparent volume
+                // Skip if submerged
+                if (current_pos.y < camera.water_level) {
+                    continue;
+                }
+
                 let rad = sample_radiance(uvw, reflect_dir);
                 let sun_lit = camera.sun_color * camera.sun_intensity * 0.5;
                 let lit_color = chunk_data.rgb * (rad * 2.5 + sun_lit);
@@ -240,6 +278,12 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>) -> vec4<f32> {
                 }
             }
         }
+    }
+
+    // FINAL FLOOR: If ray points down and we haven't hit anything, hit the water surface
+    if (remaining_alpha > 0.0 && t_water > 0.0) {
+        accumulated_color += water_color * remaining_alpha;
+        remaining_alpha = 0.0;
     }
     
     return vec4<f32>(accumulated_color, 1.0 - remaining_alpha);
