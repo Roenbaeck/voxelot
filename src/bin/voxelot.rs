@@ -600,8 +600,11 @@ struct SsrCameraUniforms {
     _pad1: [f32; 2],
     skybox_tint: [f32; 3],
     skybox_tint_strength: f32,
-    // xyz = probe center in world space, w = proxy half-extent (for parallax-corrected cubemap sampling)
-    probe_pos_extent: [f32; 4],
+    // GI grid info for volumetric reflections
+    gi_grid_origin: [i32; 3],
+    _pad_gi1: i32,
+    gi_grid_dims: [i32; 3],
+    _pad_gi2: i32,
 }
 
 /// Depth-of-field runtime settings (CPU-side convenience)
@@ -1281,19 +1284,21 @@ struct App {
     gi_grid_origin: glam::IVec3,
     gi_grid_dims: glam::IVec3,
 
-    // SSILVB GI probe 3D textures (6 faces: +X, -X, +Y, -Y, +Z, -Z)
+    // SSILVB GI probe 3D textures (6 faces: +X, -X, +Y, -Y, +Z, -Z, and a color/occupancy volume)
     gi_probe_tex_px: Option<wgpu::Texture>,
     gi_probe_tex_nx: Option<wgpu::Texture>,
     gi_probe_tex_py: Option<wgpu::Texture>,
     gi_probe_tex_ny: Option<wgpu::Texture>,
     gi_probe_tex_pz: Option<wgpu::Texture>,
     gi_probe_tex_nz: Option<wgpu::Texture>,
+    gi_probe_tex_color: Option<wgpu::Texture>,
     gi_probe_view_px: Option<wgpu::TextureView>,
     gi_probe_view_nx: Option<wgpu::TextureView>,
     gi_probe_view_py: Option<wgpu::TextureView>,
     gi_probe_view_ny: Option<wgpu::TextureView>,
     gi_probe_view_pz: Option<wgpu::TextureView>,
     gi_probe_view_nz: Option<wgpu::TextureView>,
+    gi_probe_view_color: Option<wgpu::TextureView>,
     camera_controller: CameraController,
     pending_chunk_meshes: VecDeque<(i64, i64, i64)>,
     pending_chunk_set: FxHashSet<(i64, i64, i64)>,
@@ -1454,7 +1459,8 @@ struct App {
 
     // Reflection probe (SSR fallback): low-res cubemap updated one face per frame.
     reflection_probe_color_texture: Option<wgpu::Texture>,
-    reflection_probe_color_cube_view: Option<wgpu::TextureView>,
+    reflection_probe_color_cube_prev_view: Option<wgpu::TextureView>,
+    reflection_probe_color_cube_curr_view: Option<wgpu::TextureView>,
     reflection_probe_color_face_views: Vec<wgpu::TextureView>,
     reflection_probe_emissive_texture: Option<wgpu::Texture>,
     reflection_probe_emissive_face_views: Vec<wgpu::TextureView>,
@@ -1465,8 +1471,10 @@ struct App {
     reflection_probe_depth_texture: Option<wgpu::Texture>,
     reflection_probe_depth_face_views: Vec<wgpu::TextureView>,
     reflection_probe_face_index: u32,
-    reflection_probe_valid: bool,
-    reflection_probe_anchor: [f32; 3],
+    reflection_probe_capture_slot: usize,
+    reflection_probe_crossfade_alpha: f32,
+    reflection_probe_valid: [bool; 2],
+    reflection_probe_anchor: [[f32; 3]; 2],
     reflection_probe_debug: bool,
     reflection_probe_probe_only: bool,
     reflection_probe_flip_y: bool,
@@ -1691,6 +1699,59 @@ impl App {
         Some((out, padded_bpr, extent))
     }
 
+    fn pack_gi_probe_color_volume_f16(&self) -> Option<(Vec<u8>, u32, wgpu::Extent3d)> {
+        let extent = wgpu::Extent3d {
+            width: self.gi_grid_dims.x.max(0) as u32,
+            height: self.gi_grid_dims.y.max(0) as u32,
+            depth_or_array_layers: self.gi_grid_dims.z.max(0) as u32,
+        };
+
+        if extent.width == 0 || extent.height == 0 || extent.depth_or_array_layers == 0 {
+            return None;
+        }
+
+        // Rgba16Float
+        let bytes_per_texel = 8u32;
+        let padded_bpr = Self::gi_probe_padded_bytes_per_row(extent.width, bytes_per_texel);
+        let bytes_per_image = padded_bpr * extent.height;
+        let total_bytes = bytes_per_image as usize * extent.depth_or_array_layers as usize;
+
+        let probe_count = (extent.width * extent.height * extent.depth_or_array_layers) as usize;
+        if self.gi_probes.len() != probe_count {
+            return None;
+        }
+
+        let mut out = vec![0u8; total_bytes];
+        let row_stride = padded_bpr as usize;
+        let image_stride = bytes_per_image as usize;
+        let texel_stride = bytes_per_texel as usize;
+
+        let wh = (extent.width as usize) * (extent.height as usize);
+        for z in 0..extent.depth_or_array_layers as usize {
+            let z_base = z * image_stride;
+            for y in 0..extent.height as usize {
+                let row_base = z_base + y * row_stride;
+                for x in 0..extent.width as usize {
+                    let idx = x + y * extent.width as usize + z * wh;
+                    let rgba = self.gi_probes[idx].color;
+                    let dst = row_base + x * texel_stride;
+
+                    let r = f16::from_f32(rgba[0]).to_le_bytes();
+                    let g = f16::from_f32(rgba[1]).to_le_bytes();
+                    let b = f16::from_f32(rgba[2]).to_le_bytes();
+                    let a = f16::from_f32(rgba[3]).to_le_bytes();
+
+                    out[dst..dst + 2].copy_from_slice(&r);
+                    out[dst + 2..dst + 4].copy_from_slice(&g);
+                    out[dst + 4..dst + 6].copy_from_slice(&b);
+                    out[dst + 6..dst + 8].copy_from_slice(&a);
+                }
+            }
+        }
+
+        Some((out, padded_bpr, extent))
+    }
+
     fn pack_rgba16f_padded_256(rgba: [f32; 4]) -> [u8; 256] {
         let mut out = [0u8; 256];
 
@@ -1731,6 +1792,9 @@ impl App {
         let Some(tex_nz) = self.gi_probe_tex_nz.as_ref() else {
             return;
         };
+        let Some(tex_color) = self.gi_probe_tex_color.as_ref() else {
+            return;
+        };
 
         let dx = self.gi_grid_dims.x.max(0) as u32;
         let dy = self.gi_grid_dims.y.max(0) as u32;
@@ -1740,13 +1804,14 @@ impl App {
         }
         let wh = dx * dy;
 
-        let textures: [(&wgpu::Texture, usize); 6] = [
-            (tex_px, 0),
-            (tex_nx, 1),
-            (tex_py, 2),
-            (tex_ny, 3),
-            (tex_pz, 4),
-            (tex_nz, 5),
+        let textures: [(&wgpu::Texture, Option<usize>); 7] = [
+            (tex_px, Some(0)),
+            (tex_nx, Some(1)),
+            (tex_py, Some(2)),
+            (tex_ny, Some(3)),
+            (tex_pz, Some(4)),
+            (tex_nz, Some(5)),
+            (tex_color, None),
         ];
 
         let extent = wgpu::Extent3d {
@@ -1768,8 +1833,12 @@ impl App {
 
             let origin = wgpu::Origin3d { x, y, z };
 
-            for (texture, face_idx) in textures {
-                let rgba = update.probe.light_data[face_idx];
+            for (texture, face_idx_opt) in textures {
+                let rgba = if let Some(face_idx) = face_idx_opt {
+                    update.probe.light_data[face_idx]
+                } else {
+                    update.probe.color
+                };
                 let data = Self::pack_rgba16f_padded_256(rgba);
                 queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
@@ -1809,19 +1878,28 @@ impl App {
         let Some(tex_nz) = self.gi_probe_tex_nz.as_ref() else {
             return;
         };
+        let Some(tex_color) = self.gi_probe_tex_color.as_ref() else {
+            return;
+        };
 
-        let textures: [(&wgpu::Texture, usize); 6] = [
-            (tex_px, 0),
-            (tex_nx, 1),
-            (tex_py, 2),
-            (tex_ny, 3),
-            (tex_pz, 4),
-            (tex_nz, 5),
+        let textures: [(&wgpu::Texture, Option<usize>); 7] = [
+            (tex_px, Some(0)),
+            (tex_nx, Some(1)),
+            (tex_py, Some(2)),
+            (tex_ny, Some(3)),
+            (tex_pz, Some(4)),
+            (tex_nz, Some(5)),
+            (tex_color, None),
         ];
 
-        for (texture, face_idx) in textures {
-            let Some((data, padded_bpr, extent)) = self.pack_gi_probe_face_volume_f16(face_idx)
-            else {
+        for (texture, face_idx_opt) in textures {
+            let res = if let Some(face_idx) = face_idx_opt {
+                self.pack_gi_probe_face_volume_f16(face_idx)
+            } else {
+                self.pack_gi_probe_color_volume_f16()
+            };
+
+            let Some((data, padded_bpr, extent)) = res else {
                 continue;
             };
 
@@ -2342,12 +2420,14 @@ impl App {
             gi_probe_tex_ny: None,
             gi_probe_tex_pz: None,
             gi_probe_tex_nz: None,
+            gi_probe_tex_color: None,
             gi_probe_view_px: None,
             gi_probe_view_nx: None,
             gi_probe_view_py: None,
             gi_probe_view_ny: None,
             gi_probe_view_pz: None,
             gi_probe_view_nz: None,
+            gi_probe_view_color: None,
 
             camera_controller: CameraController::new(initial_camera, &cfg.rendering),
             pending_chunk_meshes: VecDeque::new(),
@@ -2582,7 +2662,8 @@ impl App {
             ssr_debug: false,
 
             reflection_probe_color_texture: None,
-            reflection_probe_color_cube_view: None,
+            reflection_probe_color_cube_prev_view: None,
+            reflection_probe_color_cube_curr_view: None,
             reflection_probe_color_face_views: Vec::new(),
             reflection_probe_emissive_texture: None,
             reflection_probe_emissive_face_views: Vec::new(),
@@ -2593,13 +2674,18 @@ impl App {
             reflection_probe_depth_texture: None,
             reflection_probe_depth_face_views: Vec::new(),
             reflection_probe_face_index: 0,
-            reflection_probe_valid: false,
+            reflection_probe_capture_slot: 0,
+            reflection_probe_crossfade_alpha: 0.0,
+            reflection_probe_valid: [false, false],
             // Start snapped to a coarse world grid so reflections don't “zoom” with small camera moves.
-            reflection_probe_anchor: [
-                (cam_pos[0] / 128.0).floor() * 128.0 + 64.0,
-                (cam_pos[1] / 128.0).floor() * 128.0 + 64.0,
-                (cam_pos[2] / 128.0).floor() * 128.0 + 64.0,
-            ],
+            reflection_probe_anchor: {
+                let snapped = [
+                    (cam_pos[0] / 128.0).floor() * 128.0 + 64.0,
+                    (cam_pos[1] / 128.0).floor() * 128.0 + 64.0,
+                    (cam_pos[2] / 128.0).floor() * 128.0 + 64.0,
+                ];
+                [snapped, snapped]
+            },
             reflection_probe_debug: false,
             reflection_probe_probe_only: false,
             reflection_probe_flip_y: true,
@@ -3283,7 +3369,8 @@ impl App {
             rc_view_loc,
             rc_bytes,
             probe_color_texture_loc,
-            probe_color_cube_view_loc,
+            probe_color_cube_view_prev_loc,
+            probe_color_cube_view_curr_loc,
             probe_color_face_views_loc,
             probe_emissive_texture_loc,
             probe_emissive_face_views_loc,
@@ -3738,7 +3825,8 @@ impl App {
                 // Reflection probe cubemap (SSR fallback)
                 // Low-res by design; updated one face per frame.
                 let (probe_color_texture_loc,
-                    probe_color_cube_view_loc,
+                    probe_color_cube_view_prev_loc,
+                    probe_color_cube_view_curr_loc,
                     probe_color_face_views_loc,
                     probe_emissive_texture_loc,
                     probe_emissive_face_views_loc,
@@ -3755,10 +3843,12 @@ impl App {
                     probe_depth_bytes_loc,
                 ) = if self.user_config.effects.ssr.enabled {
                     let probe_res: u32 = 256;
+                    // Two cubemaps packed into a single cube array: layers 0..5 = prev/current,
+                    // layers 6..11 = new capture during a snap. Binding is a CubeArray view.
                     let extent = wgpu::Extent3d {
                         width: probe_res,
                         height: probe_res,
-                        depth_or_array_layers: 6,
+                        depth_or_array_layers: 12,
                     };
 
                     let probe_color_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
@@ -3769,7 +3859,9 @@ impl App {
                         dimension: wgpu::TextureDimension::D2,
                         format: wgpu::TextureFormat::Rgba16Float,
                         usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                            | wgpu::TextureUsages::TEXTURE_BINDING,
+                            | wgpu::TextureUsages::TEXTURE_BINDING
+                            | wgpu::TextureUsages::COPY_SRC
+                            | wgpu::TextureUsages::COPY_DST,
                         view_formats: &[],
                     });
 
@@ -3817,8 +3909,8 @@ impl App {
                         view_formats: &[],
                     });
 
-                    let probe_color_cube_view_loc = probe_color_texture_loc.create_view(&wgpu::TextureViewDescriptor {
-                        label: Some("Reflection Probe Color Cube View"),
+                    let probe_color_cube_view_prev_loc = probe_color_texture_loc.create_view(&wgpu::TextureViewDescriptor {
+                        label: Some("Reflection Probe Color Cube View Prev"),
                         format: Some(wgpu::TextureFormat::Rgba16Float),
                         dimension: Some(wgpu::TextureViewDimension::Cube),
                         aspect: wgpu::TextureAspect::All,
@@ -3828,14 +3920,25 @@ impl App {
                         array_layer_count: Some(6),
                         usage: None,
                     });
+                    let probe_color_cube_view_curr_loc = probe_color_texture_loc.create_view(&wgpu::TextureViewDescriptor {
+                        label: Some("Reflection Probe Color Cube View Curr"),
+                        format: Some(wgpu::TextureFormat::Rgba16Float),
+                        dimension: Some(wgpu::TextureViewDimension::Cube),
+                        aspect: wgpu::TextureAspect::All,
+                        base_mip_level: 0,
+                        mip_level_count: Some(1),
+                        base_array_layer: 6,
+                        array_layer_count: Some(6),
+                        usage: None,
+                    });
 
-                    let mut probe_color_face_views_loc = Vec::with_capacity(6);
-                    let mut probe_emissive_face_views_loc = Vec::with_capacity(6);
-                    let mut probe_normal_face_views_loc = Vec::with_capacity(6);
-                    let mut probe_material_face_views_loc = Vec::with_capacity(6);
-                    let mut probe_depth_face_views_loc = Vec::with_capacity(6);
-                    for face in 0..6u32 {
-                        let face_label = format!("Reflection Probe Face {}", face);
+                    let mut probe_color_face_views_loc = Vec::with_capacity(12);
+                    let mut probe_emissive_face_views_loc = Vec::with_capacity(12);
+                    let mut probe_normal_face_views_loc = Vec::with_capacity(12);
+                    let mut probe_material_face_views_loc = Vec::with_capacity(12);
+                    let mut probe_depth_face_views_loc = Vec::with_capacity(12);
+                    for face in 0..12u32 {
+                        let face_label = format!("Reflection Probe Layer {}", face);
                         probe_color_face_views_loc.push(probe_color_texture_loc.create_view(&wgpu::TextureViewDescriptor {
                             label: Some(&format!("{} Color", face_label)),
                             format: Some(wgpu::TextureFormat::Rgba16Float),
@@ -3897,7 +4000,7 @@ impl App {
                         wgpu::TextureFormat::Rgba16Float,
                         probe_res,
                         probe_res,
-                        6,
+                        12,
                         1,
                     );
                     let probe_emissive_bytes_loc = probe_color_bytes_loc;
@@ -3907,13 +4010,14 @@ impl App {
                         wgpu::TextureFormat::Depth32Float,
                         probe_res,
                         probe_res,
-                        6,
+                        12,
                         1,
                     );
 
                     (
                         Some(probe_color_texture_loc),
-                        Some(probe_color_cube_view_loc),
+                        Some(probe_color_cube_view_prev_loc),
+                        Some(probe_color_cube_view_curr_loc),
                         probe_color_face_views_loc,
                         Some(probe_emissive_texture_loc),
                         probe_emissive_face_views_loc,
@@ -3931,6 +4035,7 @@ impl App {
                     )
                 } else {
                     (
+                        None,
                         None,
                         None,
                         Vec::new(),
@@ -4001,7 +4106,8 @@ impl App {
                     rc_view_loc,
                     rc_bytes,
                     probe_color_texture_loc,
-                    probe_color_cube_view_loc,
+                    probe_color_cube_view_prev_loc,
+                    probe_color_cube_view_curr_loc,
                     probe_color_face_views_loc,
                     probe_emissive_texture_loc,
                     probe_emissive_face_views_loc,
@@ -4029,7 +4135,8 @@ impl App {
         );
 
         self.reflection_probe_color_texture = probe_color_texture_loc;
-        self.reflection_probe_color_cube_view = probe_color_cube_view_loc;
+        self.reflection_probe_color_cube_prev_view = probe_color_cube_view_prev_loc;
+        self.reflection_probe_color_cube_curr_view = probe_color_cube_view_curr_loc;
         self.reflection_probe_color_face_views = probe_color_face_views_loc;
         self.reflection_probe_emissive_texture = probe_emissive_texture_loc;
         self.reflection_probe_emissive_face_views = probe_emissive_face_views_loc;
@@ -4040,14 +4147,17 @@ impl App {
         self.reflection_probe_depth_texture = probe_depth_texture_loc;
         self.reflection_probe_depth_face_views = probe_depth_face_views_loc;
         self.reflection_probe_face_index = 0;
-        self.reflection_probe_valid = false;
+        self.reflection_probe_capture_slot = 0;
+        self.reflection_probe_crossfade_alpha = 0.0;
+        self.reflection_probe_valid = [false, false];
         // Anchor snapped to a coarse world grid for stability.
         let cam = self.camera_controller.camera.position;
-        self.reflection_probe_anchor = [
+        let snapped = [
             (cam[0] / 128.0).floor() * 128.0 + 64.0,
             (cam[1] / 128.0).floor() * 128.0 + 64.0,
             (cam[2] / 128.0).floor() * 128.0 + 64.0,
         ];
+        self.reflection_probe_anchor = [snapped, snapped];
 
         App::replace_texture_bytes_static(
             &mut self.reflection_probe_color_bytes,
@@ -4595,307 +4705,6 @@ impl App {
         });
 
         self.bind_group = Some(bind_group);
-
-        // Keep probe bind group in sync with shadow/palette/material buffers.
-        self.update_probe_bind_group();
-    }
-
-    fn update_probe_bind_group(&mut self) {
-        let (
-            Some(device),
-            Some(layout),
-            Some(probe_uniform_buffer),
-            Some(shadow_view),
-            Some(shadow_sampler),
-            Some(light_probe_buffer),
-            Some(palette_buffer),
-            Some(material_props_buffer),
-        ) = (
-            self.device.as_ref(),
-            self.main_bind_group_layout.as_ref(),
-            self.probe_uniform_buffer.as_ref(),
-            self.shadow_view.as_ref(),
-            self.shadow_sampler.as_ref(),
-            self.light_probe_buffer.as_ref(),
-            self.palette_buffer.as_ref(),
-            self.material_props_buffer.as_ref(),
-        ) else {
-            return;
-        };
-
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Probe Uniform Bind Group"),
-            layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: probe_uniform_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(shadow_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(shadow_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: light_probe_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: palette_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: material_props_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        self.probe_bind_group = Some(bind_group);
-    }
-
-    fn render_reflection_probe_face(
-        &mut self,
-        encoder: &mut wgpu::CommandEncoder,
-        queue: &wgpu::Queue,
-        base_uniforms: Uniforms,
-    ) {
-        if !self.user_config.effects.ssr.enabled {
-            return;
-        }
-
-        if self.probe_bind_group.is_none() {
-            self.update_probe_bind_group();
-        }
-
-        let (
-            Some(probe_ubo),
-            Some(probe_bg),
-            Some(skybox_pipeline),
-            Some(skybox_bg),
-            Some(mesh_pipeline),
-            Some(mega_vb),
-            Some(mega_ib),
-        ) = (
-            self.probe_uniform_buffer.as_ref(),
-            self.probe_bind_group.as_ref(),
-            self.skybox_pipeline.as_ref(),
-            self.skybox_bind_group.as_ref(),
-            self.mesh_pipeline.as_ref(),
-            self.mega_vertex_buffer.as_ref(),
-            self.mega_index_buffer.as_ref(),
-        ) else {
-            return;
-        };
-
-        if self.reflection_probe_color_face_views.len() < 6
-            || self.reflection_probe_emissive_face_views.len() < 6
-            || self.reflection_probe_normal_face_views.len() < 6
-            || self.reflection_probe_material_face_views.len() < 6
-            || self.reflection_probe_depth_face_views.len() < 6
-        {
-            return;
-        }
-
-        let face = (self.reflection_probe_face_index % 6) as usize;
-
-        // Anchor the probe to a stable world position so it does not parallax
-        // with small camera movements. Re-anchor only when the camera moves
-        // a significant distance from the probe anchor.
-        let camera_pos = Vec3::from_array(self.camera_controller.camera.position);
-        let anchor = Vec3::from_array(self.reflection_probe_anchor);
-        const PROBE_SNAP_SIZE: f32 = 128.0;
-        let desired_anchor = Vec3::new(
-            (camera_pos.x / PROBE_SNAP_SIZE).floor() * PROBE_SNAP_SIZE + PROBE_SNAP_SIZE * 0.5,
-            (camera_pos.y / PROBE_SNAP_SIZE).floor() * PROBE_SNAP_SIZE + PROBE_SNAP_SIZE * 0.5,
-            (camera_pos.z / PROBE_SNAP_SIZE).floor() * PROBE_SNAP_SIZE + PROBE_SNAP_SIZE * 0.5,
-        );
-        if (desired_anchor - anchor).length() > 0.01 {
-            self.reflection_probe_anchor = desired_anchor.to_array();
-            // Keep the previous probe valid while we refresh faces.
-            // This avoids a single-frame fallback-to-skybox "flash".
-            self.reflection_probe_face_index = 0;
-            log::debug!("Re-anchoring reflection probe to {:?}", self.reflection_probe_anchor);
-        }
-        let pos = Vec3::from_array(self.reflection_probe_anchor);
-
-        // Cubemap face orientation: match WebGPU/D3D cubemap sampling conventions.
-        // Faces are ordered: +X, -X, +Y, -Y, +Z, -Z.
-        // Note: our SSR sampling path defaults to flipping the probe sample Y.
-        // To keep the pole correct, capture +Y/-Y swapped relative to the face index.
-        let (dir, up) = match face {
-            0 => (Vec3::X, -Vec3::Y),   // +X
-            1 => (-Vec3::X, -Vec3::Y),  // -X
-            2 => (-Vec3::Y, -Vec3::Z),  // +Y (captured as -Y)
-            3 => (Vec3::Y, Vec3::Z),    // -Y (captured as +Y)
-            4 => (Vec3::Z, -Vec3::Y),   // +Z
-            _ => (-Vec3::Z, -Vec3::Y),  // -Z
-        };
-
-        // Use a 90° FOV and square aspect for cubemap faces.
-        let proj = Mat4::perspective_rh(
-            std::f32::consts::FRAC_PI_2,
-            1.0,
-            self.camera_controller.camera.near,
-            self.camera_controller.camera.far,
-        );
-        let view = Mat4::look_to_rh(pos, dir, up);
-        const OPENGL_TO_WGPU_MATRIX: Mat4 = Mat4::from_cols_array(&[
-            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5, 1.0,
-        ]);
-        let mvp = OPENGL_TO_WGPU_MATRIX * proj * view;
-
-        let mut u = base_uniforms;
-        u.mvp = mvp.to_cols_array_2d();
-        u.inverse_view = view.inverse().to_cols_array_2d();
-        u.inverse_proj = proj.inverse().to_cols_array_2d();
-        u.camera_shadow_strength[0] = pos.x;
-        u.camera_shadow_strength[1] = pos.y;
-        u.camera_shadow_strength[2] = pos.z;
-        // Probe render flag (voxel.wgsl reads uniforms._water_pad.y; in Rust this is water_elapsed_pad[1]).
-        u.water_elapsed_pad[1] = 1.0;
-
-        queue.write_buffer(probe_ubo, 0, bytemuck::cast_slice(&[u]));
-
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Reflection Probe Face Pass"),
-            color_attachments: &[
-                Some(wgpu::RenderPassColorAttachment {
-                    view: &self.reflection_probe_color_face_views[face],
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: if self.reflection_probe_debug {
-                            // Distinct per-face colors to debug cubemap orientation.
-                            let debug_colors = [
-                                wgpu::Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 }, // +X - red
-                                wgpu::Color { r: 0.0, g: 1.0, b: 0.0, a: 1.0 }, // -X - green
-                                wgpu::Color { r: 0.0, g: 0.0, b: 1.0, a: 1.0 }, // +Y - blue
-                                wgpu::Color { r: 1.0, g: 1.0, b: 0.0, a: 1.0 }, // -Y - yellow
-                                wgpu::Color { r: 1.0, g: 0.0, b: 1.0, a: 1.0 }, // +Z - magenta
-                                wgpu::Color { r: 0.0, g: 1.0, b: 1.0, a: 1.0 }, // -Z - cyan
-                            ];
-                            wgpu::LoadOp::Clear(debug_colors[face])
-                        } else {
-                            wgpu::LoadOp::Clear(wgpu::Color::BLACK)
-                        },
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                }),
-                Some(wgpu::RenderPassColorAttachment {
-                    view: &self.reflection_probe_emissive_face_views[face],
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: if self.reflection_probe_debug {
-                            // Use a distinct emissive clear color per face for debugging orientation
-                            let debug_colors = [
-                                wgpu::Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 }, // +X - red
-                                wgpu::Color { r: 0.0, g: 1.0, b: 0.0, a: 1.0 }, // -X - green
-                                wgpu::Color { r: 0.0, g: 0.0, b: 1.0, a: 1.0 }, // +Y - blue
-                                wgpu::Color { r: 1.0, g: 1.0, b: 0.0, a: 1.0 }, // -Y - yellow
-                                wgpu::Color { r: 1.0, g: 0.0, b: 1.0, a: 1.0 }, // +Z - magenta
-                                wgpu::Color { r: 0.0, g: 1.0, b: 1.0, a: 1.0 }, // -Z - cyan
-                            ];
-                            wgpu::LoadOp::Clear(debug_colors[face])
-                        } else {
-                            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
-                        },
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                }),
-                Some(wgpu::RenderPassColorAttachment {
-                    view: &self.reflection_probe_normal_face_views[face],
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                }),
-                Some(wgpu::RenderPassColorAttachment {
-                    view: &self.reflection_probe_material_face_views[face],
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                }),
-            ],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &self.reflection_probe_depth_face_views[face],
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
-                    store: wgpu::StoreOp::Store,
-                }),
-                stencil_ops: None,
-            }),
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-
-        // In debug mode we want the solid face colors to remain visible.
-        // Skip drawing skybox/meshes so the clear color isn't overwritten.
-        if self.reflection_probe_debug {
-            drop(pass);
-            self.reflection_probe_valid = true;
-            self.reflection_probe_face_index = (self.reflection_probe_face_index + 1) % 6;
-            log::debug!("Rendered probe DEBUG face {} (anchor={:?})", face, self.reflection_probe_anchor);
-            return;
-        }
-
-        // Skybox first.
-        pass.set_pipeline(skybox_pipeline);
-        pass.set_bind_group(0, probe_bg, &[]);
-        pass.set_bind_group(1, skybox_bg, &[]);
-        pass.draw(0..3, 0..1);
-
-        // Draw all cached meshes (not just main-view visible) to capture off-screen geometry.
-        pass.set_pipeline(mesh_pipeline);
-        pass.set_bind_group(0, probe_bg, &[]);
-        pass.set_vertex_buffer(0, mega_vb.slice(..));
-        pass.set_index_buffer(mega_ib.slice(..), wgpu::IndexFormat::Uint32);
-
-        for (_, entry) in self.mesh_cache.iter() {
-            let start_index = (entry.index_offset / 4) as u32;
-            let end_index = start_index + entry.index_count;
-            let base_vertex =
-                (entry.vertex_offset / std::mem::size_of::<MeshVertexRaw>() as u64) as i32;
-            pass.draw_indexed(start_index..end_index, base_vertex, 0..1);
-        }
-
-        for (_, entry) in self.envelope_mesh_cache.iter() {
-            let start_index = (entry.index_offset / 4) as u32;
-            let end_index = start_index + entry.index_count;
-            let base_vertex =
-                (entry.vertex_offset / std::mem::size_of::<MeshVertexRaw>() as u64) as i32;
-            pass.draw_indexed(start_index..end_index, base_vertex, 0..1);
-        }
-
-        // Include the active pawn mesh (boat) if present.
-        if self.boat_vertex_count > 0 {
-            if let Some(boat_buf) = self.boat_vertex_buffer.as_ref() {
-                pass.set_pipeline(mesh_pipeline);
-                pass.set_bind_group(0, probe_bg, &[]);
-                pass.set_vertex_buffer(0, boat_buf.slice(..));
-                pass.draw(0..self.boat_vertex_count, 0..1);
-            }
-        }
-
-        drop(pass);
-
-        // Mark probe valid immediately after rendering any face so SSR can use a
-        // partial probe instead of falling back to skybox and appearing to "flash".
-        self.reflection_probe_valid = true;
-        self.reflection_probe_face_index = (self.reflection_probe_face_index + 1) % 6;
-        if self.reflection_probe_debug {
-            log::debug!("Rendered probe face {} (anchor={:?})", face, self.reflection_probe_anchor);
-        }
     }
 
     fn update_dof_bind_group(&mut self) {
@@ -5519,7 +5328,8 @@ impl App {
         if self.bloom_ping_view.is_none() { log::warn!("SSR bind group: missing bloom_ping_view"); }
         if self.skybox_view.is_none() { log::warn!("SSR bind group: missing skybox_view"); }
         if self.ssr_history_view.is_none() { log::warn!("SSR bind group: missing ssr_history_view"); }
-        if self.reflection_probe_color_cube_view.is_none() { log::warn!("SSR bind group: missing reflection_probe_color_cube_view"); }
+        if self.reflection_probe_color_cube_prev_view.is_none() { log::warn!("SSR bind group: missing reflection_probe_color_cube_prev_view"); }
+        if self.reflection_probe_color_cube_curr_view.is_none() { log::warn!("SSR bind group: missing reflection_probe_color_cube_curr_view"); }
         
         let (
             Some(layout),
@@ -5536,7 +5346,13 @@ impl App {
             Some(skybox_view),
             Some(skybox_sampler),
             Some(ssr_history_view),
-            Some(reflection_probe_view),
+            Some(gi_px),
+            Some(gi_nx),
+            Some(gi_py),
+            Some(gi_ny),
+            Some(gi_pz),
+            Some(gi_nz),
+            Some(gi_color),
         ) = (
             self.ssr_bind_group_layout.as_ref(),
             self.ssr_uniform_buffer.as_ref(),
@@ -5552,7 +5368,13 @@ impl App {
             self.skybox_view.as_ref(),     // Skybox for reflections when ray misses geometry
             self.skybox_sampler.as_ref(),  // Skybox sampler with Repeat on U
             self.ssr_history_view.as_ref(), // Previous SSR output for temporal accumulation
-            self.reflection_probe_color_cube_view.as_ref(),
+            self.gi_probe_view_px.as_ref(),
+            self.gi_probe_view_nx.as_ref(),
+            self.gi_probe_view_py.as_ref(),
+            self.gi_probe_view_ny.as_ref(),
+            self.gi_probe_view_pz.as_ref(),
+            self.gi_probe_view_nz.as_ref(),
+            self.gi_probe_view_color.as_ref(),
         )
         else {
             return;
@@ -5627,10 +5449,34 @@ impl App {
                     binding: 13,
                     resource: wgpu::BindingResource::TextureView(ssr_history_view),
                 },
-                // Reflection probe cubemap fallback
+                // GI probe 3D textures (6 faces) for volumetric reflections
                 wgpu::BindGroupEntry {
                     binding: 14,
-                    resource: wgpu::BindingResource::TextureView(reflection_probe_view),
+                    resource: wgpu::BindingResource::TextureView(gi_px),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: wgpu::BindingResource::TextureView(gi_nx),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: wgpu::BindingResource::TextureView(gi_py),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 17,
+                    resource: wgpu::BindingResource::TextureView(gi_ny),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 18,
+                    resource: wgpu::BindingResource::TextureView(gi_pz),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 19,
+                    resource: wgpu::BindingResource::TextureView(gi_nz),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 20,
+                    resource: wgpu::BindingResource::TextureView(gi_color),
                 },
             ],
         });
@@ -6655,13 +6501,74 @@ impl App {
                     },
                     count: None,
                 },
-                // Reflection probe cubemap fallback
+                // Reflection probe cubemap fallback (previous)
+                // GI probe 3D textures (6 faces) for volumetric reflections
                 wgpu::BindGroupLayoutEntry {
                     binding: 14,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::Cube,
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 15,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 16,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 17,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 18,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 19,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 20,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
                         multisampled: false,
                     },
                     count: None,
@@ -6715,8 +6622,12 @@ impl App {
                 bloom_strength.to_bits(),
                 0u32, // frame_index (f32 bits)
                 0u32, // history_valid (f32 bits)
-                0u32, // probe_valid (f32 bits)
-                0u32, // probe_strength (f32 bits)
+                0u32, // gi_scale (f32 bits)
+                0u32, // pad
+                0u32, // pad
+                0u32, // pad
+                0u32, // pad
+                0u32, // pad
                 0u32, // pad
                 0u32, // pad
             ]),
@@ -8833,6 +8744,7 @@ impl App {
         let gi_tex_ny = device.create_texture(&gi_tex_desc("GI Probe -Y 3D"));
         let gi_tex_pz = device.create_texture(&gi_tex_desc("GI Probe +Z 3D"));
         let gi_tex_nz = device.create_texture(&gi_tex_desc("GI Probe -Z 3D"));
+        let gi_tex_color = device.create_texture(&gi_tex_desc("GI Color 3D"));
 
         let gi_view_px = gi_tex_px.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D3),
@@ -8858,12 +8770,16 @@ impl App {
             dimension: Some(wgpu::TextureViewDimension::D3),
             ..Default::default()
         });
+        let gi_view_color = gi_tex_color.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            ..Default::default()
+        });
 
         // Initialize volumes to zero so early frames don't sample uninitialized memory.
         let padded_bpr = App::gi_probe_padded_bytes_per_row(gi_extent.width, 8);
         let bytes_per_image = padded_bpr * gi_extent.height;
         let zero_bytes = vec![0u8; (bytes_per_image as usize) * (gi_extent.depth_or_array_layers as usize)];
-        for texture in [&gi_tex_px, &gi_tex_nx, &gi_tex_py, &gi_tex_ny, &gi_tex_pz, &gi_tex_nz] {
+        for texture in [&gi_tex_px, &gi_tex_nx, &gi_tex_py, &gi_tex_ny, &gi_tex_pz, &gi_tex_nz, &gi_tex_color] {
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture,
@@ -9378,12 +9294,14 @@ impl App {
         self.gi_probe_tex_ny = Some(gi_tex_ny);
         self.gi_probe_tex_pz = Some(gi_tex_pz);
         self.gi_probe_tex_nz = Some(gi_tex_nz);
+        self.gi_probe_tex_color = Some(gi_tex_color);
         self.gi_probe_view_px = Some(gi_view_px);
         self.gi_probe_view_nx = Some(gi_view_nx);
         self.gi_probe_view_py = Some(gi_view_py);
         self.gi_probe_view_ny = Some(gi_view_ny);
         self.gi_probe_view_pz = Some(gi_view_pz);
         self.gi_probe_view_nz = Some(gi_view_nz);
+        self.gi_probe_view_color = Some(gi_view_color);
         self.main_bind_group_layout = Some(main_bind_group_layout);
         self.shadow_bind_group_layout = Some(shadow_bind_group_layout);
         self.shadow_sampler = Some(shadow_sampler);
@@ -11650,9 +11568,6 @@ impl App {
         // Update SSR camera UBO with inverse/view/proj matrices for SSR pass
         if let Some(ssr_cam_buf) = self.ssr_camera_uniform_buffer.as_ref() {
             let view_proj = (OPENGL_TO_WGPU_MATRIX * projection * view_mat).to_cols_array_2d();
-            // Proxy extents for parallax-corrected cubemap lookup. Larger values behave more like an
-            // infinite environment map; smaller values increase local parallax.
-            let probe_half_extent: f32 = 512.0;
             let ssr_cam = SsrCameraUniforms {
                 inverse_view: inverse_view_cols,
                 inverse_proj: inverse_proj_cols,
@@ -11665,12 +11580,10 @@ impl App {
                 _pad1: [0.0, 0.0],
                 skybox_tint: self.skybox_night_tint,
                 skybox_tint_strength: self.skybox_tint_strength,
-                probe_pos_extent: [
-                    self.reflection_probe_anchor[0],
-                    self.reflection_probe_anchor[1],
-                    self.reflection_probe_anchor[2],
-                    probe_half_extent,
-                ],
+                gi_grid_origin: [self.gi_grid_origin.x, self.gi_grid_origin.y, self.gi_grid_origin.z],
+                _pad_gi1: 0,
+                gi_grid_dims: [self.gi_grid_dims.x, self.gi_grid_dims.y, self.gi_grid_dims.z],
+                _pad_gi2: 0,
             };
             queue.write_buffer(ssr_cam_buf, 0, bytemuck::bytes_of(&ssr_cam));
 
@@ -11683,12 +11596,9 @@ impl App {
             let overscan = self.user_config.rendering.render_overscan.max(0.0);
             let bloom_strength = self.bloom_settings.bloom_strength;
             let frame_index = self.frame_count as f32;
-            let history_valid: f32 = if self.ssr_history_valid { 1.0 } else { 0.0 };
-            let probe_valid: f32 = if self.reflection_probe_valid { 1.0 } else { 0.0 };
-            let probe_strength: f32 = if self.reflection_probe_valid { 1.0 } else { 0.0 };
-            let probe_only: f32 = if self.reflection_probe_probe_only { 1.0 } else { 0.0 };
-            let probe_flip_y: f32 = if self.reflection_probe_flip_y { 1.0 } else { 0.0 };
-            let params_arr: [u32; 12] = [
+            let history_valid: f32 = 1.0; 
+            let gi_scale: f32 = self.user_config.effects.gi.indirect_scale;
+            let params_arr: [u32; 16] = [
                 self.ssr_settings.max_steps,
                 self.ssr_settings.max_binary_steps,
                 self.ssr_settings.step_size.to_bits(),
@@ -11697,10 +11607,14 @@ impl App {
                 bloom_strength.to_bits(),
                 frame_index.to_bits(),
                 history_valid.to_bits(),
-                probe_valid.to_bits(),
-                probe_strength.to_bits(),
-                probe_only.to_bits(),
-                probe_flip_y.to_bits(),
+                gi_scale.to_bits(),
+                0, // _unused
+                0, // _unused
+                0, // _unused
+                0, // _unused
+                0, // _unused
+                0, // _unused
+                0, // _unused
             ];
             queue.write_buffer(ssr_params_buf, 0, bytemuck::bytes_of(&params_arr));
         }
@@ -11756,7 +11670,7 @@ impl App {
         });
 
         // Update one face of the reflection probe per frame (used as SSR fallback).
-        self.render_reflection_probe_face(&mut encoder, &queue, uniforms);
+        // self.render_reflection_probe_face(&mut encoder, &queue, uniforms);
 
         // GPU cull invocation is handled via run_gpu_culling
 

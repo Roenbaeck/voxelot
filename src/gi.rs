@@ -53,6 +53,9 @@ pub struct GiProbe {
     /// Irradiance for 6 faces: +X, -X, +Y, -Y, +Z, -Z
     /// Each is RGBA (A unused/intensity)
     pub light_data: [[f32; 4]; 6],
+    /// Average chunk color (LOD metadata) - used for coarse reflections
+    /// Alpha is occupancy (0..1)
+    pub color: [f32; 4],
 }
 
 impl Default for GiProbe {
@@ -60,6 +63,7 @@ impl Default for GiProbe {
         Self {
             position: [0.0; 4],
             light_data: [[0.0; 4]; 6],
+            color: [0.0; 4],
         }
     }
 }
@@ -374,6 +378,15 @@ impl GiSystem {
                 );
                 
                 probe.position = [center_pos.x, center_pos.y, center_pos.z, 1.0];
+
+                if let Some(chunk) = world.get_leaf_chunk_at_origin(WorldPos::new(cx as i64 * 16, cy as i64 * 16, cz as i64 * 16)) {
+                    probe.color = [
+                        chunk.average_color[0] as f32 / 255.0,
+                        chunk.average_color[1] as f32 / 255.0,
+                        chunk.average_color[2] as f32 / 255.0,
+                        chunk.average_color[3] as f32 / 255.0,
+                    ];
+                }
                 
                 let normals = [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z];
                 // Invert offsets to look "inward" from the opposite face.

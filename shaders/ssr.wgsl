@@ -1,6 +1,5 @@
-// Cubemap-only reflections pass.
-// This pass outputs a reflected color (RGB) and reflectivity in A.
-// Screen-space ray marching / temporal accumulation are intentionally disabled.
+// Volumetric Grid-Based Specular Reflections
+// Replaces anchor-based cubemaps with a stable 3D GI Radiance Grid
 
 struct CameraUniforms {
     inverse_view: mat4x4<f32>,
@@ -14,8 +13,10 @@ struct CameraUniforms {
     _pad1: vec2<f32>,
     skybox_tint: vec3<f32>,
     skybox_tint_strength: f32,
-    // xyz = probe center in world space, w = proxy half-extent for box-projected cubemap sampling
-    probe_pos_extent: vec4<f32>,
+    gi_grid_origin: vec3<i32>,
+    _pad_gi1: i32,
+    gi_grid_dims: vec3<i32>,
+    _pad_gi2: i32,
 }
 
 struct SSRParams {
@@ -27,12 +28,14 @@ struct SSRParams {
     bloom_strength: f32,
     frame_index: f32,
     history_valid: f32,
-    probe_valid: f32,
-    probe_strength: f32,
-    // Debug controls packed here:
-    //   x = probe-only debug view (1 = show probe, ignore skybox)
-    //   y = flip-Y when sampling probe (1 = invert direction.y)
-    _pad2: vec2<f32>,
+    gi_scale: f32,
+    _pad2: f32,
+    _pad3: f32,
+    _pad4: f32,
+    _pad5: f32,
+    _pad6: f32,
+    _pad7: f32,
+    _pad8: f32,
 }
 
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
@@ -49,7 +52,16 @@ struct SSRParams {
 @group(0) @binding(11) var skybox_texture: texture_2d<f32>;
 @group(0) @binding(12) var skybox_sampler: sampler;
 @group(0) @binding(13) var ssr_history: texture_2d<f32>;
-@group(0) @binding(14) var reflection_probe: texture_cube<f32>;
+// GI probe 3D volumes (Rgba16Float) with hardware trilinear filtering.
+// Faces are stored separately: +X, -X, +Y, -Y, +Z, -Z
+@group(0) @binding(14) var gi_probe_px: texture_3d<f32>;
+@group(0) @binding(15) var gi_probe_nx: texture_3d<f32>;
+@group(0) @binding(16) var gi_probe_py: texture_3d<f32>;
+@group(0) @binding(17) var gi_probe_ny: texture_3d<f32>;
+@group(0) @binding(18) var gi_probe_pz: texture_3d<f32>;
+@group(0) @binding(19) var gi_probe_nz: texture_3d<f32>;
+// Average chunk color and occupancy volume for coarse reflections
+@group(0) @binding(20) var gi_probe_color: texture_3d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -73,9 +85,9 @@ fn decode_world_normal(encoded: vec3<f32>) -> vec3<f32> {
 }
 
 fn uv_to_pixel(uv: vec2<f32>, dim: vec2<u32>) -> vec2<i32> {
-    let x = clamp(i32(uv.x * f32(dim.x)), 0, i32(dim.x) - 1);
-    let y = clamp(i32(uv.y * f32(dim.y)), 0, i32(dim.y) - 1);
-    return vec2<i32>(x, y);
+    let px = clamp(i32(uv.x * f32(dim.x)), 0, i32(dim.x) - 1);
+    let py = clamp(i32(uv.y * f32(dim.y)), 0, i32(dim.y) - 1);
+    return vec2<i32>(px, py);
 }
 
 fn load_depth_at_uv(uv: vec2<f32>) -> f32 {
@@ -91,44 +103,6 @@ fn reconstruct_world_pos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     let view_pos_3d = view_pos.xyz / view_pos.w;
     let world_pos = camera.inverse_view * vec4<f32>(view_pos_3d, 1.0);
     return world_pos.xyz;
-}
-
-fn intersect_ray_aabb(origin: vec3<f32>, dir: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> f32 {
-    // Returns the first positive intersection distance along the ray, or -1 if no hit.
-    let eps = 1e-6;
-    let safe_dir = vec3<f32>(
-        select(dir.x, eps, abs(dir.x) < eps),
-        select(dir.y, eps, abs(dir.y) < eps),
-        select(dir.z, eps, abs(dir.z) < eps),
-    );
-    let inv_dir = 1.0 / safe_dir;
-    let t0 = (bmin - origin) * inv_dir;
-    let t1 = (bmax - origin) * inv_dir;
-    let tmin3 = min(t0, t1);
-    let tmax3 = max(t0, t1);
-    let tmin = max(max(tmin3.x, tmin3.y), tmin3.z);
-    let tmax = min(min(tmax3.x, tmax3.y), tmax3.z);
-    if (tmax < max(tmin, 0.0)) {
-        return -1.0;
-    }
-    return select(tmin, tmax, tmin < 0.0);
-}
-
-fn parallax_correct_probe_dir(ray_origin: vec3<f32>, reflect_dir: vec3<f32>) -> vec3<f32> {
-    let probe_center = camera.probe_pos_extent.xyz;
-    let half_extent = camera.probe_pos_extent.w;
-    if (half_extent <= 0.0) {
-        return reflect_dir;
-    }
-    let half = vec3<f32>(half_extent);
-    let bmin = probe_center - half;
-    let bmax = probe_center + half;
-    let t = intersect_ray_aabb(ray_origin, reflect_dir, bmin, bmax);
-    if (t <= 0.0) {
-        return reflect_dir;
-    }
-    let hit_pos = ray_origin + reflect_dir * t;
-    return normalize(hit_pos - probe_center);
 }
 
 fn sample_sky_equirect(reflect_dir: vec3<f32>) -> vec3<f32> {
@@ -158,6 +132,64 @@ fn sample_sky_equirect(reflect_dir: vec3<f32>) -> vec3<f32> {
     return tinted * brightness;
 }
 
+fn sample_radiance(uvw: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
+    let w = dir * dir;
+    let color_x = select(textureSampleLevel(gi_probe_nx, linear_sampler, uvw, 0.0).rgb, textureSampleLevel(gi_probe_px, linear_sampler, uvw, 0.0).rgb, dir.x > 0.0);
+    let color_y = select(textureSampleLevel(gi_probe_ny, linear_sampler, uvw, 0.0).rgb, textureSampleLevel(gi_probe_py, linear_sampler, uvw, 0.0).rgb, dir.y > 0.0);
+    let color_z = select(textureSampleLevel(gi_probe_nz, linear_sampler, uvw, 0.0).rgb, textureSampleLevel(gi_probe_pz, linear_sampler, uvw, 0.0).rgb, dir.z > 0.0);
+    return (color_x * w.x + color_y * w.y + color_z * w.z) * params.gi_scale;
+}
+
+fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>) -> vec4<f32> {
+    let dims = vec3<f32>(camera.gi_grid_dims);
+    let grid_origin = vec3<f32>(camera.gi_grid_origin) * 16.0;
+    
+    // Coarse Volume Ray Marching
+    // We step through the GI grid looking for opaque chunks (reflected geometry)
+    var current_pos = world_pos;
+    let step_size = 16.0; // One chunk per step
+    
+    var accumulated_color = vec3<f32>(0.0);
+    var remaining_alpha = 1.0;
+    var hit_count = 0u;
+
+    for (var i = 1u; i < 16u; i++) {
+        current_pos += reflect_dir * step_size;
+        
+        let grid_coord = (current_pos - grid_origin) / 16.0;
+        let uvw = grid_coord / dims;
+        
+        if (any(grid_coord < vec3<f32>(0.0)) || any(grid_coord >= dims)) {
+            break;
+        }
+        
+        let chunk_data = textureSampleLevel(gi_probe_color, linear_sampler, uvw, 0.0);
+        let occupancy = chunk_data.a;
+        
+        if (occupancy > 0.05) {
+            let rad = sample_radiance(uvw, reflect_dir);
+            let lit_color = chunk_data.rgb * rad * 2.5; // Coarse factor for lit surface radiance
+            
+            let alpha = occupancy * remaining_alpha;
+            accumulated_color += lit_color * alpha;
+            remaining_alpha -= alpha;
+            hit_count += 1u;
+            
+            if (remaining_alpha < 0.1) {
+                remaining_alpha = 0.0;
+                break;
+            }
+        }
+    }
+    
+    if (hit_count == 0u) {
+        let distant_uvw = clamp((((world_pos + reflect_dir * 128.0) - grid_origin) / 16.0) / dims, vec3<f32>(0.0), vec3<f32>(1.0));
+        return vec4<f32>(sample_radiance(distant_uvw, reflect_dir), 0.0);
+    }
+    
+    return vec4<f32>(accumulated_color, 1.0 - remaining_alpha);
+}
+
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let depth = load_depth_at_uv(input.uv);
@@ -179,18 +211,14 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let reflect_dir = reflect(view_dir, normal);
 
     let sky_color = sample_sky_equirect(reflect_dir);
+    let gi_res = sample_gi_grid(world_pos, reflect_dir);
+    
+    let probe_color = gi_res.rgb;
+    let probe_valid = gi_res.a;
 
-    var probe_dir = parallax_correct_probe_dir(world_pos, reflect_dir);
-    if (params._pad2.y > 0.5) {
-        probe_dir.y = -probe_dir.y;
-    }
-    let probe_color = textureSample(reflection_probe, linear_sampler, probe_dir).rgb;
+    // Blend GI grid reflection with skybox
+    let out_color = mix(sky_color, probe_color, probe_valid);
 
-    if (params._pad2.x > 0.5) {
-        return vec4<f32>(probe_color, 1.0);
-    }
-
-    let probe_on = (params.probe_valid * params.probe_strength) > 0.5;
-    let out_color = select(sky_color, probe_color, probe_on);
     return vec4<f32>(out_color, reflectivity);
 }
+
