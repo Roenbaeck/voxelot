@@ -9,7 +9,6 @@
 //! - Bounded but huge worlds: 16^n units (e.g., 16^4 = 65,536³)
 
 use croaring::Bitmap;
-use rustc_hash::FxHashMap as HashMap;
 use std::cell::RefCell;
 use std::sync::Arc;
 
@@ -144,6 +143,10 @@ pub struct Chunk {
     /// Ratio of solid voxels to total slots (0.0..=1.0)
     pub solid_ratio: f32,
 
+    /// LOD metadata: The most prominent voxel type on the VISIBLE shell of this chunk.
+    /// This is used to determine the average color (mode) for better visual fidelity in reflections.
+    pub dominant_type: VoxelType,
+
     /// Shell of surface sub-chunks for this hierarchy level (None for leaf chunks)
     /// Each entry represents a sub-chunk with at least one exposed face
     /// Enables fast occlusion culling at any hierarchy level
@@ -165,6 +168,7 @@ impl Chunk {
             emissive_power: 0.0,
             emissive_voxels: 0,
             solid_ratio: 0.0,
+            dominant_type: 0,
             bounding_box: None,
             hierarchy_shell: None,
         }
@@ -216,6 +220,19 @@ impl Chunk {
 
         // rank-1 gives us the index in the voxels array
         self.voxels.get(rank - 1)
+    }
+
+    /// Get mutable reference to the voxel at (x, y, z)
+    pub fn get_mut(&mut self, x: u8, y: u8, z: u8) -> Option<&mut Voxel> {
+        if !self.contains(x, y, z) {
+            return None;
+        }
+
+        let idx = Self::flat_index(x, y, z);
+        let rank = self.presence.rank(idx) as usize;
+
+        // rank-1 gives us the index in the voxels array
+        self.voxels.get_mut(rank - 1)
     }
 
     /// Get the voxel type at (x, y, z) if it's a Solid voxel
@@ -320,58 +337,154 @@ impl Chunk {
 
     /// Update LOD metadata using palette material properties for this chunk.
     /// Should be called after modifying chunk contents.
+    /// Update LOD metadata using palette material properties for this chunk.
+    /// Should be called after modifying chunk contents.
+    /// Update LOD metadata using palette material properties for this chunk.
+    /// Should be called after modifying chunk contents.
     pub fn update_lod_metadata(&mut self, palette: &Palette) {
+        self.update_lod_metadata_with_mask(palette, 0) // Default: consider all shell voxels
+    }
+
+    /// Update LOD metadata with a specific visibility mask (bits 0-5 for +X, -X, +Y, -Y, +Z, -Z).
+    /// If mask is 0, falls back to the internal "any surface" shell heuristic.
+    /// Uses the MODE (most common type) for color to better represent prominent facades.
+    pub fn update_lod_metadata_with_mask(&mut self, palette: &Palette, mask: u8) {
         const TOTAL_SLOTS: f32 = (16 * 16 * 16) as f32; // 4096
 
-        // We'll compute both a sum for legacy average and a dominant-type count.
-        // Dominant type is preferable for per-chunk preview colors when mixed.
-        let mut albedo_sum = [0.0f32; 4];
-        let mut counts: HashMap<u32, u32> = HashMap::default();
         let mut emissive_sum = [0.0f32; 3];
         let mut emissive_power = 0.0f32;
         let mut emissive_voxels = 0u32;
         let mut solid_count = 0u32;
 
-        // Use palette color cache directly to avoid allocating `Material` per voxel.
-        let color_cache = palette.colors();
+        // Histogram for dominant type calculation (256 types)
+        let mut type_counts = [0u32; 256];
+
+        // 1. Accumulate totals for voxel_count and emissive stats across ALL voxels
         for voxel in &self.voxels {
-            if let Voxel::Solid(voxel_type) = voxel {
-                let idx = *voxel_type as usize;
-                let material_color = if idx < color_cache.len() {
-                    color_cache[idx]
-                } else {
-                    [1.0, 1.0, 1.0, 1.0]
-                };
-                albedo_sum[0] += material_color[0];
-                albedo_sum[1] += material_color[1];
-                albedo_sum[2] += material_color[2];
-                albedo_sum[3] += material_color[3];
-
-                *counts.entry(*voxel_type as u32).or_insert(0) += 1;
-                solid_count += 1;
-
-                let (emissive_color, emissive_strength) = palette.emissive(*voxel_type as u32);
-                if emissive_strength > 0.0 {
-                    emissive_sum[0] += emissive_color[0] * emissive_strength;
-                    emissive_sum[1] += emissive_color[1] * emissive_strength;
-                    emissive_sum[2] += emissive_color[2] * emissive_strength;
-                    emissive_power += emissive_strength;
-                    emissive_voxels += 1;
+            match voxel {
+                Voxel::Solid(voxel_type) => {
+                    solid_count += 1;
+                    let (em_color, em_strength) = palette.emissive(*voxel_type as u32);
+                    if em_strength > 0.0 {
+                        emissive_sum[0] += em_color[0] * em_strength;
+                        emissive_sum[1] += em_color[1] * em_strength;
+                        emissive_sum[2] += em_color[2] * em_strength;
+                        emissive_power += em_strength;
+                        emissive_voxels += 1;
+                    }
                 }
-            } else if let Voxel::Chunk(sub_chunk) = voxel {
-                solid_count = solid_count.saturating_add(sub_chunk.voxel_count);
-
-                // Also accumulate emissive stats from sub-chunks?
-                // The current implementation seems to ignore sub-chunk emissives for the parent summary.
-                // This might be another bug, but let's focus on the geometry visibility first.
-                // For now, just fixing voxel_count is enough to fix the "E-shape" holes.
+                Voxel::Chunk(sub_chunk) => {
+                    solid_count = solid_count.saturating_add(sub_chunk.voxel_count);
+                    // Propagate recursive emissive stats
+                    emissive_sum[0] += sub_chunk.emissive_sum[0];
+                    emissive_sum[1] += sub_chunk.emissive_sum[1];
+                    emissive_sum[2] += sub_chunk.emissive_sum[2];
+                    emissive_power += sub_chunk.emissive_power;
+                    emissive_voxels += sub_chunk.emissive_voxels;
+                }
             }
         }
 
         self.voxel_count = solid_count;
         self.solid_ratio = solid_count as f32 / TOTAL_SLOTS;
 
-        // Compute a per-chunk bounding box across all solid voxels (leaf or otherwise).
+        // 2. Compute dominant type based on the visual shell only.
+        let use_any_shell = mask == 0;
+
+        for ((x, y, z), voxel) in self.iter() {
+            let mut is_visible = false;
+
+            if use_any_shell {
+                is_visible = x == 0
+                    || x == 15
+                    || y == 0
+                    || y == 15
+                    || z == 0
+                    || z == 15
+                    || !self.contains(x + 1, y, z)
+                    || !self.contains(x - 1, y, z)
+                    || !self.contains(x, y + 1, z)
+                    || !self.contains(x, y - 1, z)
+                    || !self.contains(x, y, z + 1)
+                    || !self.contains(x, y, z - 1);
+            } else {
+                if (mask & (1 << 0)) != 0 && x == 15 {
+                    is_visible = true;
+                }
+                if (mask & (1 << 1)) != 0 && x == 0 {
+                    is_visible = true;
+                }
+                if (mask & (1 << 2)) != 0 && y == 15 {
+                    is_visible = true;
+                }
+                if (mask & (1 << 3)) != 0 && y == 0 {
+                    is_visible = true;
+                }
+                if (mask & (1 << 4)) != 0 && z == 15 {
+                    is_visible = true;
+                }
+                if (mask & (1 << 5)) != 0 && z == 0 {
+                    is_visible = true;
+                }
+            }
+
+            if is_visible {
+                match voxel {
+                    Voxel::Solid(t) => {
+                        type_counts[*t as usize] += 1;
+                    }
+                    Voxel::Chunk(c) => {
+                        type_counts[c.dominant_type as usize] += 1;
+                    }
+                }
+            }
+        }
+
+        // Find the most frequent type (mode)
+        let mut best_type = 0u8;
+        let mut max_count = 0u32;
+        // Skip type 0 if possible, unless it's the only one (actually Solid(0) shouldn't be empty, but usually 0 is air or similar)
+        // In our case Voxel::Solid(0) is a valid material.
+        for t in 0..256 {
+            if type_counts[t] > max_count {
+                max_count = type_counts[t];
+                best_type = t as u8;
+            }
+        }
+
+        self.dominant_type = best_type;
+
+        if max_count > 0 {
+            // Set average color to the dominant type's color
+            // Use alpha for occupancy
+            let color = palette.color_u8(best_type as u32);
+            self.average_color = [
+                color[0],
+                color[1],
+                color[2],
+                (self.solid_ratio * 255.0).clamp(0.0, 255.0) as u8,
+            ];
+        } else if solid_count > 0 {
+            // Fallback for solid chunks that somehow weren't caught by the shell
+            let voxel_type = if let Voxel::Solid(t) = self.voxels[0] {
+                t
+            } else {
+                0
+            };
+            self.dominant_type = voxel_type;
+            let color = palette.color_u8(voxel_type as u32);
+            self.average_color = [
+                color[0],
+                color[1],
+                color[2],
+                (self.solid_ratio * 255.0) as u8,
+            ];
+        } else {
+            self.average_color = [0, 0, 0, 0];
+            self.dominant_type = 0;
+        }
+
+        // 3. Compute per-chunk bounding box (covers all solid content)
         let mut xmin: u8 = 16;
         let mut ymin: u8 = 16;
         let mut zmin: u8 = 16;
@@ -380,7 +493,6 @@ impl Chunk {
         let mut zmax: u8 = 0;
         let mut bbox_found = false;
 
-        // Iterate again to build min/max if we see any solid voxel or non-empty chunk
         for ((x, y, z), voxel) in self.iter() {
             let is_occupied = match voxel {
                 Voxel::Solid(_) => true,
@@ -389,24 +501,12 @@ impl Chunk {
 
             if is_occupied {
                 bbox_found = true;
-                if x < xmin {
-                    xmin = x;
-                }
-                if y < ymin {
-                    ymin = y;
-                }
-                if z < zmin {
-                    zmin = z;
-                }
-                if x > xmax {
-                    xmax = x;
-                }
-                if y > ymax {
-                    ymax = y;
-                }
-                if z > zmax {
-                    zmax = z;
-                }
+                xmin = xmin.min(x);
+                ymin = ymin.min(y);
+                zmin = zmin.min(z);
+                xmax = xmax.max(x);
+                ymax = ymax.max(y);
+                zmax = zmax.max(z);
             }
         }
 
@@ -414,26 +514,6 @@ impl Chunk {
             self.bounding_box = Some([xmin, ymin, zmin, xmax, ymax, zmax]);
         } else {
             self.bounding_box = None;
-        }
-
-        if solid_count > 0 {
-            // Use dominant voxel type for the average color preview. Alpha will be fully opaque.
-            if let Some((dominant_type, _)) = counts.into_iter().max_by_key(|&(_t, c)| c) {
-                let color = palette.color_u8(dominant_type);
-                self.average_color = [color[0], color[1], color[2], 255u8];
-            } else {
-                // fallback to occupancy-weighted average
-                let occupancy_scale = 255.0 / TOTAL_SLOTS;
-                self.average_color = [
-                    (albedo_sum[0] * occupancy_scale).clamp(0.0, 255.0) as u8,
-                    (albedo_sum[1] * occupancy_scale).clamp(0.0, 255.0) as u8,
-                    (albedo_sum[2] * occupancy_scale).clamp(0.0, 255.0) as u8,
-                    (albedo_sum[3] * occupancy_scale).clamp(0.0, 255.0) as u8,
-                ];
-            }
-            // keep average_color set to dominant or occupancy-based value
-        } else {
-            self.average_color = [0, 0, 0, 0];
         }
 
         self.emissive_sum = emissive_sum;
@@ -604,15 +684,30 @@ impl Chunk {
                 Voxel::Solid(_) => {
                     // Solid voxels: check if neighbors exist
                     let mut mask = 0u8;
-                    if x == 15 || self.get(x + 1, y, z).is_none() { mask |= 1 << 0; }
-                    if x == 0  || self.get(x - 1, y, z).is_none() { mask |= 1 << 1; }
-                    if y == 15 || self.get(x, y + 1, z).is_none() { mask |= 1 << 2; }
-                    if y == 0  || self.get(x, y - 1, z).is_none() { mask |= 1 << 3; }
-                    if z == 15 || self.get(x, y, z + 1).is_none() { mask |= 1 << 4; }
-                    if z == 0  || self.get(x, y, z - 1).is_none() { mask |= 1 << 5; }
+                    if x == 15 || self.get(x + 1, y, z).is_none() {
+                        mask |= 1 << 0;
+                    }
+                    if x == 0 || self.get(x - 1, y, z).is_none() {
+                        mask |= 1 << 1;
+                    }
+                    if y == 15 || self.get(x, y + 1, z).is_none() {
+                        mask |= 1 << 2;
+                    }
+                    if y == 0 || self.get(x, y - 1, z).is_none() {
+                        mask |= 1 << 3;
+                    }
+                    if z == 15 || self.get(x, y, z + 1).is_none() {
+                        mask |= 1 << 4;
+                    }
+                    if z == 0 || self.get(x, y, z - 1).is_none() {
+                        mask |= 1 << 5;
+                    }
                     if mask != 0 {
                         let packed = (x as u16) | ((y as u16) << 4) | ((z as u16) << 8);
-                        shell.push(ShellVoxel { packed_pos: packed, visible_faces: mask });
+                        shell.push(ShellVoxel {
+                            packed_pos: packed,
+                            visible_faces: mask,
+                        });
                     }
                     continue;
                 }
@@ -645,9 +740,12 @@ impl Chunk {
 
             // Compute visibility mask with neighbor overlap
             let mask = child.compute_visibility_mask_with_neighbors(
-                neighbor_px, neighbor_nx,
-                neighbor_py, neighbor_ny,
-                neighbor_pz, neighbor_nz,
+                neighbor_px,
+                neighbor_nx,
+                neighbor_py,
+                neighbor_ny,
+                neighbor_pz,
+                neighbor_nz,
             );
 
             if mask != 0 {
@@ -681,12 +779,13 @@ impl Chunk {
 
         // Helper: check if neighbor blocks a face at given local position
         // For +X face at (15, y, z), check neighbor_px at (0, y, z)
-        let is_blocked_by_neighbor = |neighbor: Option<&Arc<Chunk>>, lx: u8, ly: u8, lz: u8| -> bool {
-            match neighbor {
-                Some(n) => n.contains(lx, ly, lz),
-                None => false, // No neighbor = exposed to air
-            }
-        };
+        let is_blocked_by_neighbor =
+            |neighbor: Option<&Arc<Chunk>>, lx: u8, ly: u8, lz: u8| -> bool {
+                match neighbor {
+                    Some(n) => n.contains(lx, ly, lz),
+                    None => false, // No neighbor = exposed to air
+                }
+            };
 
         // For leaf chunks, scan voxels
         if self.is_leaf_chunk() {
@@ -698,7 +797,8 @@ impl Chunk {
                 // +X: voxel has +X exposed if no neighbor at x+1
                 if (mask & (1 << 0)) == 0 {
                     let has_internal_neighbor = x < 15 && self.contains(x + 1, y, z);
-                    let blocked_by_external = x == 15 && is_blocked_by_neighbor(neighbor_px, 0, y, z);
+                    let blocked_by_external =
+                        x == 15 && is_blocked_by_neighbor(neighbor_px, 0, y, z);
                     if !has_internal_neighbor && !blocked_by_external {
                         mask |= 1 << 0;
                     }
@@ -706,7 +806,8 @@ impl Chunk {
                 // -X
                 if (mask & (1 << 1)) == 0 {
                     let has_internal_neighbor = x > 0 && self.contains(x - 1, y, z);
-                    let blocked_by_external = x == 0 && is_blocked_by_neighbor(neighbor_nx, 15, y, z);
+                    let blocked_by_external =
+                        x == 0 && is_blocked_by_neighbor(neighbor_nx, 15, y, z);
                     if !has_internal_neighbor && !blocked_by_external {
                         mask |= 1 << 1;
                     }
@@ -714,7 +815,8 @@ impl Chunk {
                 // +Y
                 if (mask & (1 << 2)) == 0 {
                     let has_internal_neighbor = y < 15 && self.contains(x, y + 1, z);
-                    let blocked_by_external = y == 15 && is_blocked_by_neighbor(neighbor_py, x, 0, z);
+                    let blocked_by_external =
+                        y == 15 && is_blocked_by_neighbor(neighbor_py, x, 0, z);
                     if !has_internal_neighbor && !blocked_by_external {
                         mask |= 1 << 2;
                     }
@@ -722,7 +824,8 @@ impl Chunk {
                 // -Y
                 if (mask & (1 << 3)) == 0 {
                     let has_internal_neighbor = y > 0 && self.contains(x, y - 1, z);
-                    let blocked_by_external = y == 0 && is_blocked_by_neighbor(neighbor_ny, x, 15, z);
+                    let blocked_by_external =
+                        y == 0 && is_blocked_by_neighbor(neighbor_ny, x, 15, z);
                     if !has_internal_neighbor && !blocked_by_external {
                         mask |= 1 << 3;
                     }
@@ -730,7 +833,8 @@ impl Chunk {
                 // +Z
                 if (mask & (1 << 4)) == 0 {
                     let has_internal_neighbor = z < 15 && self.contains(x, y, z + 1);
-                    let blocked_by_external = z == 15 && is_blocked_by_neighbor(neighbor_pz, x, y, 0);
+                    let blocked_by_external =
+                        z == 15 && is_blocked_by_neighbor(neighbor_pz, x, y, 0);
                     if !has_internal_neighbor && !blocked_by_external {
                         mask |= 1 << 4;
                     }
@@ -738,7 +842,8 @@ impl Chunk {
                 // -Z
                 if (mask & (1 << 5)) == 0 {
                     let has_internal_neighbor = z > 0 && self.contains(x, y, z - 1);
-                    let blocked_by_external = z == 0 && is_blocked_by_neighbor(neighbor_nz, x, y, 15);
+                    let blocked_by_external =
+                        z == 0 && is_blocked_by_neighbor(neighbor_nz, x, y, 15);
                     if !has_internal_neighbor && !blocked_by_external {
                         mask |= 1 << 5;
                     }
@@ -766,7 +871,7 @@ impl Chunk {
     /// Compute a visibility mask for this chunk using a greedy algorithm.
     /// For each of the 6 directions, we only need to find ONE voxel with that face exposed.
     /// This is much faster than computing the full shell for large chunks.
-    /// 
+    ///
     /// Returns a bitmask where each bit indicates if that face direction has any visible geometry:
     /// bit 0: +X, bit 1: -X, bit 2: +Y, bit 3: -Y, bit 4: +Z, bit 5: -Z
     pub fn compute_visibility_mask(&self) -> u8 {
@@ -775,22 +880,22 @@ impl Chunk {
         }
 
         let mut mask = 0u8;
-        
+
         if self.is_leaf_chunk() {
             // For leaf chunks, scan face voxels until we find one exposed
             // We iterate through the presence bitmap which is sparse
-            
+
             for ((x, y, z), voxel) in self.iter() {
                 if !matches!(voxel, Voxel::Solid(_)) {
                     continue;
                 }
-                
+
                 // Check each direction we haven't found yet
                 // +X: voxel at x=15 or with no +X neighbor
                 if (mask & (1 << 0)) == 0 && (x == 15 || !self.contains(x + 1, y, z)) {
                     mask |= 1 << 0;
                 }
-                // -X: voxel at x=0 or with no -X neighbor  
+                // -X: voxel at x=0 or with no -X neighbor
                 if (mask & (1 << 1)) == 0 && (x == 0 || !self.contains(x - 1, y, z)) {
                     mask |= 1 << 1;
                 }
@@ -810,7 +915,7 @@ impl Chunk {
                 if (mask & (1 << 5)) == 0 && (z == 0 || !self.contains(x, y, z - 1)) {
                     mask |= 1 << 5;
                 }
-                
+
                 // Early exit if all 6 faces found
                 if mask == 0b111111 {
                     break;
@@ -828,7 +933,7 @@ impl Chunk {
                 }
             }
         }
-        
+
         mask
     }
 
@@ -1216,7 +1321,7 @@ impl World {
 
         for idx in intersection.iter() {
             let (x, y, z) = Chunk::unflatten(idx);
-            
+
             // Get the sub-chunk at this position
             let rank = chunk.presence.rank(idx) as usize;
             if let Some(Voxel::Chunk(sub_chunk)) = chunk.voxels.get(rank - 1) {
@@ -1228,7 +1333,14 @@ impl World {
                 );
 
                 // Recursively check this sub-chunk
-                if !self.line_of_sight_recursive(sub_chunk, start, end, sub_origin, depth - 1, bitmap) {
+                if !self.line_of_sight_recursive(
+                    sub_chunk,
+                    start,
+                    end,
+                    sub_origin,
+                    depth - 1,
+                    bitmap,
+                ) {
                     return false; // Found obstruction
                 }
             } else {
@@ -1257,7 +1369,7 @@ impl World {
             ((start.y - chunk_origin.y) as f64 / voxel_size as f64),
             ((start.z - chunk_origin.z) as f64 / voxel_size as f64),
         ];
-        
+
         let end_local = [
             ((end.x - chunk_origin.x) as f64 / voxel_size as f64),
             ((end.y - chunk_origin.y) as f64 / voxel_size as f64),
@@ -1287,9 +1399,21 @@ impl World {
         let dir = [delta[0] / length, delta[1] / length, delta[2] / length];
 
         // Step sizes for each axis
-        let step_x = if dir[0].abs() > 0.0001 { 1.0 / dir[0].abs() } else { f64::MAX };
-        let step_y = if dir[1].abs() > 0.0001 { 1.0 / dir[1].abs() } else { f64::MAX };
-        let step_z = if dir[2].abs() > 0.0001 { 1.0 / dir[2].abs() } else { f64::MAX };
+        let step_x = if dir[0].abs() > 0.0001 {
+            1.0 / dir[0].abs()
+        } else {
+            f64::MAX
+        };
+        let step_y = if dir[1].abs() > 0.0001 {
+            1.0 / dir[1].abs()
+        } else {
+            f64::MAX
+        };
+        let step_z = if dir[2].abs() > 0.0001 {
+            1.0 / dir[2].abs()
+        } else {
+            f64::MAX
+        };
 
         // Current voxel
         let mut vx = start_local[0].floor() as i32;
@@ -1500,18 +1624,28 @@ impl World {
 
     /// Recursive helper to generate hierarchy shells bottom-up
     /// Returns (total_shells, total_entries, masks_by_depth)
-    fn generate_hierarchy_shells_recursive(chunk: &mut Chunk, depth: usize) -> (usize, usize, Vec<u32>) {
+    fn generate_hierarchy_shells_recursive(
+        chunk: &mut Chunk,
+        depth: usize,
+    ) -> (usize, usize, Vec<u32>) {
         use rayon::prelude::*;
 
         // First, recursively generate shells for all sub-chunks
-        let child_stats: Vec<_> = chunk.voxels.par_iter_mut().filter_map(|voxel| {
-            if let Voxel::Chunk(sub_chunk_arc) = voxel {
-                let sub_chunk = Arc::make_mut(sub_chunk_arc);
-                Some(Self::generate_hierarchy_shells_recursive(sub_chunk, depth + 1))
-            } else {
-                None
-            }
-        }).collect();
+        let child_stats: Vec<_> = chunk
+            .voxels
+            .par_iter_mut()
+            .filter_map(|voxel| {
+                if let Voxel::Chunk(sub_chunk_arc) = voxel {
+                    let sub_chunk = Arc::make_mut(sub_chunk_arc);
+                    Some(Self::generate_hierarchy_shells_recursive(
+                        sub_chunk,
+                        depth + 1,
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         // Aggregate child stats
         let mut total_shells = 0usize;
@@ -1529,7 +1663,7 @@ impl World {
 
         // Then generate shell for this chunk
         chunk.generate_hierarchy_shell();
-        
+
         if let Some(ref shell) = chunk.hierarchy_shell {
             total_shells += 1;
             total_entries += shell.len();
@@ -1539,6 +1673,37 @@ impl World {
         }
 
         (total_shells, total_entries, mask_counts)
+    }
+
+    /// Second pass of LOD updates: Propagate visibility masks top-down to refine average colors.
+    /// This ensures chunks on building facades don't have their average color diluted by buried faces.
+    pub fn update_all_visual_lod_metadata(&mut self, palette: &Palette) {
+        let root_mut = Arc::make_mut(&mut self.root);
+        // Root is visible from all sides in the world view
+        Self::update_visual_lod_recursive(root_mut, palette, 0b111111);
+    }
+
+    fn update_visual_lod_recursive(chunk: &mut Chunk, palette: &Palette, mask: u8) {
+        // Update this chunk with the mask from its parent
+        chunk.update_lod_metadata_with_mask(palette, mask);
+
+        // If it's a branch, propagate masks to children in the shell
+        let shell_entries = chunk.hierarchy_shell.clone();
+
+        if let Some(entries) = shell_entries {
+            for entry in entries {
+                let x = (entry.packed_pos & 0xF) as u8;
+                let y = ((entry.packed_pos >> 4) & 0xF) as u8;
+                let z = ((entry.packed_pos >> 8) & 0xF) as u8;
+
+                if let Some(voxel) = chunk.get_mut(x, y, z) {
+                    if let Voxel::Chunk(ref mut child_arc) = voxel {
+                        let child = Arc::make_mut(child_arc);
+                        Self::update_visual_lod_recursive(child, palette, entry.visible_faces);
+                    }
+                }
+            }
+        }
     }
 }
 

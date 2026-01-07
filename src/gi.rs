@@ -1,11 +1,11 @@
 use crate::lib_hierarchical::{World, WorldPos};
 use crate::palette::Palette;
 use bytemuck::{Pod, Zeroable};
+use crossbeam_channel::{Receiver, Sender};
 use glam::{IVec3, Vec3};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use crossbeam_channel::{Sender, Receiver};
 
 /// Request to update GI probes
 pub struct GiUpdateRequest {
@@ -56,6 +56,9 @@ pub struct GiProbe {
     /// Average chunk color (LOD metadata) - used for coarse reflections
     /// Alpha is occupancy (0..1)
     pub color: [f32; 4],
+    /// Axis-aligned bounding box (xmin, ymin, zmin, xmax, ymax, zmax) in 0..15 coordinates.
+    /// Used for coarse reflections. The last two elements are padding/metadata.
+    pub bounding_box: [u8; 8],
 }
 
 impl Default for GiProbe {
@@ -64,6 +67,7 @@ impl Default for GiProbe {
             position: [0.0; 4],
             light_data: [[0.0; 4]; 6],
             color: [0.0; 4],
+            bounding_box: [0u8; 8],
         }
     }
 }
@@ -160,18 +164,21 @@ impl GiSystem {
         // 2. Identify missing probes from the VISIBLE chunks (frustum culled)
         // Check for missing probes whenever grid moves OR when we have new visible chunks
         let grid_moved = new_origin != self.last_grid_origin;
-        
+
         if grid_moved {
             self.missing_probes.clear();
         }
-        
+
         // Always check visible chunks for missing probes (handles rotation case)
         for &chunk_coord in visible_chunks {
             // Check if chunk is within our grid bounds
             let relative = chunk_coord - new_origin;
-            if relative.x >= 0 && relative.x < self.grid_dims.x
-                && relative.y >= 0 && relative.y < self.grid_dims.y
-                && relative.z >= 0 && relative.z < self.grid_dims.z
+            if relative.x >= 0
+                && relative.x < self.grid_dims.x
+                && relative.y >= 0
+                && relative.y < self.grid_dims.y
+                && relative.z >= 0
+                && relative.z < self.grid_dims.z
             {
                 if !self.probe_cache.contains_key(&chunk_coord) {
                     // Only add if not already in the list
@@ -181,7 +188,7 @@ impl GiSystem {
                 }
             }
         }
-        
+
         if grid_moved {
             // Sort missing probes by distance to camera (prioritize nearest)
             // This matches the mesh worker priority system
@@ -191,30 +198,32 @@ impl GiSystem {
                 let db = (*b - cam_chunk).as_vec3().length_squared();
                 da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
             });
-            
+
             self.last_grid_origin = new_origin;
         }
 
         // If no probes are missing, we just need to update the flat buffer and return.
         // However, we should also check if we need to load lights for new areas.
         // For simplicity, we drive light loading by probe requirements.
-        
+
         let mut probes_calculated = 0;
         let mut updates: Vec<GiProbeUpdate> = Vec::new();
         if !self.missing_probes.is_empty() {
             // Throttle: only process up to 64 probes per update to prevent frame drops
             // Since GI runs async on background thread, this won't impact frame rate
-            let probes_to_process: Vec<IVec3> = self.missing_probes.iter().take(64).cloned().collect();
+            let probes_to_process: Vec<IVec3> =
+                self.missing_probes.iter().take(64).cloned().collect();
             probes_calculated = probes_to_process.len();
-            
+
             // Remove processed probes from missing list
-            self.missing_probes.drain(0..probes_to_process.len().min(self.missing_probes.len()));
-            
+            self.missing_probes
+                .drain(0..probes_to_process.len().min(self.missing_probes.len()));
+
             // 3. Identify required light chunks for the missing probes
             // We need lights from neighbors. Let's say radius is 4 chunks.
             let light_radius = 4;
             let mut required_light_chunks = HashSet::new();
-            
+
             for probe_coord in &probes_to_process {
                 for z in -light_radius..=light_radius {
                     for y in -light_radius..=light_radius {
@@ -314,33 +323,33 @@ impl GiSystem {
             // B) Use a thread-safe map (e.g. DashMap) - but I can't add dependencies easily.
             // C) Just collect the lights needed for the *batch* of missing probes?
             // D) Since we are in a mutable method, we can't share `self` immutably with par_iter.
-            
+
             // Let's go with A for now, but optimized:
             // We can flatten the relevant lights into a spatial structure or just pass the map if we use a standard iterator?
             // No, standard iterator is single threaded.
             // We want parallel.
-            
+
             // Workaround: Extract the relevant subset of light_cache into a `Arc<HashMap>` or similar?
             // Or just collect all lights in the active area into a flat Vec?
             // If the active area is small, a flat Vec of all lights might be faster than hash lookups anyway.
-            
+
             // Let's collect ALL lights in the grid+radius area into a flat list for the calculation.
             // This is O(TotalLights), but TotalLights in the active area might be manageable.
             // If we have 10k lights, it's fine.
-            
+
             // Optimization: Spatial hashing is better.
             // Let's just use the `light_cache` but we need to access it from threads.
             // We can wrap `light_cache` in a RwLock or just clone the keys/values we need?
             // Cloning `Vec<(Vec3, Vec3)>` is cheap if they are small.
-            
+
             // Let's try this:
             // 1. Collect all `(IVec3, Vec<(Vec3, Vec3)>)` pairs that are relevant for the missing probes.
             //    Actually, we can just collect *all* lights in the extended grid area.
             //    It's a bit wasteful but safe.
-            
+
             // Better: Just iterate missing probes, and for each, gather lights from `light_cache` (single threaded)
             // THEN compute the expensive raycasts in parallel.
-            
+
             // Step 5a: Build flat light list once for all probes (optimization)
             // Instead of doing 729 HashMap lookups per probe, collect all lights in radius once
             let mut all_lights = Vec::new();
@@ -359,100 +368,122 @@ impl GiSystem {
                     }
                 }
             }
-            
+
             // Step 5b: Prepare jobs with shared light list
             let jobs: Vec<IVec3> = probes_to_process;
 
             // Step 5c: Execute jobs in parallel with shared light list
-            let new_probes: Vec<(IVec3, GiProbe)> = jobs.into_par_iter().map(|probe_coord| {
-                let mut probe = GiProbe::default();
-                
-                let cx = probe_coord.x;
-                let cy = probe_coord.y;
-                let cz = probe_coord.z;
+            let new_probes: Vec<(IVec3, GiProbe)> = jobs
+                .into_par_iter()
+                .map(|probe_coord| {
+                    let mut probe = GiProbe::default();
 
-                let center_pos = Vec3::new(
-                    (cx as f32 * 16.0) + 8.0,
-                    (cy as f32 * 16.0) + 8.0,
-                    (cz as f32 * 16.0) + 8.0,
-                );
-                
-                probe.position = [center_pos.x, center_pos.y, center_pos.z, 1.0];
+                    let cx = probe_coord.x;
+                    let cy = probe_coord.y;
+                    let cz = probe_coord.z;
 
-                if let Some(chunk) = world.get_leaf_chunk_at_origin(WorldPos::new(cx as i64 * 16, cy as i64 * 16, cz as i64 * 16)) {
-                    probe.color = [
-                        chunk.average_color[0] as f32 / 255.0,
-                        chunk.average_color[1] as f32 / 255.0,
-                        chunk.average_color[2] as f32 / 255.0,
-                        chunk.average_color[3] as f32 / 255.0,
-                    ];
-                }
-                
-                let normals = [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z];
-                // Invert offsets to look "inward" from the opposite face.
-                // This ensures that for the +X bin (surfaces facing +X), we sample at the -X boundary (where those surfaces are),
-                // and look towards +X (seeing internal lights and far neighbors).
-                let face_offsets = [
-                    Vec3::new(-7.0, 0.0, 0.0), // For +X bin, sample at -X
-                    Vec3::new(7.0, 0.0, 0.0),  // For -X bin, sample at +X
-                    Vec3::new(0.0, -7.0, 0.0), // For +Y bin, sample at -Y
-                    Vec3::new(0.0, 7.0, 0.0),  // For -Y bin, sample at +Y
-                    Vec3::new(0.0, 0.0, -7.0), // For +Z bin, sample at -Z
-                    Vec3::new(0.0, 0.0, 7.0),  // For -Z bin, sample at +Z
-                ];
-
-                for f in 0..6 {
-                    let face_normal = normals[f];
-                    let face_center = center_pos + face_offsets[f];
-                    
-                    // Check if face center is buried
-                    let face_wp = WorldPos::new(
-                        face_center.x.floor() as i64,
-                        face_center.y.floor() as i64,
-                        face_center.z.floor() as i64
+                    let center_pos = Vec3::new(
+                        (cx as f32 * 16.0) + 8.0,
+                        (cy as f32 * 16.0) + 8.0,
+                        (cz as f32 * 16.0) + 8.0,
                     );
-                    // Note: We need `world` access here. `world` is &World, which is Sync.
-                    if world.get(face_wp).is_some() {
-                        continue;
+
+                    probe.position = [center_pos.x, center_pos.y, center_pos.z, 1.0];
+
+                    if let Some(chunk) = world.get_leaf_chunk_at_origin(WorldPos::new(
+                        cx as i64 * 16,
+                        cy as i64 * 16,
+                        cz as i64 * 16,
+                    )) {
+                        probe.color = [
+                            chunk.average_color[0] as f32 / 255.0,
+                            chunk.average_color[1] as f32 / 255.0,
+                            chunk.average_color[2] as f32 / 255.0,
+                            chunk.average_color[3] as f32 / 255.0,
+                        ];
+                        if let Some(bbox) = chunk.bounding_box {
+                            probe.bounding_box[0] = bbox[0];
+                            probe.bounding_box[1] = bbox[1];
+                            probe.bounding_box[2] = bbox[2];
+                            probe.bounding_box[3] = bbox[3];
+                            probe.bounding_box[4] = bbox[4];
+                            probe.bounding_box[5] = bbox[5];
+                            probe.bounding_box[6] = 1; // Valid flag
+                        } else {
+                            probe.bounding_box[6] = 0; // Invalid
+                        }
                     }
 
-                    for (light_pos, light_energy) in &all_lights {
-                        let delta = *light_pos - face_center;
-                        if delta.dot(face_normal) <= 0.0 { continue; }
+                    let normals = [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z];
+                    // Invert offsets to look "inward" from the opposite face.
+                    // This ensures that for the +X bin (surfaces facing +X), we sample at the -X boundary (where those surfaces are),
+                    // and look towards +X (seeing internal lights and far neighbors).
+                    let face_offsets = [
+                        Vec3::new(-7.0, 0.0, 0.0), // For +X bin, sample at -X
+                        Vec3::new(7.0, 0.0, 0.0),  // For -X bin, sample at +X
+                        Vec3::new(0.0, -7.0, 0.0), // For +Y bin, sample at -Y
+                        Vec3::new(0.0, 7.0, 0.0),  // For -Y bin, sample at +Y
+                        Vec3::new(0.0, 0.0, -7.0), // For +Z bin, sample at -Z
+                        Vec3::new(0.0, 0.0, 7.0),  // For -Z bin, sample at +Z
+                    ];
 
-                        let dist_sq = delta.length_squared();
-                        if dist_sq > 64.0 * 64.0 || dist_sq < 0.01 { continue; }
+                    for f in 0..6 {
+                        let face_normal = normals[f];
+                        let face_center = center_pos + face_offsets[f];
 
-                        let dist = dist_sq.sqrt();
-                        let dir = delta / dist;
-                        let cos_theta = dir.dot(face_normal);
-                        
-                        // Use hierarchical line_of_sight instead of DDA
-                        let start_pos = WorldPos::new(
+                        // Check if face center is buried
+                        let face_wp = WorldPos::new(
                             face_center.x.floor() as i64,
                             face_center.y.floor() as i64,
                             face_center.z.floor() as i64,
                         );
-                        let end_pos = WorldPos::new(
-                            light_pos.x.floor() as i64,
-                            light_pos.y.floor() as i64,
-                            light_pos.z.floor() as i64,
-                        );
-                        
-                        if !world.line_of_sight(start_pos, end_pos) {
+                        // Note: We need `world` access here. `world` is &World, which is Sync.
+                        if world.get(face_wp).is_some() {
                             continue;
                         }
 
-                        let attenuation = 1.0 / (1.0 + dist_sq * 0.1); 
-                        let contrib = *light_energy * attenuation * cos_theta;
-                        
-                        probe.light_data[f][0] += contrib.x;
-                        probe.light_data[f][1] += contrib.y;
-                        probe.light_data[f][2] += contrib.z;
+                        for (light_pos, light_energy) in &all_lights {
+                            let delta = *light_pos - face_center;
+                            if delta.dot(face_normal) <= 0.0 {
+                                continue;
+                            }
+
+                            let dist_sq = delta.length_squared();
+                            if dist_sq > 64.0 * 64.0 || dist_sq < 0.01 {
+                                continue;
+                            }
+
+                            let dist = dist_sq.sqrt();
+                            let dir = delta / dist;
+                            let cos_theta = dir.dot(face_normal);
+
+                            // Use hierarchical line_of_sight instead of DDA
+                            let start_pos = WorldPos::new(
+                                face_center.x.floor() as i64,
+                                face_center.y.floor() as i64,
+                                face_center.z.floor() as i64,
+                            );
+                            let end_pos = WorldPos::new(
+                                light_pos.x.floor() as i64,
+                                light_pos.y.floor() as i64,
+                                light_pos.z.floor() as i64,
+                            );
+
+                            if !world.line_of_sight(start_pos, end_pos) {
+                                continue;
+                            }
+
+                            let attenuation = 1.0 / (1.0 + dist_sq * 0.1);
+                            let contrib = *light_energy * attenuation * cos_theta;
+
+                            probe.light_data[f][0] += contrib.x;
+                            probe.light_data[f][1] += contrib.y;
+                            probe.light_data[f][2] += contrib.z;
+                        }
                     }
-                }
-                (probe_coord, probe)
-            }).collect();
+                    (probe_coord, probe)
+                })
+                .collect();
 
             // Update probe cache
             for (coord, probe) in new_probes {
@@ -464,12 +495,12 @@ impl GiSystem {
                 }
             }
         }
-        
+
         // 7. Prune caches (Optional, to keep memory usage bounded)
         // Remove chunks that are far away
         // let prune_dist = 10; // chunks
         // let center = new_origin + half_dims;
-        
+
         // This might be slow if map is huge. Do it occasionally?
         // For now, let's skip or do a simple check.
         // self.probe_cache.retain(|k, _| (*k - center).abs().max_element() < prune_dist);
@@ -492,35 +523,39 @@ pub fn spawn_gi_worker(
     std::thread::Builder::new()
         .name("gi-worker".to_string())
         .spawn(move || {
-        let mut gi_system = GiSystem::new(grid_dims);
-        
-        while let Ok(request) = request_rx.recv() {
-            // Update GI system - world is already Arc, no lock needed (World is Sync)
-            let (grid_moved, updates, probes_calculated) =
-                gi_system.update(&world, &palette, request.camera_pos, &request.visible_chunks);
+            let mut gi_system = GiSystem::new(grid_dims);
 
-            let grid_origin = gi_system.grid_origin;
-            let result = if grid_moved {
-                GiUpdateResult::Full {
-                    probes: gi_system.build_flat_probes(),
-                    grid_origin,
-                    probes_calculated,
+            while let Ok(request) = request_rx.recv() {
+                // Update GI system - world is already Arc, no lock needed (World is Sync)
+                let (grid_moved, updates, probes_calculated) = gi_system.update(
+                    &world,
+                    &palette,
+                    request.camera_pos,
+                    &request.visible_chunks,
+                );
+
+                let grid_origin = gi_system.grid_origin;
+                let result = if grid_moved {
+                    GiUpdateResult::Full {
+                        probes: gi_system.build_flat_probes(),
+                        grid_origin,
+                        probes_calculated,
+                    }
+                } else {
+                    GiUpdateResult::Partial {
+                        updates,
+                        grid_origin,
+                        probes_calculated,
+                    }
+                };
+
+                // If send fails, main thread has dropped the receiver (shutdown)
+                if result_tx.send(result).is_err() {
+                    break;
                 }
-            } else {
-                GiUpdateResult::Partial {
-                    updates,
-                    grid_origin,
-                    probes_calculated,
-                }
-            };
-            
-            // If send fails, main thread has dropped the receiver (shutdown)
-            if result_tx.send(result).is_err() {
-                break;
             }
-        }
-    })
-    .expect("failed to spawn GI worker");
+        })
+        .expect("failed to spawn GI worker");
 
     (request_tx, result_rx)
 }
