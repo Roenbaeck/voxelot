@@ -206,11 +206,14 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>) -> vec4<f32> {
     water_color *= 0.8;
 
     // DDA Setup
+    // Bias start point slightly to avoid self-shadowing and boundary precision issues
+    let bias = 0.05;
+    let start_pos = world_pos + reflect_dir * bias;
     let safe_dir = reflect_dir + select(vec3<f32>(0.0), vec3<f32>(1e-8), abs(reflect_dir) < vec3<f32>(1e-8));
     let inv_dir = 1.0 / safe_dir;
     let step_vec = vec3<i32>(sign(safe_dir));
     
-    let start_chunk_f = (world_pos - world_grid_origin) / 16.0;
+    let start_chunk_f = (start_pos - world_grid_origin) / 16.0;
     var current_i = vec3<i32>(floor(start_chunk_f));
     
     let t_delta = abs(inv_dir) * 16.0;
@@ -218,7 +221,7 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>) -> vec4<f32> {
 
     var accumulated_color = vec3<f32>(0.0);
     var remaining_alpha = 1.0;
-    var t_current = 0.0;
+    var t_current = 0.0; // Distance from start_pos
 
     for (var i = 0u; i < params.max_steps; i++) {
         // Bounds check
@@ -226,16 +229,15 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>) -> vec4<f32> {
             break;
         }
 
-        // Potential water intersection
-        if (t_water > 0.0 && t_current >= t_water) {
+        // Potential water intersection (relative to world_pos)
+        if (t_water > 0.0 && (t_current + bias) >= t_water) {
             accumulated_color += water_color * remaining_alpha;
             remaining_alpha = 0.0;
             break;
         }
 
-        let uvw = (vec3<f32>(current_i) + 0.5) / dims;
-        let chunk_data = textureLoad(gi_probe_color, current_i, 0);
-        let occupancy = chunk_data.a;
+        // Discrete occupancy check for quick culling
+        let occupancy = textureLoad(gi_probe_color, current_i, 0).a;
         
         if (occupancy > 0.05) {
             let packed_bbox = textureLoad(gi_probe_bbox, current_i, 0).r;
@@ -260,18 +262,22 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>) -> vec4<f32> {
                     // SURFACE CLIPPING: 
                     if (hit.t_near <= hit.t_far && hit.t_far > 0.0 && hit.t_near > 0.1) {
                         // If the specific hit point is below water level, treat it as hitting water
-                        let hit_point_y = world_pos.y + reflect_dir.y * hit.t_near;
-                        if (hit_point_y < camera.water_level) {
+                        let hit_point = world_pos + reflect_dir * hit.t_near;
+                        if (hit_point.y < camera.water_level) {
                             accumulated_color += water_color * remaining_alpha;
                             remaining_alpha = 0.0;
                             break;
                         }
 
-                        let rad = sample_radiance(uvw, reflect_dir);
+                        // Use a smooth trilinear UVW for color and radiance lookup to eliminate banding
+                        let hit_uvw = (hit_point - world_grid_origin) / (dims * 16.0);
+                        let hit_data = textureSampleLevel(gi_probe_color, linear_sampler, hit_uvw, 0.0);
+                        let rad = sample_radiance(hit_uvw, reflect_dir);
+
                         let dot_sun = saturate(dot(hit.normal, sun_dir));
                         let sun_lit = camera.sun_color * camera.sun_intensity * dot_sun * 1.5;
                         
-                        let lit_color = chunk_data.rgb * (rad * 2.5 + sun_lit);
+                        let lit_color = hit_data.rgb * (rad * 2.5 + sun_lit);
                         
                         accumulated_color += lit_color * remaining_alpha;
                         remaining_alpha = 0.0;
@@ -280,13 +286,17 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>) -> vec4<f32> {
                 }
             } else {
                 // Fallback for chunks without bbox: treat as semi-transparent volume
+                let entry_point = start_pos + safe_dir * t_current;
+                let entry_uvw = (entry_point - world_grid_origin) / (dims * 16.0);
+                
                 let chunk_world_min_y = f32(current_i.y) * 16.0 + world_grid_origin.y;
                 if (chunk_world_min_y + 16.0 >= camera.water_level) {
-                    let rad = sample_radiance(uvw, reflect_dir);
+                    let hit_data = textureSampleLevel(gi_probe_color, linear_sampler, entry_uvw, 0.0);
+                    let rad = sample_radiance(entry_uvw, reflect_dir);
                     let sun_lit = camera.sun_color * camera.sun_intensity * 0.5;
-                    let lit_color = chunk_data.rgb * (rad * 2.5 + sun_lit);
+                    let lit_color = hit_data.rgb * (rad * 2.5 + sun_lit);
                     
-                    let alpha = saturate(occupancy * 2.0) * remaining_alpha;
+                    let alpha = saturate(hit_data.a * 2.0) * remaining_alpha;
                     accumulated_color += lit_color * alpha;
                     remaining_alpha -= alpha;
                     
