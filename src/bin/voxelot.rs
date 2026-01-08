@@ -9,11 +9,11 @@
 
 #![cfg_attr(target_os = "macos", allow(unexpected_cfgs))]
 
+use bytemuck::Zeroable;
 use clap::Parser;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use glam::{Mat4, Vec3};
 use half::f16;
-use bytemuck::Zeroable;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -247,7 +247,7 @@ struct MeshVertexRaw {
     normal: [f32; 3],
     color: [f32; 4],
     emissive: [f32; 4],
-    material: [f32; 4],  // R=reflectivity, GBA=reserved
+    material: [f32; 4], // R=reflectivity, GBA=reserved
 }
 
 // -----------------------------------------------------------------------------
@@ -605,6 +605,14 @@ struct SsrCameraUniforms {
     _pad_gi1: i32,
     gi_grid_dims: [i32; 3],
     _pad_gi2: i32,
+    // Dynamic sunlight for reflections
+    sun_direction: [f32; 3],
+    sun_intensity: f32,
+    sun_color: [f32; 3],
+    water_level: f32,
+    water_visibility: f32,
+    water_color: [f32; 4],
+    _pad_end: [f32; 3],
 }
 
 /// Depth-of-field runtime settings (CPU-side convenience)
@@ -1292,6 +1300,7 @@ struct App {
     gi_probe_tex_pz: Option<wgpu::Texture>,
     gi_probe_tex_nz: Option<wgpu::Texture>,
     gi_probe_tex_color: Option<wgpu::Texture>,
+    gi_probe_tex_bbox: Option<wgpu::Texture>,
     gi_probe_view_px: Option<wgpu::TextureView>,
     gi_probe_view_nx: Option<wgpu::TextureView>,
     gi_probe_view_py: Option<wgpu::TextureView>,
@@ -1299,6 +1308,7 @@ struct App {
     gi_probe_view_pz: Option<wgpu::TextureView>,
     gi_probe_view_nz: Option<wgpu::TextureView>,
     gi_probe_view_color: Option<wgpu::TextureView>,
+    gi_probe_view_bbox: Option<wgpu::TextureView>,
     camera_controller: CameraController,
     pending_chunk_meshes: VecDeque<(i64, i64, i64)>,
     pending_chunk_set: FxHashSet<(i64, i64, i64)>,
@@ -1748,8 +1758,69 @@ impl App {
                 }
             }
         }
-
         Some((out, padded_bpr, extent))
+    }
+
+    fn pack_gi_probe_bbox_volume(&self) -> Option<(Vec<u8>, u32, wgpu::Extent3d)> {
+        let extent = wgpu::Extent3d {
+            width: self.gi_grid_dims.x.max(0) as u32,
+            height: self.gi_grid_dims.y.max(0) as u32,
+            depth_or_array_layers: self.gi_grid_dims.z.max(0) as u32,
+        };
+
+        if extent.width == 0 || extent.height == 0 || extent.depth_or_array_layers == 0 {
+            return None;
+        }
+
+        // R32Uint
+        let bytes_per_texel = 4u32;
+        let padded_bpr = Self::gi_probe_padded_bytes_per_row(extent.width, bytes_per_texel);
+        let bytes_per_image = padded_bpr * extent.height;
+        let total_bytes = bytes_per_image as usize * extent.depth_or_array_layers as usize;
+
+        let probe_count = (extent.width * extent.height * extent.depth_or_array_layers) as usize;
+        if self.gi_probes.len() != probe_count {
+            return None;
+        }
+
+        let mut out = vec![0u8; total_bytes];
+        let row_stride = padded_bpr as usize;
+        let image_stride = bytes_per_image as usize;
+        let texel_stride = bytes_per_texel as usize;
+
+        let wh = (extent.width as usize) * (extent.height as usize);
+        for z in 0..extent.depth_or_array_layers as usize {
+            let z_base = z * image_stride;
+            for y in 0..extent.height as usize {
+                let row_base = z_base + y * row_stride;
+                for x in 0..extent.width as usize {
+                    let idx = x + y * extent.width as usize + z * wh;
+                    let bbox = self.gi_probes[idx].bounding_box;
+                    let dst = row_base + x * texel_stride;
+
+                    let packed = Self::pack_gi_probe_bbox(bbox);
+                    out[dst..dst + 4].copy_from_slice(&packed.to_le_bytes());
+                }
+            }
+        }
+        Some((out, padded_bpr, extent))
+    }
+
+    fn pack_gi_probe_bbox(bbox: [u8; 8]) -> u32 {
+        let xmin = (bbox[0] & 0xF) as u32;
+        let ymin = (bbox[1] & 0xF) as u32;
+        let zmin = (bbox[2] & 0xF) as u32;
+        let xmax = (bbox[3] & 0xF) as u32;
+        let ymax = (bbox[4] & 0xF) as u32;
+        let zmax = (bbox[5] & 0xF) as u32;
+        let valid = (bbox[6] & 0x1) as u32;
+
+        xmin | (ymin << 4)
+            | (zmin << 8)
+            | (xmax << 12)
+            | (ymax << 16)
+            | (zmax << 20)
+            | (valid << 24)
     }
 
     fn pack_rgba16f_padded_256(rgba: [f32; 4]) -> [u8; 256] {
@@ -1833,8 +1904,16 @@ impl App {
 
             let origin = wgpu::Origin3d { x, y, z };
 
-            for (texture, face_idx_opt) in textures {
-                let rgba = if let Some(face_idx) = face_idx_opt {
+            for (texture, spec) in [
+                (tex_px, Some(0)),
+                (tex_nx, Some(1)),
+                (tex_py, Some(2)),
+                (tex_ny, Some(3)),
+                (tex_pz, Some(4)),
+                (tex_nz, Some(5)),
+                (tex_color, None),
+            ] {
+                let rgba = if let Some(face_idx) = spec {
                     update.probe.light_data[face_idx]
                 } else {
                     update.probe.color
@@ -1851,6 +1930,27 @@ impl App {
                     wgpu::TexelCopyBufferLayout {
                         offset: 0,
                         bytes_per_row: Some(256),
+                        rows_per_image: Some(1),
+                    },
+                    extent,
+                );
+            }
+
+            // Upload BBox update (R32Uint)
+            if let Some(tex_bbox) = self.gi_probe_tex_bbox.as_ref() {
+                let packed = Self::pack_gi_probe_bbox(update.probe.bounding_box);
+                let data = packed.to_le_bytes();
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: tex_bbox,
+                        mip_level: 0,
+                        origin,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &data,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(256), // Uint32 is 4 bytes, 256 is plenty for 1 texel
                         rows_per_image: Some(1),
                     },
                     extent,
@@ -1918,6 +2018,27 @@ impl App {
                 },
                 extent,
             );
+        }
+
+        // Upload BBox volume
+        if let Some(tex_bbox) = self.gi_probe_tex_bbox.as_ref() {
+            if let Some((data, padded_bpr, extent)) = self.pack_gi_probe_bbox_volume() {
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: tex_bbox,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &data,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded_bpr),
+                        rows_per_image: Some(extent.height),
+                    },
+                    extent,
+                );
+            }
         }
     }
 
@@ -2049,6 +2170,7 @@ impl App {
             log::info!("Generating hierarchy shells...");
             let shell_start = Instant::now();
             temp_world.generate_all_hierarchy_shells();
+            temp_world.update_all_visual_lod_metadata(&temp_palette);
             log::info!(
                 "Hierarchy shells generated (took {:.3}s)",
                 shell_start.elapsed().as_secs_f32()
@@ -2097,6 +2219,7 @@ impl App {
             log::info!("Generating hierarchy shells...");
             let shell_start = Instant::now();
             temp_world.generate_all_hierarchy_shells();
+            temp_world.update_all_visual_lod_metadata(&temp_palette);
             log::info!(
                 "Hierarchy shells generated (took {:.3}s)",
                 shell_start.elapsed().as_secs_f32()
@@ -2408,8 +2531,7 @@ impl App {
                 voxelot::gi::GiProbe::default();
                 (cfg.effects.gi.grid_dims[0]
                     * cfg.effects.gi.grid_dims[1]
-                    * cfg.effects.gi.grid_dims[2])
-                    as usize
+                    * cfg.effects.gi.grid_dims[2]) as usize
             ],
             gi_grid_origin: glam::IVec3::ZERO,
             gi_grid_dims: glam::IVec3::from_array(cfg.effects.gi.grid_dims),
@@ -2421,6 +2543,7 @@ impl App {
             gi_probe_tex_pz: None,
             gi_probe_tex_nz: None,
             gi_probe_tex_color: None,
+            gi_probe_tex_bbox: None,
             gi_probe_view_px: None,
             gi_probe_view_nx: None,
             gi_probe_view_py: None,
@@ -2428,6 +2551,7 @@ impl App {
             gi_probe_view_pz: None,
             gi_probe_view_nz: None,
             gi_probe_view_color: None,
+            gi_probe_view_bbox: None,
 
             camera_controller: CameraController::new(initial_camera, &cfg.rendering),
             pending_chunk_meshes: VecDeque::new(),
@@ -3019,10 +3143,7 @@ impl App {
         // Match wgpu's NDC depth range (0..1). glam's perspective matrices are OpenGL-style
         // (depth -1..1), so apply the same correction used elsewhere (e.g. SSAO unprojection).
         const OPENGL_TO_WGPU_MATRIX: glam::Mat4 = glam::Mat4::from_cols_array(&[
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 0.5, 0.0,
-            0.0, 0.0, 0.5, 1.0,
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5, 1.0,
         ]);
         let corrected_proj = OPENGL_TO_WGPU_MATRIX * proj;
 
@@ -3154,11 +3275,17 @@ impl App {
             }
             KeyCode::F7 => {
                 self.reflection_probe_debug = !self.reflection_probe_debug;
-                log::info!("Probe debug colors (clear-only): {}", self.reflection_probe_debug);
+                log::info!(
+                    "Probe debug colors (clear-only): {}",
+                    self.reflection_probe_debug
+                );
             }
             KeyCode::F8 => {
                 self.reflection_probe_probe_only = !self.reflection_probe_probe_only;
-                log::info!("SSR probe-only debug view: {}", self.reflection_probe_probe_only);
+                log::info!(
+                    "SSR probe-only debug view: {}",
+                    self.reflection_probe_probe_only
+                );
             }
             KeyCode::F9 => {
                 self.reflection_probe_flip_y = !self.reflection_probe_flip_y;
@@ -3654,53 +3781,57 @@ impl App {
                     App::compute_texture_bytes(config.format, target_width, target_height, 1, 1);
 
                 // SSR output + history textures (history is used for temporal accumulation)
-                let (ssr_texture_loc, ssr_texture_view_loc, ssr_history_texture_loc, ssr_history_view_loc) =
-                    if self.user_config.effects.ssr.enabled {
-                        let ssr_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
-                            label: Some("SSR Texture"),
-                            size: wgpu::Extent3d {
-                                width: target_width,
-                                height: target_height,
-                                depth_or_array_layers: 1,
-                            },
-                            mip_level_count: 1,
-                            sample_count: 1,
-                            dimension: wgpu::TextureDimension::D2,
-                            format: wgpu::TextureFormat::Rgba16Float,
-                            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                                | wgpu::TextureUsages::TEXTURE_BINDING
-                                | wgpu::TextureUsages::COPY_SRC,
-                            view_formats: &[],
-                        });
-                        let ssr_texture_view_loc =
-                            ssr_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
+                let (
+                    ssr_texture_loc,
+                    ssr_texture_view_loc,
+                    ssr_history_texture_loc,
+                    ssr_history_view_loc,
+                ) = if self.user_config.effects.ssr.enabled {
+                    let ssr_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("SSR Texture"),
+                        size: wgpu::Extent3d {
+                            width: target_width,
+                            height: target_height,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                            | wgpu::TextureUsages::TEXTURE_BINDING
+                            | wgpu::TextureUsages::COPY_SRC,
+                        view_formats: &[],
+                    });
+                    let ssr_texture_view_loc =
+                        ssr_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
 
-                        let ssr_history_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
-                            label: Some("SSR History Texture"),
-                            size: wgpu::Extent3d {
-                                width: target_width,
-                                height: target_height,
-                                depth_or_array_layers: 1,
-                            },
-                            mip_level_count: 1,
-                            sample_count: 1,
-                            dimension: wgpu::TextureDimension::D2,
-                            format: wgpu::TextureFormat::Rgba16Float,
-                            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                            view_formats: &[],
-                        });
-                        let ssr_history_view_loc =
-                            ssr_history_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
+                    let ssr_history_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("SSR History Texture"),
+                        size: wgpu::Extent3d {
+                            width: target_width,
+                            height: target_height,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                        view_formats: &[],
+                    });
+                    let ssr_history_view_loc = ssr_history_texture_loc
+                        .create_view(&wgpu::TextureViewDescriptor::default());
 
-                        (
-                            Some(ssr_texture_loc),
-                            Some(ssr_texture_view_loc),
-                            Some(ssr_history_texture_loc),
-                            Some(ssr_history_view_loc),
-                        )
-                    } else {
-                        (None, None, None, None)
-                    };
+                    (
+                        Some(ssr_texture_loc),
+                        Some(ssr_texture_view_loc),
+                        Some(ssr_history_texture_loc),
+                        Some(ssr_history_view_loc),
+                    )
+                } else {
+                    (None, None, None, None)
+                };
 
                 // Scene color copy texture (for water reflections - same format as offscreen)
                 let scene_copy_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
@@ -3810,10 +3941,12 @@ impl App {
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format: wgpu::TextureFormat::Rgba16Float,
-                    usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                    usage: wgpu::TextureUsages::STORAGE_BINDING
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
                 });
-                let rc_view_loc = rc_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
+                let rc_view_loc =
+                    rc_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
                 let rc_bytes = App::compute_texture_bytes(
                     wgpu::TextureFormat::Rgba16Float,
                     target_width,
@@ -3824,7 +3957,8 @@ impl App {
 
                 // Reflection probe cubemap (SSR fallback)
                 // Low-res by design; updated one face per frame.
-                let (probe_color_texture_loc,
+                let (
+                    probe_color_texture_loc,
                     probe_color_cube_view_prev_loc,
                     probe_color_cube_view_curr_loc,
                     probe_color_face_views_loc,
@@ -3865,38 +3999,41 @@ impl App {
                         view_formats: &[],
                     });
 
-                    let probe_emissive_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
-                        label: Some("Reflection Probe Emissive Cubemap"),
-                        size: extent,
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: wgpu::TextureFormat::Rgba16Float,
-                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                        view_formats: &[],
-                    });
+                    let probe_emissive_texture_loc =
+                        device.create_texture(&wgpu::TextureDescriptor {
+                            label: Some("Reflection Probe Emissive Cubemap"),
+                            size: extent,
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: wgpu::TextureFormat::Rgba16Float,
+                            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                            view_formats: &[],
+                        });
 
-                    let probe_normal_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
-                        label: Some("Reflection Probe Normal Cubemap"),
-                        size: extent,
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: wgpu::TextureFormat::Rgba16Float,
-                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                        view_formats: &[],
-                    });
+                    let probe_normal_texture_loc =
+                        device.create_texture(&wgpu::TextureDescriptor {
+                            label: Some("Reflection Probe Normal Cubemap"),
+                            size: extent,
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: wgpu::TextureFormat::Rgba16Float,
+                            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                            view_formats: &[],
+                        });
 
-                    let probe_material_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
-                        label: Some("Reflection Probe Material Cubemap"),
-                        size: extent,
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: wgpu::TextureFormat::Rgba16Float,
-                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                        view_formats: &[],
-                    });
+                    let probe_material_texture_loc =
+                        device.create_texture(&wgpu::TextureDescriptor {
+                            label: Some("Reflection Probe Material Cubemap"),
+                            size: extent,
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: wgpu::TextureFormat::Rgba16Float,
+                            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                            view_formats: &[],
+                        });
 
                     let probe_depth_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
                         label: Some("Reflection Probe Depth"),
@@ -3909,28 +4046,30 @@ impl App {
                         view_formats: &[],
                     });
 
-                    let probe_color_cube_view_prev_loc = probe_color_texture_loc.create_view(&wgpu::TextureViewDescriptor {
-                        label: Some("Reflection Probe Color Cube View Prev"),
-                        format: Some(wgpu::TextureFormat::Rgba16Float),
-                        dimension: Some(wgpu::TextureViewDimension::Cube),
-                        aspect: wgpu::TextureAspect::All,
-                        base_mip_level: 0,
-                        mip_level_count: Some(1),
-                        base_array_layer: 0,
-                        array_layer_count: Some(6),
-                        usage: None,
-                    });
-                    let probe_color_cube_view_curr_loc = probe_color_texture_loc.create_view(&wgpu::TextureViewDescriptor {
-                        label: Some("Reflection Probe Color Cube View Curr"),
-                        format: Some(wgpu::TextureFormat::Rgba16Float),
-                        dimension: Some(wgpu::TextureViewDimension::Cube),
-                        aspect: wgpu::TextureAspect::All,
-                        base_mip_level: 0,
-                        mip_level_count: Some(1),
-                        base_array_layer: 6,
-                        array_layer_count: Some(6),
-                        usage: None,
-                    });
+                    let probe_color_cube_view_prev_loc =
+                        probe_color_texture_loc.create_view(&wgpu::TextureViewDescriptor {
+                            label: Some("Reflection Probe Color Cube View Prev"),
+                            format: Some(wgpu::TextureFormat::Rgba16Float),
+                            dimension: Some(wgpu::TextureViewDimension::Cube),
+                            aspect: wgpu::TextureAspect::All,
+                            base_mip_level: 0,
+                            mip_level_count: Some(1),
+                            base_array_layer: 0,
+                            array_layer_count: Some(6),
+                            usage: None,
+                        });
+                    let probe_color_cube_view_curr_loc =
+                        probe_color_texture_loc.create_view(&wgpu::TextureViewDescriptor {
+                            label: Some("Reflection Probe Color Cube View Curr"),
+                            format: Some(wgpu::TextureFormat::Rgba16Float),
+                            dimension: Some(wgpu::TextureViewDimension::Cube),
+                            aspect: wgpu::TextureAspect::All,
+                            base_mip_level: 0,
+                            mip_level_count: Some(1),
+                            base_array_layer: 6,
+                            array_layer_count: Some(6),
+                            usage: None,
+                        });
 
                     let mut probe_color_face_views_loc = Vec::with_capacity(12);
                     let mut probe_emissive_face_views_loc = Vec::with_capacity(12);
@@ -3939,61 +4078,71 @@ impl App {
                     let mut probe_depth_face_views_loc = Vec::with_capacity(12);
                     for face in 0..12u32 {
                         let face_label = format!("Reflection Probe Layer {}", face);
-                        probe_color_face_views_loc.push(probe_color_texture_loc.create_view(&wgpu::TextureViewDescriptor {
-                            label: Some(&format!("{} Color", face_label)),
-                            format: Some(wgpu::TextureFormat::Rgba16Float),
-                            dimension: Some(wgpu::TextureViewDimension::D2),
-                            aspect: wgpu::TextureAspect::All,
-                            base_mip_level: 0,
-                            mip_level_count: Some(1),
-                            base_array_layer: face,
-                            array_layer_count: Some(1),
-                            usage: None,
-                        }));
-                        probe_emissive_face_views_loc.push(probe_emissive_texture_loc.create_view(&wgpu::TextureViewDescriptor {
-                            label: Some(&format!("{} Emissive", face_label)),
-                            format: Some(wgpu::TextureFormat::Rgba16Float),
-                            dimension: Some(wgpu::TextureViewDimension::D2),
-                            aspect: wgpu::TextureAspect::All,
-                            base_mip_level: 0,
-                            mip_level_count: Some(1),
-                            base_array_layer: face,
-                            array_layer_count: Some(1),
-                            usage: None,
-                        }));
-                        probe_normal_face_views_loc.push(probe_normal_texture_loc.create_view(&wgpu::TextureViewDescriptor {
-                            label: Some(&format!("{} Normal", face_label)),
-                            format: Some(wgpu::TextureFormat::Rgba16Float),
-                            dimension: Some(wgpu::TextureViewDimension::D2),
-                            aspect: wgpu::TextureAspect::All,
-                            base_mip_level: 0,
-                            mip_level_count: Some(1),
-                            base_array_layer: face,
-                            array_layer_count: Some(1),
-                            usage: None,
-                        }));
-                        probe_material_face_views_loc.push(probe_material_texture_loc.create_view(&wgpu::TextureViewDescriptor {
-                            label: Some(&format!("{} Material", face_label)),
-                            format: Some(wgpu::TextureFormat::Rgba16Float),
-                            dimension: Some(wgpu::TextureViewDimension::D2),
-                            aspect: wgpu::TextureAspect::All,
-                            base_mip_level: 0,
-                            mip_level_count: Some(1),
-                            base_array_layer: face,
-                            array_layer_count: Some(1),
-                            usage: None,
-                        }));
-                        probe_depth_face_views_loc.push(probe_depth_texture_loc.create_view(&wgpu::TextureViewDescriptor {
-                            label: Some(&format!("{} Depth", face_label)),
-                            format: Some(wgpu::TextureFormat::Depth32Float),
-                            dimension: Some(wgpu::TextureViewDimension::D2),
-                            aspect: wgpu::TextureAspect::All,
-                            base_mip_level: 0,
-                            mip_level_count: Some(1),
-                            base_array_layer: face,
-                            array_layer_count: Some(1),
-                            usage: None,
-                        }));
+                        probe_color_face_views_loc.push(probe_color_texture_loc.create_view(
+                            &wgpu::TextureViewDescriptor {
+                                label: Some(&format!("{} Color", face_label)),
+                                format: Some(wgpu::TextureFormat::Rgba16Float),
+                                dimension: Some(wgpu::TextureViewDimension::D2),
+                                aspect: wgpu::TextureAspect::All,
+                                base_mip_level: 0,
+                                mip_level_count: Some(1),
+                                base_array_layer: face,
+                                array_layer_count: Some(1),
+                                usage: None,
+                            },
+                        ));
+                        probe_emissive_face_views_loc.push(probe_emissive_texture_loc.create_view(
+                            &wgpu::TextureViewDescriptor {
+                                label: Some(&format!("{} Emissive", face_label)),
+                                format: Some(wgpu::TextureFormat::Rgba16Float),
+                                dimension: Some(wgpu::TextureViewDimension::D2),
+                                aspect: wgpu::TextureAspect::All,
+                                base_mip_level: 0,
+                                mip_level_count: Some(1),
+                                base_array_layer: face,
+                                array_layer_count: Some(1),
+                                usage: None,
+                            },
+                        ));
+                        probe_normal_face_views_loc.push(probe_normal_texture_loc.create_view(
+                            &wgpu::TextureViewDescriptor {
+                                label: Some(&format!("{} Normal", face_label)),
+                                format: Some(wgpu::TextureFormat::Rgba16Float),
+                                dimension: Some(wgpu::TextureViewDimension::D2),
+                                aspect: wgpu::TextureAspect::All,
+                                base_mip_level: 0,
+                                mip_level_count: Some(1),
+                                base_array_layer: face,
+                                array_layer_count: Some(1),
+                                usage: None,
+                            },
+                        ));
+                        probe_material_face_views_loc.push(probe_material_texture_loc.create_view(
+                            &wgpu::TextureViewDescriptor {
+                                label: Some(&format!("{} Material", face_label)),
+                                format: Some(wgpu::TextureFormat::Rgba16Float),
+                                dimension: Some(wgpu::TextureViewDimension::D2),
+                                aspect: wgpu::TextureAspect::All,
+                                base_mip_level: 0,
+                                mip_level_count: Some(1),
+                                base_array_layer: face,
+                                array_layer_count: Some(1),
+                                usage: None,
+                            },
+                        ));
+                        probe_depth_face_views_loc.push(probe_depth_texture_loc.create_view(
+                            &wgpu::TextureViewDescriptor {
+                                label: Some(&format!("{} Depth", face_label)),
+                                format: Some(wgpu::TextureFormat::Depth32Float),
+                                dimension: Some(wgpu::TextureViewDimension::D2),
+                                aspect: wgpu::TextureAspect::All,
+                                base_mip_level: 0,
+                                mip_level_count: Some(1),
+                                base_array_layer: face,
+                                array_layer_count: Some(1),
+                                usage: None,
+                            },
+                        ));
                     }
 
                     let probe_color_bytes_loc = App::compute_texture_bytes(
@@ -4320,7 +4469,11 @@ impl App {
                 let mip_levels = 32 - (max_dim.saturating_sub(1)).leading_zeros();
 
                 for i in 0..2 {
-                    let label = if i == 0 { "HZB Texture" } else { "HZB Temp Texture" };
+                    let label = if i == 0 {
+                        "HZB Texture"
+                    } else {
+                        "HZB Temp Texture"
+                    };
                     let tex = device.create_texture(&wgpu::TextureDescriptor {
                         label: Some(label),
                         size: wgpu::Extent3d {
@@ -4376,8 +4529,6 @@ impl App {
                     mip_levels,
                     1,
                 ) * 2; // Two textures
-
-
             } else {
                 // Create dummy 1x1 R32 textures (main + temp)
                 let tex_main = device.create_texture(&wgpu::TextureDescriptor {
@@ -4421,7 +4572,8 @@ impl App {
                 hzb_temp_view_opt = Some(view_temp);
                 hzb_temp_texture_opt = Some(tex_temp);
                 hzb_mips = 1;
-                hzb_bytes = App::compute_texture_bytes(wgpu::TextureFormat::R32Float, 1, 1, 1, 1) * 2;
+                hzb_bytes =
+                    App::compute_texture_bytes(wgpu::TextureFormat::R32Float, 1, 1, 1, 1) * 2;
             }
             App::replace_texture_bytes_static(
                 &mut self.hzb_texture_bytes,
@@ -4508,7 +4660,7 @@ impl App {
                             )
                         } else {
                             (
-                                self.hzb_mip_views.get(dst_mip),      // Write to MAIN
+                                self.hzb_mip_views.get(dst_mip),          // Write to MAIN
                                 self.hzb_temp_mip_views.get(dst_mip - 1), // Read from TEMP
                             )
                         };
@@ -5313,39 +5465,59 @@ impl App {
             log::warn!("SSR bind group: no device");
             return;
         };
-        
+
         // Debug: check which resources are missing
-        if self.ssr_bind_group_layout.is_none() { log::warn!("SSR bind group: missing ssr_bind_group_layout"); }
-        if self.ssr_uniform_buffer.is_none() { log::warn!("SSR bind group: missing ssr_uniform_buffer"); }
-        if self.ssr_camera_uniform_buffer.is_none() { log::warn!("SSR bind group: missing ssr_camera_uniform_buffer"); }
-        if self.offscreen_color_view.is_none() { log::warn!("SSR bind group: missing offscreen_color_view"); }
-        if self.offscreen_depth_view.is_none() { log::warn!("SSR bind group: missing offscreen_depth_view"); }
-        if self.post_sampler.is_none() { log::warn!("SSR bind group: missing post_sampler"); }
-        if self.hzb_view.is_none() { log::warn!("SSR bind group: missing hzb_view"); }
-        if self.normal_view.is_none() { log::warn!("SSR bind group: missing normal_view"); }
-        if self.material_view.is_none() { log::warn!("SSR bind group: missing material_view"); }
-        if self.ssao_ping_view.is_none() { log::warn!("SSR bind group: missing ssao_ping_view"); }
-        if self.bloom_ping_view.is_none() { log::warn!("SSR bind group: missing bloom_ping_view"); }
-        if self.skybox_view.is_none() { log::warn!("SSR bind group: missing skybox_view"); }
-        if self.ssr_history_view.is_none() { log::warn!("SSR bind group: missing ssr_history_view"); }
-        if self.reflection_probe_color_cube_prev_view.is_none() { log::warn!("SSR bind group: missing reflection_probe_color_cube_prev_view"); }
-        if self.reflection_probe_color_cube_curr_view.is_none() { log::warn!("SSR bind group: missing reflection_probe_color_cube_curr_view"); }
-        
+        if self.ssr_bind_group_layout.is_none() {
+            log::warn!("SSR bind group: missing ssr_bind_group_layout");
+        }
+        if self.ssr_uniform_buffer.is_none() {
+            log::warn!("SSR bind group: missing ssr_uniform_buffer");
+        }
+        if self.ssr_camera_uniform_buffer.is_none() {
+            log::warn!("SSR bind group: missing ssr_camera_uniform_buffer");
+        }
+        if self.offscreen_color_view.is_none() {
+            log::warn!("SSR bind group: missing offscreen_color_view");
+        }
+        if self.offscreen_depth_view.is_none() {
+            log::warn!("SSR bind group: missing offscreen_depth_view");
+        }
+        if self.post_sampler.is_none() {
+            log::warn!("SSR bind group: missing post_sampler");
+        }
+        if self.hzb_view.is_none() {
+            log::warn!("SSR bind group: missing hzb_view");
+        }
+        if self.normal_view.is_none() {
+            log::warn!("SSR bind group: missing normal_view");
+        }
+        if self.material_view.is_none() {
+            log::warn!("SSR bind group: missing material_view");
+        }
+        if self.skybox_view.is_none() {
+            log::warn!("SSR bind group: missing skybox_view");
+        }
+        if self.gi_probe_view_px.is_none() {
+            log::warn!("SSR bind group: missing gi_probe_view_px");
+        }
+        if self.reflection_probe_color_cube_prev_view.is_none() {
+            log::warn!("SSR bind group: missing reflection_probe_color_cube_prev_view");
+        }
+        if self.reflection_probe_color_cube_curr_view.is_none() {
+            log::warn!("SSR bind group: missing reflection_probe_color_cube_curr_view");
+        }
+
         let (
             Some(layout),
             Some(ssr_ubo),
             Some(ssr_cam_ubo),
-            Some(scene_view),
             Some(depth_view),
             Some(sampler),
             Some(hzb_view),
             Some(normal_view),
             Some(material_view),
-            Some(ssao_view),
-            Some(bloom_view),
             Some(skybox_view),
             Some(skybox_sampler),
-            Some(ssr_history_view),
             Some(gi_px),
             Some(gi_nx),
             Some(gi_py),
@@ -5357,17 +5529,13 @@ impl App {
             self.ssr_bind_group_layout.as_ref(),
             self.ssr_uniform_buffer.as_ref(),
             self.ssr_camera_uniform_buffer.as_ref(),
-            self.offscreen_color_view.as_ref(),
             self.offscreen_depth_view.as_ref(),
             self.post_sampler.as_ref(),
             self.hzb_view.as_ref(),
             self.normal_view.as_ref(),
             self.material_view.as_ref(),
-            self.ssao_ping_view.as_ref(),  // Use ping buffer (final SSAO result after blur)
-            self.bloom_ping_view.as_ref(), // Bloom texture for reflections with glow
-            self.skybox_view.as_ref(),     // Skybox for reflections when ray misses geometry
-            self.skybox_sampler.as_ref(),  // Skybox sampler with Repeat on U
-            self.ssr_history_view.as_ref(), // Previous SSR output for temporal accumulation
+            self.skybox_view.as_ref(),
+            self.skybox_sampler.as_ref(),
             self.gi_probe_view_px.as_ref(),
             self.gi_probe_view_nx.as_ref(),
             self.gi_probe_view_py.as_ref(),
@@ -5379,7 +5547,7 @@ impl App {
         else {
             return;
         };
-        
+
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("SSR Bind Group"),
             layout,
@@ -5393,90 +5561,77 @@ impl App {
                     resource: ssr_ubo.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(scene_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
+                    binding: 2, // Was 3
                     resource: wgpu::BindingResource::TextureView(depth_view),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 4,
+                    binding: 3, // Was 4
                     resource: wgpu::BindingResource::Sampler(sampler),
                 },
                 // HZB texture for hierarchical ray marching
                 wgpu::BindGroupEntry {
-                    binding: 5,
+                    binding: 4, // Was 5
                     resource: wgpu::BindingResource::TextureView(hzb_view),
                 },
                 // HZB sampler (reuse post_sampler for now)
                 wgpu::BindGroupEntry {
-                    binding: 6,
+                    binding: 5, // Was 6
                     resource: wgpu::BindingResource::Sampler(sampler),
                 },
                 // Normal G-buffer
                 wgpu::BindGroupEntry {
-                    binding: 7,
+                    binding: 6, // Was 7
                     resource: wgpu::BindingResource::TextureView(normal_view),
                 },
                 // Material G-buffer (reflectivity)
                 wgpu::BindGroupEntry {
-                    binding: 8,
+                    binding: 7, // Was 8
                     resource: wgpu::BindingResource::TextureView(material_view),
-                },
-                // SSAO texture for reflected surfaces
-                wgpu::BindGroupEntry {
-                    binding: 9,
-                    resource: wgpu::BindingResource::TextureView(ssao_view),
-                },
-                // Bloom texture for reflections with glow
-                wgpu::BindGroupEntry {
-                    binding: 10,
-                    resource: wgpu::BindingResource::TextureView(bloom_view),
                 },
                 // Skybox texture for reflections when ray misses geometry
                 wgpu::BindGroupEntry {
-                    binding: 11,
+                    binding: 8, // Was 11
                     resource: wgpu::BindingResource::TextureView(skybox_view),
                 },
                 // Skybox sampler with Repeat on U for equirectangular wrapping
                 wgpu::BindGroupEntry {
-                    binding: 12,
+                    binding: 9, // Was 12
                     resource: wgpu::BindingResource::Sampler(skybox_sampler),
-                },
-                // SSR history texture (previous frame)
-                wgpu::BindGroupEntry {
-                    binding: 13,
-                    resource: wgpu::BindingResource::TextureView(ssr_history_view),
                 },
                 // GI probe 3D textures (6 faces) for volumetric reflections
                 wgpu::BindGroupEntry {
-                    binding: 14,
+                    binding: 10, // Was 14
                     resource: wgpu::BindingResource::TextureView(gi_px),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 15,
+                    binding: 11, // Was 15
                     resource: wgpu::BindingResource::TextureView(gi_nx),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 16,
+                    binding: 12, // Was 16
                     resource: wgpu::BindingResource::TextureView(gi_py),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 17,
+                    binding: 13, // Was 17
                     resource: wgpu::BindingResource::TextureView(gi_ny),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 18,
+                    binding: 14, // Was 18
                     resource: wgpu::BindingResource::TextureView(gi_pz),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 19,
+                    binding: 15, // Was 19
                     resource: wgpu::BindingResource::TextureView(gi_nz),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 20,
+                    binding: 16, // Was 20
                     resource: wgpu::BindingResource::TextureView(gi_color),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 17, // Was 21
+                    resource: wgpu::BindingResource::TextureView(
+                        self.gi_probe_view_bbox.as_ref().unwrap(),
+                    ),
                 },
             ],
         });
@@ -6385,17 +6540,7 @@ impl App {
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
+                    binding: 2, // Was 3
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Depth,
@@ -6405,14 +6550,14 @@ impl App {
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 4,
+                    binding: 3, // Was 4
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
                 // HZB texture for hierarchical ray marching
                 wgpu::BindGroupLayoutEntry {
-                    binding: 5,
+                    binding: 4, // Was 5
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -6423,14 +6568,14 @@ impl App {
                 },
                 // HZB sampler (point sampling for mip levels)
                 wgpu::BindGroupLayoutEntry {
-                    binding: 6,
+                    binding: 5, // Was 6
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
                 // Normal G-buffer (world-space normals encoded in RGB)
                 wgpu::BindGroupLayoutEntry {
-                    binding: 7,
+                    binding: 6, // Was 7
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -6441,29 +6586,7 @@ impl App {
                 },
                 // Material G-buffer (reflectivity in R channel)
                 wgpu::BindGroupLayoutEntry {
-                    binding: 8,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                // SSAO texture for applying AO to reflected surfaces
-                wgpu::BindGroupLayoutEntry {
-                    binding: 9,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                // Bloom texture for including glow in reflections
-                wgpu::BindGroupLayoutEntry {
-                    binding: 10,
+                    binding: 7, // Was 8
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -6474,7 +6597,7 @@ impl App {
                 },
                 // Skybox texture for reflections when ray misses geometry
                 wgpu::BindGroupLayoutEntry {
-                    binding: 11,
+                    binding: 8, // Was 11
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -6485,24 +6608,51 @@ impl App {
                 },
                 // Skybox sampler with Repeat on U for equirectangular wrapping
                 wgpu::BindGroupLayoutEntry {
-                    binding: 12,
+                    binding: 9, // Was 12
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
-                // SSR history texture (previous frame)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 11,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 12,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
                 wgpu::BindGroupLayoutEntry {
                     binding: 13,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                        view_dimension: wgpu::TextureViewDimension::D3,
                         multisampled: false,
                     },
                     count: None,
                 },
-                // Reflection probe cubemap fallback (previous)
-                // GI probe 3D textures (6 faces) for volumetric reflections
                 wgpu::BindGroupLayoutEntry {
                     binding: 14,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -6537,37 +6687,7 @@ impl App {
                     binding: 17,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D3,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 18,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D3,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 19,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D3,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 20,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        sample_type: wgpu::TextureSampleType::Uint,
                         view_dimension: wgpu::TextureViewDimension::D3,
                         multisampled: false,
                     },
@@ -8069,101 +8189,104 @@ impl App {
 
         let rc_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Radiance Cascades Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/radiance_cascades.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../shaders/radiance_cascades.wgsl").into(),
+            ),
         });
 
-        let rc_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Radiance Cascades Bind Group Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+        let rc_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Radiance Cascades Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                // Normal G-buffer for Lambertian weighting
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
+                    // Normal G-buffer for Lambertian weighting
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 7,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba16Float,
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 8,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: wgpu::TextureFormat::Rgba16Float,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-            ],
-        });
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 8,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
 
         let rc_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Radiance Cascades Pipeline Layout"),
@@ -8746,6 +8869,18 @@ impl App {
         let gi_tex_nz = device.create_texture(&gi_tex_desc("GI Probe -Z 3D"));
         let gi_tex_color = device.create_texture(&gi_tex_desc("GI Color 3D"));
 
+        let gi_bbox_tex_desc = wgpu::TextureDescriptor {
+            label: Some("GI BBox 3D"),
+            size: gi_extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::R32Uint,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        };
+        let gi_tex_bbox = device.create_texture(&gi_bbox_tex_desc);
+
         let gi_view_px = gi_tex_px.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D3),
             ..Default::default()
@@ -8774,12 +8909,26 @@ impl App {
             dimension: Some(wgpu::TextureViewDimension::D3),
             ..Default::default()
         });
+        let gi_view_bbox = gi_tex_bbox.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            ..Default::default()
+        });
 
         // Initialize volumes to zero so early frames don't sample uninitialized memory.
         let padded_bpr = App::gi_probe_padded_bytes_per_row(gi_extent.width, 8);
         let bytes_per_image = padded_bpr * gi_extent.height;
-        let zero_bytes = vec![0u8; (bytes_per_image as usize) * (gi_extent.depth_or_array_layers as usize)];
-        for texture in [&gi_tex_px, &gi_tex_nx, &gi_tex_py, &gi_tex_ny, &gi_tex_pz, &gi_tex_nz, &gi_tex_color] {
+        let zero_bytes =
+            vec![0u8; (bytes_per_image as usize) * (gi_extent.depth_or_array_layers as usize)];
+        for texture in [
+            &gi_tex_px,
+            &gi_tex_nx,
+            &gi_tex_py,
+            &gi_tex_ny,
+            &gi_tex_pz,
+            &gi_tex_nz,
+            &gi_tex_color,
+            &gi_tex_bbox,
+        ] {
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture,
@@ -9295,6 +9444,7 @@ impl App {
         self.gi_probe_tex_pz = Some(gi_tex_pz);
         self.gi_probe_tex_nz = Some(gi_tex_nz);
         self.gi_probe_tex_color = Some(gi_tex_color);
+        self.gi_probe_tex_bbox = Some(gi_tex_bbox);
         self.gi_probe_view_px = Some(gi_view_px);
         self.gi_probe_view_nx = Some(gi_view_nx);
         self.gi_probe_view_py = Some(gi_view_py);
@@ -9302,6 +9452,7 @@ impl App {
         self.gi_probe_view_pz = Some(gi_view_pz);
         self.gi_probe_view_nz = Some(gi_view_nz);
         self.gi_probe_view_color = Some(gi_view_color);
+        self.gi_probe_view_bbox = Some(gi_view_bbox);
         self.main_bind_group_layout = Some(main_bind_group_layout);
         self.shadow_bind_group_layout = Some(shadow_bind_group_layout);
         self.shadow_sampler = Some(shadow_sampler);
@@ -11580,10 +11731,29 @@ impl App {
                 _pad1: [0.0, 0.0],
                 skybox_tint: self.skybox_night_tint,
                 skybox_tint_strength: self.skybox_tint_strength,
-                gi_grid_origin: [self.gi_grid_origin.x, self.gi_grid_origin.y, self.gi_grid_origin.z],
+                gi_grid_origin: [
+                    self.gi_grid_origin.x,
+                    self.gi_grid_origin.y,
+                    self.gi_grid_origin.z,
+                ],
                 _pad_gi1: 0,
-                gi_grid_dims: [self.gi_grid_dims.x, self.gi_grid_dims.y, self.gi_grid_dims.z],
+                gi_grid_dims: [
+                    self.gi_grid_dims.x,
+                    self.gi_grid_dims.y,
+                    self.gi_grid_dims.z,
+                ],
                 _pad_gi2: 0,
+                sun_direction: [
+                    sun_direction_vec.x,
+                    sun_direction_vec.y,
+                    sun_direction_vec.z,
+                ],
+                sun_intensity: sun_fade,
+                sun_color: [sun_color[0], sun_color[1], sun_color[2]],
+                water_level: self.water_level,
+                water_visibility: self.water_visibility,
+                water_color: [0.0, 0.3, 0.5, 0.6],
+                _pad_end: [0.0, 0.0, 0.0],
             };
             queue.write_buffer(ssr_cam_buf, 0, bytemuck::bytes_of(&ssr_cam));
 
@@ -11596,7 +11766,7 @@ impl App {
             let overscan = self.user_config.rendering.render_overscan.max(0.0);
             let bloom_strength = self.bloom_settings.bloom_strength;
             let frame_index = self.frame_count as f32;
-            let history_valid: f32 = 1.0; 
+            let history_valid: f32 = 1.0;
             let gi_scale: f32 = self.user_config.effects.gi.indirect_scale;
             let params_arr: [u32; 16] = [
                 self.ssr_settings.max_steps,
@@ -11697,13 +11867,13 @@ impl App {
                     stencil_ops: None,
                 }),
                 timestamp_writes: if self.gui_visible {
-                    self.query_set.as_ref().map(|qs| {
-                        wgpu::RenderPassTimestampWrites {
+                    self.query_set
+                        .as_ref()
+                        .map(|qs| wgpu::RenderPassTimestampWrites {
                             query_set: qs,
                             beginning_of_pass_write_index: Some(14),
                             end_of_pass_write_index: Some(15),
-                        }
-                    })
+                        })
                 } else {
                     None
                 },
@@ -12042,15 +12212,17 @@ impl App {
                     })],
                     depth_stencil_attachment: None,
                     timestamp_writes: if self.gui_visible {
-                        self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
-                            query_set: qs,
-                            beginning_of_pass_write_index: Some(12),
-                            end_of_pass_write_index: if self.ssao_settings.blur_enabled {
-                                None
-                            } else {
-                                Some(13)
-                            },
-                        })
+                        self.query_set
+                            .as_ref()
+                            .map(|qs| wgpu::RenderPassTimestampWrites {
+                                query_set: qs,
+                                beginning_of_pass_write_index: Some(12),
+                                end_of_pass_write_index: if self.ssao_settings.blur_enabled {
+                                    None
+                                } else {
+                                    Some(13)
+                                },
+                            })
                     } else {
                         None
                     },
@@ -12110,11 +12282,13 @@ impl App {
                         })],
                         depth_stencil_attachment: None,
                         timestamp_writes: if self.gui_visible {
-                            self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
-                                query_set: qs,
-                                beginning_of_pass_write_index: None,
-                                end_of_pass_write_index: Some(13),
-                            })
+                            self.query_set
+                                .as_ref()
+                                .map(|qs| wgpu::RenderPassTimestampWrites {
+                                    query_set: qs,
+                                    beginning_of_pass_write_index: None,
+                                    end_of_pass_write_index: Some(13),
+                                })
                         } else {
                             None
                         },
@@ -12598,8 +12772,6 @@ impl App {
                 self.bloom_extract_bind_group.as_ref(),
                 self.bloom_ping_view.as_ref(),
             ) {
-
-
                 let bloom_extract_ts = if self.gui_visible {
                     self.query_set
                         .as_ref()
@@ -12753,8 +12925,6 @@ impl App {
             }
         }
 
-
-
         if let (Some(composite_pipeline), Some(composite_bind_group)) = (
             self.composite_pipeline.as_ref(),
             self.composite_bind_group.as_ref(),
@@ -12877,9 +13047,8 @@ impl App {
                         // - Use (begin,end) only for the *first* pass in an encoder (to establish baseline).
                         // - For all subsequent passes, compute isolated duration from successive end timestamps.
                         // This matches the previous behavior that was stable for Bloom/SSILVB.
-                        let ticks_to_ms = |dt_ticks: u64| -> f64 {
-                            (dt_ticks as f64 * period_ns) / 1_000_000.0
-                        };
+                        let ticks_to_ms =
+                            |dt_ticks: u64| -> f64 { (dt_ticks as f64 * period_ns) / 1_000_000.0 };
 
                         let iso_first = |begin: u64, end: u64| -> f64 {
                             if begin != 0 && end != 0 && end > begin {
@@ -12894,7 +13063,11 @@ impl App {
                                 return 0.0;
                             }
                             let dt_ticks = if let Some(prev) = *prev_end_tick {
-                                if end > prev { end - prev } else { 0 }
+                                if end > prev {
+                                    end - prev
+                                } else {
+                                    0
+                                }
                             } else {
                                 0
                             };

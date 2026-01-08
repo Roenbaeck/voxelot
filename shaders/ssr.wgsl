@@ -17,6 +17,12 @@ struct CameraUniforms {
     _pad_gi1: i32,
     gi_grid_dims: vec3<i32>,
     _pad_gi2: i32,
+    sun_direction: vec3<f32>,
+    sun_intensity: f32,
+    sun_color: vec3<f32>,
+    water_level: f32,
+    water_visibility: f32,
+    water_color: vec4<f32>,
 }
 
 struct SSRParams {
@@ -40,28 +46,22 @@ struct SSRParams {
 
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
 @group(0) @binding(1) var<uniform> params: SSRParams;
-@group(0) @binding(2) var scene_color: texture_2d<f32>;
-@group(0) @binding(3) var scene_depth: texture_depth_2d;
-@group(0) @binding(4) var linear_sampler: sampler;
-@group(0) @binding(5) var hzb_texture: texture_2d<f32>;
-@group(0) @binding(6) var hzb_sampler: sampler;
-@group(0) @binding(7) var normal_gbuffer: texture_2d<f32>;
-@group(0) @binding(8) var material_gbuffer: texture_2d<f32>;
-@group(0) @binding(9) var ssao_texture: texture_2d<f32>;
-@group(0) @binding(10) var bloom_texture: texture_2d<f32>;
-@group(0) @binding(11) var skybox_texture: texture_2d<f32>;
-@group(0) @binding(12) var skybox_sampler: sampler;
-@group(0) @binding(13) var ssr_history: texture_2d<f32>;
-// GI probe 3D volumes (Rgba16Float) with hardware trilinear filtering.
-// Faces are stored separately: +X, -X, +Y, -Y, +Z, -Z
-@group(0) @binding(14) var gi_probe_px: texture_3d<f32>;
-@group(0) @binding(15) var gi_probe_nx: texture_3d<f32>;
-@group(0) @binding(16) var gi_probe_py: texture_3d<f32>;
-@group(0) @binding(17) var gi_probe_ny: texture_3d<f32>;
-@group(0) @binding(18) var gi_probe_pz: texture_3d<f32>;
-@group(0) @binding(19) var gi_probe_nz: texture_3d<f32>;
-// Average chunk color and occupancy volume for coarse reflections
-@group(0) @binding(20) var gi_probe_color: texture_3d<f32>;
+@group(0) @binding(2) var scene_depth: texture_depth_2d;
+@group(0) @binding(3) var linear_sampler: sampler;
+@group(0) @binding(4) var hzb_texture: texture_2d<f32>;
+@group(0) @binding(5) var hzb_sampler: sampler;
+@group(0) @binding(6) var normal_gbuffer: texture_2d<f32>;
+@group(0) @binding(7) var material_gbuffer: texture_2d<f32>;
+@group(0) @binding(8) var skybox_texture: texture_2d<f32>;
+@group(0) @binding(9) var skybox_sampler: sampler;
+@group(0) @binding(10) var gi_probe_px: texture_3d<f32>;
+@group(0) @binding(11) var gi_probe_nx: texture_3d<f32>;
+@group(0) @binding(12) var gi_probe_py: texture_3d<f32>;
+@group(0) @binding(13) var gi_probe_ny: texture_3d<f32>;
+@group(0) @binding(14) var gi_probe_pz: texture_3d<f32>;
+@group(0) @binding(15) var gi_probe_nz: texture_3d<f32>;
+@group(0) @binding(16) var gi_probe_color: texture_3d<f32>;
+@group(0) @binding(17) var gi_probe_bbox: texture_3d<u32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -140,51 +140,170 @@ fn sample_radiance(uvw: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     return (color_x * w.x + color_y * w.y + color_z * w.z) * params.gi_scale;
 }
 
+struct RayHit {
+    t_near: f32,
+    t_far: f32,
+    normal: vec3<f32>,
+}
+
+fn ray_aabb_intersection(ro: vec3<f32>, rd: vec3<f32>, min_p: vec3<f32>, max_p: vec3<f32>) -> RayHit {
+    let inv_dir = 1.0 / rd;
+    let t_bot = inv_dir * (min_p - ro);
+    let t_top = inv_dir * (max_p - ro);
+    let t_min = min(t_bot, t_top);
+    let t_max = max(t_bot, t_top);
+    let t_near = max(max(t_min.x, t_min.y), t_min.z);
+    let t_far = min(min(t_max.x, t_max.y), t_max.z);
+    
+    // Improved robust normal calculation using masks
+    var normal = vec3<f32>(0.0);
+    let mask = vec3<f32>(
+        select(0.0, 1.0, t_near == t_min.x),
+        select(0.0, 1.0, t_near == t_min.y),
+        select(0.0, 1.0, t_near == t_min.z)
+    );
+    normal = -sign(rd) * mask;
+    
+    return RayHit(t_near, t_far, normal);
+}
+
 fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>) -> vec4<f32> {
     let dims = vec3<f32>(camera.gi_grid_dims);
     let grid_origin = vec3<f32>(camera.gi_grid_origin) * 16.0;
     
     // Coarse Volume Ray Marching
-    // We step through the GI grid looking for opaque chunks (reflected geometry)
     var current_pos = world_pos;
-    let step_size = 16.0; // One chunk per step
+    let step_size = 8.0; 
     
     var accumulated_color = vec3<f32>(0.0);
     var remaining_alpha = 1.0;
-    var hit_count = 0u;
 
-    for (var i = 1u; i < 16u; i++) {
-        current_pos += reflect_dir * step_size;
+    // Water plane intersection: t = (water_y - pos_y) / dir_y
+    var t_water = -1.0;
+    if (abs(reflect_dir.y) > 0.001) {
+        t_water = (camera.water_level - world_pos.y) / reflect_dir.y;
+    }
+
+    // Water base color synthesized from sun and ambient
+    // Use a depth-aware tint to better match the water surface shader (shallow/deep blend + visibility)
+    let brightness = camera.skybox_brightness;
+    let shallow_color = vec3<f32>(0.15, 0.45, 0.50) * brightness;
+    let deep_color = vec3<f32>(0.02, 0.12, 0.20) * brightness;
+    let sky_on_water = sample_sky_equirect(reflect(reflect_dir, vec3<f32>(0.0, 1.0, 0.0)));
+
+    // Default to a simple tint if we don't compute a water intersection depth
+    var water_color = camera.water_color.rgb * (brightness + 0.1);
+
+    // If we have a valid water intersection distance, synthesize a closer match to `water.wgsl`
+    if (t_water > 0.0) {
+        let hit_y = world_pos.y + reflect_dir.y * t_water;
+        let depth_diff = camera.water_level - hit_y;
+        let max_depth = max(camera.water_visibility, 1.0);
+        let depth_factor = clamp(depth_diff / max_depth, 0.0, 1.0);
+        let water_tint = mix(shallow_color, deep_color, depth_factor);
+        let underwater_visibility = exp(-depth_diff * 0.3);
+
+        // Approximate underwater blend: prefer the water tint while allowing some sky influence
+        water_color = mix(water_tint, sky_on_water * 0.3 + water_tint * 0.7, underwater_visibility);
+    }
+
+    // Slightly darken synthesized water reflections so they don't appear brighter than the surface
+    water_color *= 0.8;
+    let sun_dir = normalize(camera.sun_direction);
+
+    for (var i = 0u; i < 32u; i++) {
+        let t_ray = f32(i) * step_size;
         
-        let grid_coord = (current_pos - grid_origin) / 16.0;
-        let uvw = grid_coord / dims;
+        // If we reached the water plane before any geometry, stop and return water color
+        if (t_water > 0.0 && t_ray >= t_water) {
+            accumulated_color += water_color * remaining_alpha;
+            remaining_alpha = 0.0;
+            break;
+        }
+
+        current_pos = world_pos + reflect_dir * t_ray;
         
-        if (any(grid_coord < vec3<f32>(0.0)) || any(grid_coord >= dims)) {
+        let grid_f_coord = (current_pos - grid_origin) / 16.0;
+        let grid_i_coord = vec3<i32>(floor(grid_f_coord));
+        
+        if (any(grid_i_coord < vec3<i32>(0)) || any(grid_i_coord >= camera.gi_grid_dims)) {
             break;
         }
         
+        let uvw = (vec3<f32>(grid_i_coord) + 0.5) / dims;
         let chunk_data = textureSampleLevel(gi_probe_color, linear_sampler, uvw, 0.0);
         let occupancy = chunk_data.a;
         
         if (occupancy > 0.05) {
-            let rad = sample_radiance(uvw, reflect_dir);
-            let lit_color = chunk_data.rgb * rad * 2.5; // Coarse factor for lit surface radiance
+            let packed_bbox = textureLoad(gi_probe_bbox, grid_i_coord, 0).r;
+            let valid = (packed_bbox >> 24u) & 1u;
             
-            let alpha = occupancy * remaining_alpha;
-            accumulated_color += lit_color * alpha;
-            remaining_alpha -= alpha;
-            hit_count += 1u;
-            
-            if (remaining_alpha < 0.1) {
-                remaining_alpha = 0.0;
-                break;
+            if (valid == 1u) {
+                let xmin = f32(packed_bbox & 0xFu);
+                let ymin = f32((packed_bbox >> 4u) & 0xFu);
+                let zmin = f32((packed_bbox >> 8u) & 0xFu);
+                let xmax = f32((packed_bbox >> 12u) & 0xFu);
+                let ymax = f32((packed_bbox >> 16u) & 0xFu);
+                let zmax = f32((packed_bbox >> 20u) & 0xFu);
+                
+                let chunk_world_origin = vec3<f32>(grid_i_coord) * 16.0 + grid_origin;
+                let aabb_min = chunk_world_origin + vec3<f32>(xmin, ymin, zmin);
+                let aabb_max = chunk_world_origin + vec3<f32>(xmax + 1.0, ymax + 1.0, zmax + 1.0);
+                
+                // IGNORE SUBMERGED GEOMETRY: if the entire chunk is below water, skip it
+                if (aabb_max.y < camera.water_level) {
+                   continue;
+                }
+
+                let hit = ray_aabb_intersection(world_pos, reflect_dir, aabb_min, aabb_max);
+                
+                // SURFACE CLIPPING: 
+                if (hit.t_near <= hit.t_far && hit.t_far > 0.0 && hit.t_near > 0.1) {
+                    // If the specific hit point is below water level, treat it as hitting water
+                    let hit_point_y = world_pos.y + reflect_dir.y * hit.t_near;
+                    if (hit_point_y < camera.water_level) {
+                        accumulated_color += water_color * remaining_alpha;
+                        remaining_alpha = 0.0;
+                        break;
+                    }
+
+                    let rad = sample_radiance(uvw, reflect_dir);
+                    let dot_sun = saturate(dot(hit.normal, sun_dir));
+                    let sun_lit = camera.sun_color * camera.sun_intensity * dot_sun * 1.5;
+                    
+                    let lit_color = chunk_data.rgb * (rad * 2.5 + sun_lit);
+                    
+                    accumulated_color += lit_color * remaining_alpha;
+                    remaining_alpha = 0.0;
+                    break; 
+                }
+            } else {
+                // Fallback for chunks without bbox: treat as semi-transparent volume
+                // Skip if submerged
+                if (current_pos.y < camera.water_level) {
+                    continue;
+                }
+
+                let rad = sample_radiance(uvw, reflect_dir);
+                let sun_lit = camera.sun_color * camera.sun_intensity * 0.5;
+                let lit_color = chunk_data.rgb * (rad * 2.5 + sun_lit);
+                
+                let alpha = saturate(occupancy * 2.0) * remaining_alpha;
+                accumulated_color += lit_color * alpha;
+                remaining_alpha -= alpha;
+                
+                if (remaining_alpha < 0.1) {
+                    remaining_alpha = 0.0;
+                    break;
+                }
             }
         }
     }
-    
-    if (hit_count == 0u) {
-        let distant_uvw = clamp((((world_pos + reflect_dir * 128.0) - grid_origin) / 16.0) / dims, vec3<f32>(0.0), vec3<f32>(1.0));
-        return vec4<f32>(sample_radiance(distant_uvw, reflect_dir), 0.0);
+
+    // FINAL FLOOR: If ray points down and we haven't hit anything, hit the water surface
+    if (remaining_alpha > 0.0 && t_water > 0.0) {
+        accumulated_color += water_color * remaining_alpha;
+        remaining_alpha = 0.0;
     }
     
     return vec4<f32>(accumulated_color, 1.0 - remaining_alpha);
@@ -204,6 +323,12 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     let world_pos = reconstruct_world_pos(input.uv, depth);
+
+    // Disable SSR for submerged materials to avoid underwater reflection artifacts.
+    // (Water surface reflections are handled separately in `water.wgsl`.)
+    if (camera.water_visibility > 0.0 && world_pos.y < camera.water_level) {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
     let gbuf = textureSample(normal_gbuffer, linear_sampler, input.uv);
     let normal = decode_world_normal(gbuf.rgb);
 
