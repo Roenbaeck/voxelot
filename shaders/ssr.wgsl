@@ -277,7 +277,32 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>) -> vec4<f32> {
                         let dot_sun = saturate(dot(hit.normal, sun_dir));
                         let sun_lit = camera.sun_color * camera.sun_intensity * dot_sun * 1.5;
                         
-                        let lit_color = hit_data.rgb * (rad * 2.5 + sun_lit);
+                        let base_lit_color = hit_data.rgb * (rad * 2.5 + sun_lit);
+
+                        // Add skybox reflections for reflected surfaces.
+                        // Key change: blend toward the skybox directly (not tinted by albedo)
+                        // and weight it using a Fresnel term so it reads as "reflective".
+                        let hit_view_dir = normalize(hit_point - camera.camera_pos);
+                        let hit_reflect_dir = reflect(hit_view_dir, hit.normal);
+                        let hit_sky_color = sample_sky_equirect(hit_reflect_dir);
+
+                        // Heuristic material reflectivity proxy (we don't store reflectivity in GI probes).
+                        // Use brightness to bias metallic-looking chunks to higher reflectance.
+                        let surface_brightness = dot(hit_data.rgb, vec3<f32>(0.299, 0.587, 0.114));
+                        let metallic_bias = saturate(surface_brightness * 1.25);
+
+                        // Fresnel Schlick approximation.
+                        // cos_theta uses the view vector from surface -> camera.
+                        let view_to_cam = normalize(camera.camera_pos - hit_point);
+                        let cos_theta = saturate(dot(hit.normal, view_to_cam));
+                        let fresnel = pow(1.0 - cos_theta, 5.0);
+
+                        // Base reflectance: dielectric ~0.04, increase toward ~0.6 for bright/metallic chunks.
+                        let f0 = mix(0.04, 0.6, metallic_bias);
+                        let reflect_w = saturate(f0 + (1.0 - f0) * fresnel);
+
+                        // Final blend. Extra boost to make "reflection of reflective" visible.
+                        let lit_color = mix(base_lit_color, hit_sky_color, reflect_w);
                         
                         accumulated_color += lit_color * remaining_alpha;
                         remaining_alpha = 0.0;
