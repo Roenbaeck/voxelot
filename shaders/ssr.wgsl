@@ -176,6 +176,9 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>) -> vec4<f32> {
     let brightness = camera.skybox_brightness;
 
     // Water plane intersection: t = (water_y - pos_y) / dir_y
+    // IMPORTANT: we do NOT treat water as an infinite guaranteed hit.
+    // We only accept a water hit if the intersection point is inside the GI grid
+    // AND that local chunk has no geometry at/above water level.
     var t_water = -1.0;
     if (abs(reflect_dir.y) > 0.001) {
         t_water = (camera.water_level - world_pos.y) / reflect_dir.y;
@@ -231,9 +234,38 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>) -> vec4<f32> {
 
         // Potential water intersection (relative to world_pos)
         if (t_water > 0.0 && (t_current + bias) >= t_water) {
-            accumulated_color += water_color * remaining_alpha;
-            remaining_alpha = 0.0;
-            break;
+            let water_hit_point = world_pos + reflect_dir * t_water;
+            let water_chunk_f = (water_hit_point - world_grid_origin) / 16.0;
+            let water_chunk_i = vec3<i32>(floor(water_chunk_f));
+
+            // Only allow water if the intersection is inside the GI grid.
+            var water_visible = false;
+            if (all(water_chunk_i >= vec3<i32>(0)) && all(water_chunk_i < camera.gi_grid_dims)) {
+                let occ = textureLoad(gi_probe_color, water_chunk_i, 0).a;
+                if (occ <= 0.05) {
+                    water_visible = true;
+                } else {
+                    let packed = textureLoad(gi_probe_bbox, water_chunk_i, 0).r;
+                    let bbox_valid = (packed >> 24u) & 1u;
+                    if (bbox_valid == 1u) {
+                        let ymax = f32((packed >> 16u) & 0xFu);
+                        let chunk_origin = vec3<f32>(water_chunk_i) * 16.0 + world_grid_origin;
+                        let aabb_max_y = chunk_origin.y + (ymax + 1.0);
+                        // If the chunk's highest voxel is below the water plane, water surface can exist here.
+                        // Otherwise (land/buildings above water), don't force a water hit.
+                        water_visible = aabb_max_y < camera.water_level;
+                    }
+                }
+            }
+
+            if (water_visible) {
+                accumulated_color += water_color * remaining_alpha;
+                remaining_alpha = 0.0;
+                break;
+            }
+
+            // Water not visible here (likely land above water) or outside grid: disable water fallback.
+            t_water = -1.0;
         }
 
         // Discrete occupancy check for quick culling
@@ -357,10 +389,29 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>) -> vec4<f32> {
         }
     }
 
-    // FINAL FLOOR: If ray points down and we haven't hit anything, hit the water surface
+    // FINAL FLOOR: only allow water if we can validate it inside the GI grid.
     if (remaining_alpha > 0.0 && t_water > 0.0) {
-        accumulated_color += water_color * remaining_alpha;
-        remaining_alpha = 0.0;
+        let water_hit_point = world_pos + reflect_dir * t_water;
+        let water_chunk_f = (water_hit_point - world_grid_origin) / 16.0;
+        let water_chunk_i = vec3<i32>(floor(water_chunk_f));
+        if (all(water_chunk_i >= vec3<i32>(0)) && all(water_chunk_i < camera.gi_grid_dims)) {
+            let occ = textureLoad(gi_probe_color, water_chunk_i, 0).a;
+            var water_visible = occ <= 0.05;
+            if (!water_visible) {
+                let packed = textureLoad(gi_probe_bbox, water_chunk_i, 0).r;
+                let bbox_valid = (packed >> 24u) & 1u;
+                if (bbox_valid == 1u) {
+                    let ymax = f32((packed >> 16u) & 0xFu);
+                    let chunk_origin = vec3<f32>(water_chunk_i) * 16.0 + world_grid_origin;
+                    let aabb_max_y = chunk_origin.y + (ymax + 1.0);
+                    water_visible = aabb_max_y < camera.water_level;
+                }
+            }
+            if (water_visible) {
+                accumulated_color += water_color * remaining_alpha;
+                remaining_alpha = 0.0;
+            }
+        }
     }
     
     return vec4<f32>(accumulated_color, 1.0 - remaining_alpha);
