@@ -1510,6 +1510,7 @@ struct App {
     kawase_up_pipeline: Option<wgpu::RenderPipeline>,
     // SSR Kawase blur (uses Y-flipped UVs to match composite sampling)
     ssr_kawase_pipeline: Option<wgpu::RenderPipeline>,
+    ssr_kawase_bind_group_layout: Option<wgpu::BindGroupLayout>,
     kawase_bind_group_layout: Option<wgpu::BindGroupLayout>,
     kawase_down_bind_groups: Vec<Option<wgpu::BindGroup>>,
     kawase_up_bind_groups: Vec<Option<wgpu::BindGroup>>,
@@ -2717,6 +2718,7 @@ impl App {
             kawase_down_pipeline: None,
             kawase_up_pipeline: None,
             ssr_kawase_pipeline: None,
+            ssr_kawase_bind_group_layout: None,
             kawase_bind_group_layout: None,
             kawase_down_bind_groups: Vec::new(),
             kawase_up_bind_groups: Vec::new(),
@@ -8162,6 +8164,53 @@ impl App {
                 ],
             });
 
+        let ssr_kawase_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("SSR Kawase Bind Group Layout"),
+                entries: &[
+                    // SSR input (RGBA16F)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // Sampler
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    // Scene depth
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // Normal gbuffer (unfilterable load)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
         let kawase_down_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Kawase Down Pipeline Layout"),
@@ -8172,6 +8221,13 @@ impl App {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Kawase Up Pipeline Layout"),
                 bind_group_layouts: &[&kawase_bind_group_layout],
+                immediate_size: 16,
+            });
+
+        let ssr_kawase_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("SSR Kawase Blur Pipeline Layout"),
+                bind_group_layouts: &[&ssr_kawase_bind_group_layout],
                 immediate_size: 16,
             });
 
@@ -8203,7 +8259,7 @@ impl App {
 
         let ssr_kawase_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("SSR Kawase Blur Pipeline"),
-            layout: Some(&kawase_down_pipeline_layout),
+            layout: Some(&ssr_kawase_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &ssr_kawase_shader,
                 entry_point: Some("vs_main"),
@@ -8257,6 +8313,7 @@ impl App {
         self.kawase_up_pipeline = Some(kawase_up_pipeline);
         self.ssr_kawase_pipeline = Some(ssr_kawase_pipeline);
         self.kawase_bind_group_layout = Some(kawase_bind_group_layout);
+    self.ssr_kawase_bind_group_layout = Some(ssr_kawase_bind_group_layout);
 
         let post_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("DoF Sampler"),
@@ -12454,18 +12511,22 @@ impl App {
             // Important: water samples the *unblurred* SSR texture, so we write into a separate ping/pong.
             if let (
                 Some(ssr_kawase_pipeline),
-                Some(kawase_layout),
+                Some(ssr_kawase_layout),
                 Some(sampler),
                 Some(ssr_src_view),
                 Some(ssr_blur_ping_view),
                 Some(ssr_blur_pong_view),
+                Some(depth_view),
+                Some(normal_view),
             ) = (
                 self.ssr_kawase_pipeline.as_ref(),
-                self.kawase_bind_group_layout.as_ref(),
+                self.ssr_kawase_bind_group_layout.as_ref(),
                 self.post_sampler.as_ref(),
                 self.ssr_texture_view.as_ref(),
                 self.ssr_blur_ping_view.as_ref(),
                 self.ssr_blur_pong_view.as_ref(),
+                self.offscreen_depth_view.as_ref(),
+                self.normal_view.as_ref(),
             ) {
                 // Fixed parameters: tuned to approximate a Gaussian-like blur.
                 // Keep odd iterations so the final output ends up in ping (which the composite pass samples).
@@ -12489,7 +12550,7 @@ impl App {
 
                     let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some(&format!("SSR Kawase Temp BG L{}", level)),
-                        layout: kawase_layout,
+                        layout: ssr_kawase_layout,
                         entries: &[
                             wgpu::BindGroupEntry {
                                 binding: 0,
@@ -12498,6 +12559,14 @@ impl App {
                             wgpu::BindGroupEntry {
                                 binding: 1,
                                 resource: wgpu::BindingResource::Sampler(sampler),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::TextureView(depth_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: wgpu::BindingResource::TextureView(normal_view),
                             },
                         ],
                     });

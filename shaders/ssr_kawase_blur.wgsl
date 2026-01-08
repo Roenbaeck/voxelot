@@ -12,6 +12,10 @@ var<immediate> kawase: KawaseUniforms;
 var input_texture: texture_2d<f32>;
 @group(0) @binding(1)
 var input_sampler: sampler;
+@group(0) @binding(2)
+var scene_depth: texture_depth_2d;
+@group(0) @binding(3)
+var normal_gbuffer: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -34,28 +38,107 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return out;
 }
 
+fn decode_world_normal(encoded: vec3<f32>) -> vec3<f32> {
+    let n = encoded * 2.0 - 1.0;
+    return normalize(select(n, vec3<f32>(0.0, 1.0, 0.0), dot(n, n) < 1e-8));
+}
+
+fn uv_to_pixel(uv: vec2<f32>, dim: vec2<u32>) -> vec2<i32> {
+    let px = clamp(i32(uv.x * f32(dim.x)), 0, i32(dim.x) - 1);
+    let py = clamp(i32(uv.y * f32(dim.y)), 0, i32(dim.y) - 1);
+    return vec2<i32>(px, py);
+}
+
+fn load_depth_at_uv(uv: vec2<f32>) -> f32 {
+    let dim = textureDimensions(scene_depth);
+    let px = uv_to_pixel(uv, dim);
+    return textureLoad(scene_depth, px, 0);
+}
+
+fn load_normal_at_uv(uv: vec2<f32>) -> vec3<f32> {
+    let dim = textureDimensions(normal_gbuffer);
+    let px = uv_to_pixel(uv, dim);
+    return decode_world_normal(textureLoad(normal_gbuffer, px, 0).xyz);
+}
+
+fn edge_weight(depth0: f32, normal0: vec3<f32>, uv: vec2<f32>) -> f32 {
+    let depth1 = load_depth_at_uv(uv);
+    let normal1 = load_normal_at_uv(uv);
+    let depth_diff = abs(depth1 - depth0);
+    let ndot = clamp(dot(normal0, normal1), 0.0, 1.0);
+    let normal_diff = 1.0 - ndot;
+
+    // Tune: raw depth is non-linear; this is still a good edge-stop for silhouettes.
+    let w_depth = exp(-depth_diff * 200.0);
+    let w_normal = exp(-normal_diff * 12.0);
+    return w_depth * w_normal;
+}
+
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let uv = input.uv;
     let off = kawase.offset;
     let ts = kawase.texel_size;
 
-    // 9-tap kernel: center + 4 neighbors + 4 diagonals with Gaussian-like weights
+    // 9-tap kernel: center + 4 neighbors + 4 diagonals with Gaussian-like weights.
+    // Important: make it alpha-aware so reflection color doesn't bleed past reflective geometry edges.
+    // We weight each tap by its own SSR alpha and normalize by total alpha weight.
     let center_sample = textureSample(input_texture, input_sampler, uv);
-    let c = center_sample.rgb;
+    let depth0 = load_depth_at_uv(uv);
+    let normal0 = load_normal_at_uv(uv);
 
-    let s1 = textureSample(input_texture, input_sampler, uv + vec2<f32>( ts.x * off, 0.0)).rgb;
-    let s2 = textureSample(input_texture, input_sampler, uv + vec2<f32>(-ts.x * off, 0.0)).rgb;
-    let s3 = textureSample(input_texture, input_sampler, uv + vec2<f32>(0.0, ts.y * off)).rgb;
-    let s4 = textureSample(input_texture, input_sampler, uv + vec2<f32>(0.0, -ts.y * off)).rgb;
-    let s5 = textureSample(input_texture, input_sampler, uv + vec2<f32>( ts.x * off,  ts.y * off)).rgb;
-    let s6 = textureSample(input_texture, input_sampler, uv + vec2<f32>(-ts.x * off,  ts.y * off)).rgb;
-    let s7 = textureSample(input_texture, input_sampler, uv + vec2<f32>( ts.x * off, -ts.y * off)).rgb;
-    let s8 = textureSample(input_texture, input_sampler, uv + vec2<f32>(-ts.x * off, -ts.y * off)).rgb;
+    let uv1 = uv + vec2<f32>( ts.x * off, 0.0);
+    let uv2 = uv + vec2<f32>(-ts.x * off, 0.0);
+    let uv3 = uv + vec2<f32>(0.0, ts.y * off);
+    let uv4 = uv + vec2<f32>(0.0, -ts.y * off);
+    let uv5 = uv + vec2<f32>( ts.x * off,  ts.y * off);
+    let uv6 = uv + vec2<f32>(-ts.x * off,  ts.y * off);
+    let uv7 = uv + vec2<f32>( ts.x * off, -ts.y * off);
+    let uv8 = uv + vec2<f32>(-ts.x * off, -ts.y * off);
 
-    // Weighted Gaussian-like kernel (center 4, edges 2, corners 1) normalized by 16
-    let avg = (4.0 * c + 2.0 * (s1 + s2 + s3 + s4) + (s5 + s6 + s7 + s8)) / 16.0;
+    let t1 = textureSample(input_texture, input_sampler, uv1);
+    let t2 = textureSample(input_texture, input_sampler, uv2);
+    let t3 = textureSample(input_texture, input_sampler, uv3);
+    let t4 = textureSample(input_texture, input_sampler, uv4);
+    let t5 = textureSample(input_texture, input_sampler, uv5);
+    let t6 = textureSample(input_texture, input_sampler, uv6);
+    let t7 = textureSample(input_texture, input_sampler, uv7);
+    let t8 = textureSample(input_texture, input_sampler, uv8);
 
-    // Preserve alpha (SSR strength) from the center sample
+    // Edge-stop weights (preserve internal edges where the reflective surface changes normal/depth).
+    let e1 = edge_weight(depth0, normal0, uv1);
+    let e2 = edge_weight(depth0, normal0, uv2);
+    let e3 = edge_weight(depth0, normal0, uv3);
+    let e4 = edge_weight(depth0, normal0, uv4);
+    let e5 = edge_weight(depth0, normal0, uv5);
+    let e6 = edge_weight(depth0, normal0, uv6);
+    let e7 = edge_weight(depth0, normal0, uv7);
+    let e8 = edge_weight(depth0, normal0, uv8);
+
+    let w0 = 4.0 * center_sample.a;
+    let w1 = 2.0 * t1.a * e1;
+    let w2 = 2.0 * t2.a * e2;
+    let w3 = 2.0 * t3.a * e3;
+    let w4 = 2.0 * t4.a * e4;
+    let w5 = 1.0 * t5.a * e5;
+    let w6 = 1.0 * t6.a * e6;
+    let w7 = 1.0 * t7.a * e7;
+    let w8 = 1.0 * t8.a * e8;
+
+    let rgb_sum =
+        w0 * center_sample.rgb +
+        w1 * t1.rgb +
+        w2 * t2.rgb +
+        w3 * t3.rgb +
+        w4 * t4.rgb +
+        w5 * t5.rgb +
+        w6 * t6.rgb +
+        w7 * t7.rgb +
+        w8 * t8.rgb;
+
+    let w_sum = w0 + w1 + w2 + w3 + w4 + w5 + w6 + w7 + w8;
+    let avg = select(vec3<f32>(0.0), rgb_sum / max(w_sum, 1e-5), w_sum > 1e-5);
+
+    // Preserve alpha (SSR strength) from the center sample (avoid expanding reflection coverage).
     return vec4<f32>(avg, center_sample.a);
 }
