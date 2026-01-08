@@ -1461,6 +1461,11 @@ struct App {
     ssr_camera_uniform_buffer: Option<wgpu::Buffer>,
     ssr_texture: Option<wgpu::Texture>,
     ssr_texture_view: Option<wgpu::TextureView>,
+    // Optional blurred SSR texture (used for final compositing only; water samples the unblurred SSR texture)
+    ssr_blur_ping_texture: Option<wgpu::Texture>,
+    ssr_blur_ping_view: Option<wgpu::TextureView>,
+    ssr_blur_pong_texture: Option<wgpu::Texture>,
+    ssr_blur_pong_view: Option<wgpu::TextureView>,
     ssr_history_texture: Option<wgpu::Texture>,
     ssr_history_view: Option<wgpu::TextureView>,
     ssr_history_valid: bool,
@@ -1503,6 +1508,8 @@ struct App {
     // Dual Kawase resources for DoF blur
     kawase_down_pipeline: Option<wgpu::RenderPipeline>,
     kawase_up_pipeline: Option<wgpu::RenderPipeline>,
+    // SSR Kawase blur (uses Y-flipped UVs to match composite sampling)
+    ssr_kawase_pipeline: Option<wgpu::RenderPipeline>,
     kawase_bind_group_layout: Option<wgpu::BindGroupLayout>,
     kawase_down_bind_groups: Vec<Option<wgpu::BindGroup>>,
     kawase_up_bind_groups: Vec<Option<wgpu::BindGroup>>,
@@ -2709,6 +2716,7 @@ impl App {
             dof_enabled: cfg.effects.depth_of_field.enabled,
             kawase_down_pipeline: None,
             kawase_up_pipeline: None,
+            ssr_kawase_pipeline: None,
             kawase_bind_group_layout: None,
             kawase_down_bind_groups: Vec::new(),
             kawase_up_bind_groups: Vec::new(),
@@ -2774,6 +2782,10 @@ impl App {
             ssr_camera_uniform_buffer: None,
             ssr_texture: None,
             ssr_texture_view: None,
+            ssr_blur_ping_texture: None,
+            ssr_blur_ping_view: None,
+            ssr_blur_pong_texture: None,
+            ssr_blur_pong_view: None,
             ssr_history_texture: None,
             ssr_history_view: None,
             ssr_history_valid: false,
@@ -3479,6 +3491,10 @@ impl App {
             ssao_bytes,
             ssr_texture_loc,
             ssr_texture_view_loc,
+            ssr_blur_ping_texture_loc,
+            ssr_blur_ping_view_loc,
+            ssr_blur_pong_texture_loc,
+            ssr_blur_pong_view_loc,
             ssr_history_texture_loc,
             ssr_history_view_loc,
             scene_copy_texture_loc,
@@ -3784,6 +3800,10 @@ impl App {
                 let (
                     ssr_texture_loc,
                     ssr_texture_view_loc,
+                    ssr_blur_ping_texture_loc,
+                    ssr_blur_ping_view_loc,
+                    ssr_blur_pong_texture_loc,
+                    ssr_blur_pong_view_loc,
                     ssr_history_texture_loc,
                     ssr_history_view_loc,
                 ) = if self.user_config.effects.ssr.enabled {
@@ -3806,6 +3826,43 @@ impl App {
                     let ssr_texture_view_loc =
                         ssr_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
 
+                    // SSR blur ping/pong (full resolution). Used to soften building reflections in the final composite.
+                    let ssr_blur_ping_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("SSR Blur Ping Texture"),
+                        size: wgpu::Extent3d {
+                            width: target_width,
+                            height: target_height,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                            | wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    });
+                    let ssr_blur_ping_view_loc = ssr_blur_ping_texture_loc
+                        .create_view(&wgpu::TextureViewDescriptor::default());
+
+                    let ssr_blur_pong_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("SSR Blur Pong Texture"),
+                        size: wgpu::Extent3d {
+                            width: target_width,
+                            height: target_height,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                            | wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    });
+                    let ssr_blur_pong_view_loc = ssr_blur_pong_texture_loc
+                        .create_view(&wgpu::TextureViewDescriptor::default());
+
                     let ssr_history_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
                         label: Some("SSR History Texture"),
                         size: wgpu::Extent3d {
@@ -3826,11 +3883,15 @@ impl App {
                     (
                         Some(ssr_texture_loc),
                         Some(ssr_texture_view_loc),
+                        Some(ssr_blur_ping_texture_loc),
+                        Some(ssr_blur_ping_view_loc),
+                        Some(ssr_blur_pong_texture_loc),
+                        Some(ssr_blur_pong_view_loc),
                         Some(ssr_history_texture_loc),
                         Some(ssr_history_view_loc),
                     )
                 } else {
-                    (None, None, None, None)
+                    (None, None, None, None, None, None, None, None)
                 };
 
                 // Scene color copy texture (for water reflections - same format as offscreen)
@@ -4238,6 +4299,10 @@ impl App {
                     ssao_bytes,
                     ssr_texture_loc,
                     ssr_texture_view_loc,
+                    ssr_blur_ping_texture_loc,
+                    ssr_blur_ping_view_loc,
+                    ssr_blur_pong_texture_loc,
+                    ssr_blur_pong_view_loc,
                     ssr_history_texture_loc,
                     ssr_history_view_loc,
                     scene_copy_texture_loc,
@@ -4343,6 +4408,10 @@ impl App {
         self.offscreen_color_texture = Some(color_texture);
         self.ssr_texture = ssr_texture_loc;
         self.ssr_texture_view = ssr_texture_view_loc;
+        self.ssr_blur_ping_texture = ssr_blur_ping_texture_loc;
+        self.ssr_blur_ping_view = ssr_blur_ping_view_loc;
+        self.ssr_blur_pong_texture = ssr_blur_pong_texture_loc;
+        self.ssr_blur_pong_view = ssr_blur_pong_view_loc;
         self.ssr_history_texture = ssr_history_texture_loc;
         self.ssr_history_view = ssr_history_view_loc;
         self.ssr_history_valid = false;
@@ -5261,7 +5330,11 @@ impl App {
             self.rc_texture_view.as_ref(),
             self.hzb_view.as_ref(),
         ) {
-            let ssr_view = self.ssr_texture_view.as_ref().unwrap_or(post_view_ref);
+            let ssr_view = self
+                .ssr_blur_ping_view
+                .as_ref()
+                .or(self.ssr_texture_view.as_ref())
+                .unwrap_or(post_view_ref);
             self.composite_bind_group =
                 Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("Composite Bind Group"),
@@ -8053,6 +8126,12 @@ impl App {
                 include_str!("../../shaders/dual_kawase_down.wgsl").into(),
             ),
         });
+        let ssr_kawase_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("SSR Kawase Blur Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../shaders/ssr_kawase_blur.wgsl").into(),
+            ),
+        });
         let kawase_up_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Kawase Up Shader"),
             source: wgpu::ShaderSource::Wgsl(
@@ -8122,6 +8201,32 @@ impl App {
             cache: None,
         });
 
+        let ssr_kawase_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("SSR Kawase Blur Pipeline"),
+            layout: Some(&kawase_down_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &ssr_kawase_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &ssr_kawase_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let kawase_up_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Kawase Up Pipeline"),
             layout: Some(&kawase_up_pipeline_layout),
@@ -8150,6 +8255,7 @@ impl App {
 
         self.kawase_down_pipeline = Some(kawase_down_pipeline);
         self.kawase_up_pipeline = Some(kawase_up_pipeline);
+        self.ssr_kawase_pipeline = Some(ssr_kawase_pipeline);
         self.kawase_bind_group_layout = Some(kawase_bind_group_layout);
 
         let post_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -12342,6 +12448,81 @@ impl App {
                 ssr_pass.set_pipeline(pipeline);
                 ssr_pass.set_bind_group(0, bind_group, &[]);
                 ssr_pass.draw(0..3, 0..1);
+            }
+
+            // Blur SSR for final compositing (buildings) using the existing Kawase blur pipeline.
+            // Important: water samples the *unblurred* SSR texture, so we write into a separate ping/pong.
+            if let (
+                Some(ssr_kawase_pipeline),
+                Some(kawase_layout),
+                Some(sampler),
+                Some(ssr_src_view),
+                Some(ssr_blur_ping_view),
+                Some(ssr_blur_pong_view),
+            ) = (
+                self.ssr_kawase_pipeline.as_ref(),
+                self.kawase_bind_group_layout.as_ref(),
+                self.post_sampler.as_ref(),
+                self.ssr_texture_view.as_ref(),
+                self.ssr_blur_ping_view.as_ref(),
+                self.ssr_blur_pong_view.as_ref(),
+            ) {
+                // Fixed parameters: tuned to approximate a Gaussian-like blur.
+                // Keep odd iterations so the final output ends up in ping (which the composite pass samples).
+                let iterations: usize = 3;
+                let base_offset: f32 = 1.10;
+                let blur_radius: f32 = 1.0;
+
+                for level in 0..iterations {
+                    let (src_view, dst_view) = if level == 0 {
+                        (ssr_src_view, ssr_blur_ping_view)
+                    } else if level % 2 == 1 {
+                        (ssr_blur_ping_view, ssr_blur_pong_view)
+                    } else {
+                        (ssr_blur_pong_view, ssr_blur_ping_view)
+                    };
+
+                    let texel_x = 1.0 / self.render_target_width.max(1) as f32;
+                    let texel_y = 1.0 / self.render_target_height.max(1) as f32;
+                    let offset = base_offset * (level as f32 + 1.0) * blur_radius;
+                    let immediate_data = [texel_x, texel_y, offset, 0.0_f32];
+
+                    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(&format!("SSR Kawase Temp BG L{}", level)),
+                        layout: kawase_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(src_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(sampler),
+                            },
+                        ],
+                    });
+
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some(&format!("SSR Kawase Blur L{}", level)),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: dst_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_pipeline(ssr_kawase_pipeline);
+                    pass.set_immediates(0, bytemuck::cast_slice(&immediate_data));
+                    pass.set_bind_group(0, &bg, &[]);
+                    pass.draw(0..3, 0..1);
+                }
             }
 
             // Update SSR history for temporal accumulation (next frame).

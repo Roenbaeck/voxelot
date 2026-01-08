@@ -67,12 +67,12 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let sample_uv = composite.uv_offset + uv * composite.uv_scale;
     let base = textureSample(post_color, post_sampler, sample_uv).rgb;
     let bloom = textureSample(bloom_texture, post_sampler, sample_uv).rgb;
-    
+
     // Sample SSILVB: RGB = accumulated emissive light, A = ambient occlusion
     let ssilvb_sample = textureSample(ssao_texture, post_sampler, sample_uv);
     let indirect_light = ssilvb_sample.rgb;
     let raw_ao = ssilvb_sample.a;
-    
+
     var ao: f32 = 1.0;
     if (composite.ssao_enabled > 0.5) {
         // Blend between no occlusion (1.0) and raw AO by strength.
@@ -95,41 +95,41 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     if (composite.hzb_debug > 0.5) {
         let tiles: f32 = 4.0;
         let tiles_i: u32 = 4u;
-        
+
         // Map sample_uv (0..1 over whole texture) to viewport_uv (0..1 over viewport)
         let viewport_uv = (sample_uv - composite.uv_offset) / composite.uv_scale;
-        
+
         if (viewport_uv.x >= 0.0 && viewport_uv.x <= 1.0 && viewport_uv.y >= 0.0 && viewport_uv.y <= 1.0) {
             let cell = vec2<u32>(u32(floor(viewport_uv.x * tiles)), u32(floor(viewport_uv.y * tiles)));
             let mip_idx = cell.x + cell.y * tiles_i;
             let mip_f = f32(mip_idx);
-            
+
             // local uv inside cell
             let local_uv = fract(viewport_uv * tiles);
-            
+
             // clamp mip to available mips
             if (mip_f < composite.hzb_mips) {
                 // Sample HZB at specified mip
                 // We sample the viewport part of the HZB mip for each cell
                 let hzb_uv = local_uv * composite.uv_scale + composite.uv_offset;
                 let depth_sample = textureSampleLevel(hzb_texture, post_sampler, hzb_uv, mip_f).r;
-                
+
                 // Draw thin borders for cells
                 let border = 0.02;
                 let edge = step(local_uv.x, border) + step(local_uv.y, border) + step(1.0 - local_uv.x, border) + step(1.0 - local_uv.y, border);
                 let border_col = vec3<f32>(0.0, 0.0, 0.0);
-                
+
                 // Linearize depth for better visualization
                 // Standard depth: d = f/(f-n) - (f*n)/((f-n)*z)
                 // z = (f*n) / (f - d*(f-n))
                 let n = composite.near;
                 let f = composite.far;
                 let z_linear = (f * n) / (f - depth_sample * (f - n));
-                
+
                 // Logarithmic mapping to see detail across the whole range [near, far]
                 let fill_val = (log2(z_linear) - log2(n)) / (log2(f) - log2(n));
                 let fill = vec3<f32>(fill_val);
-                
+
                 let col = mix(fill, border_col, clamp(edge, 0.0, 1.0));
                 return vec4<f32>(col, 1.0);
             }
@@ -147,7 +147,7 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     // Apply AO to all lighting (direct + bloom + GI)
     // AO represents how much ambient light reaches a surface, affecting both direct and indirect
     var color = (saturated + bloom * composite.bloom_strength + (indirect_light + rc_light) * composite.indirect_light_scale) * ao;
-    
+
     // Apply SSR reflections if enabled
     // The SSR texture contains (reflection_color.rgb, reflectivity * edge_fade)
     if (composite.ssr_enabled > 0.5) {
@@ -158,7 +158,7 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
         // This gives partial reflections for lower reflectivity materials
         color = color + ssr_reflection * ssr_strength;
     }
-    
+
     color = color * composite.exposure;
     color = max(color, vec3<f32>(0.0));
 
