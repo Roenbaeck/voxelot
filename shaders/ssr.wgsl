@@ -169,14 +169,11 @@ fn ray_aabb_intersection(ro: vec3<f32>, rd: vec3<f32>, min_p: vec3<f32>, max_p: 
 
 fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>) -> vec4<f32> {
     let dims = vec3<f32>(camera.gi_grid_dims);
-    let grid_origin = vec3<f32>(camera.gi_grid_origin) * 16.0;
+    let world_grid_origin = vec3<f32>(camera.gi_grid_origin) * 16.0;
     
-    // Coarse Volume Ray Marching
-    var current_pos = world_pos;
-    let step_size = 8.0; 
-    
-    var accumulated_color = vec3<f32>(0.0);
-    var remaining_alpha = 1.0;
+    // Coarse Volume Ray Marching - Using DDA for stability at distance
+    let sun_dir = normalize(camera.sun_direction);
+    let brightness = camera.skybox_brightness;
 
     // Water plane intersection: t = (water_y - pos_y) / dir_y
     var t_water = -1.0;
@@ -185,8 +182,6 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>) -> vec4<f32> {
     }
 
     // Water base color synthesized from sun and ambient
-    // Use a depth-aware tint to better match the water surface shader (shallow/deep blend + visibility)
-    let brightness = camera.skybox_brightness;
     let shallow_color = vec3<f32>(0.15, 0.45, 0.50) * brightness;
     let deep_color = vec3<f32>(0.02, 0.12, 0.20) * brightness;
     let sky_on_water = sample_sky_equirect(reflect(reflect_dir, vec3<f32>(0.0, 1.0, 0.0)));
@@ -209,33 +204,41 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>) -> vec4<f32> {
 
     // Slightly darken synthesized water reflections so they don't appear brighter than the surface
     water_color *= 0.8;
-    let sun_dir = normalize(camera.sun_direction);
 
-    for (var i = 0u; i < 32u; i++) {
-        let t_ray = f32(i) * step_size;
-        
-        // If we reached the water plane before any geometry, stop and return water color
-        if (t_water > 0.0 && t_ray >= t_water) {
+    // DDA Setup
+    let safe_dir = reflect_dir + select(vec3<f32>(0.0), vec3<f32>(1e-8), abs(reflect_dir) < vec3<f32>(1e-8));
+    let inv_dir = 1.0 / safe_dir;
+    let step_vec = vec3<i32>(sign(safe_dir));
+    
+    let start_chunk_f = (world_pos - world_grid_origin) / 16.0;
+    var current_i = vec3<i32>(floor(start_chunk_f));
+    
+    let t_delta = abs(inv_dir) * 16.0;
+    var t_max = (vec3<f32>(current_i) + max(vec3<f32>(step_vec), vec3<f32>(0.0)) - start_chunk_f) * 16.0 * inv_dir;
+
+    var accumulated_color = vec3<f32>(0.0);
+    var remaining_alpha = 1.0;
+    var t_current = 0.0;
+
+    for (var i = 0u; i < params.max_steps; i++) {
+        // Bounds check
+        if (any(current_i < vec3<i32>(0)) || any(current_i >= camera.gi_grid_dims)) {
+            break;
+        }
+
+        // Potential water intersection
+        if (t_water > 0.0 && t_current >= t_water) {
             accumulated_color += water_color * remaining_alpha;
             remaining_alpha = 0.0;
             break;
         }
 
-        current_pos = world_pos + reflect_dir * t_ray;
-        
-        let grid_f_coord = (current_pos - grid_origin) / 16.0;
-        let grid_i_coord = vec3<i32>(floor(grid_f_coord));
-        
-        if (any(grid_i_coord < vec3<i32>(0)) || any(grid_i_coord >= camera.gi_grid_dims)) {
-            break;
-        }
-        
-        let uvw = (vec3<f32>(grid_i_coord) + 0.5) / dims;
-        let chunk_data = textureSampleLevel(gi_probe_color, linear_sampler, uvw, 0.0);
+        let uvw = (vec3<f32>(current_i) + 0.5) / dims;
+        let chunk_data = textureLoad(gi_probe_color, current_i, 0);
         let occupancy = chunk_data.a;
         
         if (occupancy > 0.05) {
-            let packed_bbox = textureLoad(gi_probe_bbox, grid_i_coord, 0).r;
+            let packed_bbox = textureLoad(gi_probe_bbox, current_i, 0).r;
             let valid = (packed_bbox >> 24u) & 1u;
             
             if (valid == 1u) {
@@ -246,56 +249,75 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>) -> vec4<f32> {
                 let ymax = f32((packed_bbox >> 16u) & 0xFu);
                 let zmax = f32((packed_bbox >> 20u) & 0xFu);
                 
-                let chunk_world_origin = vec3<f32>(grid_i_coord) * 16.0 + grid_origin;
+                let chunk_world_origin = vec3<f32>(current_i) * 16.0 + world_grid_origin;
                 let aabb_min = chunk_world_origin + vec3<f32>(xmin, ymin, zmin);
                 let aabb_max = chunk_world_origin + vec3<f32>(xmax + 1.0, ymax + 1.0, zmax + 1.0);
                 
                 // IGNORE SUBMERGED GEOMETRY: if the entire chunk is below water, skip it
-                if (aabb_max.y < camera.water_level) {
-                   continue;
-                }
+                if (aabb_max.y >= camera.water_level) {
+                    let hit = ray_aabb_intersection(world_pos, reflect_dir, aabb_min, aabb_max);
+                    
+                    // SURFACE CLIPPING: 
+                    if (hit.t_near <= hit.t_far && hit.t_far > 0.0 && hit.t_near > 0.1) {
+                        // If the specific hit point is below water level, treat it as hitting water
+                        let hit_point_y = world_pos.y + reflect_dir.y * hit.t_near;
+                        if (hit_point_y < camera.water_level) {
+                            accumulated_color += water_color * remaining_alpha;
+                            remaining_alpha = 0.0;
+                            break;
+                        }
 
-                let hit = ray_aabb_intersection(world_pos, reflect_dir, aabb_min, aabb_max);
-                
-                // SURFACE CLIPPING: 
-                if (hit.t_near <= hit.t_far && hit.t_far > 0.0 && hit.t_near > 0.1) {
-                    // If the specific hit point is below water level, treat it as hitting water
-                    let hit_point_y = world_pos.y + reflect_dir.y * hit.t_near;
-                    if (hit_point_y < camera.water_level) {
-                        accumulated_color += water_color * remaining_alpha;
+                        let rad = sample_radiance(uvw, reflect_dir);
+                        let dot_sun = saturate(dot(hit.normal, sun_dir));
+                        let sun_lit = camera.sun_color * camera.sun_intensity * dot_sun * 1.5;
+                        
+                        let lit_color = chunk_data.rgb * (rad * 2.5 + sun_lit);
+                        
+                        accumulated_color += lit_color * remaining_alpha;
                         remaining_alpha = 0.0;
-                        break;
+                        break; 
                     }
-
-                    let rad = sample_radiance(uvw, reflect_dir);
-                    let dot_sun = saturate(dot(hit.normal, sun_dir));
-                    let sun_lit = camera.sun_color * camera.sun_intensity * dot_sun * 1.5;
-                    
-                    let lit_color = chunk_data.rgb * (rad * 2.5 + sun_lit);
-                    
-                    accumulated_color += lit_color * remaining_alpha;
-                    remaining_alpha = 0.0;
-                    break; 
                 }
             } else {
                 // Fallback for chunks without bbox: treat as semi-transparent volume
-                // Skip if submerged
-                if (current_pos.y < camera.water_level) {
-                    continue;
+                let chunk_world_min_y = f32(current_i.y) * 16.0 + world_grid_origin.y;
+                if (chunk_world_min_y + 16.0 >= camera.water_level) {
+                    let rad = sample_radiance(uvw, reflect_dir);
+                    let sun_lit = camera.sun_color * camera.sun_intensity * 0.5;
+                    let lit_color = chunk_data.rgb * (rad * 2.5 + sun_lit);
+                    
+                    let alpha = saturate(occupancy * 2.0) * remaining_alpha;
+                    accumulated_color += lit_color * alpha;
+                    remaining_alpha -= alpha;
+                    
+                    if (remaining_alpha < 0.1) {
+                        remaining_alpha = 0.0;
+                        break;
+                    }
                 }
+            }
+        }
 
-                let rad = sample_radiance(uvw, reflect_dir);
-                let sun_lit = camera.sun_color * camera.sun_intensity * 0.5;
-                let lit_color = chunk_data.rgb * (rad * 2.5 + sun_lit);
-                
-                let alpha = saturate(occupancy * 2.0) * remaining_alpha;
-                accumulated_color += lit_color * alpha;
-                remaining_alpha -= alpha;
-                
-                if (remaining_alpha < 0.1) {
-                    remaining_alpha = 0.0;
-                    break;
-                }
+        // Advance DDA to next boundary
+        if (t_max.x < t_max.y) {
+            if (t_max.x < t_max.z) {
+                t_current = t_max.x;
+                t_max.x += t_delta.x;
+                current_i.x += step_vec.x;
+            } else {
+                t_current = t_max.z;
+                t_max.z += t_delta.z;
+                current_i.z += step_vec.z;
+            }
+        } else {
+            if (t_max.y < t_max.z) {
+                t_current = t_max.y;
+                t_max.y += t_delta.y;
+                current_i.y += step_vec.y;
+            } else {
+                t_current = t_max.z;
+                t_max.z += t_delta.z;
+                current_i.z += step_vec.z;
             }
         }
     }
