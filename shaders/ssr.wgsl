@@ -21,6 +21,7 @@ struct CameraUniforms {
     sun_intensity: f32,
     sun_color: vec3<f32>,
     water_level: f32,
+    water_visibility: f32,
     water_color: vec4<f32>,
 }
 
@@ -184,11 +185,30 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>) -> vec4<f32> {
     }
 
     // Water base color synthesized from sun and ambient
-    // We use skybox_brightness + a small offset to ensure it doesn't go pitch black
-    // and matches the "deep water" tone in water.wgsl.
-    let water_base = camera.water_color.rgb * (camera.skybox_brightness + 0.1);
+    // Use a depth-aware tint to better match the water surface shader (shallow/deep blend + visibility)
+    let brightness = camera.skybox_brightness;
+    let shallow_color = vec3<f32>(0.15, 0.45, 0.50) * brightness;
+    let deep_color = vec3<f32>(0.02, 0.12, 0.20) * brightness;
     let sky_on_water = sample_sky_equirect(reflect(reflect_dir, vec3<f32>(0.0, 1.0, 0.0)));
-    let water_color = mix(water_base, sky_on_water, 0.5);
+
+    // Default to a simple tint if we don't compute a water intersection depth
+    var water_color = camera.water_color.rgb * (brightness + 0.1);
+
+    // If we have a valid water intersection distance, synthesize a closer match to `water.wgsl`
+    if (t_water > 0.0) {
+        let hit_y = world_pos.y + reflect_dir.y * t_water;
+        let depth_diff = camera.water_level - hit_y;
+        let max_depth = max(camera.water_visibility, 1.0);
+        let depth_factor = clamp(depth_diff / max_depth, 0.0, 1.0);
+        let water_tint = mix(shallow_color, deep_color, depth_factor);
+        let underwater_visibility = exp(-depth_diff * 0.3);
+
+        // Approximate underwater blend: prefer the water tint while allowing some sky influence
+        water_color = mix(water_tint, sky_on_water * 0.3 + water_tint * 0.7, underwater_visibility);
+    }
+
+    // Slightly darken synthesized water reflections so they don't appear brighter than the surface
+    water_color *= 0.8;
     let sun_dir = normalize(camera.sun_direction);
 
     for (var i = 0u; i < 32u; i++) {

@@ -610,7 +610,9 @@ struct SsrCameraUniforms {
     sun_intensity: f32,
     sun_color: [f32; 3],
     water_level: f32,
+    water_visibility: f32,
     water_color: [f32; 4],
+    _pad_end: [f32; 3],
 }
 
 /// Depth-of-field runtime settings (CPU-side convenience)
@@ -11749,7 +11751,9 @@ impl App {
                 sun_intensity: sun_fade,
                 sun_color: [sun_color[0], sun_color[1], sun_color[2]],
                 water_level: self.water_level,
+                water_visibility: self.water_visibility,
                 water_color: [0.0, 0.3, 0.5, 0.6],
+                _pad_end: [0.0, 0.0, 0.0],
             };
             queue.write_buffer(ssr_cam_buf, 0, bytemuck::bytes_of(&ssr_cam));
 
