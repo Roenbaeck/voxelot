@@ -323,6 +323,12 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     let world_pos = reconstruct_world_pos(input.uv, depth);
+
+    // Disable SSR for submerged materials to avoid underwater reflection artifacts.
+    // (Water surface reflections are handled separately in `water.wgsl`.)
+    if (camera.water_visibility > 0.0 && world_pos.y < camera.water_level) {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
     let gbuf = textureSample(normal_gbuffer, linear_sampler, input.uv);
     let normal = decode_world_normal(gbuf.rgb);
 
