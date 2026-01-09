@@ -182,10 +182,16 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
         t_water = (camera.water_level - world_pos.y) / reflect_dir.y;
     }
 
-    // Water color - use proper blue/cyan tones (camera.water_color may not be set in SSR uniforms)
+    // Water color - blend skybox reflection for visual structure
     let shallow_color = vec3<f32>(0.15, 0.45, 0.50) * brightness;
     let deep_color = vec3<f32>(0.02, 0.12, 0.20) * brightness;
-    let water_color = mix(shallow_color, deep_color, 0.5) * 0.8;
+    let base_water = mix(shallow_color, deep_color, 0.5);
+    // Reflect the incoming ray off the water surface (approximate normal = up)
+    let water_reflect_dir = reflect(reflect_dir, vec3<f32>(0.0, 1.0, 0.0));
+    let water_sky = sample_sky_equirect(water_reflect_dir);
+    // Fresnel-ish blend: more sky reflection at grazing angles
+    let water_fresnel = pow(1.0 - abs(reflect_dir.y), 2.0);
+    let water_color = mix(base_water, water_sky * 0.8, 0.4 + water_fresnel * 0.5) * 0.85;
 
     // DDA Setup
     let bias = 0.05;
