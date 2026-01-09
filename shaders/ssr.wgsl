@@ -182,8 +182,10 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
         t_water = (camera.water_level - world_pos.y) / reflect_dir.y;
     }
 
-    // Simplified water color
-    let water_color = camera.water_color.rgb * (brightness * 0.7 + 0.1);
+    // Water color - use proper blue/cyan tones (camera.water_color may not be set in SSR uniforms)
+    let shallow_color = vec3<f32>(0.15, 0.45, 0.50) * brightness;
+    let deep_color = vec3<f32>(0.02, 0.12, 0.20) * brightness;
+    let water_color = mix(shallow_color, deep_color, 0.5) * 0.8;
 
     // DDA Setup
     let bias = 0.05;
