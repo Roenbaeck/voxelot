@@ -62,6 +62,8 @@ struct SSRParams {
 @group(0) @binding(15) var gi_probe_nz: texture_3d<f32>;
 @group(0) @binding(16) var gi_probe_color: texture_3d<f32>;
 @group(0) @binding(17) var gi_probe_bbox: texture_3d<u32>;
+@group(0) @binding(18) var scene_color: texture_2d<f32>;
+
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -259,7 +261,48 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                     let hit = ray_aabb_intersection(world_pos, reflect_dir, aabb_min, aabb_max);
                     
                     if (hit.t_near <= hit.t_far && hit.t_far > 0.0 && hit.t_near > 0.1) {
-                        let hit_point = world_pos + reflect_dir * hit.t_near;
+                        let hit_point_raw = world_pos + reflect_dir * hit.t_near;
+                        var hit_point = hit_point_raw;
+                        var hit_normal = hit.normal;
+
+                        // Hybrid Mesh Snapping: Check if we hit visible screen geometry
+                        // This uses the depth buffer to resolve the exact mesh surface instead of the bounding box
+                        let clip_pos = camera.view_proj * vec4<f32>(hit_point, 1.0);
+                        if (clip_pos.w > 0.0) {
+                            let ndc = clip_pos.xyz / clip_pos.w;
+                            if (abs(ndc.x) < 1.0 && abs(ndc.y) < 1.0) {
+                                let screen_uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+                                let dim = textureDimensions(scene_depth);
+                                let px = vec2<i32>(screen_uv * vec2<f32>(dim));
+                                let d_buf = textureLoad(scene_depth, px, 0);
+                                // Skip background or invalid depth
+                                if (d_buf < 0.9999) {
+                                    let mesh_pos = reconstruct_world_pos(screen_uv, d_buf);
+                                    // If the mesh is reasonably close to our voxel hit, assume we hit the mesh
+                                    // 3.0 is a heuristic tolerance (voxel size is 16, but bbox is smaller)
+                                    if (distance(mesh_pos, hit_point) < 3.0) {
+                                        // Precise mesh hit: Sample screen color directly
+                                        // This gives us full detail (texture, lighting, shadows) instead of coarse GI
+                                        let screen_color = textureSampleLevel(scene_color, linear_sampler, screen_uv, 0.0).rgb;
+                                        
+                                        // Check for water below mesh (e.g. pier piling)
+                                        if (mesh_pos.y < camera.water_level) {
+                                            // Submerged part might be tinted or hidden, but for now just use screen entry
+                                            // Or maybe we shouldn't have hit it if it's underwater?
+                                            // The screen color includes water surface if water was drawn? 
+                                            // No, water pass is AFTER ssr. So 'scene_color' is opaque geometry only.
+                                            // If mesh_pos.y < water, it's underwater geometry.
+                                            // We should tint it blue?
+                                            // Let's keep it simple: just reflect what we see.
+                                        }
+
+                                        accumulated_color += screen_color * remaining_alpha;
+                                        remaining_alpha = 0.0;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                         
                         // Hit below water
                         if (hit_point.y < camera.water_level) {
@@ -273,14 +316,14 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                         let hit_data = textureSampleLevel(gi_probe_color, linear_sampler, hit_uvw, 0.0);
                         let rad = sample_radiance(hit_uvw, reflect_dir);
 
-                        let dot_sun = saturate(dot(hit.normal, sun_dir));
+                        let dot_sun = saturate(dot(hit_normal, sun_dir));
                         let sun_lit = camera.sun_color * camera.sun_intensity * dot_sun * 1.5;
                         let base_color = hit_data.rgb * (rad * 2.5 + sun_lit);
                         
                         // Secondary reflection (simplified Fresnel, reuse sky_color)
                         let surface_brightness = dot(hit_data.rgb, vec3<f32>(0.299, 0.587, 0.114));
                         let view_to_cam = normalize(camera.camera_pos - hit_point);
-                        let cos_theta = saturate(dot(hit.normal, view_to_cam));
+                        let cos_theta = saturate(dot(hit_normal, view_to_cam));
                         let f0 = 0.04 + surface_brightness * 0.5;
                         let fresnel = f0 + (1.0 - f0) * pow(1.0 - cos_theta, 5.0);
                         

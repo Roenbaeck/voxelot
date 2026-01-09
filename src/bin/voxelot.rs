@@ -5600,6 +5600,7 @@ impl App {
             Some(gi_pz),
             Some(gi_nz),
             Some(gi_color),
+            Some(offscreen_color_view),
         ) = (
             self.ssr_bind_group_layout.as_ref(),
             self.ssr_uniform_buffer.as_ref(),
@@ -5618,6 +5619,7 @@ impl App {
             self.gi_probe_view_pz.as_ref(),
             self.gi_probe_view_nz.as_ref(),
             self.gi_probe_view_color.as_ref(),
+            self.offscreen_color_view.as_ref(),
         )
         else {
             return;
@@ -5707,6 +5709,10 @@ impl App {
                     resource: wgpu::BindingResource::TextureView(
                         self.gi_probe_view_bbox.as_ref().unwrap(),
                     ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 18,
+                    resource: wgpu::BindingResource::TextureView(offscreen_color_view),
                 },
             ],
         });
@@ -6764,6 +6770,16 @@ impl App {
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Uint,
                         view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 18,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
                     count: None,
