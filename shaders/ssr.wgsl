@@ -263,6 +263,8 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                     if (hit.t_near <= hit.t_far && hit.t_far > 0.0 && hit.t_near > 0.1) {
                         let hit_point_raw = world_pos + reflect_dir * hit.t_near;
                         var hit_point = hit_point_raw;
+                        var mesh_color = vec3<f32>(0.0);
+                        var mesh_blend = 0.0;
                         var hit_normal = hit.normal;
 
                         // Hybrid Mesh Snapping: Check if we hit visible screen geometry
@@ -278,27 +280,14 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                                 // Skip background or invalid depth
                                 if (d_buf < 0.9999) {
                                     let mesh_pos = reconstruct_world_pos(screen_uv, d_buf);
-                                    // If the mesh is reasonably close to our voxel hit, assume we hit the mesh
-                                    // 3.0 is a heuristic tolerance (voxel size is 16, but bbox is smaller)
-                                    if (distance(mesh_pos, hit_point) < 3.0) {
-                                        // Precise mesh hit: Sample screen color directly
-                                        // This gives us full detail (texture, lighting, shadows) instead of coarse GI
-                                        let screen_color = textureSampleLevel(scene_color, linear_sampler, screen_uv, 0.0).rgb;
-                                        
-                                        // Check for water below mesh (e.g. pier piling)
-                                        if (mesh_pos.y < camera.water_level) {
-                                            // Submerged part might be tinted or hidden, but for now just use screen entry
-                                            // Or maybe we shouldn't have hit it if it's underwater?
-                                            // The screen color includes water surface if water was drawn? 
-                                            // No, water pass is AFTER ssr. So 'scene_color' is opaque geometry only.
-                                            // If mesh_pos.y < water, it's underwater geometry.
-                                            // We should tint it blue?
-                                            // Let's keep it simple: just reflect what we see.
-                                        }
-
-                                        accumulated_color += screen_color * remaining_alpha;
-                                        remaining_alpha = 0.0;
-                                        break;
+                                    let dist = distance(mesh_pos, hit_point);
+                                    if (dist < 4.0) {
+                                        mesh_color = textureSampleLevel(scene_color, linear_sampler, screen_uv, 0.0).rgb;
+                                        let edge_x = min(screen_uv.x, 1.0 - screen_uv.x);
+                                        let edge_y = min(screen_uv.y, 1.0 - screen_uv.y);
+                                        let edge_factor = saturate(min(edge_x, edge_y) * 10.0);
+                                        let dist_factor = 1.0 - saturate((dist - 1.0) / 3.0);
+                                        mesh_blend = edge_factor * dist_factor;
                                     }
                                 }
                             }
@@ -307,6 +296,12 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                         // Hit below water
                         if (hit_point.y < camera.water_level) {
                             accumulated_color += water_color * remaining_alpha;
+                            remaining_alpha = 0.0;
+                            break;
+                        }
+
+                        if (mesh_blend >= 0.99) {
+                            accumulated_color += mesh_color * remaining_alpha;
                             remaining_alpha = 0.0;
                             break;
                         }
@@ -328,8 +323,9 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                         let fresnel = f0 + (1.0 - f0) * pow(1.0 - cos_theta, 5.0);
                         
                         let lit_color = mix(base_color, sky_color, fresnel * 0.7);
+                        let final_color = mix(lit_color, mesh_color, mesh_blend);
                         
-                        accumulated_color += lit_color * remaining_alpha;
+                        accumulated_color += final_color * remaining_alpha;
                         remaining_alpha = 0.0;
                         break;
                     }
