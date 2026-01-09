@@ -77,7 +77,6 @@ fn edge_weight(depth0: f32, normal0: vec3<f32>, uv: vec2<f32>) -> f32 {
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let uv = input.uv;
-    let off = kawase.offset;
     let ts = kawase.texel_size;
 
     // 9-tap kernel: center + 4 neighbors + 4 diagonals with Gaussian-like weights.
@@ -86,6 +85,12 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let center_sample = textureSample(input_texture, input_sampler, uv);
     let depth0 = load_depth_at_uv(uv);
     let normal0 = load_normal_at_uv(uv);
+
+    // Distance-based blur scaling: reduce blur for distant surfaces.
+    // Reversed-Z depth: close surfaces have depth ~1, far surfaces have depth ~0.
+    // We want more blur when close and less when far.
+    let distance_factor = smoothstep(0.001, 0.5, depth0);
+    let off = kawase.offset * (0.3 + 0.7 * distance_factor);
 
     let uv1 = uv + vec2<f32>( ts.x * off, 0.0);
     let uv2 = uv + vec2<f32>(-ts.x * off, 0.0);
