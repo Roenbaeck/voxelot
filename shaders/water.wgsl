@@ -408,7 +408,7 @@ fn get_max_mip_level() -> f32 {
 // Screen-space reflection ray marching with HZB acceleration
 fn trace_water_reflection(start_pos: vec3<f32>, ray_dir: vec3<f32>, cam_pos: vec3<f32>, pixel_uv: vec2<f32>) -> vec3<f32> {
     // HZB acceleration allows for fewer steps while covering more ground.
-    let max_steps = 80u;
+    let max_steps = 64u;
     let thickness_base = 5.0;
     let max_binary_steps = 5u;
     
@@ -424,6 +424,7 @@ fn trace_water_reflection(start_pos: vec3<f32>, ray_dir: vec3<f32>, cam_pos: vec
     
     // Calculate screen-space step magnitude for adaptive thickness
     let screen_delta_length = length(delta.xy * vec2<f32>(f32(dim.x), f32(dim.y)));
+    let screen_factor = max(1.0, screen_delta_length * 0.5);
 
     // Jitter the start along the ray in screen-space to avoid visible marching bands.
     let jitter = hash2(pixel_uv * vec2<f32>(f32(dim.x), f32(dim.y)));
@@ -431,12 +432,17 @@ fn trace_water_reflection(start_pos: vec3<f32>, ray_dir: vec3<f32>, cam_pos: vec
     
     let max_mip = get_max_mip_level();
     var current_mip = min(3.0, max_mip); // Start at a coarse mip for speed
+
+    // Precalculate thickness parts to move math out of the loop
+    let thickness_scale = 0.00005 * screen_factor; // divide by 1000 here to save ops in loop
+    let thickness_offset = (thickness_base * 0.001) * screen_factor;
+    let start_cam_dist = distance(cam_pos, start_pos);
+    let world_step = max_dist / f32(max_steps);
     
     for (var i = 0u; i < max_steps; i++) {
         current_screen += delta;
         
         let uv = current_screen.xy;
-        
         if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
             break;
         }
@@ -445,15 +451,15 @@ fn trace_water_reflection(start_pos: vec3<f32>, ray_dir: vec3<f32>, cam_pos: vec
         let hzb_depth = textureSampleLevel(hzb_texture, hzb_sampler, uv, current_mip).r;
         let ray_depth = current_screen.z;
         
-        // Adaptive thickness: increase for distance and screen-space step size
-        let dist_to_ray = distance(cam_pos, start_pos + ray_dir * (f32(i) / f32(max_steps)) * max_dist);
-        let dynamic_thickness = (thickness_base + dist_to_ray * 0.05) * screen_space_factor_calc(screen_delta_length);
+        // Optimized linear thickness heuristic
+        let dist_to_ray = start_cam_dist + f32(i) * world_step;
+        let dynamic_thickness = thickness_offset + dist_to_ray * thickness_scale;
         
         // Check if ray is behind surface (potential intersection)
         if (ray_depth > hzb_depth) {
             if (current_mip <= 0.5) {
                 // At finest detail, check thickness to avoid hitting backfaces or distant geometry
-                if (ray_depth - hzb_depth < dynamic_thickness / 1000.0) { // thickness is in world units, depth is [0,1]
+                if (ray_depth - hzb_depth < dynamic_thickness) { 
                     // Refine hit with binary search
                     var refined_screen = current_screen - delta;
                     var refined_delta = delta;
