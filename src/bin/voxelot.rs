@@ -1434,9 +1434,6 @@ struct App {
     hzb_texture: Option<wgpu::Texture>,
     hzb_view: Option<wgpu::TextureView>,
     hzb_mip_views: Vec<wgpu::TextureView>, // Per-mip views for storage
-    hzb_temp_texture: Option<wgpu::Texture>,
-    hzb_temp_view: Option<wgpu::TextureView>,
-    hzb_temp_mip_views: Vec<wgpu::TextureView>,
     hzb_mip_levels: u32,
     hzb_gen_copy_pipeline: Option<wgpu::ComputePipeline>,
     hzb_gen_downsample_pipeline: Option<wgpu::ComputePipeline>,
@@ -1444,6 +1441,7 @@ struct App {
     hzb_copy_bind_group: Option<wgpu::BindGroup>, // For mip 0 copy
     hzb_downsample_bind_groups: Vec<wgpu::BindGroup>, // Per-mip downsample bind groups
     hzb_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    hzb_bind_group: Option<wgpu::BindGroup>, // For GPU culling
     _hzb_gen_downsample_bind_groups: Vec<Option<wgpu::BindGroup>>,
     hzb_enabled: bool,
     hzb_debug: bool,
@@ -2636,9 +2634,6 @@ impl App {
             hzb_texture: None,
             hzb_view: None,
             hzb_mip_views: Vec::new(),
-            hzb_temp_texture: None,
-            hzb_temp_view: None,
-            hzb_temp_mip_views: Vec::new(),
             hzb_mip_levels: 0,
             hzb_gen_copy_pipeline: None,
             hzb_gen_downsample_pipeline: None,
@@ -2646,6 +2641,7 @@ impl App {
             hzb_copy_bind_group: None,
             hzb_downsample_bind_groups: Vec::new(),
             hzb_bind_group_layout: None,
+            hzb_bind_group: None,
             _hzb_gen_downsample_bind_groups: Vec::new(),
             hzb_params_buffer: None,
             hzb_enabled: cfg.performance.hzb_enabled,
@@ -3313,6 +3309,8 @@ impl App {
                         "disabled"
                     }
                 );
+                // Invalidate composite bind group to re-bind source color (offscreen vs post_color)
+                self.composite_bind_group = None;
                 // Update water UBO when toggling DoF so gather range/mode can reflect new state
                 self.update_water_uniforms();
             }
@@ -4477,9 +4475,6 @@ impl App {
             let mut hzb_texture_opt: Option<wgpu::Texture> = None;
             let mut hzb_view_opt: Option<wgpu::TextureView> = None;
             let mut hzb_mip_views_local: Vec<wgpu::TextureView> = Vec::new();
-            let mut hzb_temp_mip_views_local: Vec<wgpu::TextureView> = Vec::new();
-            let mut hzb_temp_view_opt: Option<wgpu::TextureView> = None;
-            let mut hzb_temp_texture_opt: Option<wgpu::Texture> = None;
 
             if self.hzb_enabled || self.hzb_debug {
                 let target_width = self.render_target_width.max(1);
@@ -4487,58 +4482,45 @@ impl App {
                 let max_dim = target_width.max(target_height);
                 let mip_levels = 32 - (max_dim.saturating_sub(1)).leading_zeros();
 
-                for i in 0..2 {
-                    let label = if i == 0 {
-                        "HZB Texture"
-                    } else {
-                        "HZB Temp Texture"
-                    };
-                    let tex = device.create_texture(&wgpu::TextureDescriptor {
-                        label: Some(label),
-                        size: wgpu::Extent3d {
-                            width: target_width,
-                            height: target_height,
-                            depth_or_array_layers: 1,
-                        },
-                        mip_level_count: mip_levels,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: wgpu::TextureFormat::R32Float,
-                        usage: wgpu::TextureUsages::TEXTURE_BINDING
-                            | wgpu::TextureUsages::STORAGE_BINDING
-                            | wgpu::TextureUsages::COPY_SRC
-                            | wgpu::TextureUsages::COPY_DST,
-                        view_formats: &[],
+                let tex = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("HZB Texture"),
+                    size: wgpu::Extent3d {
+                        width: target_width,
+                        height: target_height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: mip_levels,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::R32Float,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::STORAGE_BINDING
+                        | wgpu::TextureUsages::COPY_SRC
+                        | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+                let mut views = Vec::new();
+                // Create per-mip views for storage binding
+                for mip in 0..mip_levels {
+                    let mip_view = tex.create_view(&wgpu::TextureViewDescriptor {
+                        label: Some(&format!("HZB Mip {} View", mip)),
+                        format: Some(wgpu::TextureFormat::R32Float),
+                        dimension: Some(wgpu::TextureViewDimension::D2),
+                        aspect: wgpu::TextureAspect::All,
+                        base_mip_level: mip,
+                        mip_level_count: Some(1),
+                        base_array_layer: 0,
+                        array_layer_count: Some(1),
+                        usage: None,
                     });
-                    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-
-                    let mut views = Vec::new();
-                    // Create per-mip views for storage binding
-                    for mip in 0..mip_levels {
-                        let mip_view = tex.create_view(&wgpu::TextureViewDescriptor {
-                            label: Some(&format!("{} Mip {} View", label, mip)),
-                            format: Some(wgpu::TextureFormat::R32Float),
-                            dimension: Some(wgpu::TextureViewDimension::D2),
-                            aspect: wgpu::TextureAspect::All,
-                            base_mip_level: mip,
-                            mip_level_count: Some(1),
-                            base_array_layer: 0,
-                            array_layer_count: Some(1),
-                            usage: None,
-                        });
-                        views.push(mip_view);
-                    }
-
-                    if i == 0 {
-                        hzb_texture_opt = Some(tex);
-                        hzb_view_opt = Some(view);
-                        hzb_mip_views_local = views;
-                    } else {
-                        hzb_temp_texture_opt = Some(tex);
-                        hzb_temp_view_opt = Some(view);
-                        hzb_temp_mip_views_local = views;
-                    }
+                    views.push(mip_view);
                 }
+
+                hzb_texture_opt = Some(tex);
+                hzb_view_opt = Some(view);
+                hzb_mip_views_local = views;
 
                 hzb_mips = mip_levels;
                 hzb_bytes = App::compute_texture_bytes(
@@ -4547,9 +4529,9 @@ impl App {
                     target_height,
                     mip_levels,
                     1,
-                ) * 2; // Two textures
+                ); // ONLY ONE texture now!
             } else {
-                // Create dummy 1x1 R32 textures (main + temp)
+                // Create dummy 1x1 R32 texture
                 let tex_main = device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("HZB Dummy Texture"),
                     size: wgpu::Extent3d {
@@ -4566,33 +4548,13 @@ impl App {
                         | wgpu::TextureUsages::COPY_DST,
                     view_formats: &[],
                 });
-                let tex_temp = device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("HZB Dummy Temp Texture"),
-                    size: wgpu::Extent3d {
-                        width: 1,
-                        height: 1,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::R32Float,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING
-                        | wgpu::TextureUsages::STORAGE_BINDING
-                        | wgpu::TextureUsages::COPY_DST,
-                    view_formats: &[],
-                });
                 let view_main = tex_main.create_view(&wgpu::TextureViewDescriptor::default());
-                let view_temp = tex_temp.create_view(&wgpu::TextureViewDescriptor::default());
                 hzb_mip_views_local.push(view_main.clone());
-                hzb_temp_mip_views_local.push(view_temp.clone());
                 hzb_texture_opt = Some(tex_main);
-                hzb_view_opt = Some(view_main.clone());
-                hzb_temp_view_opt = Some(view_temp);
-                hzb_temp_texture_opt = Some(tex_temp);
+                hzb_view_opt = Some(view_main);
                 hzb_mips = 1;
                 hzb_bytes =
-                    App::compute_texture_bytes(wgpu::TextureFormat::R32Float, 1, 1, 1, 1) * 2;
+                    App::compute_texture_bytes(wgpu::TextureFormat::R32Float, 1, 1, 1, 1);
             }
             App::replace_texture_bytes_static(
                 &mut self.hzb_texture_bytes,
@@ -4602,9 +4564,6 @@ impl App {
             self.hzb_texture = hzb_texture_opt;
             self.hzb_view = hzb_view_opt;
             self.hzb_mip_views = hzb_mip_views_local;
-            self.hzb_temp_texture = hzb_temp_texture_opt;
-            self.hzb_temp_view = hzb_temp_view_opt;
-            self.hzb_temp_mip_views = hzb_temp_mip_views_local;
             self.hzb_mip_levels = hzb_mips;
 
             // Create HZB Generation bind groups
@@ -4630,19 +4589,22 @@ impl App {
                 );
                 self.hzb_params_buffer = Some(params_buf.clone());
 
-                // Create copy bind group (depth -> TEMP mip 0)
-                if let (Some(depth_view), Some(mip0_view), Some(main_mip0_view)) = (
-                    self.offscreen_depth_view.as_ref(),
-                    self.hzb_temp_mip_views.get(0), // Write to TEMP
-                    self.hzb_mip_views.get(0),      // Read from MAIN (dummy)
+                // Create copy bind group (depth -> MAIN mip 0)
+                if let (Some(depth_view_ref), Some(mip0_view)) = (
+                    self.offscreen_depth_view.as_ref(), // This IS a reference
+                    self.hzb_mip_views.get(0),          // This IS a reference
                 ) {
+                    // Use a different mip (or same mip if we must, but let's try mip 0 since it's WriteOnly)
+                    // as a dummy for the source-sampled binding.
+                    let dummy_src_view = self.hzb_mip_views.get(1).unwrap_or(mip0_view);
+
                     let copy_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("HZB Copy Bind Group"),
                         layout: gen_layout,
                         entries: &[
                             wgpu::BindGroupEntry {
                                 binding: 0,
-                                resource: wgpu::BindingResource::TextureView(depth_view),
+                                resource: wgpu::BindingResource::TextureView(depth_view_ref),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 1,
@@ -4654,7 +4616,7 @@ impl App {
                             },
                             wgpu::BindGroupEntry {
                                 binding: 3,
-                                resource: wgpu::BindingResource::TextureView(main_mip0_view), // Use MAIN as dummy to avoid conflict
+                                resource: wgpu::BindingResource::TextureView(dummy_src_view),
                             },
                         ],
                     });
@@ -4662,27 +4624,14 @@ impl App {
                 }
 
                 let mut downsample_bgs = Vec::new();
-                if let Some(depth_view) = self.offscreen_depth_view.as_ref() {
+                if let Some(depth_view_ref) = self.offscreen_depth_view.as_ref() {
                     let target_width = self.render_target_width.max(1);
                     let target_height = self.render_target_height.max(1);
                     for dst_mip in 1..(self.hzb_mip_levels as usize) {
-                        // Ping-pong between MAIN and TEMP to avoid intermediate copies
-                        // Mip 0 is in MAIN.
-                        // Mip 1: MAIN[0] -> TEMP[1]
-                        // Mip 2: TEMP[1] -> MAIN[2]
-                        // Mip 3: MAIN[2] -> TEMP[3]
-                        // ...
-                        let (dst_view, src_view) = if dst_mip % 2 == 1 {
-                            (
-                                self.hzb_temp_mip_views.get(dst_mip), // Write to TEMP
-                                self.hzb_mip_views.get(dst_mip - 1),  // Read from MAIN
-                            )
-                        } else {
-                            (
-                                self.hzb_mip_views.get(dst_mip),          // Write to MAIN
-                                self.hzb_temp_mip_views.get(dst_mip - 1), // Read from TEMP
-                            )
-                        };
+                        // Sequential downsampling: Read from Mip N-1, Write to Mip N.
+                        // All mips are in MAIN (hzb_texture).
+                        let src_view = self.hzb_mip_views.get(dst_mip - 1);
+                        let dst_view = self.hzb_mip_views.get(dst_mip);
 
                         if let (Some(dst_view), Some(src_view)) = (dst_view, src_view) {
                             // Calculate mip dimensions
@@ -4693,11 +4642,10 @@ impl App {
                             let params = HzbParams {
                                 width: mip_width,
                                 height: mip_height,
-                                src_mip: 0,
+                                src_mip: 0, // In the shader, textureLoad(hzb_src, s, 0)
                                 dst_mip: dst_mip as u32,
                             };
 
-                            use wgpu::util::DeviceExt;
                             let params_buf =
                                 device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                                     label: Some(&format!("HZB Params Mip {}", dst_mip)),
@@ -4711,7 +4659,7 @@ impl App {
                                 entries: &[
                                     wgpu::BindGroupEntry {
                                         binding: 0,
-                                        resource: wgpu::BindingResource::TextureView(depth_view),
+                                        resource: wgpu::BindingResource::TextureView(depth_view_ref),
                                     },
                                     wgpu::BindGroupEntry {
                                         binding: 1,
@@ -4737,22 +4685,22 @@ impl App {
 
             // Build HZB cull bind group (for GPU culling shader)
             if let Some(layout) = self.hzb_bind_group_layout.as_ref() {
-                if let (Some(depth_view), Some(hzb_view), Some(hzb_params_buf)) = (
+                if let (Some(depth_view_ref), Some(hzb_view_ref), Some(hzb_params_buf)) = (
                     self.offscreen_depth_view.as_ref(),
                     self.hzb_view.as_ref(),
                     self.hzb_params_buffer.as_ref(),
                 ) {
-                    let _bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    let hzb_cull_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("HZB Cull Bind Group"),
                         layout,
                         entries: &[
                             wgpu::BindGroupEntry {
                                 binding: 0,
-                                resource: wgpu::BindingResource::TextureView(depth_view),
+                                resource: wgpu::BindingResource::TextureView(depth_view_ref),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 1,
-                                resource: wgpu::BindingResource::TextureView(hzb_view),
+                                resource: wgpu::BindingResource::TextureView(hzb_view_ref),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 2,
@@ -4760,6 +4708,7 @@ impl App {
                             },
                         ],
                     });
+                    self.hzb_bind_group = Some(hzb_cull_bg); // Assigned to self.hzb_bind_group
                 }
             }
         }
@@ -5276,15 +5225,28 @@ impl App {
             self.composite_uniform_buffer.as_ref(),
             self.post_sampler.as_ref(),
             self.ssao_ping_view.as_ref(),
-            self.post_color_view.as_ref(),
+            self.post_color_view.as_ref(), // This is the designated POST texture view
             self.rc_texture_view.as_ref(),
             self.hzb_view.as_ref(),
         ) {
+            // If DoF is fully disabled or negligible, bind the offscreen color DIRECTLY
+            // to the composite pass to avoid a full-resolution texture copy every frame.
+            let skip_dof = !self.dof_enabled
+                || self.dof_settings.blur_strength < 0.05
+                || self.dof_settings.focal_range > 450.0;
+
+            let source_color_view = if skip_dof {
+                self.offscreen_color_view.as_ref().unwrap_or(post_view_ref)
+            } else {
+                post_view_ref
+            };
+
             let ssr_view = self
                 .ssr_blur_ping_view
                 .as_ref()
                 .or(self.ssr_texture_view.as_ref())
-                .unwrap_or(post_view_ref);
+                .unwrap_or(source_color_view);
+
             self.composite_bind_group =
                 Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("Composite Bind Group"),
@@ -5296,7 +5258,7 @@ impl App {
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
-                            resource: wgpu::BindingResource::TextureView(post_view_ref),
+                            resource: wgpu::BindingResource::TextureView(source_color_view),
                         },
                         wgpu::BindGroupEntry {
                             binding: 2,
@@ -6918,31 +6880,6 @@ impl App {
             let dispatch_y = ((target_height + 7) / 8) as u32;
             hzb_copy_pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
             drop(hzb_copy_pass);
-
-            // Copy Mip 0 from TEMP back to MAIN
-            if let (Some(src_tex), Some(dst_tex)) =
-                (self.hzb_temp_texture.as_ref(), self.hzb_texture.as_ref())
-            {
-                encoder.copy_texture_to_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: src_tex,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::TexelCopyTextureInfo {
-                        texture: dst_tex,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::Extent3d {
-                        width: target_width,
-                        height: target_height,
-                        depth_or_array_layers: 1,
-                    },
-                );
-            }
         }
 
         // Pass 2-N: Downsample mip chain
@@ -6966,39 +6903,6 @@ impl App {
                     let dispatch_y = ((mip_height + 7) / 8) as u32;
                     hzb_downsample_pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
                     drop(hzb_downsample_pass);
-                }
-            }
-
-            // Final step: Copy all mips that were generated in TEMP back to MAIN
-            // Mips 1, 3, 5, 7, 9... are in TEMP.
-            // Mips 0, 2, 4, 6, 8, 10... are already in MAIN.
-            if let (Some(src_tex), Some(dst_tex)) =
-                (self.hzb_temp_texture.as_ref(), self.hzb_texture.as_ref())
-            {
-                for mip in 1..(self.hzb_mip_levels as u32) {
-                    if mip % 2 == 1 {
-                        let mip_width = (target_width >> mip).max(1);
-                        let mip_height = (target_height >> mip).max(1);
-                        encoder.copy_texture_to_texture(
-                            wgpu::TexelCopyTextureInfo {
-                                texture: src_tex,
-                                mip_level: mip,
-                                origin: wgpu::Origin3d::ZERO,
-                                aspect: wgpu::TextureAspect::All,
-                            },
-                            wgpu::TexelCopyTextureInfo {
-                                texture: dst_tex,
-                                mip_level: mip,
-                                origin: wgpu::Origin3d::ZERO,
-                                aspect: wgpu::TextureAspect::All,
-                            },
-                            wgpu::Extent3d {
-                                width: mip_width,
-                                height: mip_height,
-                                depth_or_array_layers: 1,
-                            },
-                        );
-                    }
                 }
             }
         }
@@ -12670,22 +12574,9 @@ impl App {
                 combine_pass.draw(0..3, 0..1);
             }
         } else {
-            // DoF disabled: copy offscreen color directly to post_color_view for bloom/composite
-            if let (Some(offscreen_tex), Some(post_tex)) = (
-                self.offscreen_color_texture.as_ref(),
-                self.post_color_texture.as_ref(),
-            ) {
-                let extent = wgpu::Extent3d {
-                    width: self.render_target_width.max(1),
-                    height: self.render_target_height.max(1),
-                    depth_or_array_layers: 1,
-                };
-                encoder.copy_texture_to_texture(
-                    offscreen_tex.as_image_copy(),
-                    post_tex.as_image_copy(),
-                    extent,
-                );
-            }
+            // DoF disabled: we no longer need to copy here because the composite pass
+            // bind group will dynamically read from offscreen_color directly.
+            // (Removed copy_texture_to_texture of offscreen_color -> post_color)
         }
         // Radiance Cascades Pass
         // Compute timestamps don't work reliably on all backends, so we use empty render passes
