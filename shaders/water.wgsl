@@ -199,22 +199,6 @@ fn fbm(p: vec2<f32>, octaves: i32) -> f32 {
     return value;
 }
 
-// Perlin-style gradient noise for smoother results
-fn gradient_noise(p: vec2<f32>) -> f32 {
-    let i = floor(p);
-    let f = fract(p);
-    
-    // Smooth interpolation
-    let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
-    
-    let a = hash2(i);
-    let b = hash2(i + vec2<f32>(1.0, 0.0));
-    let c = hash2(i + vec2<f32>(0.0, 1.0));
-    let d = hash2(i + vec2<f32>(1.0, 1.0));
-    
-    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y) * 2.0 - 1.0;
-}
-
 // ============================================================================
 // WATER WAVE FUNCTIONS  
 // ============================================================================
@@ -229,49 +213,28 @@ fn get_water_normal(world_pos: vec3<f32>, time: f32) -> vec3<f32> {
     var height_dx = 0.0;
     var height_dz = 0.0;
     
-    // Wave 1: Primary large waves
-    let w1_freq = wave_scale;
+    // Large Waves (Reduced complexity)
     let w1_dir = vec2<f32>(1.0, 0.3);
-    let w1_phase = dot(pos, w1_dir) * w1_freq + time * wave_speed;
+    let w1_phase = dot(pos, w1_dir) * wave_scale + time * wave_speed;
     let w1_amp = water.wave_strength * 0.4;
     height_dx += w1_amp * w1_dir.x * cos(w1_phase);
     height_dz += w1_amp * w1_dir.y * cos(w1_phase);
     
-    // Wave 2: Secondary waves at angle
-    let w2_freq = wave_scale * 1.8;
     let w2_dir = vec2<f32>(0.7, 0.7);
-    let w2_phase = dot(pos, w2_dir) * w2_freq + time * wave_speed * 1.1;
+    let w2_phase = dot(pos, w2_dir) * (wave_scale * 1.8) + time * (wave_speed * 1.1);
     let w2_amp = water.wave_strength * 0.25;
     height_dx += w2_amp * w2_dir.x * cos(w2_phase);
     height_dz += w2_amp * w2_dir.y * cos(w2_phase);
     
-    // Wave 3: Smaller detail waves
-    let w3_freq = wave_scale * 3.2;
-    let w3_dir = vec2<f32>(-0.4, 0.9);
-    let w3_phase = dot(pos, w3_dir) * w3_freq + time * wave_speed * 0.9;
-    let w3_amp = water.wave_strength * 0.15;
-    height_dx += w3_amp * w3_dir.x * cos(w3_phase);
-    height_dz += w3_amp * w3_dir.y * cos(w3_phase);
-    
-    // Wave 4: High frequency ripples
-    let w4_freq = wave_scale * 5.5;
-    let w4_dir = vec2<f32>(0.3, -0.95);
-    let w4_phase = dot(pos, w4_dir) * w4_freq + time * wave_speed * 1.3;
-    let w4_amp = water.wave_strength * 0.08;
-    height_dx += w4_amp * w4_dir.x * cos(w4_phase);
-    height_dz += w4_amp * w4_dir.y * cos(w4_phase);
-    
-    // Add noise-based perturbation for organic look
+    // Single noise layer for organic detail (instead of 2 + 4 wave layers)
     let noise_scale = 0.02;
     let noise_time = time * wave_speed * 0.3;
-    let n1 = gradient_noise(pos * noise_scale + vec2<f32>(noise_time, 0.0));
-    let n2 = gradient_noise(pos * noise_scale + vec2<f32>(0.0, noise_time));
-    height_dx += n1 * water.wave_strength * 0.1;
-    height_dz += n2 * water.wave_strength * 0.1;
+    let n1 = gradient_noise(pos * noise_scale + vec2<f32>(noise_time, noise_time * 0.5));
+    height_dx += n1 * water.wave_strength * 0.15;
+    height_dz += n1 * water.wave_strength * 0.15;
     
     // Construct normal from height gradients
-    let normal = normalize(vec3<f32>(-height_dx, 1.0, -height_dz));
-    return normal;
+    return normalize(vec3<f32>(-height_dx, 1.0, -height_dz));
 }
 
 // Distorted UV coordinates for refraction effect
@@ -280,16 +243,9 @@ fn get_refraction_offset(world_pos: vec3<f32>, time: f32) -> vec2<f32> {
     let distort_freq = 0.05;
     let distort_speed = water.speed * 0.3;
     
-    // Layer multiple noise patterns for organic distortion
-    var offset = vec2<f32>(0.0);
-    
-    offset.x += gradient_noise(pos * distort_freq + vec2<f32>(time * distort_speed, 0.0)) * 0.5;
-    offset.y += gradient_noise(pos * distort_freq + vec2<f32>(0.0, time * distort_speed)) * 0.5;
-    
-    offset.x += gradient_noise(pos * distort_freq * 2.0 + vec2<f32>(time * distort_speed * 0.7, 0.5)) * 0.25;
-    offset.y += gradient_noise(pos * distort_freq * 2.0 + vec2<f32>(0.3, time * distort_speed * 0.7)) * 0.25;
-    
-    return offset * water.wave_strength * 0.01;
+    // Reduced to single noise sample for refraction
+    let n = gradient_noise(pos * distort_freq + vec2<f32>(time * distort_speed, time * distort_speed * 0.7));
+    return vec2<f32>(n, n * 0.5) * water.wave_strength * 0.01;
 }
 
 // ============================================================================
@@ -384,18 +340,35 @@ fn decode_world_normal(encoded: vec3<f32>) -> vec3<f32> {
 // Project world position to screen UV coordinates
 fn world_to_screen_uv(world_pos: vec3<f32>) -> vec3<f32> {
     let clip_pos = camera.mvp * vec4<f32>(world_pos, 1.0);
-    let ndc = clip_pos.xyz / clip_pos.w;
-    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-    return vec3<f32>(uv, ndc.z);
+    // Use rcp to avoid two divisions
+    let inv_w = 1.0 / clip_pos.w;
+    let ndc = clip_pos.xyz * inv_w;
+    return vec3<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5, ndc.z);
 }
 
-// Reconstruct world position from UV and depth
-fn reconstruct_world_pos_uv(uv: vec2<f32>, depth: f32) -> vec3<f32> {
-    let z_ndc = depth * 2.0 - 1.0;
-    let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - 2.0 * uv.y, z_ndc, 1.0);
-    let view_pos_unnorm = camera.inverse_proj * ndc;
-    let view_pos = view_pos_unnorm.xyz / view_pos_unnorm.w;
-    return (camera.inverse_view * vec4<f32>(view_pos, 1.0)).xyz;
+// Faster bitwise hash for M1
+fn fast_hash(p: vec2<f32>) -> f32 {
+    let v = bitcast<vec2<u32>>(p);
+    let q = (v.x * 1597334677u) ^ (v.y * 3812015487u);
+    let h = (q ^ (q >> 16u)) * 1597334677u;
+    return f32(h) * (1.0 / 4294967296.0);
+}
+
+// Perlin-style gradient noise with optimized hash
+fn gradient_noise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    
+    // Smooth interpolation (Hermite)
+    let u = f * f * (3.0 - 2.0 * f);
+    
+    // Use bitwise hash instead of sin
+    let a = fast_hash(i);
+    let b = fast_hash(i + vec2<f32>(1.0, 0.0));
+    let c = fast_hash(i + vec2<f32>(0.0, 1.0));
+    let d = fast_hash(i + vec2<f32>(1.0, 1.0));
+    
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y) * 2.0 - 1.0;
 }
 
 // Calculate max mip level for HZB
@@ -407,98 +380,73 @@ fn get_max_mip_level() -> f32 {
 
 // Screen-space reflection ray marching with HZB acceleration
 fn trace_water_reflection(start_pos: vec3<f32>, ray_dir: vec3<f32>, cam_pos: vec3<f32>, pixel_uv: vec2<f32>) -> vec3<f32> {
-    // HZB acceleration allows for fewer steps while covering more ground.
-    let max_steps = 64u;
+    let max_steps = 40u;
     let thickness_base = 5.0;
-    let max_binary_steps = 5u;
     
-    // Calculate end position in world space
-    let max_dist = 400.0; // Limit water SSR distance for performance
+    let max_dist = 400.0;
     let end_pos = start_pos + ray_dir * max_dist;
     
     let start_screen = world_to_screen_uv(start_pos);
     let end_screen = world_to_screen_uv(end_pos);
     
     let delta = (end_screen - start_screen) / f32(max_steps);
-    let dim = textureDimensions(depth_texture);
+    let delta_uv = delta.xy;
+    let delta_z = delta.z;
     
-    // Calculate screen-space step magnitude for adaptive thickness
-    let screen_delta_length = length(delta.xy * vec2<f32>(f32(dim.x), f32(dim.y)));
+    let dim = textureDimensions(depth_texture);
+    let screen_delta_length = length(delta_uv * vec2<f32>(f32(dim.x), f32(dim.y)));
     let screen_factor = max(1.0, screen_delta_length * 0.5);
 
-    // Jitter the start along the ray in screen-space to avoid visible marching bands.
-    let jitter = hash2(pixel_uv * vec2<f32>(f32(dim.x), f32(dim.y)));
-    var current_screen = start_screen + delta * jitter;
+    let jitter = fast_hash(pixel_uv * vec2<f32>(f32(dim.x), f32(dim.y)));
+    var uv = start_screen.xy + delta_uv * jitter;
+    var ray_z = start_screen.z + delta_z * jitter;
     
     let max_mip = get_max_mip_level();
-    var current_mip = min(3.0, max_mip); // Start at a coarse mip for speed
+    var current_mip = min(3.0, max_mip);
 
-    // Precalculate thickness parts to move math out of the loop
-    let thickness_scale = 0.00005 * screen_factor; // divide by 1000 here to save ops in loop
+    let thickness_scale = 0.00005 * screen_factor; 
     let thickness_offset = (thickness_base * 0.001) * screen_factor;
     let start_cam_dist = distance(cam_pos, start_pos);
     let world_step = max_dist / f32(max_steps);
     
     for (var i = 0u; i < max_steps; i++) {
-        current_screen += delta;
+        uv += delta_uv;
+        ray_z += delta_z;
         
-        let uv = current_screen.xy;
-        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
-            break;
-        }
+        let outside = uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0;
+        if (outside) { break; }
         
-        // Sample HZB at current mip level
         let hzb_depth = textureSampleLevel(hzb_texture, hzb_sampler, uv, current_mip).r;
-        let ray_depth = current_screen.z;
         
-        // Optimized linear thickness heuristic
-        let dist_to_ray = start_cam_dist + f32(i) * world_step;
-        let dynamic_thickness = thickness_offset + dist_to_ray * thickness_scale;
-        
-        // Check if ray is behind surface (potential intersection)
-        if (ray_depth > hzb_depth) {
+        if (ray_z > hzb_depth) {
             if (current_mip <= 0.5) {
-                // At finest detail, check thickness to avoid hitting backfaces or distant geometry
-                if (ray_depth - hzb_depth < dynamic_thickness) { 
-                    // Refine hit with binary search
-                    var refined_screen = current_screen - delta;
-                    var refined_delta = delta;
-                    
-                    for (var j = 0u; j < max_binary_steps; j++) {
-                        refined_delta *= 0.5;
-                        refined_screen += refined_delta;
-                        
-                        let refined_uv = refined_screen.xy;
-                        let refined_depth_sample = textureSampleLevel(hzb_texture, hzb_sampler, refined_uv, 0.0).r;
-                        
-                        if (refined_screen.z > refined_depth_sample) {
-                            refined_screen -= refined_delta;
+                let dist_to_ray = start_cam_dist + f32(i) * world_step;
+                if (ray_z - hzb_depth < (thickness_offset + dist_to_ray * thickness_scale)) { 
+                    // Binary search (inlined and simplified)
+                    var r_uv = uv - delta_uv;
+                    var r_z = ray_z - delta_z;
+                    var r_duv = delta_uv;
+                    var r_dz = delta_z;
+                    for (var j = 0u; j < 4u; j++) {
+                        r_duv *= 0.5; r_dz *= 0.5;
+                        r_uv += r_duv; r_z += r_dz;
+                        if (r_z > textureSampleLevel(hzb_texture, hzb_sampler, r_uv, 0.0).r) {
+                            r_uv -= r_duv; r_z -= r_dz;
                         }
                     }
-                    
-                    let hit_uv = refined_screen.xy;
-                    let edge_fade = min(
-                        min(hit_uv.x, 1.0 - hit_uv.x),
-                        min(hit_uv.y, 1.0 - hit_uv.y)
-                    );
-                    let edge_factor = smoothstep(0.0, 0.1, edge_fade);
-                    return vec3<f32>(hit_uv, edge_factor);
+                    let edge_fade = min(min(r_uv.x, 1.0 - r_uv.x), min(r_uv.y, 1.0 - r_uv.y));
+                    return vec3<f32>(r_uv, smoothstep(0.0, 0.1, edge_fade));
                 }
             } else {
-                // Descend to finer mip level
                 current_mip = max(0.0, current_mip - 1.0);
-                // Backtrack slightly to re-check at finer level
-                current_screen -= delta;
+                uv -= delta_uv;
+                ray_z -= delta_z;
             }
         } else {
-            // No intersection, optionally ascend
-            if (current_mip < 3.0) {
-                current_mip += 1.0;
-            }
+            current_mip = min(3.0, current_mip + 1.0);
         }
     }
-    
-    return vec3<f32>(0.0, 0.0, 0.0);
+    return vec3<f32>(0.0);
 }
 
 fn screen_space_factor_calc(screen_delta_length: f32) -> f32 {
@@ -575,7 +523,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     
     // Animated water normal + optional boat wake perturbation
     let base_water_normal = get_water_normal(hit_pos, time);
-    let water_normal_full = get_boat_wake_normal(hit_pos, time, base_water_normal);
+    var water_normal_full = base_water_normal;
+    if (water.boat_pos_wake.w > 0.0001) {
+        water_normal_full = get_boat_wake_normal(hit_pos, time, base_water_normal);
+    }
     let view_dir = -world_dir;
     
     // Distance from camera to water
@@ -813,7 +764,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     
     let shore_foam = get_shore_foam(depth_diff, hit_pos, time);
     let surface_foam = get_surface_foam(hit_pos, time);
-    let boat_wake = get_boat_wake(hit_pos, time);
+    var boat_wake = 0.0;
+    if (water.boat_pos_wake.w > 0.0001) {
+        boat_wake = get_boat_wake(hit_pos, time);
+    }
     let total_foam = clamp(shore_foam + surface_foam + boat_wake, 0.0, 1.0);
     
     // Foam color darkens with scene brightness
