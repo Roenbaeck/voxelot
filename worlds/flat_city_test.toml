@@ -2,9 +2,9 @@
 file = "worlds/flat_city_test.vhc"
 palette = "worlds/palette.txt"
 camera_position = [
-    306.2473,
-    50.718525,
-    362.97458,
+    306.66907,
+    62.37096,
+    322.42587,
 ]
 water_level = 45.0
 water_visibility = 15.0
@@ -72,6 +72,7 @@ thickness = 8.0
 strength = 1.0
 blur_enabled = true
 blur_radius = 1.0
+max_ao_distance = 450.0
 
 [effects.radiance_cascades]
 enabled = true

@@ -692,6 +692,7 @@ struct SsaoSettings {
     strength: f32,
     blur_enabled: bool,
     blur_radius: f32,
+    max_ao_distance: f32,
     _bias: f32,
 }
 
@@ -746,7 +747,7 @@ struct SsaoUniformsRaw {
     gi_fade_range: f32,
     water_level: f32,
     water_visibility: f32,
-    _pad2: f32,
+    max_ao_distance: f32,
     inverse_projection: [[f32; 4]; 4],
     inverse_view: [[f32; 4]; 4],
     grid_origin: [i32; 3],
@@ -2707,6 +2708,7 @@ impl App {
                 strength: cfg.effects.ssao.strength,
                 blur_enabled: cfg.effects.ssao.blur_enabled,
                 blur_radius: cfg.effects.ssao.blur_radius,
+                max_ao_distance: cfg.effects.ssao.max_ao_distance,
                 _bias: 0.01,
             },
             gi_settings: GiSettings {
@@ -2999,7 +3001,7 @@ impl App {
             gi_fade_range: self.gi_settings.fade_range,
             water_level: self.water_level,
             water_visibility: self.water_visibility,
-            _pad2: 0.0,
+            max_ao_distance: self.ssao_settings.max_ao_distance,
             inverse_projection: inv_proj.to_cols_array_2d(),
             inverse_view: inv_view.to_cols_array_2d(),
             grid_origin: self.gi_grid_origin.into(),
@@ -3710,8 +3712,8 @@ impl App {
                 let ssao_ping_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("SSAO Ping Texture"),
                     size: wgpu::Extent3d {
-                        width: target_width,
-                        height: target_height,
+                        width: (target_width / 2).max(1),
+                        height: (target_height / 2).max(1),
                         depth_or_array_layers: 1,
                     },
                     mip_level_count: 1,
@@ -3727,8 +3729,8 @@ impl App {
                 let ssao_pong_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("SSAO Pong Texture"),
                     size: wgpu::Extent3d {
-                        width: target_width,
-                        height: target_height,
+                        width: (target_width / 2).max(1),
+                        height: (target_height / 2).max(1),
                         depth_or_array_layers: 1,
                     },
                     mip_level_count: 1,
@@ -4977,10 +4979,11 @@ impl App {
             queue.write_buffer(cam_buf, 0, bytemuck::cast_slice(&[camera]));
         }
 
-        // SSILVB uniforms
+        // SSILVB uniforms (pass half-res dimensions since SSAO runs at half resolution)
         if let Some(buffer) = self.ssilvb_uniform_buffer.as_ref() {
-            let data =
-                self.build_ssilvb_uniforms(self.render_target_width, self.render_target_height);
+            let half_width = (self.render_target_width / 2).max(1);
+            let half_height = (self.render_target_height / 2).max(1);
+            let data = self.build_ssilvb_uniforms(half_width, half_height);
             queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[data]));
         }
     }

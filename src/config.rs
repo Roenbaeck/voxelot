@@ -236,6 +236,8 @@ pub struct SsaoConfig {
     pub blur_enabled: bool,
     #[serde(default = "default_ssao_blur_radius")]
     pub blur_radius: f32,
+    #[serde(default = "default_ssao_max_ao_distance")]
+    pub max_ao_distance: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -532,6 +534,10 @@ fn default_ssao_blur_radius() -> f32 {
     2.0
 }
 
+fn default_ssao_max_ao_distance() -> f32 {
+    300.0
+}
+
 fn default_radiance_cascades_enabled() -> bool {
     true
 }
@@ -770,6 +776,7 @@ impl Default for SsaoConfig {
             strength: default_ssao_strength(),
             blur_enabled: default_ssao_blur_enabled(),
             blur_radius: default_ssao_blur_radius(),
+            max_ao_distance: default_ssao_max_ao_distance(),
         }
     }
 }

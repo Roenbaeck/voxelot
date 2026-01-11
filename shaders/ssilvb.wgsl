@@ -10,7 +10,7 @@ struct SsaoUniforms {
     gi_fade_range: f32,
     water_level: f32,
     water_visibility: f32,
-    _pad2: f32,
+    max_ao_distance: f32, // Skip AO for pixels beyond this depth
     inverse_projection: mat4x4<f32>,
     inverse_view: mat4x4<f32>,
     grid_origin: vec3<i32>,
@@ -89,10 +89,7 @@ fn fast_acos(x: f32) -> f32 {
 }
 
 fn count_bits(value: u32) -> u32 {
-    var v = value;
-    v = v - ((v >> 1u) & 0x55555555u);
-    v = (v & 0x33333333u) + ((v >> 2u) & 0x33333333u);
-    return (((v + (v >> 4u)) & 0x0F0F0F0Fu) * 0x01010101u) >> 24u;
+    return countOneBits(value);
 }
 
 fn sample_grid_irradiance(world_pos: vec3<f32>, normal: vec3<f32>, camera_pos: vec3<f32>) -> vec3<f32> {
@@ -171,6 +168,12 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
 
+    // Early-out for distant pixels - AO is not visible at distance anyway
+    // Return full visibility (1.0) to avoid darkening distant geometry
+    if (linear_depth > ssao.max_ao_distance) {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+
     let inv_proj_00 = ssao.inverse_projection[0][0];
     let inv_proj_11 = ssao.inverse_projection[1][1];
     let ndc_xy_pixel = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
@@ -194,6 +197,11 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let screen_size = vec2<f32>(ssao.screen_width, ssao.screen_height);
     let inv_screen_size = 1.0 / screen_size;
     let frag_coord = uv * screen_size;
+
+    // Integer screen bounds for fast clamping checks (avoid runtime texture size queries)
+    let screen_w_i = i32(ssao.screen_width);
+    let screen_h_i = i32(ssao.screen_height);
+    let max_screen_dim_i = max(screen_w_i, screen_h_i);
     
     // Random rotation
     let noise = ign(frag_coord);
@@ -240,18 +248,24 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
             var current_step = pow(step_ratio, select(noise, 1.0 - noise, side == 1u));
             
             for (var s = 0u; s < 64u; s = s + 1u) {
-                if (s >= ssao.sample_count) { break; } 
+                if (s >= ssao.sample_count) { break; }
 
+                // Compute sample UV directly (avoids integer coord path that triggers naga bounds checks)
                 let sample_uv = uv + (ray_dir * current_step) * inv_screen_size;
+
                 current_step *= step_ratio;
-                
-                if (sample_uv.x < 0.0 || sample_uv.x > 1.0 || sample_uv.y < 0.0 || sample_uv.y > 1.0) { break; }
-                
-                let sample_normal = textureSampleLevel(normal_tex, post_sampler, sample_uv, 0);
+
+                // Fast UV bounds test
+                if (sample_uv.x < 0.0 || sample_uv.x > 1.0 ||
+                    sample_uv.y < 0.0 || sample_uv.y > 1.0) { break; }
+
+                // Use sampler-based access - hardware handles clamping natively without
+                // naga inserting min(coord, get_width()-1) bounds checks per read
+                let sample_normal = textureSampleLevel(normal_tex, post_sampler, sample_uv, 0.0);
                 let sample_linear_depth = sample_normal.w;
-                
+
                 if (sample_linear_depth <= 0.0) { continue; }
-                
+
                 let sample_ndc_xy = vec2<f32>(sample_uv.x * 2.0 - 1.0, 1.0 - sample_uv.y * 2.0);
                 let sample_pos = vec3<f32>(sample_ndc_xy.x * sample_linear_depth * inv_proj_00, sample_ndc_xy.y * sample_linear_depth * inv_proj_11, -sample_linear_depth);
                 
