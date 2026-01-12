@@ -12592,36 +12592,11 @@ impl App {
             // (Removed copy_texture_to_texture of offscreen_color -> post_color)
         }
         // Radiance Cascades Pass
-        // Compute timestamps don't work reliably on all backends, so we use empty render passes
-        // as timestamp "fences" before and after the compute work.
-        // Only capture timestamps when GUI is visible.
         if self.rc_enabled {
-            if let (Some(rc_pipeline), Some(rc_bind_group), Some(post_view)) = (
+            if let (Some(rc_pipeline), Some(rc_bind_group)) = (
                 self.rc_pipeline.as_ref(),
                 self.rc_bind_group.as_ref(),
-                self.post_color_view.as_ref(),
             ) {
-                // Timestamp fence: mark start of RC (only when GUI visible)
-                if self.gui_visible {
-                    let mut _fence = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("RC Start Timestamp"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: post_view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Load,
-                                store: wgpu::StoreOp::Store,
-                            },
-                            depth_slice: None,
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                        multiview_mask: None,
-                    });
-                    // Pass ends immediately
-                }
-
                 // Actual RC compute work
                 {
                     let mut rc_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -12633,27 +12608,6 @@ impl App {
                     let workgroup_x = (self.render_target_width + 7) / 8;
                     let workgroup_y = (self.render_target_height + 7) / 8;
                     rc_pass.dispatch_workgroups(workgroup_x, workgroup_y, 1);
-                }
-
-                // Timestamp fence: mark end of RC (only when GUI visible)
-                if self.gui_visible {
-                    let mut _fence = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("RC End Timestamp"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: post_view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Load,
-                                store: wgpu::StoreOp::Store,
-                            },
-                            depth_slice: None,
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                        multiview_mask: None,
-                    });
-                    // Pass ends immediately
                 }
             }
         }
