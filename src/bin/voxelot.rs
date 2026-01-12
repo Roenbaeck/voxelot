@@ -7138,6 +7138,7 @@ impl App {
         extern "C" {
             static kCGColorSpaceExtendedLinearDisplayP3: *const c_void;
             static kCGColorSpaceExtendedLinearSRGB: *const c_void;
+            static kCGColorSpaceExtendedLinearITUR_2020: *const c_void;
             fn CGColorSpaceCreateWithName(name: *const c_void) -> *mut c_void;
             fn CGColorSpaceRelease(space: *mut c_void);
         }
@@ -7178,15 +7179,17 @@ impl App {
             if supports_colorspace != NO {
                 // IMPORTANT: Our renderer outputs linear RGB values assuming sRGB primaries.
                 // Advertising Display P3 without converting the output will shift hues (e.g. sun tint).
-                // Default to extended-linear sRGB unless the user opts into Display P3.
-                let want_p3 = matches!(
-                    colorspace,
-                    voxelot::config::MacosHdrColorspace::ExtendedLinearDisplayP3
-                );
-                let cs_name = if want_p3 {
-                    kCGColorSpaceExtendedLinearDisplayP3
-                } else {
-                    kCGColorSpaceExtendedLinearSRGB
+                // Default to extended-linear sRGB unless the user opts into Display P3 or BT.2020.
+                let cs_name = match colorspace {
+                    voxelot::config::MacosHdrColorspace::ExtendedLinearDisplayP3 => {
+                        kCGColorSpaceExtendedLinearDisplayP3
+                    }
+                    voxelot::config::MacosHdrColorspace::ExtendedLinearItur2020 => {
+                        kCGColorSpaceExtendedLinearITUR_2020
+                    }
+                    voxelot::config::MacosHdrColorspace::ExtendedLinearSrgb => {
+                        kCGColorSpaceExtendedLinearSRGB
+                    }
                 };
 
                 let cs = CGColorSpaceCreateWithName(cs_name);
@@ -7280,6 +7283,13 @@ impl App {
         self.hdr_active = cfg!(target_os = "macos")
             && self.user_config.rendering.macos_hdr
             && surface_format == wgpu::TextureFormat::Rgba16Float;
+
+        log::info!(
+            "HDR setup: macos_hdr={}, surface_format={:?}, hdr_active={}",
+            self.user_config.rendering.macos_hdr,
+            surface_format,
+            self.hdr_active
+        );
 
         viewer_debug!(
             "Surface formats: {:?} => selected {:?}",

@@ -11,6 +11,8 @@ pub enum MacosHdrColorspace {
     ExtendedLinearSrgb,
     /// Extended linear Display P3 (wide gamut; requires rendering pipeline to be in P3 to avoid hue shifts).
     ExtendedLinearDisplayP3,
+    /// Extended linear ITU-R BT.2020 (very wide gamut HDR; best for HDR content).
+    ExtendedLinearItur2020,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
