@@ -80,9 +80,19 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return output;
 }
 
-fn decode_world_normal(encoded: vec3<f32>) -> vec3<f32> {
-    let n = encoded * 2.0 - 1.0;
-    return normalize(select(n, vec3<f32>(0.0, 1.0, 0.0), dot(n, n) < 1e-8));
+fn oct_decode(e: vec2<f32>) -> vec3<f32> {
+    // Start on octahedron surface
+    var v = vec3<f32>(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
+
+    // Fold back the parts where z is negative (lower hemisphere)
+    if (v.z < 0.0) {
+        let ox = (1.0 - abs(v.y)) * select(-1.0, 1.0, v.x >= 0.0);
+        let oy = (1.0 - abs(v.x)) * select(-1.0, 1.0, v.y >= 0.0);
+        v.x = ox;
+        v.y = oy;
+    }
+
+    return normalize(v);
 }
 
 fn load_depth_at_uv(uv: vec2<f32>) -> f32 {
@@ -412,8 +422,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
     
-    let gbuf = textureSample(normal_gbuffer, linear_sampler, input.uv);
-    let normal = decode_world_normal(gbuf.rgb);
+    let gbuf = textureSample(normal_gbuffer, linear_sampler, input.uv).xy;
+    let normal = oct_decode(gbuf);
 
     let view_dir = normalize(world_pos - camera.camera_pos);
     let reflect_dir = reflect(view_dir, normal);

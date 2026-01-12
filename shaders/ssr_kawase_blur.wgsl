@@ -38,9 +38,19 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return out;
 }
 
-fn decode_world_normal(encoded: vec3<f32>) -> vec3<f32> {
-    let n = encoded * 2.0 - 1.0;
-    return normalize(select(n, vec3<f32>(0.0, 1.0, 0.0), dot(n, n) < 1e-8));
+fn oct_decode(e: vec2<f32>) -> vec3<f32> {
+    // Start on octahedron surface
+    var v = vec3<f32>(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
+
+    // Fold back the parts where z is negative (lower hemisphere)
+    if (v.z < 0.0) {
+        let ox = (1.0 - abs(v.y)) * select(-1.0, 1.0, v.x >= 0.0);
+        let oy = (1.0 - abs(v.x)) * select(-1.0, 1.0, v.y >= 0.0);
+        v.x = ox;
+        v.y = oy;
+    }
+
+    return normalize(v);
 }
 
 fn uv_to_pixel(uv: vec2<f32>, dim: vec2<u32>) -> vec2<i32> {
@@ -58,7 +68,7 @@ fn load_depth_at_uv(uv: vec2<f32>) -> f32 {
 fn load_normal_at_uv(uv: vec2<f32>) -> vec3<f32> {
     let dim = textureDimensions(normal_gbuffer);
     let px = uv_to_pixel(uv, dim);
-    return decode_world_normal(textureLoad(normal_gbuffer, px, 0).xyz);
+    return oct_decode(textureLoad(normal_gbuffer, px, 0).xy);
 }
 
 fn edge_weight(depth0: f32, normal0: vec3<f32>, uv: vec2<f32>) -> f32 {

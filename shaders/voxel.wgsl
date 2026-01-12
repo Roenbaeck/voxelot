@@ -159,8 +159,24 @@ fn vs_main(
 struct FragmentOutput {
     @location(0) color: vec4<f32>,
     @location(1) emissive: vec4<f32>,
-    @location(2) normal: vec4<f32>,
-    @location(3) material: vec4<f32>,  // R=reflectivity, GBA=reserved
+    @location(2) normal: vec2<f32>,
+    @location(3) material: f32,
+}
+
+fn oct_encode(n_in: vec3<f32>) -> vec2<f32> {
+    let n = normalize(n_in);
+
+    // Project onto octahedron via L1 norm
+    var p = n.xy / (abs(n.x) + abs(n.y) + abs(n.z));
+
+    // Fold lower hemisphere
+    if (n.z < 0.0) {
+        p = vec2<f32>(
+            (1.0 - abs(p.y)) * select(-1.0, 1.0, p.x >= 0.0),
+            (1.0 - abs(p.x)) * select(-1.0, 1.0, p.y >= 0.0)
+        );
+    }
+    return p; // in [-1,1]
 }
 
 @fragment
@@ -361,11 +377,12 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     // Scale emissive by strength and apply fades so it doesn't pop in/out
     let final_emissive = input.emissive.rgb * input.emissive.a * (1.0 - env_fade_factor) * alpha;
     out.emissive = vec4<f32>(final_emissive, input.emissive.a);
-    // Encode world-space normal: map [-1,1] to [0,1] for storage
-    // Store linear depth in W channel for SSILVB/GTAO
-    out.normal = vec4<f32>(input.normal * 0.5 + 0.5, input.view_z);
-    // Look up material reflectivity from material_props buffer
-    out.material = vec4<f32>(reflectivity, 0.0, 0.0, 0.0);
+    
+    // Octahedral encoding for normal (2-channel snorm)
+    out.normal = oct_encode(input.normal);
+    
+    // Material reflectivity (1-channel unorm)
+    out.material = reflectivity;
     return out;
 }
 
@@ -573,11 +590,12 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     // Scale emissive by strength and apply fades so it doesn't pop in/out
     let final_emissive = input.emissive.rgb * input.emissive.a * (1.0 - env_fade_factor) * alpha;
     out.emissive = vec4<f32>(final_emissive, input.emissive.a);
-    // Encode world-space normal: map [-1,1] to [0,1] for storage
-    // Store linear depth in W channel for SSILVB/GTAO
-    out.normal = vec4<f32>(input.normal * 0.5 + 0.5, input.view_z);
-    // Use material reflectivity from vertex attribute
-    out.material = input.material;
+    
+    // Octahedral encoding for normal (2-channel snorm)
+    out.normal = oct_encode(input.normal);
+    
+    // Material reflectivity (1-channel unorm)
+    out.material = reflectivity;
     return out;
 }
 

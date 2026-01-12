@@ -57,9 +57,19 @@ fn reconstruct_world_pos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     return world_pos.xyz / world_pos.w;
 }
 
-fn decode_world_normal(encoded: vec3<f32>) -> vec3<f32> {
-    let n = encoded * 2.0 - 1.0;
-    return normalize(select(n, vec3<f32>(0.0, 1.0, 0.0), dot(n, n) < 1e-8));
+fn oct_decode(e: vec2<f32>) -> vec3<f32> {
+    // Start on octahedron surface
+    var v = vec3<f32>(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
+
+    // Fold back the parts where z is negative (lower hemisphere)
+    if (v.z < 0.0) {
+        let ox = (1.0 - abs(v.y)) * select(-1.0, 1.0, v.x >= 0.0);
+        let oy = (1.0 - abs(v.x)) * select(-1.0, 1.0, v.y >= 0.0);
+        v.x = ox;
+        v.y = oy;
+    }
+
+    return normalize(v);
 }
 
 fn sample_dynamic_lights_avg(world_pos: vec3<f32>, normal: vec3<f32>, max_dist: f32) -> vec3<f32> {
@@ -105,9 +115,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     let world_pos = reconstruct_world_pos(uv, depth);
     
-    // Sample normal from G-buffer
-    let gbuf = textureLoad(normal_gbuffer, vec2<i32>(id.xy), 0);
-    let world_normal = decode_world_normal(gbuf.rgb);
+    // Sample Octahedral-encoded world-space normal from G-buffer
+    let gbuf = textureLoad(normal_gbuffer, vec2<i32>(id.xy), 0).xy;
+    let world_normal = oct_decode(gbuf);
     
     // Distance culling + smooth fade for dynamic lights.
     // We fade in near the probe influence edge to avoid abrupt popping.

@@ -77,6 +77,13 @@ fn fetch_depth(coord: vec2<i32>) -> f32 {
     return textureLoad(depth_tex, coord, 0);
 }
 
+fn load_depth_at_uv(uv: vec2<f32>) -> f32 {
+    let dims = vec2<i32>(textureDimensions(depth_tex));
+    let xy = vec2<i32>(uv * vec2<f32>(dims));
+    let clamped = clamp(xy, vec2<i32>(0, 0), dims - vec2<i32>(1, 1));
+    return textureLoad(depth_tex, clamped, 0);
+}
+
 // Interleaved Gradient Noise
 fn ign(uv: vec2<f32>) -> f32 {
     return fract(52.9829189 * fract(dot(uv, vec2<f32>(0.06711056, 0.00583715))));
@@ -90,6 +97,21 @@ fn fast_acos(x: f32) -> f32 {
 
 fn count_bits(value: u32) -> u32 {
     return countOneBits(value);
+}
+
+fn oct_decode(e: vec2<f32>) -> vec3<f32> {
+    // Start on octahedron surface
+    var v = vec3<f32>(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
+
+    // Fold back the parts where z is negative (lower hemisphere)
+    if (v.z < 0.0) {
+        let ox = (1.0 - abs(v.y)) * select(-1.0, 1.0, v.x >= 0.0);
+        let oy = (1.0 - abs(v.x)) * select(-1.0, 1.0, v.y >= 0.0);
+        v.x = ox;
+        v.y = oy;
+    }
+
+    return normalize(v);
 }
 
 fn sample_grid_irradiance(world_pos: vec3<f32>, normal: vec3<f32>, camera_pos: vec3<f32>) -> vec3<f32> {
@@ -159,10 +181,15 @@ fn sample_grid_irradiance(world_pos: vec3<f32>, normal: vec3<f32>, camera_pos: v
 
 @fragment
 fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    // Sample G-buffer normal and linear depth
-    let normal_sample = textureSample(normal_tex, post_sampler, uv);
-    let linear_depth = normal_sample.w;
+    // Reconstruct linear depth from depth texture (previously stored in normal.w)
+    let raw_depth = load_depth_at_uv(uv);
+    if (raw_depth >= 1.0) {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
     
+    let view_pos_reconst = reconstruct_position(uv, raw_depth);
+    let linear_depth = -view_pos_reconst.z;
+
     // If linear depth is 0, it's likely the skybox or background
     if (linear_depth <= 0.0) {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
@@ -179,8 +206,10 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let ndc_xy_pixel = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     let view_pos = vec3<f32>(ndc_xy_pixel.x * linear_depth * inv_proj_00, ndc_xy_pixel.y * linear_depth * inv_proj_11, -linear_depth);
 
-    // Sample world-space normal from G-buffer and decode from [0,1] to [-1,1]
-    let world_normal = normalize(normal_sample.rgb * 2.0 - 1.0);
+    // Sample Octahedral-encoded world-space normal from G-buffer and decode
+    let normal_data = textureSample(normal_tex, post_sampler, uv).xy;
+    let world_normal = oct_decode(normal_data);
+    
     // Transform world normal to view-space for GTAO calculations
     let view_mat_rot = transpose(mat3x3<f32>(
         ssao.inverse_view[0].xyz,
@@ -261,8 +290,11 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
 
                 // Use sampler-based access - hardware handles clamping natively without
                 // naga inserting min(coord, get_width()-1) bounds checks per read
-                let sample_normal = textureSampleLevel(normal_tex, post_sampler, sample_uv, 0.0);
-                let sample_linear_depth = sample_normal.w;
+                // Reconstruct linear depth from depth buffer
+                let sample_raw_depth = load_depth_at_uv(sample_uv);
+                if (sample_raw_depth >= 1.0) { continue; }
+                let sample_view_z_reconst = ssao.inverse_projection * vec4<f32>(0.0, 0.0, sample_raw_depth, 1.0);
+                let sample_linear_depth = -(sample_view_z_reconst.z / sample_view_z_reconst.w);
 
                 if (sample_linear_depth <= 0.0) { continue; }
 

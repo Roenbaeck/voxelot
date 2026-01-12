@@ -3899,7 +3899,7 @@ impl App {
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba16Float,
+                    format: wgpu::TextureFormat::Rg16Float,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                         | wgpu::TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
@@ -3907,7 +3907,7 @@ impl App {
                 let normal_view_loc =
                     normal_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
                 let normal_bytes = App::compute_texture_bytes(
-                    wgpu::TextureFormat::Rgba16Float,
+                    wgpu::TextureFormat::Rg16Float,
                     target_width,
                     target_height,
                     1,
@@ -3925,7 +3925,7 @@ impl App {
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba16Float,
+                    format: wgpu::TextureFormat::R8Unorm,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                         | wgpu::TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
@@ -3933,7 +3933,7 @@ impl App {
                 let material_view_loc =
                     material_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
                 let material_bytes = App::compute_texture_bytes(
-                    wgpu::TextureFormat::Rgba16Float,
+                    wgpu::TextureFormat::R8Unorm,
                     target_width,
                     target_height,
                     1,
@@ -4029,7 +4029,7 @@ impl App {
                             mip_level_count: 1,
                             sample_count: 1,
                             dimension: wgpu::TextureDimension::D2,
-                            format: wgpu::TextureFormat::Rgba16Float,
+                            format: wgpu::TextureFormat::Rg16Float,
                             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                             view_formats: &[],
                         });
@@ -4041,7 +4041,7 @@ impl App {
                             mip_level_count: 1,
                             sample_count: 1,
                             dimension: wgpu::TextureDimension::D2,
-                            format: wgpu::TextureFormat::Rgba16Float,
+                            format: wgpu::TextureFormat::R8Unorm,
                             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                             view_formats: &[],
                         });
@@ -4118,7 +4118,7 @@ impl App {
                         probe_normal_face_views_loc.push(probe_normal_texture_loc.create_view(
                             &wgpu::TextureViewDescriptor {
                                 label: Some(&format!("{} Normal", face_label)),
-                                format: Some(wgpu::TextureFormat::Rgba16Float),
+                                format: Some(wgpu::TextureFormat::Rg16Float),
                                 dimension: Some(wgpu::TextureViewDimension::D2),
                                 aspect: wgpu::TextureAspect::All,
                                 base_mip_level: 0,
@@ -4131,7 +4131,7 @@ impl App {
                         probe_material_face_views_loc.push(probe_material_texture_loc.create_view(
                             &wgpu::TextureViewDescriptor {
                                 label: Some(&format!("{} Material", face_label)),
-                                format: Some(wgpu::TextureFormat::Rgba16Float),
+                                format: Some(wgpu::TextureFormat::R8Unorm),
                                 dimension: Some(wgpu::TextureViewDimension::D2),
                                 aspect: wgpu::TextureAspect::All,
                                 base_mip_level: 0,
@@ -6178,13 +6178,13 @@ impl App {
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
                     Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba16Float,
+                        format: wgpu::TextureFormat::Rg16Float,
                         blend: None,
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
                     // Material G-buffer (reflectivity in R channel)
                     Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba16Float,
+                        format: wgpu::TextureFormat::R8Unorm,
                         blend: None,
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
@@ -7234,6 +7234,9 @@ impl App {
         if adapter.features().contains(wgpu::Features::IMMEDIATES) {
             req_features |= wgpu::Features::IMMEDIATES;
         }
+        if adapter.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM) {
+            req_features |= wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
+        }
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -7501,13 +7504,13 @@ impl App {
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
                     Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba16Float,
+                        format: wgpu::TextureFormat::Rg16Float,
                         blend: Some(wgpu::BlendState::REPLACE),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
                     // Material G-buffer (reflectivity in R channel)
                     Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba16Float,
+                        format: wgpu::TextureFormat::R8Unorm,
                         blend: Some(wgpu::BlendState::REPLACE),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
@@ -7634,13 +7637,13 @@ impl App {
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
                     Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba16Float,
+                        format: wgpu::TextureFormat::Rg16Float,
                         blend: Some(wgpu::BlendState::REPLACE),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
                     // Material G-buffer (reflectivity in R channel)
                     Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba16Float,
+                        format: wgpu::TextureFormat::R8Unorm,
                         blend: Some(wgpu::BlendState::REPLACE),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
