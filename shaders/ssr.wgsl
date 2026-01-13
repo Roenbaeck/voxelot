@@ -130,6 +130,83 @@ fn sample_sky_equirect(reflect_dir: vec3<f32>) -> vec3<f32> {
     return tinted * brightness;
 }
 
+fn trace_local_ssr(start_pos: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
+    let step_size = 0.8;
+    let max_steps = 180; // ~144 units
+    var current_pos = start_pos + dir * 0.2; 
+
+    let dim = textureDimensions(scene_depth);
+    let fdim = vec2<f32>(dim);
+
+    for (var i = 0; i < max_steps; i++) {
+        current_pos += dir * step_size;
+
+        let clip_pos = camera.view_proj * vec4<f32>(current_pos, 1.0);
+        if (clip_pos.w <= 0.0) { continue; }
+        
+        let ndc = clip_pos.xyz / clip_pos.w;
+        let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+
+        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+            continue;
+        }
+
+        let px = vec2<i32>(uv * fdim);
+        let d_raw = textureLoad(scene_depth, px, 0);
+
+        if (d_raw >= 0.9999 || d_raw <= 0.0) { continue; } 
+
+        let sample_pos = reconstruct_world_pos(uv, d_raw);
+        let dist_sample = distance(camera.camera_pos, sample_pos);
+        let dist_ray = distance(camera.camera_pos, current_pos);
+
+        // Ray is "behind" surface from camera view
+        if (dist_ray > dist_sample + 0.05) {
+            let thickness = 0.5 + f32(i) * 0.015;
+            if (dist_ray - dist_sample < thickness) {
+                // Binary refinement for better precision
+                var refine_pos = current_pos;
+                var prev_pos = current_pos - dir * step_size;
+                for (var j = 0; j < 3; j++) {
+                    let mid = mix(prev_pos, refine_pos, 0.5);
+                    let mid_clip = camera.view_proj * vec4<f32>(mid, 1.0);
+                    let mid_ndc = mid_clip.xyz / mid_clip.w;
+                    let mid_uv = vec2<f32>(mid_ndc.x * 0.5 + 0.5, 0.5 - mid_ndc.y * 0.5);
+                    let mid_d = textureLoad(scene_depth, vec2<i32>(mid_uv * fdim), 0);
+                    if (distance(camera.camera_pos, mid) > distance(camera.camera_pos, reconstruct_world_pos(mid_uv, mid_d)) + 0.05) {
+                        refine_pos = mid;
+                    } else {
+                        prev_pos = mid;
+                    }
+                }
+
+                let final_clip = camera.view_proj * vec4<f32>(refine_pos, 1.0);
+                let final_ndc = final_clip.xyz / final_clip.w;
+                let final_uv = vec2<f32>(final_ndc.x * 0.5 + 0.5, 0.5 - final_ndc.y * 0.5);
+                let final_px = vec2<i32>(final_uv * fdim);
+
+                let color = textureLoad(scene_color, final_px, 0).rgb;
+                // Tight edge fade
+                let edge_fade = clamp(10.0 * min(min(final_uv.x, 1.0 - final_uv.x), min(final_uv.y, 1.0 - final_uv.y)), 0.0, 1.0);
+                return vec4<f32>(color, edge_fade);
+            }
+        }
+    }
+    return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+}
+
+// Optimized radiance: 3 samples with branchless selection (Integer/Discrete version)
+fn sample_radiance_int(pos: vec3<i32>, dir: vec3<f32>) -> vec3<f32> {
+    let w = dir * dir;
+    let color_x = select(textureLoad(gi_probe_nx, pos, 0).rgb,
+                         textureLoad(gi_probe_px, pos, 0).rgb, dir.x > 0.0);
+    let color_y = select(textureLoad(gi_probe_ny, pos, 0).rgb,
+                         textureLoad(gi_probe_py, pos, 0).rgb, dir.y > 0.0);
+    let color_z = select(textureLoad(gi_probe_nz, pos, 0).rgb,
+                         textureLoad(gi_probe_pz, pos, 0).rgb, dir.z > 0.0);
+    return (color_x * w.x + color_y * w.y + color_z * w.z) * params.gi_scale;
+}
+
 // Optimized radiance: 3 samples with branchless selection
 fn sample_radiance(uvw: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     let w = dir * dir;
@@ -167,7 +244,7 @@ fn ray_aabb_intersection(ro: vec3<f32>, rd: vec3<f32>, min_p: vec3<f32>, max_p: 
     return RayHit(t_near, t_far, normal);
 }
 
-fn is_water_visible_at_chunk(chunk_i: vec3<i32>, world_grid_origin: vec3<f32>) -> bool {
+fn is_water_visible_at_chunk(chunk_i: vec3<i32>, world_grid_origin: vec3<f32>, water_pos: vec3<f32>) -> bool {
     let occ = textureLoad(gi_probe_color, chunk_i, 0).a;
     if (occ <= 0.05) {
         return true;
@@ -175,9 +252,35 @@ fn is_water_visible_at_chunk(chunk_i: vec3<i32>, world_grid_origin: vec3<f32>) -
     let packed = textureLoad(gi_probe_bbox, chunk_i, 0).r;
     let bbox_valid = (packed >> 24u) & 1u;
     if (bbox_valid == 1u) {
+        let xmin = f32(packed & 0xFu);
+        let ymin = f32((packed >> 4u) & 0xFu);
+        let zmin = f32((packed >> 8u) & 0xFu);
+        let xmax = f32((packed >> 12u) & 0xFu);
         let ymax = f32((packed >> 16u) & 0xFu);
+        let zmax = f32((packed >> 20u) & 0xFu);
+        
         let chunk_origin_y = f32(chunk_i.y) * 16.0 + world_grid_origin.y;
-        return (chunk_origin_y + ymax + 1.0) < camera.water_level;
+        let chunk_origin_x = f32(chunk_i.x) * 16.0 + world_grid_origin.x;
+        let chunk_origin_z = f32(chunk_i.z) * 16.0 + world_grid_origin.z;
+
+        // If the chunk is completely submerged, water is visible above it
+        if (chunk_origin_y + ymax + 1.0) < camera.water_level {
+            return true;
+        }
+
+        // Check if the water intersection point is within the solid column of this chunk
+        let lx = water_pos.x - chunk_origin_x;
+        let lz = water_pos.z - chunk_origin_z;
+        
+        // Expand bounds slightly for robustness
+        if (lx >= xmin - 0.1 && lx <= xmax + 1.1 && lz >= zmin - 0.1 && lz <= zmax + 1.1) {
+             // We are inside the horizontal bounds of the solid part.
+             // If the solid part goes below water, then it blocks water.
+             if (chunk_origin_y + ymin <= camera.water_level) {
+                 return false;
+             }
+        }
+        return true;
     }
     return false;
 }
@@ -215,6 +318,11 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
     let start_chunk_f = (start_pos - world_grid_origin) / 16.0;
     var current_i = vec3<i32>(floor(start_chunk_f));
     
+    // Identify the chunk containing the ray origin to prevent self-intersection,
+    // while allowing immediate hits in neighboring chunks.
+    let origin_chunk_f = (world_pos - world_grid_origin) / 16.0;
+    let origin_chunk_i = vec3<i32>(floor(origin_chunk_f));
+    
     let t_delta = abs(inv_dir) * 16.0;
     var t_max = (vec3<f32>(current_i) + max(vec3<f32>(step_vec), vec3<f32>(0.0)) - start_chunk_f) * 16.0 * inv_dir;
 
@@ -231,6 +339,8 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
             break;
         }
 
+        var water_opportunity = false;
+
         // Water intersection check
         if (t_water > 0.0 && (t_current + bias) >= t_water) {
             let water_hit = world_pos + reflect_dir * t_water;
@@ -238,12 +348,20 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
             let water_chunk_i = vec3<i32>(floor(water_chunk_f));
 
             if (all(water_chunk_i >= vec3<i32>(0)) && all(water_chunk_i < camera.gi_grid_dims)) {
-                if (is_water_visible_at_chunk(water_chunk_i, world_grid_origin)) {
+                let occ = textureLoad(gi_probe_color, water_chunk_i, 0).a;
+                if (occ <= 0.05) {
                     accumulated_color += water_color * remaining_alpha;
                     remaining_alpha = 0.0;
                     break;
                 }
+                water_opportunity = true;
+            } else {
+                 // Water outside grid? Render it.
+                 accumulated_color += water_color * remaining_alpha;
+                 remaining_alpha = 0.0;
+                 break;
             }
+            // Consume t_water but remember the opportunity to draw it
             t_water = -1.0;
         }
 
@@ -270,7 +388,13 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                 if (aabb_max.y >= camera.water_level) {
                     let hit = ray_aabb_intersection(world_pos, reflect_dir, aabb_min, aabb_max);
                     
-                    if (hit.t_near <= hit.t_far && hit.t_far > 0.0 && hit.t_near > 0.1) {
+                    // Only enforce the large bias (0.1) if we are in the same chunk as the origin.
+                    // For neighbor chunks, even if we are very close (e.g. at the boundary),
+                    // we should accept the hit to avoid gaps (the "H shape" artifact).
+                    let is_self = all(current_i == origin_chunk_i);
+                    let min_dist = select(0.001, 0.1, is_self);
+
+                    if (hit.t_near <= hit.t_far && hit.t_far > 0.0 && hit.t_near > min_dist) {
                         let hit_point_raw = world_pos + reflect_dir * hit.t_near;
                         var hit_point = hit_point_raw;
                         var mesh_color = vec3<f32>(0.0);
@@ -291,13 +415,18 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                                 if (d_buf < 0.9999) {
                                     let mesh_pos = reconstruct_world_pos(screen_uv, d_buf);
                                     let dist = distance(mesh_pos, hit_point);
+                                    // Require closer match and roughly similar surface normal to avoid snapping to unrelated geometry
                                     if (dist < 4.0) {
-                                        mesh_color = textureSampleLevel(scene_color, linear_sampler, screen_uv, 0.0).rgb;
-                                        let edge_x = min(screen_uv.x, 1.0 - screen_uv.x);
-                                        let edge_y = min(screen_uv.y, 1.0 - screen_uv.y);
-                                        let edge_factor = saturate(min(edge_x, edge_y) * 10.0);
-                                        let dist_factor = 1.0 - saturate((dist - 1.0) / 3.0);
-                                        mesh_blend = edge_factor * dist_factor;
+                                        let mesh_normal = oct_decode(textureSample(normal_gbuffer, linear_sampler, screen_uv).xy);
+                                        let normal_align = dot(mesh_normal, hit_normal);
+                                        if (normal_align > 0.4) {
+                                            mesh_color = textureSampleLevel(scene_color, linear_sampler, screen_uv, 0.0).rgb;
+                                            let edge_x = min(screen_uv.x, 1.0 - screen_uv.x);
+                                            let edge_y = min(screen_uv.y, 1.0 - screen_uv.y);
+                                            let edge_factor = saturate(min(edge_x, edge_y) * 10.0);
+                                            let dist_factor = 1.0 - saturate((dist - 1.0) / 3.0);
+                                            mesh_blend = edge_factor * dist_factor;
+                                        }
                                     }
                                 }
                             }
@@ -310,56 +439,128 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                             break;
                         }
 
-                        if (mesh_blend >= 0.99) {
-                            accumulated_color += mesh_color * remaining_alpha;
+                        // Decide whether to accept a coarse AABB/probe hit, or skip it and continue DDA.
+                        let dim = textureDimensions(scene_depth);
+                        var screen_disproved = false;
+                        var is_on_screen = false;
+
+                        {
+                            let clip_pos = camera.view_proj * vec4<f32>(hit_point, 1.0);
+                            if (clip_pos.w > 0.0) {
+                                let ndc = clip_pos.xyz / clip_pos.w;
+                                if (abs(ndc.x) < 0.99 && abs(ndc.y) < 0.99) {
+                                    is_on_screen = true;
+                                    let screen_uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+                                    let px = vec2<i32>(screen_uv * vec2<f32>(dim));
+                                    let d_raw = textureLoad(scene_depth, px, 0);
+                                    
+                                    // DISPROVE: If the depth buffer shows something clearly behind our hit,
+                                    // then the AABB is hitting empty air at that location.
+                                    let mesh_pos = reconstruct_world_pos(screen_uv, d_raw);
+                                    let mesh_dist_to_cam = distance(camera.camera_pos, mesh_pos);
+                                    let hit_dist_to_cam = distance(camera.camera_pos, hit_point);
+                                    
+                                    // Disprove if the screen depth is significantly behind the hit point
+                                    if (d_raw >= 0.9999 || mesh_dist_to_cam > hit_dist_to_cam + 1.0) {
+                                        screen_disproved = true;
+                                    }
+                                }
+                            }
+                        }
+
+                        let probe_alpha = textureLoad(gi_probe_color, current_i, 0).a;
+                        let hit_dot = abs(dot(reflect_dir, hit_normal));
+                        
+                        // Grazing rejection: kills "H-shapes" on side-faces of AABBs
+                        let is_grazing = (hit_dot < 0.04); 
+
+                        // Accept if: 
+                        // 1. Strong mesh snap (always reliable)
+                        // 2. Off-screen (cannot disprove, so trust probe)
+                        // 3. On-screen and not disproved by depth
+                        // AND it's not a grazing artifact.
+                        let accept_aabb = (mesh_blend >= 0.25) || (!is_grazing && (!is_on_screen || !screen_disproved) && probe_alpha > 0.1);
+
+                        if (accept_aabb) {
+                            // Use exact chunk color to avoid bleeding dark edges from empty neighbors
+                            let hit_data = textureLoad(gi_probe_color, current_i, 0);
+                            let rad = sample_radiance_int(current_i, reflect_dir);
+
+                            let dot_sun = saturate(dot(hit_normal, sun_dir));
+                            let sun_lit = camera.sun_color * camera.sun_intensity * dot_sun * 1.5;
+                            let base_color = hit_data.rgb * (rad * 2.5 + sun_lit);
+                            
+                            // Secondary reflection (simplified Fresnel, reuse sky_color)
+                            let surface_brightness = dot(hit_data.rgb, vec3<f32>(0.299, 0.587, 0.114));
+                            let view_to_cam = normalize(camera.camera_pos - hit_point);
+                            let cos_theta = saturate(dot(hit_normal, view_to_cam));
+                            let f0 = 0.04 + surface_brightness * 0.5;
+                            let fresnel = f0 + (1.0 - f0) * pow(1.0 - cos_theta, 5.0);
+                            
+                            var lit_color = mix(base_color, sky_color, fresnel * 0.7);
+
+                            // Attenuate local probe-only hits slightly to blend better with mesh detail
+                            if (mesh_blend < 0.25) {
+                                lit_color = lit_color * 0.75;
+                            }
+
+                            let final_color = mix(lit_color, mesh_color, mesh_blend);
+
+                            accumulated_color += final_color * remaining_alpha;
                             remaining_alpha = 0.0;
                             break;
                         }
-
-                        // Trilinear color lookup
-                        let hit_uvw = (hit_point - world_grid_origin) / (dims * 16.0);
-                        let hit_data = textureSampleLevel(gi_probe_color, linear_sampler, hit_uvw, 0.0);
-                        let rad = sample_radiance(hit_uvw, reflect_dir);
-
-                        let dot_sun = saturate(dot(hit_normal, sun_dir));
-                        let sun_lit = camera.sun_color * camera.sun_intensity * dot_sun * 1.5;
-                        let base_color = hit_data.rgb * (rad * 2.5 + sun_lit);
-                        
-                        // Secondary reflection (simplified Fresnel, reuse sky_color)
-                        let surface_brightness = dot(hit_data.rgb, vec3<f32>(0.299, 0.587, 0.114));
-                        let view_to_cam = normalize(camera.camera_pos - hit_point);
-                        let cos_theta = saturate(dot(hit_normal, view_to_cam));
-                        let f0 = 0.04 + surface_brightness * 0.5;
-                        let fresnel = f0 + (1.0 - f0) * pow(1.0 - cos_theta, 5.0);
-                        
-                        let lit_color = mix(base_color, sky_color, fresnel * 0.7);
-                        let final_color = mix(lit_color, mesh_color, mesh_blend);
-                        
-                        accumulated_color += final_color * remaining_alpha;
+                    }
+                    else if (water_opportunity) {
+                        // Bizarre case: Dense chunk, solid bbox, but ray missed bbox face or started inside.
+                        // Implies empty space inside bbox (or precision issue).
+                        // Since we are "inside" the bounding volume, assume we are seeing water.
+                        accumulated_color += water_color * remaining_alpha;
                         remaining_alpha = 0.0;
                         break;
                     }
+                } else if (water_opportunity) {
+                    // Chunk submerged fully or partially -> but we had an opportunity?
+                    // If AABB is submerged, geometry check is skipped.
+                    // Water wins.
+                    accumulated_color += water_color * remaining_alpha;
+                    remaining_alpha = 0.0;
+                    break;
                 }
             } else {
                 // Fallback: semi-transparent volume
                 let chunk_min_y = f32(current_i.y) * 16.0 + world_grid_origin.y;
                 if (chunk_min_y + 16.0 >= camera.water_level) {
+                    // Use discrete probe lookup to avoid trilinear bleeding at chunk boundaries
                     let entry_uvw = (start_pos + safe_dir * t_current - world_grid_origin) / (dims * 16.0);
-                    let hit_data = textureSampleLevel(gi_probe_color, linear_sampler, entry_uvw, 0.0);
-                    let rad = sample_radiance(entry_uvw, reflect_dir);
-                    let sun_lit = camera.sun_color * camera.sun_intensity * 0.5;
-                    let lit_color = hit_data.rgb * (rad * 2.5 + sun_lit);
-                    
-                    let alpha = saturate(hit_data.a * 2.0) * remaining_alpha;
-                    accumulated_color += lit_color * alpha;
-                    remaining_alpha -= alpha;
-                    
-                    if (remaining_alpha < 0.1) {
-                        remaining_alpha = 0.0;
-                        break;
+                    let entry_chunk_f = entry_uvw * vec3<f32>(camera.gi_grid_dims);
+                    let entry_chunk_i = vec3<i32>(floor(entry_chunk_f));
+
+                    if (all(entry_chunk_i >= vec3<i32>(0)) && all(entry_chunk_i < camera.gi_grid_dims)) {
+                        let hit_data = textureLoad(gi_probe_color, entry_chunk_i, 0);
+                        let rad = sample_radiance_int(entry_chunk_i, reflect_dir);
+                        let sun_lit = camera.sun_color * camera.sun_intensity * 0.5;
+                        let lit_color = hit_data.rgb * (rad * 2.5 + sun_lit);
+
+                        let alpha = saturate(hit_data.a * 2.0) * remaining_alpha;
+                        accumulated_color += lit_color * alpha;
+                        remaining_alpha -= alpha;
+
+                        if (remaining_alpha < 0.1) {
+                            remaining_alpha = 0.0;
+                            break;
+                        }
                     }
                 }
             }
+        } else if (water_opportunity) {
+             // Chunk was empty (or occupancy < 0.05), but we entered here? 
+             // Note: occupancy check `if (chunk_data.a > 0.05)` controls this block.
+             // If we are here in `else`, chunk is empty.
+             // If trunk is empty, water is not blocked.
+             accumulated_color += water_color * remaining_alpha;
+             remaining_alpha = 0.0;
+             break;
         }
 
         // DDA advance
@@ -392,7 +593,7 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
         let water_chunk_f = (water_hit - world_grid_origin) / 16.0;
         let water_chunk_i = vec3<i32>(floor(water_chunk_f));
         if (all(water_chunk_i >= vec3<i32>(0)) && all(water_chunk_i < camera.gi_grid_dims)) {
-            if (is_water_visible_at_chunk(water_chunk_i, world_grid_origin)) {
+            if (is_water_visible_at_chunk(water_chunk_i, world_grid_origin, water_hit)) {
                 accumulated_color += water_color * remaining_alpha;
                 remaining_alpha = 0.0;
             }
@@ -431,8 +632,22 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Sample sky once
     let sky_color = sample_sky_equirect(reflect_dir);
     
-    // GI grid trace
-    let gi_res = sample_gi_grid(world_pos, reflect_dir, sky_color);
+    // Hybrid: Local Screen-Space Raymarch + Distant GI Grid Trace
+    let ssr_res = trace_local_ssr(world_pos, reflect_dir);
+    
+    // Hybrid Strategy: 
+    // - Use High-Res SSR for everything on-screen up to ~140 units.
+    // - Start GI Trace further out to avoid "Phantom AABB" artifacts from local geometry.
+    // - If SSR misses, GI starts closer to pick up low-frequency details.
+    let gi_start_offset = mix(2.0, 64.0, ssr_res.a);
+    let gi_res_raw = sample_gi_grid(world_pos + reflect_dir * gi_start_offset, reflect_dir, sky_color);
+    
+    // If we have a clear SSR hit (no fade), ignore GI entirely for this ray.
+    // Otherwise, blend GI into the gaps (edges/range limit).
+    let gi_res = vec4<f32>(
+        mix(gi_res_raw.rgb, ssr_res.rgb, ssr_res.a),
+        max(ssr_res.a, gi_res_raw.a)
+    );
     
     let out_color = mix(sky_color, gi_res.rgb, gi_res.a);
 
