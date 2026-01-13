@@ -3,7 +3,11 @@
 struct KawaseUniforms {
     texel_size: vec2<f32>,
     offset: f32,
-    _pad: f32,
+    _pad_offset: f32,
+    near: f32,
+    far: f32,
+    _pad1: f32,
+    _pad2: f32,
 };
 
 var<immediate> kawase: KawaseUniforms;
@@ -96,11 +100,17 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let depth0 = load_depth_at_uv(uv);
     let normal0 = load_normal_at_uv(uv);
 
-    // Distance-based blur scaling: reduce blur for distant surfaces.
-    // Reversed-Z depth: close surfaces have depth ~1, far surfaces have depth ~0.
+    // Linearize depth for more natural distance-based falloff.
+    // Reversed-Z: d=0 is far, d=1 is near.
+    // Linear distance: z = (f*n) / max(f - depth0 * (f - n), 1e-5);
+    let n = kawase.near;
+    let f = kawase.far;
+    let z_linear = (f * n) / max(f - depth0 * (f - n), 1e-5);
+
     // We want more blur when close and less when far.
-    let distance_factor = smoothstep(0.001, 0.5, depth0);
-    let off = kawase.offset * (0.3 + 0.7 * distance_factor);
+    // Range tuning: full blur up to 50.0 units, then fade to 10% blur at 500.0 units.
+    let distance_factor = 1.0 - smoothstep(50.0, 500.0, z_linear);
+    let off = kawase.offset * (0.1 + 0.9 * distance_factor);
 
     let uv1 = uv + vec2<f32>( ts.x * off, 0.0);
     let uv2 = uv + vec2<f32>(-ts.x * off, 0.0);

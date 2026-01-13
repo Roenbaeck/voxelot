@@ -8034,7 +8034,7 @@ impl App {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("SSR Kawase Blur Pipeline Layout"),
                 bind_group_layouts: &[&ssr_kawase_bind_group_layout],
-                immediate_size: 16,
+                immediate_size: 32,
             });
 
         let kawase_down_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -12254,7 +12254,9 @@ impl App {
                     let texel_x = 1.0 / self.render_target_width.max(1) as f32;
                     let texel_y = 1.0 / self.render_target_height.max(1) as f32;
                     let offset = base_offset * (level as f32 + 1.0) * blur_radius;
-                    let immediate_data = [texel_x, texel_y, offset, 0.0_f32];
+                    let near = self.camera_controller.camera.near;
+                    let far = self.camera_controller.camera.far;
+                    let immediate_data = [texel_x, texel_y, offset, 0.0_f32, near, far, 0.0, 0.0];
 
                     let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some(&format!("SSR Kawase Temp BG L{}", level)),
