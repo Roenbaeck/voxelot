@@ -152,6 +152,13 @@ var hzb_sampler: sampler;
 @group(1) @binding(9)
 var ssr_texture: texture_2d<f32>;
 
+fn load_depth_at_uv(uv: vec2<f32>) -> f32 {
+    let dims = vec2<i32>(textureDimensions(depth_texture));
+    let xy = vec2<i32>(uv * vec2<f32>(dims));
+    let clamped = clamp(xy, vec2<i32>(0, 0), dims - vec2<i32>(1, 1));
+    return textureLoad(depth_texture, clamped, 0);
+}
+
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
@@ -332,9 +339,19 @@ fn get_specular(normal: vec3<f32>, view_dir: vec3<f32>, light_dir: vec3<f32>, sm
 // HELPER FUNCTIONS
 // ============================================================================
 
-fn decode_world_normal(encoded: vec3<f32>) -> vec3<f32> {
-    let n = encoded * 2.0 - 1.0;
-    return normalize(select(n, vec3<f32>(0.0, 1.0, 0.0), dot(n, n) < 1e-8));
+fn oct_decode(e: vec2<f32>) -> vec3<f32> {
+    // Start on octahedron surface
+    var v = vec3<f32>(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
+
+    // Fold back the parts where z is negative (lower hemisphere)
+    if (v.z < 0.0) {
+        let ox = (1.0 - abs(v.y)) * select(-1.0, 1.0, v.x >= 0.0);
+        let oy = (1.0 - abs(v.x)) * select(-1.0, 1.0, v.y >= 0.0);
+        v.x = ox;
+        v.y = oy;
+    }
+
+    return normalize(v);
 }
 
 // Project world position to screen UV coordinates
@@ -658,11 +675,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         sample_center = ssr_hit.xy;
 
         // Use the G-buffer at the hit point:
-        // - A provides a stable view-space distance (view_z)
-        // - RGB provides world normal for a cheap hit validity check (reduces silhouette/false hits)
-        let hit_gbuf = textureSample(normal_gbuffer, scene_sampler, ssr_hit.xy);
-        reflection_distance = max(hit_gbuf.a, 0.0);
-        let hit_normal = decode_world_normal(hit_gbuf.rgb);
+        // RGB provides world normal for a cheap hit validity check (reduces silhouette/false hits)
+        let hit_gbuf = textureSample(normal_gbuffer, scene_sampler, ssr_hit.xy).xy;
+        let hit_normal = oct_decode(hit_gbuf);
+        
+        // Reconstruct view-space distance (view_z) from depth buffer at the hit point
+        let hit_raw_depth = load_depth_at_uv(ssr_hit.xy);
+        let hit_view_pos_reconst = camera.inverse_proj * vec4<f32>(ssr_hit.x * 2.0 - 1.0, 1.0 - ssr_hit.y * 2.0, hit_raw_depth, 1.0);
+        reflection_distance = max(-(hit_view_pos_reconst.z / hit_view_pos_reconst.w), 0.0);
+        
         // Ray marches from water toward the scene along reflect_dir_raw.
         // For a plausible hit, the surface should face the incoming ray somewhat.
         let facing = dot(hit_normal, -reflect_dir_raw);
