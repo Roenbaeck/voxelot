@@ -22,6 +22,11 @@ struct CameraUniforms {
     _water_pad: vec2<f32>,
     inverse_view: mat4x4<f32>,
     inverse_proj: mat4x4<f32>,
+    gi_scale: f32,
+    _pad_gi0: f32,
+    _pad_gi1: f32,
+    _pad_gi2: f32,
+    _pad_gi3: vec4<f32>,
 };
 
 @group(0) @binding(0)

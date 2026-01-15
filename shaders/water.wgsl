@@ -21,6 +21,11 @@ struct CameraUniforms {
     water_elapsed_pad: vec2<f32>, // x = elapsed time for animation
     inverse_view: mat4x4<f32>,
     inverse_proj: mat4x4<f32>,
+    gi_scale: f32,
+    _pad_gi0: f32,
+    _pad_gi1: f32,
+    _pad_gi2: f32,
+    _pad_gi3: vec4<f32>,
 };
 
 struct WaterUniforms {

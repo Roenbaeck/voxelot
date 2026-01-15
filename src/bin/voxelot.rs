@@ -583,6 +583,8 @@ struct Uniforms {
     water_elapsed_pad: [f32; 2], // x = elapsed time for animation, y = padding
     inverse_view: [[f32; 4]; 4],
     inverse_proj: [[f32; 4]; 4],
+    gi_scale: f32,
+    _pad_gi: [f32; 7],
 }
 
 // SSR camera uniform buffer (matches shaders/ssr.wgsl CameraUniforms)
@@ -709,6 +711,7 @@ struct SSRSettings {
     step_size: f32,
     thickness: f32,
     enabled: bool,
+    gi_scale: f32,
 }
 
 #[repr(C)]
@@ -1172,10 +1175,12 @@ struct App {
     uniform_buffer: Option<wgpu::Buffer>,
     palette_buffer: Option<wgpu::Buffer>,
     material_props_buffer: Option<wgpu::Buffer>,
-    bind_group: Option<wgpu::BindGroup>,
-    shadow_bind_group: Option<wgpu::BindGroup>,
     main_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    voxel_gi_bind_group_layout: Option<wgpu::BindGroupLayout>,
     shadow_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    bind_group: Option<wgpu::BindGroup>,
+    voxel_gi_bind_group: Option<wgpu::BindGroup>,
+    shadow_bind_group: Option<wgpu::BindGroup>,
     cube_vertex_buffer: Option<wgpu::Buffer>,
 
     // Simple dynamic mesh for the active pawn (e.g., boat)
@@ -1376,6 +1381,7 @@ struct App {
     dof_bind_group: Option<wgpu::BindGroup>,
     dof_uniform_buffer: Option<wgpu::Buffer>,
     post_sampler: Option<wgpu::Sampler>,
+    linear_sampler: Option<wgpu::Sampler>,
     offscreen_color_texture: Option<wgpu::Texture>,
     offscreen_color_view: Option<wgpu::TextureView>,
     offscreen_depth_texture: Option<wgpu::Texture>,
@@ -2381,8 +2387,10 @@ impl App {
             palette_buffer: None,
             material_props_buffer: None,
             bind_group: None,
+            voxel_gi_bind_group: None,
             shadow_bind_group: None,
             main_bind_group_layout: None,
+            voxel_gi_bind_group_layout: None,
             shadow_bind_group_layout: None,
             cube_vertex_buffer: None,
 
@@ -2587,6 +2595,7 @@ impl App {
             dof_bind_group: None,
             dof_uniform_buffer: None,
             post_sampler: None,
+            linear_sampler: None,
             offscreen_color_texture: None,
             offscreen_color_view: None,
             offscreen_depth_texture: None,
@@ -2722,6 +2731,7 @@ impl App {
                 step_size: cfg.effects.ssr.step_size,
                 thickness: cfg.effects.ssr.thickness,
                 enabled: cfg.effects.ssr.enabled,
+                gi_scale: cfg.effects.gi.indirect_scale, // Initialize with gi indirect_scale
             },
             ssr_pipeline: None,
             ssr_bind_group_layout: None,
@@ -3777,39 +3787,41 @@ impl App {
                         ssr_texture_loc.create_view(&wgpu::TextureViewDescriptor::default());
 
                     // SSR blur ping/pong (full resolution). Used to soften building reflections in the final composite.
-                    let ssr_blur_ping_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
-                        label: Some("SSR Blur Ping Texture"),
-                        size: wgpu::Extent3d {
-                            width: target_width,
-                            height: target_height,
-                            depth_or_array_layers: 1,
-                        },
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: wgpu::TextureFormat::Rgba16Float,
-                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                            | wgpu::TextureUsages::TEXTURE_BINDING,
-                        view_formats: &[],
-                    });
+                    let ssr_blur_ping_texture_loc =
+                        device.create_texture(&wgpu::TextureDescriptor {
+                            label: Some("SSR Blur Ping Texture"),
+                            size: wgpu::Extent3d {
+                                width: target_width,
+                                height: target_height,
+                                depth_or_array_layers: 1,
+                            },
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: wgpu::TextureFormat::Rgba16Float,
+                            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                                | wgpu::TextureUsages::TEXTURE_BINDING,
+                            view_formats: &[],
+                        });
                     let ssr_blur_ping_view_loc = ssr_blur_ping_texture_loc
                         .create_view(&wgpu::TextureViewDescriptor::default());
 
-                    let ssr_blur_pong_texture_loc = device.create_texture(&wgpu::TextureDescriptor {
-                        label: Some("SSR Blur Pong Texture"),
-                        size: wgpu::Extent3d {
-                            width: target_width,
-                            height: target_height,
-                            depth_or_array_layers: 1,
-                        },
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: wgpu::TextureFormat::Rgba16Float,
-                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                            | wgpu::TextureUsages::TEXTURE_BINDING,
-                        view_formats: &[],
-                    });
+                    let ssr_blur_pong_texture_loc =
+                        device.create_texture(&wgpu::TextureDescriptor {
+                            label: Some("SSR Blur Pong Texture"),
+                            size: wgpu::Extent3d {
+                                width: target_width,
+                                height: target_height,
+                                depth_or_array_layers: 1,
+                            },
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: wgpu::TextureFormat::Rgba16Float,
+                            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                                | wgpu::TextureUsages::TEXTURE_BINDING,
+                            view_formats: &[],
+                        });
                     let ssr_blur_pong_view_loc = ssr_blur_pong_texture_loc
                         .create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -4555,8 +4567,7 @@ impl App {
                 hzb_texture_opt = Some(tex_main);
                 hzb_view_opt = Some(view_main);
                 hzb_mips = 1;
-                hzb_bytes =
-                    App::compute_texture_bytes(wgpu::TextureFormat::R32Float, 1, 1, 1, 1);
+                hzb_bytes = App::compute_texture_bytes(wgpu::TextureFormat::R32Float, 1, 1, 1, 1);
             }
             App::replace_texture_bytes_static(
                 &mut self.hzb_texture_bytes,
@@ -4661,7 +4672,9 @@ impl App {
                                 entries: &[
                                     wgpu::BindGroupEntry {
                                         binding: 0,
-                                        resource: wgpu::BindingResource::TextureView(depth_view_ref),
+                                        resource: wgpu::BindingResource::TextureView(
+                                            depth_view_ref,
+                                        ),
                                     },
                                     wgpu::BindGroupEntry {
                                         binding: 1,
@@ -4827,6 +4840,88 @@ impl App {
         });
 
         self.bind_group = Some(bind_group);
+    }
+
+    fn update_voxel_gi_bind_group(&mut self) {
+        let (
+            Some(device),
+            Some(layout),
+            Some(ssr_cam_ubo),
+            Some(gi_px),
+            Some(gi_nx),
+            Some(gi_py),
+            Some(gi_ny),
+            Some(gi_pz),
+            Some(gi_nz),
+            Some(gi_color),
+            Some(gi_bbox),
+            Some(sampler),
+        ) = (
+            self.device.as_ref(),
+            self.voxel_gi_bind_group_layout.as_ref(),
+            self.ssr_camera_uniform_buffer.as_ref(),
+            self.gi_probe_view_px.as_ref(),
+            self.gi_probe_view_nx.as_ref(),
+            self.gi_probe_view_py.as_ref(),
+            self.gi_probe_view_ny.as_ref(),
+            self.gi_probe_view_pz.as_ref(),
+            self.gi_probe_view_nz.as_ref(),
+            self.gi_probe_view_color.as_ref(),
+            self.gi_probe_view_bbox.as_ref(),
+            self.linear_sampler.as_ref(), // Use linear_sampler for probe lookup
+        )
+        else {
+            return;
+        };
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Voxel GI Bind Group"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: ssr_cam_ubo.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(gi_px),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(gi_nx),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(gi_py),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(gi_ny),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(gi_pz),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(gi_nz),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(gi_color),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(gi_bbox),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ] as &[wgpu::BindGroupEntry],
+        });
+
+        self.voxel_gi_bind_group = Some(bind_group);
     }
 
     fn update_dof_bind_group(&mut self) {
@@ -7234,7 +7329,10 @@ impl App {
         if adapter.features().contains(wgpu::Features::IMMEDIATES) {
             req_features |= wgpu::Features::IMMEDIATES;
         }
-        if adapter.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM) {
+        if adapter
+            .features()
+            .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
+        {
             req_features |= wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
         }
 
@@ -7429,6 +7527,113 @@ impl App {
                 ],
             });
 
+        let voxel_gi_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Voxel GI Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // pX, nX, pY, nY, pZ, nZ texture_3d
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // color texture_3d
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // bbox texture_3d
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 8,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Uint,
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // linear sampler
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 9,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
         // Create pipeline layouts
         // Compute and cache internal render target dims.
         // - presented: logical window size * render_scale
@@ -7447,7 +7652,7 @@ impl App {
         self.render_target_height = render_target_height.max(1);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
-            bind_group_layouts: &[&main_bind_group_layout],
+            bind_group_layouts: &[&main_bind_group_layout, &voxel_gi_bind_group_layout],
             immediate_size: 0,
         });
 
@@ -8119,7 +8324,18 @@ impl App {
         self.kawase_up_pipeline = Some(kawase_up_pipeline);
         self.ssr_kawase_pipeline = Some(ssr_kawase_pipeline);
         self.kawase_bind_group_layout = Some(kawase_bind_group_layout);
-    self.ssr_kawase_bind_group_layout = Some(ssr_kawase_bind_group_layout);
+        self.ssr_kawase_bind_group_layout = Some(ssr_kawase_bind_group_layout);
+
+        let linear_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Linear Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
 
         let post_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("DoF Sampler"),
@@ -8131,6 +8347,8 @@ impl App {
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
+
+        self.linear_sampler = Some(linear_sampler);
 
         let bloom_extract_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Bloom Extract Shader"),
@@ -8724,6 +8942,8 @@ impl App {
             water_elapsed_pad: [0.0, 0.0], // Will be updated in render loop
             inverse_view: [[0.0; 4]; 4],
             inverse_proj: [[0.0; 4]; 4],
+            gi_scale: 1.0,
+            _pad_gi: [0.0; 7],
         };
 
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -9423,6 +9643,7 @@ impl App {
         self.gi_probe_view_color = Some(gi_view_color);
         self.gi_probe_view_bbox = Some(gi_view_bbox);
         self.main_bind_group_layout = Some(main_bind_group_layout);
+        self.voxel_gi_bind_group_layout = Some(voxel_gi_bind_group_layout);
         self.shadow_bind_group_layout = Some(shadow_bind_group_layout);
         self.shadow_sampler = Some(shadow_sampler);
 
@@ -11636,6 +11857,8 @@ impl App {
             water_elapsed_pad: [self.elapsed_time, 0.0],
             inverse_view: inverse_view_cols,
             inverse_proj: inverse_proj_cols,
+            gi_scale: self.ssr_settings.gi_scale, // Use gi_scale from SSR settings
+            _pad_gi: [0.0; 7],
         };
 
         queue.write_buffer(
@@ -11752,6 +11975,9 @@ impl App {
         }
         if self.bind_group.is_none() {
             self.update_main_bind_group();
+        }
+        if self.voxel_gi_bind_group.is_none() {
+            self.update_voxel_gi_bind_group();
         }
 
         self.draw_debug_voxels();
@@ -11988,6 +12214,7 @@ impl App {
             if let Some(mesh_indirect) = &self.mesh_indirect_buffer {
                 render_pass.set_pipeline(self.mesh_pipeline.as_ref().unwrap());
                 render_pass.set_bind_group(0, self.bind_group.as_ref().unwrap(), &[]);
+                render_pass.set_bind_group(1, self.voxel_gi_bind_group.as_ref().unwrap(), &[]);
 
                 // Bind mega buffers once per pass
                 render_pass
@@ -12075,6 +12302,7 @@ impl App {
                 if let Some(boat_buf) = self.boat_vertex_buffer.as_ref() {
                     render_pass.set_pipeline(self.mesh_pipeline.as_ref().unwrap());
                     render_pass.set_bind_group(0, self.bind_group.as_ref().unwrap(), &[]);
+                    render_pass.set_bind_group(1, self.voxel_gi_bind_group.as_ref().unwrap(), &[]);
                     render_pass.set_vertex_buffer(0, boat_buf.slice(..));
                     render_pass.draw(0..self.boat_vertex_count, 0..1);
                     draw_calls += 1;
@@ -12084,6 +12312,7 @@ impl App {
             // Draw remaining instanced cubes
             render_pass.set_pipeline(self.render_pipeline.as_ref().unwrap());
             render_pass.set_bind_group(0, self.bind_group.as_ref().unwrap(), &[]);
+            render_pass.set_bind_group(1, self.voxel_gi_bind_group.as_ref().unwrap(), &[]);
             render_pass.set_vertex_buffer(0, self.cube_vertex_buffer.as_ref().unwrap().slice(..));
             if let Some(fallback_indirect) = &self.fallback_indirect_buffer {
                 render_pass.set_vertex_buffer(
@@ -12598,10 +12827,9 @@ impl App {
         }
         // Radiance Cascades Pass
         if self.rc_enabled {
-            if let (Some(rc_pipeline), Some(rc_bind_group)) = (
-                self.rc_pipeline.as_ref(),
-                self.rc_bind_group.as_ref(),
-            ) {
+            if let (Some(rc_pipeline), Some(rc_bind_group)) =
+                (self.rc_pipeline.as_ref(), self.rc_bind_group.as_ref())
+            {
                 // Actual RC compute work
                 {
                     let mut rc_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -12792,6 +13020,11 @@ impl App {
                 ) {
                     composite_pass.set_pipeline(pipeline);
                     composite_pass.set_bind_group(0, bind_group, &[]);
+                    composite_pass.set_bind_group(
+                        1,
+                        self.voxel_gi_bind_group.as_ref().unwrap(),
+                        &[],
+                    );
                     composite_pass
                         .set_vertex_buffer(0, self.cube_vertex_buffer.as_ref().unwrap().slice(..));
                     composite_pass.set_vertex_buffer(1, buf.slice(..));

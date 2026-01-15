@@ -1,5 +1,29 @@
 // Voxel rendering shader for hierarchical chunks with global lighting
 
+struct CameraUniforms {
+    inverse_view: mat4x4<f32>,
+    inverse_proj: mat4x4<f32>,
+    view_proj: mat4x4<f32>,
+    prev_view_proj: mat4x4<f32>,
+    camera_pos: vec3<f32>,
+    skybox_rotation: f32,
+    skybox_brightness: f32,
+    skybox_saturation: f32,
+    _pad1: vec2<f32>,
+    skybox_tint: vec3<f32>,
+    skybox_tint_strength: f32,
+    gi_grid_origin: vec3<i32>,
+    _pad_gi1: i32,
+    gi_grid_dims: vec3<i32>,
+    _pad_gi2: i32,
+    sun_direction: vec3<f32>,
+    sun_intensity: f32,
+    sun_color: vec3<f32>,
+    water_level: f32,
+    water_visibility: f32,
+    water_color: vec4<f32>,
+}
+
 struct Uniforms {
     mvp: mat4x4<f32>,
     sun_view_proj: mat4x4<f32>,
@@ -24,6 +48,11 @@ struct Uniforms {
     _water_pad: vec2<f32>,
     inverse_view: mat4x4<f32>,
     inverse_proj: mat4x4<f32>,
+    gi_scale: f32,
+    _pad_gi0: f32,
+    _pad_gi1: f32,
+    _pad_gi2: f32,
+    _pad_gi3: vec4<f32>,
 }
 
 struct LightProbe {
@@ -40,6 +69,18 @@ struct LightProbe {
 // Material properties buffer: [reflectivity, reserved, reserved, reserved] per voxel type
 @group(0) @binding(5) var<storage, read> material_props: array<vec4<f32>>;
 
+// GI probe textures
+@group(1) @binding(0) var<uniform> camera: CameraUniforms; // Re-use camera uniforms if needed or just for origin/dims
+@group(1) @binding(1) var gi_probe_px: texture_3d<f32>;
+@group(1) @binding(2) var gi_probe_nx: texture_3d<f32>;
+@group(1) @binding(3) var gi_probe_py: texture_3d<f32>;
+@group(1) @binding(4) var gi_probe_ny: texture_3d<f32>;
+@group(1) @binding(5) var gi_probe_pz: texture_3d<f32>;
+@group(1) @binding(6) var gi_probe_nz: texture_3d<f32>;
+@group(1) @binding(7) var gi_probe_color: texture_3d<f32>;
+@group(1) @binding(8) var gi_probe_bbox: texture_3d<u32>;
+@group(1) @binding(9) var linear_sampler: sampler;
+
 
 struct VertexOutputInstanced {
     @builtin(position) position: vec4<f32>,
@@ -51,6 +92,7 @@ struct VertexOutputInstanced {
     @location(5) ao: f32,
     @location(6) view_z: f32,  // Linear depth for G-buffer
     @location(7) @interpolate(flat) voxel_type: u32,  // For material property lookup
+    @location(8) @interpolate(flat) scale: f32,
 }
 
 struct VertexOutputMesh {
@@ -110,6 +152,18 @@ fn get_voxel_color(voxel_type: u32) -> vec3<f32> {
     return palette[idx].rgb;
 }
 
+// Optimized radiance sampling for fallback bounding boxes
+fn sample_radiance_int(pos: vec3<i32>, dir: vec3<f32>) -> vec3<f32> {
+    let w = dir * dir;
+    let color_x = select(textureLoad(gi_probe_nx, pos, 0).rgb,
+                         textureLoad(gi_probe_px, pos, 0).rgb, dir.x > 0.0);
+    let color_y = select(textureLoad(gi_probe_ny, pos, 0).rgb,
+                         textureLoad(gi_probe_py, pos, 0).rgb, dir.y > 0.0);
+    let color_z = select(textureLoad(gi_probe_nz, pos, 0).rgb,
+                         textureLoad(gi_probe_pz, pos, 0).rgb, dir.z > 0.0);
+    return (color_x * w.x + color_y * w.y + color_z * w.z) * uniforms.gi_scale;
+}
+
 @vertex
 fn vs_main(
     @location(0) instance_position: vec3<f32>,
@@ -152,6 +206,7 @@ fn vs_main(
     output.view_z = output.position.w;
     // Pass voxel type to fragment shader for material property lookup
     output.voxel_type = instance_voxel_type;
+    output.scale = instance_scale.x;
     
     return output;
 }
@@ -229,7 +284,20 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     
     // emissive_strength is already defined above
     let ao = input.ao; // AO passed separately from instance AO attribute
-    let color = input.color.rgb * lighting * ao;
+    var color = input.color.rgb * lighting * ao;
+
+    // Check if we are a fallback bounding box (scale is 16)
+    if (input.scale > 15.0) {
+        let world_grid_origin = vec3<f32>(camera.gi_grid_origin) * 16.0;
+        let chunk_coord = vec3<i32>(floor(input.world_pos / 16.0)) - camera.gi_grid_origin;
+        
+        if (all(chunk_coord >= vec3<i32>(0)) && all(chunk_coord < camera.gi_grid_dims)) {
+            let probe_color = textureLoad(gi_probe_color, chunk_coord, 0).rgb;
+            let radiance = sample_radiance_int(chunk_coord, input.normal);
+            // Blend probe color with radiance and add a tiny bit of ambient for visibility
+            color = probe_color * (radiance + uniforms.ambient_color_pad.xyz * 0.1);
+        }
+    }
 
     // Fog color modulated by ambient and sky brightness (darker at night)
     let base_fog_color = vec3<f32>(0.7, 0.8, 0.9);
