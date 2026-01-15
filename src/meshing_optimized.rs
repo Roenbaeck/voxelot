@@ -271,7 +271,7 @@ pub fn generate_chunk_mesh_optimized(
                     };
 
                     let voxel_type = if envelope {
-                        0
+                        chunk.dominant_type
                     } else {
                         chunk.get_type(x as u8, y as u8, z as u8).unwrap_or(0)
                     };
@@ -329,11 +329,7 @@ pub fn generate_chunk_mesh_optimized(
                     material.emissive_intensity,
                 ]
             };
-            let material_props = if envelope {
-                [0.0, 0.0, 0.0, 0.0]
-            } else {
-                [material.reflectivity, 0.0, 0.0, 0.0]
-            };
+            let material_props = [material.reflectivity, 0.0, 0.0, 0.0];
 
             for (depth, plane) in depth_map {
                 let quads = greedy_mesh_binary_plane(*plane);

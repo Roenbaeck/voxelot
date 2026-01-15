@@ -356,9 +356,6 @@ impl Chunk {
         let mut emissive_voxels = 0u32;
         let mut solid_count = 0u32;
 
-        // Histogram for dominant type calculation (256 types)
-        let mut type_counts = [0u32; 256];
-
         // 1. Accumulate totals for voxel_count and emissive stats across ALL voxels
         for voxel in &self.voxels {
             match voxel {
@@ -388,8 +385,11 @@ impl Chunk {
         self.voxel_count = solid_count;
         self.solid_ratio = solid_count as f32 / TOTAL_SLOTS;
 
-        // 2. Compute dominant type based on the visual shell only.
+        // 2. Compute dominant type and average color based on the visual shell only.
         let use_any_shell = mask == 0;
+        let mut color_sum = [0.0f32; 3];
+        let mut visible_total = 0u32;
+        let mut type_scores = [0.0f32; 256];
 
         for ((x, y, z), voxel) in self.iter() {
             let mut is_visible = false;
@@ -429,39 +429,43 @@ impl Chunk {
             }
 
             if is_visible {
-                match voxel {
-                    Voxel::Solid(t) => {
-                        type_counts[*t as usize] += 1;
-                    }
-                    Voxel::Chunk(c) => {
-                        type_counts[c.dominant_type as usize] += 1;
-                    }
-                }
+                let (v_type, v_color) = match voxel {
+                    Voxel::Solid(t) => (*t, palette.color(*t as u32)),
+                    Voxel::Chunk(c) => (c.dominant_type, Palette::normalize_rgba(c.average_color)),
+                };
+
+                let refl = palette.reflectivity(v_type as u32);
+                // Weight scoring by reflectivity to favor reflective materials for distant LOD
+                type_scores[v_type as usize] += 1.0 + refl * 100.0;
+
+                color_sum[0] += v_color[0];
+                color_sum[1] += v_color[1];
+                color_sum[2] += v_color[2];
+                visible_total += 1;
             }
         }
 
-        // Find the most frequent type (mode)
+        // Find the best type based on scores (favors reflective materials)
         let mut best_type = 0u8;
-        let mut max_count = 0u32;
-        // Skip type 0 if possible, unless it's the only one (actually Solid(0) shouldn't be empty, but usually 0 is air or similar)
-        // In our case Voxel::Solid(0) is a valid material.
+        let mut max_score = 0.0f32;
         for t in 0..256 {
-            if type_counts[t] > max_count {
-                max_count = type_counts[t];
+            if type_scores[t] > max_score {
+                max_score = type_scores[t];
                 best_type = t as u8;
             }
         }
-
         self.dominant_type = best_type;
 
-        if max_count > 0 {
-            // Set average color to the dominant type's color
-            // Use alpha for occupancy
-            let color = palette.color_u8(best_type as u32);
+        if visible_total > 0 {
+            // Compute real average color of the shell
+            let avg_r = (color_sum[0] / visible_total as f32).clamp(0.0, 1.0);
+            let avg_g = (color_sum[1] / visible_total as f32).clamp(0.0, 1.0);
+            let avg_b = (color_sum[2] / visible_total as f32).clamp(0.0, 1.0);
+
             self.average_color = [
-                color[0],
-                color[1],
-                color[2],
+                (avg_r * 255.0) as u8,
+                (avg_g * 255.0) as u8,
+                (avg_b * 255.0) as u8,
                 (self.solid_ratio * 255.0).clamp(0.0, 255.0) as u8,
             ];
         } else if solid_count > 0 {

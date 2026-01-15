@@ -12,7 +12,12 @@ pub struct Material {
 }
 
 impl Material {
-    const fn new(albedo: [f32; 4], emissive: [f32; 3], emissive_intensity: f32, reflectivity: f32) -> Self {
+    const fn new(
+        albedo: [f32; 4],
+        emissive: [f32; 3],
+        emissive_intensity: f32,
+        reflectivity: f32,
+    ) -> Self {
         Self {
             albedo,
             emissive,
@@ -108,7 +113,7 @@ impl Palette {
                     .and_then(|v| v.try_into().ok());
 
                 let strength = parts[8].parse::<u8>().ok();
-                
+
                 // Parse optional reflectivity (10th column, index 9)
                 let reflect = if parts.len() == 10 {
                     parts[9].parse::<u8>().ok()
@@ -116,7 +121,9 @@ impl Palette {
                     Some(0)
                 };
 
-                if let (Some(em_bytes), Some(strength_byte), Some(reflect_byte)) = (emissive_bytes, strength, reflect) {
+                if let (Some(em_bytes), Some(strength_byte), Some(reflect_byte)) =
+                    (emissive_bytes, strength, reflect)
+                {
                     (
                         Self::normalize_rgb(em_bytes),
                         (strength_byte as f32 / 255.0).clamp(0.0, 1.0),
@@ -133,7 +140,10 @@ impl Palette {
                 ([0.0, 0.0, 0.0], 0.0, 0.0)
             };
 
-            map.insert(index, Material::new(base, emissive, intensity, reflectivity));
+            map.insert(
+                index,
+                Material::new(base, emissive, intensity, reflectivity),
+            );
         }
 
         if map.is_empty() {
@@ -152,7 +162,7 @@ impl Palette {
         })
     }
 
-    fn normalize_rgba(bytes: [u8; 4]) -> [f32; 4] {
+    pub fn normalize_rgba(bytes: [u8; 4]) -> [f32; 4] {
         [
             bytes[0] as f32 / 255.0,
             bytes[1] as f32 / 255.0,

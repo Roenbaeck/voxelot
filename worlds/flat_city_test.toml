@@ -2,9 +2,9 @@
 file = "worlds/flat_city_test.vhc"
 palette = "worlds/palette.txt"
 camera_position = [
-    341.29187,
-    103.83215,
-    251.78017,
+    340.11246,
+    89.67752,
+    361.6229,
 ]
 water_level = 15.0
 water_visibility = 15.0
@@ -26,7 +26,7 @@ macos_hdr_colorspace = "extended_linear_itur2020"
 
 [atmosphere]
 fog_density = 0.00009999995
-time_of_day = 0.34871784
+time_of_day = 0.39202517
 time_paused = true
 night_skybox_brightness = 0.02
 horizon_fade_up = 0.05

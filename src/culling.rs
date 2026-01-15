@@ -936,7 +936,7 @@ fn process_voxels<I>(
                         ) {
                             result.push(VoxelInstance {
                                 position: [world_x, world_y, world_z],
-                                voxel_type: VoxelType::from(0),
+                                voxel_type: sub_chunk.dominant_type,
                                 distance,
                                 custom_color: Some(sub_chunk.average_color),
                                 scale: [scale as f32, scale as f32, scale as f32],

@@ -164,6 +164,44 @@ fn sample_radiance_int(pos: vec3<i32>, dir: vec3<f32>) -> vec3<f32> {
     return (color_x * w.x + color_y * w.y + color_z * w.z) * uniforms.gi_scale;
 }
 
+// Cheap analytical sky for distant reflections without binding skybox texture
+fn get_cheap_sky_color(rdir: vec3<f32>) -> vec3<f32> {
+    let sun_dir = normalize(uniforms.sun_direction_shadow_bias.xyz);
+    let brightness = uniforms.fog_time_pad.w;
+    
+    // Simple procedural sky (varies with elevation + azimuth + horizon glow).
+    let t = clamp(rdir.y * 0.5 + 0.5, 0.0, 1.0);
+    let PI = 3.14159265359;
+    let TWO_PI = 6.28318530718;
+    let u = fract(0.5 + atan2(rdir.z, rdir.x) / TWO_PI);
+    
+    let night_a = vec3<f32>(0.02, 0.02, 0.03);
+    let night_b = vec3<f32>(0.04, 0.05, 0.08);
+    let day_a = vec3<f32>(0.45, 0.62, 0.92);
+    let day_b = vec3<f32>(0.62, 0.74, 0.96);
+    
+    let az_blend = 0.5 + 0.5 * sin(u * TWO_PI);
+    let night = mix(night_a, night_b, az_blend);
+    let day = mix(day_a, day_b, az_blend);
+    var env = mix(night, day, t);
+    
+    // Horizon glow makes vertical-face reflections less uniform.
+    let horizon = pow(1.0 - abs(rdir.y), 3.0);
+    env += vec3<f32>(0.35, 0.30, 0.25) * horizon * brightness;
+    
+    // Add a small sun highlight in the reflection direction.
+    let sun_lobe = pow(max(dot(rdir, sun_dir), 0.0), 64.0);
+    env += uniforms.sun_color_pad.xyz * (0.35 * sun_lobe) * brightness;
+    
+    // Apply night tint similarly to skybox shading.
+    let tint = uniforms.skybox_tint_pad.xyz;
+    let tint_strength = uniforms.skybox_tint_pad.w;
+    let effect_strength = (1.0 - brightness) * tint_strength;
+    env = mix(env, env * tint, effect_strength);
+    
+    return env * brightness;
+}
+
 @vertex
 fn vs_main(
     @location(0) instance_position: vec3<f32>,
@@ -236,6 +274,9 @@ fn oct_encode(n_in: vec3<f32>) -> vec2<f32> {
 
 @fragment
 fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
+    let mat_idx = min(input.voxel_type, 255u);
+    let reflectivity = material_props[mat_idx].r;
+    
     let sun_dir = normalize(uniforms.sun_direction_shadow_bias.xyz);
     let ndotl_raw = dot(input.normal, sun_dir);
     let sun_diffuse = max(ndotl_raw, 0.0);
@@ -296,10 +337,25 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
             let radiance = sample_radiance_int(chunk_coord, input.normal);
             // Re-integrate sun/moon for fallbacks to avoid "flat" look
             let total_lighting = sun_contribution + moon_light + (radiance * uniforms.gi_scale) + uniforms.ambient_color_pad.xyz * 0.1;
-            color = vec4<f32>(probe_color * total_lighting, 1.0).rgb;
+            
+            // Simplified distant reflection
+            var reflection = vec3<f32>(0.0);
+            if (reflectivity > 0.0) {
+                let view_dir = normalize(input.world_pos - uniforms.camera_shadow_strength.xyz);
+                let reflect_dir = reflect(view_dir, input.normal);
+                reflection = get_cheap_sky_color(reflect_dir) * reflectivity;
+            }
+            
+            color = vec4<f32>(probe_color * total_lighting + reflection, 1.0).rgb;
         } else {
             // Outside GI grid, use the passed color (chunk average) + direct light
-            color = input.color.rgb * (sun_contribution + moon_light + uniforms.ambient_color_pad.xyz * 0.1);
+            var reflection = vec3<f32>(0.0);
+            if (reflectivity > 0.001) {
+                let view_dir = normalize(input.world_pos - uniforms.camera_shadow_strength.xyz);
+                let reflect_dir = reflect(view_dir, input.normal);
+                reflection = get_cheap_sky_color(reflect_dir) * reflectivity;
+            }
+            color = input.color.rgb * (sun_contribution + moon_light + uniforms.ambient_color_pad.xyz * 0.1) + reflection;
         }
     }
 
@@ -344,38 +400,10 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     // the brightening factor to avoid extreme brightening near the horizon.
     var brightened = mix(final_color, fog_color, fade_factor * 0.18);
 
-    // Probe-only cheap sky reflection for reflective materials.
-    // This is used for the reflection cubemap capture so reflective buildings look
-    // closer to the main-view shading (which adds SSR/sky reflections later).
-    let mat_idx = min(input.voxel_type, 255u);
-    let reflectivity = material_props[mat_idx].r;
-    if (uniforms._water_pad.y > 0.5 && reflectivity > 0.001) {
+    // Cheap sky reflection for reflective materials in the distance
+    if (reflectivity > 0.001) {
         let rdir = reflect(-view_dir, normalize(input.normal));
-        // Simple procedural sky (varies with elevation + azimuth + horizon glow).
-        let t = clamp(rdir.y * 0.5 + 0.5, 0.0, 1.0);
-        let PI = 3.14159265359;
-        let TWO_PI = 6.28318530718;
-        let u = fract(0.5 + atan2(rdir.z, rdir.x) / TWO_PI);
-        let night_a = vec3<f32>(0.02, 0.02, 0.03);
-        let night_b = vec3<f32>(0.04, 0.05, 0.08);
-        let day_a = vec3<f32>(0.45, 0.62, 0.92);
-        let day_b = vec3<f32>(0.62, 0.74, 0.96);
-        let az_blend = 0.5 + 0.5 * sin(u * TWO_PI);
-        let night = mix(night_a, night_b, az_blend);
-        let day = mix(day_a, day_b, az_blend);
-        var env = mix(night, day, t);
-        // Horizon glow makes vertical-face reflections less uniform.
-        let horizon = pow(1.0 - abs(rdir.y), 3.0);
-        env += vec3<f32>(0.35, 0.30, 0.25) * horizon * uniforms.fog_time_pad.w;
-        // Add a small sun highlight in the reflection direction.
-        let sun_lobe = pow(max(dot(rdir, -sun_dir_local), 0.0), 64.0);
-        env += uniforms.sun_color_pad.xyz * (0.35 * sun_lobe) * uniforms.fog_time_pad.w;
-        // Apply night tint similarly to skybox shading.
-        let tint = uniforms.skybox_tint_pad.xyz;
-        let tint_strength = uniforms.skybox_tint_pad.w;
-        let brightness = uniforms.fog_time_pad.w;
-        let effect_strength = (1.0 - brightness) * tint_strength;
-        env = mix(env, env * tint, effect_strength);
+        let env = get_cheap_sky_color(rdir);
         let env_strength = clamp(reflectivity * 0.75, 0.0, 0.9);
         brightened = mix(brightened, env, env_strength);
     }
@@ -396,10 +424,23 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
             let radiance = sample_radiance_int(chunk_coord, input.normal);
             // Re-integrate sun/moon for envelopes
             let total_lighting = sun_contribution + moon_light + (radiance * uniforms.gi_scale) + uniforms.ambient_color_pad.xyz * 0.1;
-            env_lit = probe_color * total_lighting;
+            
+            // Simplified distant reflection for envelopes
+            var reflection = vec3<f32>(0.0);
+            if (reflectivity > 0.001) {
+                let rdir = reflect(-view_dir, normalize(input.normal));
+                reflection = get_cheap_sky_color(rdir) * reflectivity;
+            }
+            
+            env_lit = probe_color * total_lighting + reflection;
         } else {
             // Fallback to average color + light
-            env_lit = input.color.rgb * lighting;
+            var reflection = vec3<f32>(0.0);
+            if (reflectivity > 0.001) {
+                let rdir = reflect(-view_dir, normalize(input.normal));
+                reflection = get_cheap_sky_color(rdir) * reflectivity;
+            }
+            env_lit = input.color.rgb * lighting + reflection;
         }
         let env_fogged = mix(env_lit, fog_color + inscatter, fog_factor);
         
@@ -490,6 +531,7 @@ fn vs_mesh(
 
 @fragment
 fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
+    let reflectivity = input.material.r;
     let sun_dir = normalize(uniforms.sun_direction_shadow_bias.xyz);
     let sun_diffuse = max(dot(input.normal, sun_dir), 0.0);
     let base_shadow = compute_shadow(input.light_space_pos, input.normal, sun_dir);
@@ -571,31 +613,10 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     // Brighten colors as they approach fade region for fog-like appearance
     var brightened = mix(final_color, fog_color, fade_factor * 0.18);
 
-    // Probe-only cheap sky reflection for reflective materials.
-    let reflectivity = input.material.r;
-    if (uniforms._water_pad.y > 0.5 && reflectivity > 0.001) {
+    // Cheap sky reflection for reflective materials in the distance
+    if (reflectivity > 0.001) {
         let rdir = reflect(-view_dir, normalize(input.normal));
-        let t = clamp(rdir.y * 0.5 + 0.5, 0.0, 1.0);
-        let PI = 3.14159265359;
-        let TWO_PI = 6.28318530718;
-        let u = fract(0.5 + atan2(rdir.z, rdir.x) / TWO_PI);
-        let night_a = vec3<f32>(0.02, 0.02, 0.03);
-        let night_b = vec3<f32>(0.04, 0.05, 0.08);
-        let day_a = vec3<f32>(0.45, 0.62, 0.92);
-        let day_b = vec3<f32>(0.62, 0.74, 0.96);
-        let az_blend = 0.5 + 0.5 * sin(u * TWO_PI);
-        let night = mix(night_a, night_b, az_blend);
-        let day = mix(day_a, day_b, az_blend);
-        var env = mix(night, day, t);
-        let horizon = pow(1.0 - abs(rdir.y), 3.0);
-        env += vec3<f32>(0.35, 0.30, 0.25) * horizon * uniforms.fog_time_pad.w;
-        let sun_lobe = pow(max(dot(rdir, -sun_dir_local), 0.0), 64.0);
-        env += uniforms.sun_color_pad.xyz * (0.35 * sun_lobe) * uniforms.fog_time_pad.w;
-        let tint = uniforms.skybox_tint_pad.xyz;
-        let tint_strength = uniforms.skybox_tint_pad.w;
-        let brightness = uniforms.fog_time_pad.w;
-        let effect_strength = (1.0 - brightness) * tint_strength;
-        env = mix(env, env * tint, effect_strength);
+        let env = get_cheap_sky_color(rdir);
         let env_strength = clamp(reflectivity * 0.75, 0.0, 0.9);
         brightened = mix(brightened, env, env_strength);
     }
@@ -616,10 +637,23 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
             let radiance = sample_radiance_int(chunk_coord, input.normal);
             // Re-integrate sun/moon for envelopes
             let total_lighting = sun_contribution + moon_light + (radiance * uniforms.gi_scale) + uniforms.ambient_color_pad.xyz * 0.1;
-            env_lit = probe_color * total_lighting;
+            
+            // Simplified distant reflection for envelopes
+            var reflection = vec3<f32>(0.0);
+            if (reflectivity > 0.001) {
+                let rdir = reflect(-view_dir, normalize(input.normal));
+                reflection = get_cheap_sky_color(rdir) * reflectivity;
+            }
+            
+            env_lit = probe_color * total_lighting + reflection;
         } else {
             // Fallback to average color + light
-            env_lit = input.color.rgb * lighting;
+            var reflection = vec3<f32>(0.0);
+            if (reflectivity > 0.001) {
+                let rdir = reflect(-view_dir, normalize(input.normal));
+                reflection = get_cheap_sky_color(rdir) * reflectivity;
+            }
+            env_lit = input.color.rgb * lighting + reflection;
         }
         let env_fogged = mix(env_lit, fog_color + inscatter, fog_factor);
         
