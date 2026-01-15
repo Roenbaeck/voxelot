@@ -10283,7 +10283,7 @@ impl App {
                     } else if v.is_leaf_chunk {
                         // Use chunk average color for better blending?
                         // For now keep existing logic
-                        [0.4, 0.4, 0.45, 0.6]
+                        [0.0, 0.0, 0.0, 0.0]
                     } else {
                         [0.0, 0.0, 0.0, 0.0]
                     };
@@ -10318,7 +10318,7 @@ impl App {
                     rgba[3] as f32 / 255.0,
                 ]
             } else if v.is_leaf_chunk {
-                [0.4, 0.4, 0.45, 0.6]
+                [0.0, 0.0, 0.0, 0.0]
             } else {
                 [0.0, 0.0, 0.0, 0.0]
             };

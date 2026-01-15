@@ -2,9 +2,9 @@
 file = "worlds/flat_city_test.vhc"
 palette = "worlds/palette.txt"
 camera_position = [
-    419.13693,
-    81.62755,
-    162.39993,
+    419.13422,
+    87.46008,
+    366.62967,
 ]
 water_level = 15.0
 water_visibility = 15.0
@@ -16,8 +16,8 @@ fov_degrees = 70.0
 near_plane = 0.1
 far_plane = 8000.0
 camera_speed_multiplier = 2.147484
-window_width = 860
-window_height = 565
+window_width = 1728
+window_height = 1052
 culling_overscan = 0.2
 render_overscan = 0.2
 macos_hdr = true

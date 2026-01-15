@@ -294,8 +294,12 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
         if (all(chunk_coord >= vec3<i32>(0)) && all(chunk_coord < camera.gi_grid_dims)) {
             let probe_color = textureLoad(gi_probe_color, chunk_coord, 0).rgb;
             let radiance = sample_radiance_int(chunk_coord, input.normal);
-            // Blend probe color with radiance and add a tiny bit of ambient for visibility
-            color = probe_color * (radiance + uniforms.ambient_color_pad.xyz * 0.1);
+            // Re-integrate sun/moon for fallbacks to avoid "flat" look
+            let total_lighting = sun_contribution + moon_light + (radiance * uniforms.gi_scale) + uniforms.ambient_color_pad.xyz * 0.1;
+            color = vec4<f32>(probe_color * total_lighting, 1.0).rgb;
+        } else {
+            // Outside GI grid, use the passed color (chunk average) + direct light
+            color = input.color.rgb * (sun_contribution + moon_light + uniforms.ambient_color_pad.xyz * 0.1);
         }
     }
 
@@ -385,11 +389,18 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     let env_fade_factor = smoothstep(env_fade_start, env_dist, distance);
     
     if (env_fade_factor > 0.0) {
-        // Get color of Type 0 (envelope color)
-        // We assume Type 0 is used for envelopes as per design
-        let env_color_base = get_voxel_color(0u);
-        // Apply lighting to envelope color so it matches the scene
-        let env_lit = env_color_base * lighting;
+        let chunk_coord = vec3<i32>(floor(input.world_pos / 16.0)) - camera.gi_grid_origin;
+        var env_lit: vec3<f32>;
+        if (all(chunk_coord >= vec3<i32>(0)) && all(chunk_coord < camera.gi_grid_dims)) {
+            let probe_color = textureLoad(gi_probe_color, chunk_coord, 0).rgb;
+            let radiance = sample_radiance_int(chunk_coord, input.normal);
+            // Re-integrate sun/moon for envelopes
+            let total_lighting = sun_contribution + moon_light + (radiance * uniforms.gi_scale) + uniforms.ambient_color_pad.xyz * 0.1;
+            env_lit = probe_color * total_lighting;
+        } else {
+            // Fallback to average color + light
+            env_lit = input.color.rgb * lighting;
+        }
         let env_fogged = mix(env_lit, fog_color + inscatter, fog_factor);
         
         brightened = mix(brightened, env_fogged, env_fade_factor);
@@ -598,11 +609,18 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     let env_fade_factor = smoothstep(env_fade_start, env_dist, distance);
     
     if (env_fade_factor > 0.0) {
-        // Get color of Type 0 (envelope color)
-        // We assume Type 0 is used for envelopes as per design
-        let env_color_base = get_voxel_color(0u);
-        // Apply lighting to envelope color so it matches the scene
-        let env_lit = env_color_base * lighting;
+        let chunk_coord = vec3<i32>(floor(input.world_pos / 16.0)) - camera.gi_grid_origin;
+        var env_lit: vec3<f32>;
+        if (all(chunk_coord >= vec3<i32>(0)) && all(chunk_coord < camera.gi_grid_dims)) {
+            let probe_color = textureLoad(gi_probe_color, chunk_coord, 0).rgb;
+            let radiance = sample_radiance_int(chunk_coord, input.normal);
+            // Re-integrate sun/moon for envelopes
+            let total_lighting = sun_contribution + moon_light + (radiance * uniforms.gi_scale) + uniforms.ambient_color_pad.xyz * 0.1;
+            env_lit = probe_color * total_lighting;
+        } else {
+            // Fallback to average color + light
+            env_lit = input.color.rgb * lighting;
+        }
         let env_fogged = mix(env_lit, fog_color + inscatter, fog_factor);
         
         brightened = mix(brightened, env_fogged, env_fade_factor);

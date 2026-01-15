@@ -787,9 +787,13 @@ fn process_voxels<I>(
 
     // Pre-compute the shell lookup: map packed_pos -> visible_faces
     // The parent chunk's shell tells us which children have exposed faces
-    let shell_map: Option<rustc_hash::FxHashMap<u16, u8>> = chunk.hierarchy_shell.as_ref().map(|shell| {
-        shell.iter().map(|sv| (sv.packed_pos, sv.visible_faces)).collect()
-    });
+    let shell_map: Option<rustc_hash::FxHashMap<u16, u8>> =
+        chunk.hierarchy_shell.as_ref().map(|shell| {
+            shell
+                .iter()
+                .map(|sv| (sv.packed_pos, sv.visible_faces))
+                .collect()
+        });
 
     for index in indices {
         let z = index >> 8;
@@ -846,7 +850,7 @@ fn process_voxels<I>(
                 // The visibility mask now correctly propagates from leaf voxels up through
                 // the hierarchy, so we can use direction-based culling.
                 let packed_pos = (x as u16) | ((y as u16) << 4) | ((z as u16) << 8);
-                
+
                 if let Some(ref shell) = shell_map {
                     if let Some(&visible_faces) = shell.get(&packed_pos) {
                         // Compute demand mask based on camera direction
@@ -858,9 +862,21 @@ fn process_voxels<I>(
                         let mut demand_mask = 0u8;
                         // Chunk to right of camera (dx > 0) -> we see its left face (-X, bit 1)
                         // Chunk to left of camera (dx < 0) -> we see its right face (+X, bit 0)
-                        if dx > 0.0 { demand_mask |= 1 << 1; } else { demand_mask |= 1 << 0; }
-                        if dy > 0.0 { demand_mask |= 1 << 3; } else { demand_mask |= 1 << 2; }
-                        if dz > 0.0 { demand_mask |= 1 << 5; } else { demand_mask |= 1 << 4; }
+                        if dx > 0.0 {
+                            demand_mask |= 1 << 1;
+                        } else {
+                            demand_mask |= 1 << 0;
+                        }
+                        if dy > 0.0 {
+                            demand_mask |= 1 << 3;
+                        } else {
+                            demand_mask |= 1 << 2;
+                        }
+                        if dz > 0.0 {
+                            demand_mask |= 1 << 5;
+                        } else {
+                            demand_mask |= 1 << 4;
+                        }
 
                         // Check if ANY demanded face is visible
                         if (visible_faces & demand_mask) == 0 {
@@ -922,12 +938,12 @@ fn process_voxels<I>(
                                 position: [world_x, world_y, world_z],
                                 voxel_type: VoxelType::from(0),
                                 distance,
-                                custom_color: None,
+                                custom_color: Some(sub_chunk.average_color),
                                 scale: [scale as f32, scale as f32, scale as f32],
                                 is_leaf_chunk: true,
                             });
                             stats.chunks_visible += 1;
-                            
+
                             // Track visible leaf chunk position for GI system
                             let chunk_coord = glam::IVec3::new(
                                 (world_x / 16) as i32,
@@ -1002,14 +1018,25 @@ pub fn cull_visible_voxels_with_occlusion(world: &World, camera: &Camera) -> Vec
 
     let mut stats = CullStats::default();
     let mut visible_chunks = Vec::new();
-    collect_voxels_recursive(world.root(), [0, 0, 0], scale, camera, &mut instances, &mut stats, &mut visible_chunks);
+    collect_voxels_recursive(
+        world.root(),
+        [0, 0, 0],
+        scale,
+        camera,
+        &mut instances,
+        &mut stats,
+        &mut visible_chunks,
+    );
 
     instances
 }
 
 /// Parallel culling - for hierarchical world, parallelize at top level of root chunk
 /// Returns visible voxel instances and culling statistics
-pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> (Vec<VoxelInstance>, CullStats, Vec<glam::IVec3>) {
+pub fn cull_visible_voxels_parallel(
+    world: &World,
+    camera: &Camera,
+) -> (Vec<VoxelInstance>, CullStats, Vec<glam::IVec3>) {
     use rayon::prelude::*;
 
     // For hierarchical world, we can parallelize by processing top-level cells
@@ -1127,12 +1154,12 @@ pub fn cull_visible_voxels_parallel(world: &World, camera: &Camera) -> (Vec<Voxe
                                     position: [world_x, world_y, world_z],
                                     voxel_type: 0,
                                     distance,
-                                    custom_color: None,
+                                    custom_color: Some(chunk.average_color),
                                     scale: [scale as f32, scale as f32, scale as f32],
                                     is_leaf_chunk: true,
                                 });
                                 cell_stats.chunks_visible += 1;
-                                
+
                                 // Track visible leaf chunk position for GI system
                                 let chunk_coord = glam::IVec3::new(
                                     (world_x / 16) as i32,
