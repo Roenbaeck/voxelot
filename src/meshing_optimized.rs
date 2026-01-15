@@ -12,7 +12,7 @@ pub struct MeshVertex {
     pub normal: [f32; 3],
     pub color: [f32; 4],
     pub emissive: [f32; 4],
-    pub material: [f32; 4],  // R=reflectivity, GBA=reserved
+    pub material: [f32; 4], // R=reflectivity, GBA=reserved
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -309,15 +309,31 @@ pub fn generate_chunk_mesh_optimized(
             let ao_mask = (key & 0xFF) as u8;
             let material = palette.material(voxel_type as u32);
 
-            // Pre-calculate colors/emissive
-            let base_color = material.albedo;
-            let emissive = [
-                material.emissive[0],
-                material.emissive[1],
-                material.emissive[2],
-                material.emissive_intensity,
-            ];
-            let material_props = [material.reflectivity, 0.0, 0.0, 0.0];
+            let base_color = if envelope {
+                [
+                    chunk.average_color[0] as f32 / 255.0,
+                    chunk.average_color[1] as f32 / 255.0,
+                    chunk.average_color[2] as f32 / 255.0,
+                    1.0, // Force opaque for meshes
+                ]
+            } else {
+                material.albedo
+            };
+            let emissive = if envelope {
+                [0.0, 0.0, 0.0, 0.0]
+            } else {
+                [
+                    material.emissive[0],
+                    material.emissive[1],
+                    material.emissive[2],
+                    material.emissive_intensity,
+                ]
+            };
+            let material_props = if envelope {
+                [0.0, 0.0, 0.0, 0.0]
+            } else {
+                [material.reflectivity, 0.0, 0.0, 0.0]
+            };
 
             for (depth, plane) in depth_map {
                 let quads = greedy_mesh_binary_plane(*plane);
