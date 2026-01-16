@@ -195,10 +195,16 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
 
-    // Early-out for distant pixels - AO is not visible at distance anyway
-    // Return full visibility (1.0) to avoid darkening distant geometry
+    // Sample Octahedral-encoded world-space normal from G-buffer and decode
+    let normal_data = textureSample(normal_tex, post_sampler, uv).xy;
+    let world_normal = oct_decode(normal_data);
+
+    // Cheap "Sky AO" fallback for distant pixels to avoid flat/washed out look
+    let cheap_sky_ao = 0.75 + 0.25 * world_normal.y;
+
+    // Early-out for very distant pixels - AO is not visible at distance anyway
     if (linear_depth > ssao.max_ao_distance) {
-        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        return vec4<f32>(0.0, 0.0, 0.0, cheap_sky_ao);
     }
 
     let inv_proj_00 = ssao.inverse_projection[0][0];
@@ -206,9 +212,6 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let ndc_xy_pixel = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     let view_pos = vec3<f32>(ndc_xy_pixel.x * linear_depth * inv_proj_00, ndc_xy_pixel.y * linear_depth * inv_proj_11, -linear_depth);
 
-    // Sample Octahedral-encoded world-space normal from G-buffer and decode
-    let normal_data = textureSample(normal_tex, post_sampler, uv).xy;
-    let world_normal = oct_decode(normal_data);
     
     // Transform world normal to view-space for GTAO calculations
     let view_mat_rot = transpose(mat3x3<f32>(
@@ -341,9 +344,16 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
         visibility += 1.0 - occluded_fraction;
     }
     
-    visibility /= slice_count;
-    visibility = pow(visibility, 2.0);
+    visibility /= f32(ssao.slice_count);
+
+    // Softer AO exponent (was 2.0)
+    visibility = pow(visibility, 1.3);
     
+    // Smoothly fade calculated AO to Cheap Sky AO over the fade range
+    let fade_start = ssao.max_ao_distance * 0.75;
+    let fade_factor = smoothstep(fade_start, ssao.max_ao_distance, linear_depth);
+    visibility = mix(visibility, cheap_sky_ao, fade_factor);
+
     // Extract camera position from inverse view matrix (translation component)
     let camera_pos = ssao.inverse_view[3].xyz;
     
