@@ -190,13 +190,7 @@ fn trace_local_ssr(start_pos: vec3<f32>, dir: vec3<f32>, sky_color: vec3<f32>) -
                 let color = textureLoad(scene_color, final_px, 0).rgb;
                 // Tight edge fade
                 let edge_fade = clamp(10.0 * min(min(final_uv.x, 1.0 - final_uv.x), min(final_uv.y, 1.0 - final_uv.y)), 0.0, 1.0);
-                // Distance-based hit confidence to avoid sharp cutoffs at the ray range limit
-                let hit_dist = distance(camera.camera_pos, refine_pos);
-                let max_dist = f32(params.max_steps) * params.step_size + 0.2;
-                var hit_conf = clamp(1.0 - (hit_dist / max_dist), 0.0, 1.0);
-                hit_conf = pow(hit_conf, 1.5);
-                let alpha = edge_fade * hit_conf;
-                return vec4<f32>(color, alpha);
+                return vec4<f32>(color, edge_fade);
             }
         }
     }
