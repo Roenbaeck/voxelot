@@ -177,8 +177,8 @@ fn get_cheap_sky_color(rdir: vec3<f32>) -> vec3<f32> {
     
     let night_a = vec3<f32>(0.02, 0.02, 0.03);
     let night_b = vec3<f32>(0.04, 0.05, 0.08);
-    let day_a = vec3<f32>(0.45, 0.62, 0.92);
-    let day_b = vec3<f32>(0.62, 0.74, 0.96);
+    let day_a = vec3<f32>(0.90, 0.92, 0.95);
+    let day_b = vec3<f32>(0.95, 0.96, 0.98);
     
     let az_blend = 0.5 + 0.5 * sin(u * TWO_PI);
     let night = mix(night_a, night_b, az_blend);
@@ -191,7 +191,7 @@ fn get_cheap_sky_color(rdir: vec3<f32>) -> vec3<f32> {
     
     // Add a small sun highlight in the reflection direction.
     let sun_lobe = pow(max(dot(rdir, sun_dir), 0.0), 64.0);
-    env += uniforms.sun_color_pad.xyz * (0.35 * sun_lobe) * brightness;
+    env += uniforms.sun_color_pad.xyz * (2.0 * sun_lobe) * brightness;
     
     // Apply night tint similarly to skybox shading.
     let tint = uniforms.skybox_tint_pad.xyz;

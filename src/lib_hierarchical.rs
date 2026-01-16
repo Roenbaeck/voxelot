@@ -434,9 +434,7 @@ impl Chunk {
                     Voxel::Chunk(c) => (c.dominant_type, Palette::normalize_rgba(c.average_color)),
                 };
 
-                let refl = palette.reflectivity(v_type as u32);
-                // Weight scoring by reflectivity to favor reflective materials for distant LOD
-                type_scores[v_type as usize] += 1.0 + refl * 100.0;
+                type_scores[v_type as usize] += 1.0;
 
                 color_sum[0] += v_color[0];
                 color_sum[1] += v_color[1];
