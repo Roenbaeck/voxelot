@@ -130,20 +130,21 @@ fn sample_sky_equirect(reflect_dir: vec3<f32>) -> vec3<f32> {
     return tinted * brightness;
 }
 
-fn trace_local_ssr(start_pos: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
-    let step_size = 0.8;
-    let max_steps = 180; // ~144 units
-    var current_pos = start_pos + dir * 0.2; 
+fn trace_local_ssr(start_pos: vec3<f32>, dir: vec3<f32>, sky_color: vec3<f32>) -> vec4<f32> {
+    // Use parameters from the SSR UBO so range/steps are configurable
+    let step_size = params.step_size;
+    let max_steps_u = params.max_steps;
+    var current_pos = start_pos + dir * 0.2;
 
     let dim = textureDimensions(scene_depth);
     let fdim = vec2<f32>(dim);
 
-    for (var i = 0; i < max_steps; i++) {
+    for (var i: u32 = 0u; i < max_steps_u; i = i + 1u) {
         current_pos += dir * step_size;
 
         let clip_pos = camera.view_proj * vec4<f32>(current_pos, 1.0);
         if (clip_pos.w <= 0.0) { continue; }
-        
+
         let ndc = clip_pos.xyz / clip_pos.w;
         let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
 
@@ -154,7 +155,7 @@ fn trace_local_ssr(start_pos: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
         let px = vec2<i32>(uv * fdim);
         let d_raw = textureLoad(scene_depth, px, 0);
 
-        if (d_raw >= 0.9999 || d_raw <= 0.0) { continue; } 
+        if (d_raw >= 0.999999 || d_raw <= 0.0) { continue; }
 
         let sample_pos = reconstruct_world_pos(uv, d_raw);
         let dist_sample = distance(camera.camera_pos, sample_pos);
@@ -162,12 +163,13 @@ fn trace_local_ssr(start_pos: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
 
         // Ray is "behind" surface from camera view
         if (dist_ray > dist_sample + 0.05) {
-            let thickness = 0.5 + f32(i) * 0.015;
+            // Thickness can be adjusted via UBO
+            let thickness = params.thickness + f32(i) * 0.015;
             if (dist_ray - dist_sample < thickness) {
-                // Binary refinement for better precision
+                // Binary refinement for better precision (use UBO limit)
                 var refine_pos = current_pos;
                 var prev_pos = current_pos - dir * step_size;
-                for (var j = 0; j < 3; j++) {
+                for (var j: u32 = 0u; j < params.max_binary_steps; j = j + 1u) {
                     let mid = mix(prev_pos, refine_pos, 0.5);
                     let mid_clip = camera.view_proj * vec4<f32>(mid, 1.0);
                     let mid_ndc = mid_clip.xyz / mid_clip.w;
@@ -188,11 +190,24 @@ fn trace_local_ssr(start_pos: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
                 let color = textureLoad(scene_color, final_px, 0).rgb;
                 // Tight edge fade
                 let edge_fade = clamp(10.0 * min(min(final_uv.x, 1.0 - final_uv.x), min(final_uv.y, 1.0 - final_uv.y)), 0.0, 1.0);
-                return vec4<f32>(color, edge_fade);
+                // Distance-based hit confidence to avoid sharp cutoffs at the ray range limit
+                let hit_dist = distance(camera.camera_pos, refine_pos);
+                let max_dist = f32(params.max_steps) * params.step_size + 0.2;
+                var hit_conf = clamp(1.0 - (hit_dist / max_dist), 0.0, 1.0);
+                hit_conf = pow(hit_conf, 1.5);
+                let alpha = edge_fade * hit_conf;
+                return vec4<f32>(color, alpha);
             }
         }
     }
-    return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+
+    // No precise screen-space hit: return sky_color with a distance-based confidence
+    let marched = distance(start_pos, current_pos);
+    let max_dist = f32(params.max_steps) * params.step_size + 0.2;
+    var conf = clamp(1.0 - (marched / max_dist), 0.0, 1.0);
+    // bias the falloff to make the transition visually pleasant
+    conf = pow(conf, 1.5);
+    return vec4<f32>(sky_color * conf, conf);
 }
 
 // Optimized radiance: 3 samples with branchless selection (Integer/Discrete version)
@@ -606,7 +621,7 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let depth = load_depth_at_uv(input.uv);
-    if (depth >= 0.9999) {
+    if (depth >= 0.999999) {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
 
@@ -633,13 +648,13 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let sky_color = sample_sky_equirect(reflect_dir);
     
     // Hybrid: Local Screen-Space Raymarch + Distant GI Grid Trace
-    let ssr_res = trace_local_ssr(world_pos, reflect_dir);
+    let ssr_res = trace_local_ssr(world_pos, reflect_dir, sky_color);
     
     // Hybrid Strategy: 
-    // - Use High-Res SSR for everything on-screen up to ~140 units.
+    // - Use High-Res SSR for close-to-mid range (configurable via UBO).
     // - Start GI Trace further out to avoid "Phantom AABB" artifacts from local geometry.
     // - If SSR misses, GI starts closer to pick up low-frequency details.
-    let gi_start_offset = mix(2.0, 64.0, ssr_res.a);
+    let gi_start_offset = mix(2.0, 32.0, ssr_res.a);
     let gi_res_raw = sample_gi_grid(world_pos + reflect_dir * gi_start_offset, reflect_dir, sky_color);
     
     // If we have a clear SSR hit (no fade), ignore GI entirely for this ray.

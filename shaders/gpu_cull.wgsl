@@ -42,6 +42,7 @@ struct CullParams {
     lod_render_distance : f32,
     detail_cull_distance : f32,
     envelope_distance : f32,
+    envelope_fade_range : f32,
     hzb_enabled : u32,
     max_hzb_mip : u32,
     _pad3 : f32,
@@ -110,8 +111,12 @@ fn cs_main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         candidates[index].flags = candidates[index].flags | 4u; // Mark visible for debug
         
         let detail_sq = params.detail_cull_distance * params.detail_cull_distance;
-        let envelope_sq = params.envelope_distance * params.envelope_distance;
-        
+        // Use envelope_fade_range to bias the threshold so detail remains active through the fade band
+        let env = params.envelope_distance;
+        let fade = params.envelope_fade_range;
+        let env_plus = env + fade;
+        let env_plus_sq = env_plus * env_plus;
+
         let has_mesh = (instance.flags & 1u) != 0u;
         let has_envelope = (instance.flags & 2u) != 0u;
         let cpu_prepopulated = (instance.flags & 4u) != 0u;
@@ -121,11 +126,9 @@ fn cs_main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         // 2. Envelope Mesh (if exists AND (far enough OR detail missing))
         // 3. Fallback (if neither exists)
         
-        // Note: Original logic was "use envelope if dist > envelope_dist".
-        // But if envelope is missing, we might want detail mesh even if far?
-        // Or if detail is missing, we want envelope even if near?
-        
-        var use_detail = has_mesh && (dist_sq <= envelope_sq);
+        // Revised logic: extend detail usage out to (env + fade) so the detail mesh
+        // can smoothly fade towards envelope shading over the configured fade range.
+        var use_detail = has_mesh && (dist_sq <= env_plus_sq);
         var use_envelope = has_envelope && (!use_detail);
         
         // If we want to use detail but don't have it, try envelope
