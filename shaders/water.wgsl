@@ -813,6 +813,27 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     final_color = mix(final_color, foam_color, total_foam);
     
     // ========================================================================
+    // FOG
+    // ========================================================================
+    
+    // Fog color modulated by ambient and sky brightness (darker at night)
+    let base_fog_color = vec3<f32>(0.7, 0.8, 0.9);
+    // Mix between a very dark night fog and the ambient color scaled by `brightness`.
+    let fog_base = mix(vec3<f32>(0.02, 0.02, 0.03), camera.ambient_color_pad.xyz, brightness);
+    let fog_color = base_fog_color * fog_base * 2.0;
+
+    let distance = t; // 't' is the world-space distance to water surface
+    let transmittance = exp(-camera.fog_time_pad.x * distance);
+    let fog_factor = 1.0 - transmittance;
+    
+    // Add directional volumetric scattering from sun (towards sun only)
+    let sun_dir_local = normalize(camera.sun_direction_shadow_bias.xyz);
+    let sun_view_dot = max(dot(-world_dir, -sun_dir_local), 0.0);
+    let inscatter = camera.sun_color_pad.xyz * 0.15 * fog_factor * sun_view_dot;
+    
+    final_color = mix(final_color, fog_color + inscatter, fog_factor);
+    
+    // ========================================================================
     // ALPHA / TRANSPARENCY
     // ========================================================================
     

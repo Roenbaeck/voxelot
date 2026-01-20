@@ -3255,8 +3255,8 @@ impl App {
 
         match setting {
             ConfigurableSetting::FogDensity => {
-                let delta = 0.00005 * direction as f32;
-                self.fog_density = (self.fog_density + delta).clamp(0.0, 0.01);
+                let delta = 0.0001 * direction as f32;
+                self.fog_density = (self.fog_density + delta).clamp(0.0, 0.1);
                 log::info!("Fog density: {:.6}", self.fog_density);
             }
             ConfigurableSetting::BloomEnabled => {
