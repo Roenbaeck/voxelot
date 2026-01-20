@@ -1016,35 +1016,7 @@ impl CameraController {
                 self.speed_multiplier = 1.0;
                 log::info!("Camera speed multiplier reset to 1.00");
             }
-            // Runtime config adjustments (only on key press, not release)
-            KeyCode::PageDown if pressed => {
-                self.camera.config.lod_render_distance =
-                    (self.camera.config.lod_render_distance - 50.0).max(50.0);
-                log::info!(
-                    "LOD render distance: {:.0}",
-                    self.camera.config.lod_render_distance
-                );
-            }
-            KeyCode::PageUp if pressed => {
-                self.camera.config.lod_render_distance =
-                    (self.camera.config.lod_render_distance + 50.0).min(2000.0);
-                log::info!(
-                    "LOD render distance: {:.0}",
-                    self.camera.config.lod_render_distance
-                );
-            }
-            KeyCode::KeyZ if pressed => {
-                self.camera.config.far_plane = (self.camera.config.far_plane - 500.0).max(1000.0);
-                self.camera.far = self.camera.config.far_plane;
-                self.update_camera_vectors(); // Recalculate frustum
-                log::info!("Far plane: {:.0}", self.camera.config.far_plane);
-            }
-            KeyCode::KeyC if pressed => {
-                self.camera.config.far_plane = (self.camera.config.far_plane + 500.0).min(20000.0);
-                self.camera.far = self.camera.config.far_plane;
-                self.update_camera_vectors(); // Recalculate frustum
-                log::info!("Far plane: {:.0}", self.camera.config.far_plane);
-            }
+            // Note: PageDown/Up (LOD distance) and Z/C (far plane) are now handled by InputManager
             _ => {}
         }
     }
@@ -1402,6 +1374,10 @@ struct App {
     ssilvb_pipeline: Option<wgpu::RenderPipeline>,
     ssao_blur_pipeline: Option<wgpu::RenderPipeline>,
     composite_pipeline: Option<wgpu::RenderPipeline>,
+
+    // Input Manager
+    input_manager: voxelot::input::InputManager,
+
     // SSILVB bind/group
     ssilvb_bind_group_layout: Option<wgpu::BindGroupLayout>,
     ssilvb_bind_group: Option<wgpu::BindGroup>,
@@ -1498,7 +1474,6 @@ struct App {
     reflection_probe_probe_only: bool,
     reflection_probe_flip_y: bool,
     probe_uniform_buffer: Option<wgpu::Buffer>,
-    probe_bind_group: Option<wgpu::BindGroup>,
 
     // Scene color copy for water reflections (avoids read-while-write conflict)
     scene_copy_texture: Option<wgpu::Texture>,
@@ -2537,6 +2512,8 @@ impl App {
             gi_probe_view_color: None,
             gi_probe_view_bbox: None,
 
+            input_manager: voxelot::input::InputManager::new(),
+
             camera_controller: CameraController::new(initial_camera, &cfg.rendering),
             pending_chunk_meshes: VecDeque::new(),
             pending_chunk_set: FxHashSet::default(),
@@ -2785,7 +2762,6 @@ impl App {
             reflection_probe_probe_only: false,
             reflection_probe_flip_y: true,
             probe_uniform_buffer: None,
-            probe_bind_group: None,
 
             scene_copy_texture: None,
             scene_copy_view: None,
@@ -3130,11 +3106,14 @@ impl App {
     }
 
     fn process_lighting_key(&mut self, key: KeyCode) {
-        match key {
-            KeyCode::KeyT => {
-                // Toggle time pause
+        use voxelot::input::InputAction;
+
+        let action = self.input_manager.map_key(key);
+        self.input_manager.handle_action(action);
+
+        match action {
+            InputAction::ToggleTimePause => {
                 self.time_paused = !self.time_paused;
-                // UPDATED THRESHOLDS: 0.20 (was 0.125) and 0.80 (was 0.875)
                 let phase = if self.time_of_day < 0.20 {
                     "Midnight→Dawn"
                 } else if self.time_of_day < 0.25 {
@@ -3159,247 +3138,74 @@ impl App {
                     phase
                 );
             }
-            KeyCode::KeyF => {
-                // Decrease fog density (smaller step)
-                self.fog_density = (self.fog_density - 0.00005).max(0.0);
-                log::info!("Fog density: {:.6}", self.fog_density);
-            }
-            KeyCode::KeyG => {
-                // Increase fog density (smaller step)
-                self.fog_density = (self.fog_density + 0.00005).min(0.01);
-                log::info!("Fog density: {:.6}", self.fog_density);
-            }
-            KeyCode::KeyB => {
-                self.bloom_enabled = !self.bloom_enabled;
-                log::info!(
-                    "Bloom {}",
-                    if self.bloom_enabled {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    }
-                );
-            }
-            KeyCode::KeyN => {
-                self.ssao_enabled = !self.ssao_enabled;
-                log::info!(
-                    "SSAO {}",
-                    if self.ssao_enabled {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    }
-                );
-            }
-            KeyCode::F1 => {
-                // decrease SSILVB sample count
-                if self.ssao_settings.sample_count > 1 {
-                    self.ssao_settings.sample_count =
-                        self.ssao_settings.sample_count.saturating_sub(1);
-                    log::info!("SSAO sample_count: {}", self.ssao_settings.sample_count);
-                }
-            }
-            KeyCode::F2 => {
-                // increase SSILVB sample count
-                self.ssao_settings.sample_count = (self.ssao_settings.sample_count + 1).min(32);
-                log::info!("SSAO sample_count: {}", self.ssao_settings.sample_count);
-            }
-            KeyCode::F5 => {
+            InputAction::ToggleGui => {
                 self.gui_visible = !self.gui_visible;
                 log::info!(
                     "GUI overlay: {}",
                     if self.gui_visible { "ON" } else { "OFF" }
                 );
             }
-            KeyCode::F3 => {
-                // decrease sampling radius
-                self.ssao_settings.radius = (self.ssao_settings.radius - 1.0).max(0.0);
-                log::info!("SSAO radius: {}", self.ssao_settings.radius);
-            }
-            KeyCode::F4 => {
-                // increase sampling radius
-                self.ssao_settings.radius += 1.0;
-                log::info!("SSAO radius: {}", self.ssao_settings.radius);
-            }
-            KeyCode::KeyH => {
-                self.hzb_enabled = !self.hzb_enabled;
-                log::info!(
-                    "HZB occlusion culling {}",
-                    if self.hzb_enabled {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    }
-                );
-                self.pending_recreate_offscreen = true;
-            }
-            KeyCode::F6 => {
-                self.ssao_debug = !self.ssao_debug;
-                log::info!(
-                    "SSAO debug {}",
-                    if self.ssao_debug {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    }
-                );
-            }
-            KeyCode::F7 => {
-                self.reflection_probe_debug = !self.reflection_probe_debug;
-                log::info!(
-                    "Probe debug colors (clear-only): {}",
-                    self.reflection_probe_debug
-                );
-            }
-            KeyCode::F8 => {
-                self.reflection_probe_probe_only = !self.reflection_probe_probe_only;
-                log::info!(
-                    "SSR probe-only debug view: {}",
-                    self.reflection_probe_probe_only
-                );
-            }
-            KeyCode::F9 => {
-                self.reflection_probe_flip_y = !self.reflection_probe_flip_y;
-                log::info!("SSR probe sample flip-Y: {}", self.reflection_probe_flip_y);
-            }
-            KeyCode::KeyK => {
-                // Decrease LOD distance (more detail at distance)
-                self.lod_distance = (self.lod_distance - 100.0).max(100.0);
-                self.camera_controller.camera.config.lod_render_distance = self.lod_distance;
-                log::info!("LOD distance: {:.0} units", self.lod_distance);
-            }
-            KeyCode::KeyL => {
-                // Increase LOD distance (less detail at distance)
-                self.lod_distance = (self.lod_distance + 100.0).min(5000.0);
-                self.camera_controller.camera.config.lod_render_distance = self.lod_distance;
-                log::info!("LOD distance: {:.0} units", self.lod_distance);
-            }
-            KeyCode::Comma => {
-                self.dof_settings.focal_distance =
-                    (self.dof_settings.focal_distance - 10.0).max(10.0);
-                log::info!(
-                    "DoF focal distance: {:.1}",
-                    self.dof_settings.focal_distance
-                );
-                self.update_water_uniforms();
-            }
-            KeyCode::Period => {
-                self.dof_settings.focal_distance =
-                    (self.dof_settings.focal_distance + 10.0).min(5000.0);
-                log::info!(
-                    "DoF focal distance: {:.1}",
-                    self.dof_settings.focal_distance
-                );
-                self.update_water_uniforms();
-            }
-            KeyCode::BracketLeft => {
-                self.dof_settings.focal_range = (self.dof_settings.focal_range - 5.0).max(5.0);
-                log::info!("DoF focal range: {:.1}", self.dof_settings.focal_range);
-                self.update_water_uniforms();
-            }
-            KeyCode::BracketRight => {
-                self.dof_settings.focal_range = (self.dof_settings.focal_range + 5.0).min(500.0);
-                log::info!("DoF focal range: {:.1}", self.dof_settings.focal_range);
-                self.update_water_uniforms();
-            }
-            KeyCode::Semicolon => {
-                self.dof_settings.blur_strength = (self.dof_settings.blur_strength - 0.1).max(0.0);
-                log::info!("DoF blur strength: {:.2}", self.dof_settings.blur_strength);
-                self.update_water_uniforms();
-            }
-            KeyCode::Quote => {
-                self.dof_settings.blur_strength = (self.dof_settings.blur_strength + 0.1).min(2.5);
-                log::info!("DoF blur strength: {:.2}", self.dof_settings.blur_strength);
-                self.update_water_uniforms();
-            }
-            KeyCode::Slash => {
-                self.dof_enabled = !self.dof_enabled;
-                log::info!(
-                    "DoF {}",
-                    if self.dof_enabled {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    }
-                );
-                // Invalidate composite bind group to re-bind source color (offscreen vs post_color)
-                self.composite_bind_group = None;
-                // Update water UBO when toggling DoF so gather range/mode can reflect new state
-                self.update_water_uniforms();
-            }
-            KeyCode::KeyX => {
-                self.dof_settings.kawase_enabled = !self.dof_settings.kawase_enabled;
-                log::info!(
-                    "Kawase {}",
-                    if self.dof_settings.kawase_enabled {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    }
-                );
-                // Recreate kawase UBOs/bind groups if enabled
-                if self.dof_settings.kawase_enabled {
-                    self.update_kawase_bind_groups();
-                }
-            }
-            KeyCode::KeyJ => {
-                if !self.hzb_debug {
-                    self.hzb_debug = true;
-                    log::info!("HZB debug view enabled");
+            InputAction::ToggleVessel => {
+                if self.active_pawn.is_some() {
+                    self.active_pawn = None;
+                    log::info!("Exited vessel: returning to free camera");
                 } else {
-                    self.hzb_debug = false;
-                    log::info!("HZB debug view disabled");
+                    let spawn = self.camera_controller.camera.position;
+                    self.active_pawn =
+                        Some(Box::new(voxelot::BoatPawn::new(spawn, self.water_level)));
+                    log::info!(
+                        "Spawned vessel at ({:.1},{:.1},{:.1})",
+                        spawn[0],
+                        spawn[1],
+                        spawn[2]
+                    );
                 }
-                self.pending_recreate_offscreen = true;
             }
-            KeyCode::KeyU => {
-                self.dof_settings.kawase_offset =
-                    (self.dof_settings.kawase_offset - 0.25).max(0.25);
-                log::info!("Kawase offset: {:.2}", self.dof_settings.kawase_offset);
-                self.update_kawase_bind_groups();
-            }
-            KeyCode::KeyI => {
-                self.dof_settings.kawase_offset =
-                    (self.dof_settings.kawase_offset + 0.25).min(10.0);
-                log::info!("Kawase offset: {:.2}", self.dof_settings.kawase_offset);
-                self.update_kawase_bind_groups();
-            }
-            KeyCode::KeyO => {
-                self.dof_settings.kawase_iterations =
-                    (self.dof_settings.kawase_iterations.saturating_sub(1)).max(1);
-                log::info!("Kawase iterations: {}", self.dof_settings.kawase_iterations);
-                self.update_kawase_bind_groups();
-            }
-            KeyCode::KeyP => {
-                self.dof_settings.kawase_iterations =
-                    (self.dof_settings.kawase_iterations + 1).min(6);
-                log::info!("Kawase iterations: {}", self.dof_settings.kawase_iterations);
-                self.update_kawase_bind_groups();
-            }
-            KeyCode::KeyR => {
-                self.ssr_settings.enabled = !self.ssr_settings.enabled;
-                log::info!(
-                    "SSR: {}",
-                    if self.ssr_settings.enabled {
-                        "ENABLED"
-                    } else {
-                        "DISABLED"
+            InputAction::CycleDebugView => {
+                use voxelot::input::DebugView;
+                // Reset all debug flags first
+                self.ssao_debug = false;
+                self.ssr_debug = false;
+                self.hzb_debug = false;
+                self.reflection_probe_debug = false;
+                self.reflection_probe_probe_only = false;
+
+                // Set the appropriate flag based on active view
+                match self.input_manager.active_debug_view {
+                    DebugView::None => {}
+                    DebugView::Ssao => {
+                        self.ssao_debug = true;
                     }
+                    DebugView::Ssr => {
+                        self.ssr_debug = true;
+                    }
+                    DebugView::Hzb => {
+                        self.hzb_debug = true;
+                        self.pending_recreate_offscreen = true;
+                    }
+                    DebugView::ReflectionProbe => {
+                        self.reflection_probe_debug = true;
+                    }
+                    DebugView::ProbeOnly => {
+                        self.reflection_probe_probe_only = true;
+                    }
+                }
+                log::info!(
+                    "Debug View: {}",
+                    self.input_manager.active_debug_view.name()
                 );
             }
-            KeyCode::KeyV => {
-                self.ssr_debug = !self.ssr_debug;
-                log::info!("SSR DEBUG overlay: {}", self.ssr_debug);
+            InputAction::CycleSetting => {
+                if let Some(setting) = self.input_manager.selected_setting {
+                    log::info!("Selected Setting: {}", setting.name());
+                }
             }
-            KeyCode::KeyY => {
-                self.water_level = (self.water_level - 5.0).max(0.0);
-                log::info!("Water level: {:.1}", self.water_level);
+            InputAction::SettingAdjust { direction } => {
+                if let Some(setting) = self.input_manager.selected_setting {
+                    self.apply_setting_adjustment(setting, direction);
+                }
             }
-            KeyCode::KeyM => {
-                self.water_level = (self.water_level + 5.0).min(1000.0);
-                log::info!("Water level: {:.1}", self.water_level);
-            }
-            KeyCode::F11 => {
+            InputAction::ToggleFullscreen => {
                 if let Some(window) = &self.window {
                     if self.is_fullscreen {
                         window.set_fullscreen(None);
@@ -3412,7 +3218,222 @@ impl App {
                     }
                 }
             }
-            _ => {}
+            InputAction::SaveAndQuit => {
+                // This is handled specially in window_event since we need event_loop access
+            }
+            InputAction::AdjustLodRender { direction } => {
+                let delta = 50.0 * direction as f32;
+                self.camera_controller.camera.config.lod_render_distance =
+                    (self.camera_controller.camera.config.lod_render_distance + delta)
+                        .clamp(50.0, 2000.0);
+                log::info!(
+                    "LOD render distance: {:.0}",
+                    self.camera_controller.camera.config.lod_render_distance
+                );
+            }
+            InputAction::AdjustFarPlane { direction } => {
+                let delta = 500.0 * direction as f32;
+                self.camera_controller.camera.config.far_plane =
+                    (self.camera_controller.camera.config.far_plane + delta).clamp(1000.0, 20000.0);
+                self.camera_controller.camera.far = self.camera_controller.camera.config.far_plane;
+                self.camera_controller.update_camera_vectors();
+                log::info!(
+                    "Far plane: {:.0}",
+                    self.camera_controller.camera.config.far_plane
+                );
+            }
+            InputAction::None => {}
+        }
+    }
+
+    fn apply_setting_adjustment(
+        &mut self,
+        setting: voxelot::input::ConfigurableSetting,
+        direction: i32,
+    ) {
+        use voxelot::input::ConfigurableSetting;
+
+        match setting {
+            ConfigurableSetting::FogDensity => {
+                let delta = 0.00005 * direction as f32;
+                self.fog_density = (self.fog_density + delta).clamp(0.0, 0.01);
+                log::info!("Fog density: {:.6}", self.fog_density);
+            }
+            ConfigurableSetting::BloomEnabled => {
+                self.bloom_enabled = direction > 0;
+                log::info!("Bloom {}", if self.bloom_enabled { "ON" } else { "OFF" });
+            }
+            ConfigurableSetting::SsaoEnabled => {
+                self.ssao_enabled = direction > 0;
+                log::info!("SSAO {}", if self.ssao_enabled { "ON" } else { "OFF" });
+            }
+            ConfigurableSetting::SsrEnabled => {
+                self.ssr_settings.enabled = direction > 0;
+                log::info!(
+                    "SSR {}",
+                    if self.ssr_settings.enabled {
+                        "ON"
+                    } else {
+                        "OFF"
+                    }
+                );
+            }
+            ConfigurableSetting::DofEnabled => {
+                self.dof_enabled = direction > 0;
+                self.composite_bind_group = None;
+                self.update_water_uniforms();
+                log::info!("DoF {}", if self.dof_enabled { "ON" } else { "OFF" });
+            }
+            ConfigurableSetting::KawaseEnabled => {
+                self.dof_settings.kawase_enabled = direction > 0;
+                if self.dof_settings.kawase_enabled {
+                    self.update_kawase_bind_groups();
+                }
+                log::info!(
+                    "Kawase {}",
+                    if self.dof_settings.kawase_enabled {
+                        "ON"
+                    } else {
+                        "OFF"
+                    }
+                );
+            }
+            ConfigurableSetting::HzbEnabled => {
+                self.hzb_enabled = direction > 0;
+                self.pending_recreate_offscreen = true;
+                log::info!("HZB {}", if self.hzb_enabled { "ON" } else { "OFF" });
+            }
+            ConfigurableSetting::SsilvbSamples => {
+                if direction > 0 {
+                    self.ssao_settings.sample_count = (self.ssao_settings.sample_count + 1).min(32);
+                } else if self.ssao_settings.sample_count > 1 {
+                    self.ssao_settings.sample_count =
+                        self.ssao_settings.sample_count.saturating_sub(1);
+                }
+                log::info!("SSILVB samples: {}", self.ssao_settings.sample_count);
+            }
+            ConfigurableSetting::SsaoRadius => {
+                let delta = 1.0 * direction as f32;
+                self.ssao_settings.radius = (self.ssao_settings.radius + delta).max(0.0);
+                log::info!("SSAO radius: {:.1}", self.ssao_settings.radius);
+            }
+            ConfigurableSetting::LodDistance => {
+                let delta = 100.0 * direction as f32;
+                self.lod_distance = (self.lod_distance + delta).clamp(100.0, 5000.0);
+                self.camera_controller.camera.config.lod_render_distance = self.lod_distance;
+                log::info!("LOD distance: {:.0}", self.lod_distance);
+            }
+            ConfigurableSetting::DofFocalDistance => {
+                let delta = 10.0 * direction as f32;
+                self.dof_settings.focal_distance =
+                    (self.dof_settings.focal_distance + delta).clamp(10.0, 5000.0);
+                log::info!(
+                    "DoF focal distance: {:.1}",
+                    self.dof_settings.focal_distance
+                );
+                self.update_water_uniforms();
+            }
+            ConfigurableSetting::DofFocalRange => {
+                let delta = 5.0 * direction as f32;
+                self.dof_settings.focal_range =
+                    (self.dof_settings.focal_range + delta).clamp(5.0, 500.0);
+                log::info!("DoF focal range: {:.1}", self.dof_settings.focal_range);
+                self.update_water_uniforms();
+            }
+            ConfigurableSetting::DofBlurStrength => {
+                let delta = 0.1 * direction as f32;
+                self.dof_settings.blur_strength =
+                    (self.dof_settings.blur_strength + delta).clamp(0.0, 2.5);
+                log::info!("DoF blur strength: {:.2}", self.dof_settings.blur_strength);
+                self.update_water_uniforms();
+            }
+            ConfigurableSetting::KawaseIterations => {
+                if direction > 0 {
+                    self.dof_settings.kawase_iterations =
+                        (self.dof_settings.kawase_iterations + 1).min(6);
+                } else {
+                    self.dof_settings.kawase_iterations =
+                        (self.dof_settings.kawase_iterations.saturating_sub(1)).max(1);
+                }
+                log::info!("Kawase iterations: {}", self.dof_settings.kawase_iterations);
+                self.update_kawase_bind_groups();
+            }
+            ConfigurableSetting::KawaseOffset => {
+                let delta = 0.25 * direction as f32;
+                self.dof_settings.kawase_offset =
+                    (self.dof_settings.kawase_offset + delta).clamp(0.25, 10.0);
+                log::info!("Kawase offset: {:.2}", self.dof_settings.kawase_offset);
+                self.update_kawase_bind_groups();
+            }
+            ConfigurableSetting::WaterLevel => {
+                let delta = 5.0 * direction as f32;
+                self.water_level = (self.water_level + delta).clamp(0.0, 1000.0);
+                log::info!("Water level: {:.1}", self.water_level);
+            }
+        }
+    }
+
+    fn get_setting_value_string(&self, setting: voxelot::input::ConfigurableSetting) -> String {
+        use voxelot::input::ConfigurableSetting;
+        match setting {
+            ConfigurableSetting::FogDensity => format!("{:.5}", self.fog_density),
+            ConfigurableSetting::BloomEnabled => {
+                if self.bloom_enabled {
+                    "ON".into()
+                } else {
+                    "OFF".into()
+                }
+            }
+            ConfigurableSetting::SsaoEnabled => {
+                if self.ssao_enabled {
+                    "ON".into()
+                } else {
+                    "OFF".into()
+                }
+            }
+            ConfigurableSetting::SsrEnabled => {
+                if self.ssr_settings.enabled {
+                    "ON".into()
+                } else {
+                    "OFF".into()
+                }
+            }
+            ConfigurableSetting::DofEnabled => {
+                if self.dof_enabled {
+                    "ON".into()
+                } else {
+                    "OFF".into()
+                }
+            }
+            ConfigurableSetting::KawaseEnabled => {
+                if self.dof_settings.kawase_enabled {
+                    "ON".into()
+                } else {
+                    "OFF".into()
+                }
+            }
+            ConfigurableSetting::HzbEnabled => {
+                if self.hzb_enabled {
+                    "ON".into()
+                } else {
+                    "OFF".into()
+                }
+            }
+            ConfigurableSetting::SsilvbSamples => format!("{}", self.ssao_settings.sample_count),
+            ConfigurableSetting::SsaoRadius => format!("{:.1}", self.ssao_settings.radius),
+            ConfigurableSetting::LodDistance => format!("{:.0}", self.lod_distance),
+            ConfigurableSetting::DofFocalDistance => {
+                format!("{:.1}", self.dof_settings.focal_distance)
+            }
+            ConfigurableSetting::DofFocalRange => format!("{:.1}", self.dof_settings.focal_range),
+            ConfigurableSetting::DofBlurStrength => {
+                format!("{:.2}", self.dof_settings.blur_strength)
+            }
+            ConfigurableSetting::KawaseIterations => {
+                format!("{}", self.dof_settings.kawase_iterations)
+            }
+            ConfigurableSetting::KawaseOffset => format!("{:.2}", self.dof_settings.kawase_offset),
+            ConfigurableSetting::WaterLevel => format!("{:.1}", self.water_level),
         }
     }
 
@@ -9779,6 +9800,37 @@ impl App {
             current_y += line_spacing;
         }
 
+        // Display current debug view (F3 cycles)
+        let debug_view_text = format!("DEBUG: {}", self.input_manager.active_debug_view.name());
+        let debug_pos = [
+            ui_origin[0] - cam_up[0] * current_y,
+            ui_origin[1] - cam_up[1] * current_y,
+            ui_origin[2] - cam_up[2] * current_y,
+        ];
+        self.render_voxel_text(&debug_view_text, debug_pos, char_size, white, glow, true);
+        current_y += line_spacing;
+
+        // Display current selected setting (Tab cycles, 1/2 adjusts)
+        if let Some(setting) = self.input_manager.selected_setting {
+            let setting_val = self.get_setting_value_string(setting);
+            let setting_text = format!("SET: {} = {}", setting.name(), setting_val);
+            let setting_pos = [
+                ui_origin[0] - cam_up[0] * current_y,
+                ui_origin[1] - cam_up[1] * current_y,
+                ui_origin[2] - cam_up[2] * current_y,
+            ];
+            let yellow = [1.0, 1.0, 0.3, 1.0];
+            let yellow_glow = [1.0, 1.0, 0.3, 2.0];
+            self.render_voxel_text(
+                &setting_text,
+                setting_pos,
+                char_size,
+                yellow,
+                yellow_glow,
+                true,
+            );
+        }
+
         // Update the GPU buffer
         if !self.debug_ui_instances.is_empty() {
             let data = bytemuck::cast_slice(&self.debug_ui_instances);
@@ -13257,24 +13309,6 @@ impl ApplicationHandler for App {
                 // Forward key events to active pawn (if any)
                 if let Some(pawn) = &mut self.active_pawn {
                     pawn.process_key(key, pressed);
-                }
-
-                // Toggle pawn enter/exit with Digit1 (press only)
-                if key == KeyCode::Digit1 && pressed {
-                    if self.active_pawn.is_some() {
-                        self.active_pawn = None;
-                        log::info!("Exited pawn: returning to free camera");
-                    } else {
-                        let spawn = self.camera_controller.camera.position;
-                        self.active_pawn =
-                            Some(Box::new(voxelot::BoatPawn::new(spawn, self.water_level)));
-                        log::info!(
-                            "Spawned and entered boat at ({:.1},{:.1},{:.1})",
-                            spawn[0],
-                            spawn[1],
-                            spawn[2]
-                        );
-                    }
                 }
 
                 // Handle lighting controls on key press only

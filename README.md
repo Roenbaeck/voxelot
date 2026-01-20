@@ -82,34 +82,26 @@ cargo run --bin generate_world -- --help
 - `-` / `+` - Decrease/increase camera speed multiplier
 - `0` - Reset camera speed multiplier
 
-- **Runtime Configuration:**
-- `PageDown` / `PageUp` - Decrease/increase LOD render distance (affects how far high-detail chunks are kept)
+**Runtime Configuration:**
+- `PageDown` / `PageUp` - Decrease/increase LOD render distance
 - `Z` / `C` - Decrease/increase draw distance (far plane)
-- `K` / `L` - Decrease/increase chunk LOD render distance (100-5000 units)
-- `F` / `G` - Decrease/increase fog density
 - `ESC` - Save config and quit
 
-- **Time & Environment:**
-- `T` - Cycle time of day (day → dusk → night → dawn)
-- `Y` / `M` - Lower/raise water level
+**Time & Environment:**
+- `T` - Toggle time pause (logs current time phase)
+- `V` - Toggle vessel mode (boat) / free camera
 
-**Effects Controls:**
-- `B` - Toggle Bloom
-- `N` - Toggle SSAO
-- `H` - Toggle SSAO debug view
-- `/` - Toggle Depth of Field (DoF)
-- `X` - Toggle Kawase DoF blur
-- `,` / `.` - Decrease/increase DoF focal distance
-- `[` / `]` - Decrease/increase DoF focal range
-- `;` / `'` - Decrease/increase DoF blur strength
-- `U` / `I` - Decrease/increase Kawase offset
-- `O` / `P` - Decrease/increase Kawase iterations
-- `F1` / `F2` - Decrease/increase SSAO sample count
-- `F3` / `F4` - Decrease/increase SSAO radius
+**GUI & Debug:**
 - `F5` - Toggle GUI overlay (FPS counter & debug stats)
-- `R` - Toggle SSR (Screen Space Reflections)
-    - Also configurable via `effects.ssr.enabled` in `config.toml` (default: true)
-- `J` - Toggle HZB (Hierarchical Z-Buffer) culling
+- `F3` - Cycle debug views (None → SSAO → SSR → HZB → Refl Probe → Probe Only)
+
+**Modal Settings System (Tab + 1/2):**
+- `Tab` - Cycle through configurable settings (displayed in GUI when active)
+- `1` - Decrease value / Turn OFF (for toggles)
+- `2` - Increase value / Turn ON (for toggles)
+
+Available settings: Fog Density, Bloom, SSAO, SSR, DoF, Kawase, HZB, SSILVB Samples, SSAO Radius, LOD Distance, DoF Distance, DoF Range, DoF Strength, Kawase Iterations, Kawase Offset, Water Level
+
 
 ## Configuration
 

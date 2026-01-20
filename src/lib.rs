@@ -5,11 +5,12 @@ pub mod config;
 pub mod culling;
 pub mod file_format;
 pub mod gi;
+pub mod input;
 pub mod lib_hierarchical;
 pub mod meshing_optimized;
 pub mod palette;
-pub mod profiling;
 pub mod pawn;
+pub mod profiling;
 
 // Re-export main types
 pub use buffer_allocator::{AllocationError, SlabAllocator};
@@ -24,4 +25,4 @@ pub use lib_hierarchical::bbox_local_to_world;
 pub use lib_hierarchical::{Chunk, ShellVoxel, Voxel, VoxelType, World, WorldPos};
 pub use meshing_optimized::{generate_chunk_mesh_optimized, ChunkEmitter, ChunkMesh, MeshVertex};
 pub use palette::Palette;
-pub use pawn::{Pawn, BoatPawn};
+pub use pawn::{BoatPawn, Pawn};
