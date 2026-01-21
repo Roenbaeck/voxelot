@@ -100,22 +100,6 @@ fn load_depth_at_uv(uv: vec2<f32>) -> f32 {
     return textureLoad(scene_depth, px, 0);
 }
 
-// Consistent fog matching voxel shader
-fn apply_fog(color: vec3<f32>, distance: f32, view_dir: vec3<f32>) -> vec3<f32> {
-    let base_fog_color = vec3<f32>(0.7, 0.8, 0.9);
-    let fog_base = mix(vec3<f32>(0.02, 0.02, 0.03), camera.ambient_color.xyz, camera.skybox_brightness);
-    let fog_color = base_fog_color * fog_base * 2.0;
-    
-    let transmittance = exp(-camera.water_vis_fog_density.y * distance);
-    let fog_factor = 1.0 - transmittance;
-    
-    let sun_dir = normalize(camera.sun_direction_intensity.xyz);
-    let sun_view_dot = max(dot(-view_dir, -sun_dir), 0.0);
-    let inscatter = camera.sun_color_water_level.xyz * 0.15 * fog_factor * sun_view_dot;
-    
-    return mix(color, fog_color + inscatter, fog_factor);
-}
-
 fn reconstruct_world_pos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - 2.0 * uv.y, depth * 2.0 - 1.0, 1.0);
     let view_pos = camera.inverse_proj * ndc;
@@ -145,21 +129,20 @@ fn sample_sky_equirect(reflect_dir: vec3<f32>) -> vec3<f32> {
     return tinted * brightness;
 }
 
-fn trace_local_ssr(start_pos: vec3<f32>, dir: vec3<f32>, sky_color: vec3<f32>) -> vec4<f32> {
-    // Use parameters from the SSR UBO so range/steps are configurable
-    let step_size = params.step_size;
-    let max_steps_u = params.max_steps;
-    var current_pos = start_pos + dir * 0.2;
+fn trace_local_ssr(start_pos: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
+    let step_size = 0.8;
+    let max_steps = 180; // ~144 units
+    var current_pos = start_pos + dir * 0.2; 
 
     let dim = textureDimensions(scene_depth);
     let fdim = vec2<f32>(dim);
 
-    for (var i: u32 = 0u; i < max_steps_u; i = i + 1u) {
+    for (var i = 0; i < max_steps; i++) {
         current_pos += dir * step_size;
 
         let clip_pos = camera.view_proj * vec4<f32>(current_pos, 1.0);
         if (clip_pos.w <= 0.0) { continue; }
-
+        
         let ndc = clip_pos.xyz / clip_pos.w;
         let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
 
@@ -170,7 +153,7 @@ fn trace_local_ssr(start_pos: vec3<f32>, dir: vec3<f32>, sky_color: vec3<f32>) -
         let px = vec2<i32>(uv * fdim);
         let d_raw = textureLoad(scene_depth, px, 0);
 
-        if (d_raw >= 0.999999 || d_raw <= 0.0) { continue; }
+        if (d_raw >= 0.999999 || d_raw <= 0.0) { continue; } 
 
         let sample_pos = reconstruct_world_pos(uv, d_raw);
         let dist_sample = distance(camera.camera_pos, sample_pos);
@@ -178,13 +161,12 @@ fn trace_local_ssr(start_pos: vec3<f32>, dir: vec3<f32>, sky_color: vec3<f32>) -
 
         // Ray is "behind" surface from camera view
         if (dist_ray > dist_sample + 0.05) {
-            // Thickness can be adjusted via UBO
-            let thickness = params.thickness + f32(i) * 0.015;
+            let thickness = 0.5 + f32(i) * 0.015;
             if (dist_ray - dist_sample < thickness) {
-                // Binary refinement for better precision (use UBO limit)
+                // Binary refinement for better precision
                 var refine_pos = current_pos;
                 var prev_pos = current_pos - dir * step_size;
-                for (var j: u32 = 0u; j < params.max_binary_steps; j = j + 1u) {
+                for (var j = 0; j < 3; j++) {
                     let mid = mix(prev_pos, refine_pos, 0.5);
                     let mid_clip = camera.view_proj * vec4<f32>(mid, 1.0);
                     let mid_ndc = mid_clip.xyz / mid_clip.w;
@@ -205,23 +187,11 @@ fn trace_local_ssr(start_pos: vec3<f32>, dir: vec3<f32>, sky_color: vec3<f32>) -
                 let color = textureLoad(scene_color, final_px, 0).rgb;
                 // Tight edge fade
                 let edge_fade = clamp(10.0 * min(min(final_uv.x, 1.0 - final_uv.x), min(final_uv.y, 1.0 - final_uv.y)), 0.0, 1.0);
-                
-                // Fog the screen-space reflection based on distance to the point
-                let ssr_dist = distance(start_pos, refine_pos);
-                let fogged_ssr = apply_fog(color, ssr_dist, dir);
-                
-                return vec4<f32>(fogged_ssr, edge_fade);
+                return vec4<f32>(color, edge_fade);
             }
         }
     }
-
-    // No precise screen-space hit: return sky_color with a distance-based confidence
-    let marched = distance(start_pos, current_pos);
-    let max_dist = f32(params.max_steps) * params.step_size + 0.2;
-    var conf = clamp(1.0 - (marched / max_dist), 0.0, 1.0);
-    // bias the falloff to make the transition visually pleasant
-    conf = pow(conf, 1.5);
-    return vec4<f32>(sky_color * conf, conf);
+    return vec4<f32>(0.0, 0.0, 0.0, 0.0);
 }
 
 // Optimized radiance: 3 samples with branchless selection (Integer/Discrete version)
@@ -441,7 +411,7 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                                 let px = vec2<i32>(screen_uv * vec2<f32>(dim));
                                 let d_buf = textureLoad(scene_depth, px, 0);
                                 // Skip background or invalid depth
-                                if (d_buf < 0.9999) {
+                                if (d_buf < 0.999999) {
                                     let mesh_pos = reconstruct_world_pos(screen_uv, d_buf);
                                     let dist = distance(mesh_pos, hit_point);
                                     // Require closer match and roughly similar surface normal to avoid snapping to unrelated geometry
@@ -463,7 +433,7 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                         
                         // Hit below water
                         if (hit_point.y < camera.sun_color_water_level.w) {
-                            accumulated_color += camera.water_color.rgb * remaining_alpha;
+                            accumulated_color += water_color * remaining_alpha;
                             remaining_alpha = 0.0;
                             break;
                         }
@@ -490,7 +460,7 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                                     let hit_dist_to_cam = distance(camera.camera_pos, hit_point);
                                     
                                     // Disprove if the screen depth is significantly behind the hit point
-                                    if (d_raw >= 0.9999 || mesh_dist_to_cam > hit_dist_to_cam + 1.0) {
+                                    if (d_raw >= 0.999999 || mesh_dist_to_cam > hit_dist_to_cam + 1.0) {
                                         screen_disproved = true;
                                     }
                                 }
@@ -515,7 +485,6 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                             let hit_data = textureLoad(gi_probe_color, current_i, 0);
                             let rad = sample_radiance_int(current_i, reflect_dir);
 
-                            let sun_dir = normalize(camera.sun_direction_intensity.xyz);
                             let dot_sun = saturate(dot(hit_normal, sun_dir));
                             let sun_lit = camera.sun_color_water_level.xyz * camera.sun_direction_intensity.w * dot_sun * 1.5;
                             let base_color = hit_data.rgb * (rad * 2.5 + sun_lit);
@@ -535,11 +504,8 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                             }
 
                             let final_color = mix(lit_color, mesh_color, mesh_blend);
-                            
-                            // Fog the reflected object based on its distance from the reflection point
-                            let fogged_reflection = apply_fog(final_color, t_current, reflect_dir);
 
-                            accumulated_color += fogged_reflection * remaining_alpha;
+                            accumulated_color += final_color * remaining_alpha;
                             remaining_alpha = 0.0;
                             break;
                         }
@@ -548,8 +514,7 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                         // Bizarre case: Dense chunk, solid bbox, but ray missed bbox face or started inside.
                         // Implies empty space inside bbox (or precision issue).
                         // Since we are "inside" the bounding volume, assume we are seeing water.
-                        let water_fogged = apply_fog(water_color, t_current, reflect_dir);
-                        accumulated_color += water_fogged * remaining_alpha;
+                        accumulated_color += water_color * remaining_alpha;
                         remaining_alpha = 0.0;
                         break;
                     }
@@ -557,8 +522,7 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                     // Chunk submerged fully or partially -> but we had an opportunity?
                     // If AABB is submerged, geometry check is skipped.
                     // Water wins.
-                    let water_fogged = apply_fog(water_color, t_current, reflect_dir);
-                    accumulated_color += water_fogged * remaining_alpha;
+                    accumulated_color += water_color * remaining_alpha;
                     remaining_alpha = 0.0;
                     break;
                 }
@@ -577,11 +541,8 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                         let sun_lit = camera.sun_color_water_level.xyz * camera.sun_direction_intensity.w * 0.5;
                         let lit_color = hit_data.rgb * (rad * 2.5 + sun_lit);
 
-                        // Fog the reflected object
-                        let fogged_lit = apply_fog(lit_color, t_current, reflect_dir);
-
                         let alpha = saturate(hit_data.a * 2.0) * remaining_alpha;
-                        accumulated_color += fogged_lit * alpha;
+                        accumulated_color += lit_color * alpha;
                         remaining_alpha -= alpha;
 
                         if (remaining_alpha < 0.1) {
@@ -655,7 +616,6 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     let world_pos = reconstruct_world_pos(input.uv, depth);
-    let dist_to_cam = distance(camera.camera_pos, world_pos);
 
     // Skip submerged surfaces
     if (camera.water_vis_fog_density.x > 0.0 && world_pos.y < camera.sun_color_water_level.w) {
@@ -672,13 +632,13 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let sky_color = sample_sky_equirect(reflect_dir);
     
     // Hybrid: Local Screen-Space Raymarch + Distant GI Grid Trace
-    let ssr_res = trace_local_ssr(world_pos, reflect_dir, sky_color);
+    let ssr_res = trace_local_ssr(world_pos, reflect_dir);
     
     // Hybrid Strategy: 
-    // - Use High-Res SSR for close-to-mid range (configurable via UBO).
+    // - Use High-Res SSR for everything on-screen up to ~140 units.
     // - Start GI Trace further out to avoid "Phantom AABB" artifacts from local geometry.
     // - If SSR misses, GI starts closer to pick up low-frequency details.
-    let gi_start_offset = mix(2.0, 32.0, ssr_res.a);
+    let gi_start_offset = mix(2.0, 64.0, ssr_res.a);
     let gi_res_raw = sample_gi_grid(world_pos + reflect_dir * gi_start_offset, reflect_dir, sky_color);
     
     // If we have a clear SSR hit (no fade), ignore GI entirely for this ray.
@@ -690,9 +650,6 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     
     let out_color = mix(sky_color, gi_res.rgb, gi_res.a);
 
-    // Attenuate reflection by transmittance based on distance to surface.
-    // This ensures reflections fade into the fog along with the surface they are on.
-    let transmittance = exp(-camera.water_vis_fog_density.y * dist_to_cam);
-    return vec4<f32>(out_color * transmittance, reflectivity);
+    return vec4<f32>(out_color, reflectivity);
 }
 
