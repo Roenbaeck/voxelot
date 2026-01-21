@@ -17,12 +17,11 @@ struct CameraUniforms {
     _pad_gi1: i32,
     gi_grid_dims: vec3<i32>,
     _pad_gi2: i32,
-    sun_direction: vec3<f32>,
-    sun_intensity: f32,
-    sun_color: vec3<f32>,
-    water_level: f32,
-    water_visibility: f32,
+    sun_direction_intensity: vec4<f32>,
+    sun_color_water_level: vec4<f32>,
+    water_vis_fog_density: vec4<f32>,
     water_color: vec4<f32>,
+    ambient_color: vec4<f32>,
 }
 
 struct SSRParams {
@@ -99,6 +98,22 @@ fn load_depth_at_uv(uv: vec2<f32>) -> f32 {
     let dim = textureDimensions(scene_depth);
     let px = clamp(vec2<i32>(uv * vec2<f32>(dim)), vec2<i32>(0), vec2<i32>(dim) - 1);
     return textureLoad(scene_depth, px, 0);
+}
+
+// Consistent fog matching voxel shader
+fn apply_fog(color: vec3<f32>, distance: f32, view_dir: vec3<f32>) -> vec3<f32> {
+    let base_fog_color = vec3<f32>(0.7, 0.8, 0.9);
+    let fog_base = mix(vec3<f32>(0.02, 0.02, 0.03), camera.ambient_color.xyz, camera.skybox_brightness);
+    let fog_color = base_fog_color * fog_base * 2.0;
+    
+    let transmittance = exp(-camera.water_vis_fog_density.y * distance);
+    let fog_factor = 1.0 - transmittance;
+    
+    let sun_dir = normalize(camera.sun_direction_intensity.xyz);
+    let sun_view_dot = max(dot(-view_dir, -sun_dir), 0.0);
+    let inscatter = camera.sun_color_water_level.xyz * 0.15 * fog_factor * sun_view_dot;
+    
+    return mix(color, fog_color + inscatter, fog_factor);
 }
 
 fn reconstruct_world_pos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
@@ -190,7 +205,12 @@ fn trace_local_ssr(start_pos: vec3<f32>, dir: vec3<f32>, sky_color: vec3<f32>) -
                 let color = textureLoad(scene_color, final_px, 0).rgb;
                 // Tight edge fade
                 let edge_fade = clamp(10.0 * min(min(final_uv.x, 1.0 - final_uv.x), min(final_uv.y, 1.0 - final_uv.y)), 0.0, 1.0);
-                return vec4<f32>(color, edge_fade);
+                
+                // Fog the screen-space reflection based on distance to the point
+                let ssr_dist = distance(start_pos, refine_pos);
+                let fogged_ssr = apply_fog(color, ssr_dist, dir);
+                
+                return vec4<f32>(fogged_ssr, edge_fade);
             }
         }
     }
@@ -273,7 +293,7 @@ fn is_water_visible_at_chunk(chunk_i: vec3<i32>, world_grid_origin: vec3<f32>, w
         let chunk_origin_z = f32(chunk_i.z) * 16.0 + world_grid_origin.z;
 
         // If the chunk is completely submerged, water is visible above it
-        if (chunk_origin_y + ymax + 1.0) < camera.water_level {
+        if (chunk_origin_y + ymax + 1.0) < camera.sun_color_water_level.w {
             return true;
         }
 
@@ -285,7 +305,7 @@ fn is_water_visible_at_chunk(chunk_i: vec3<i32>, world_grid_origin: vec3<f32>, w
         if (lx >= xmin - 0.1 && lx <= xmax + 1.1 && lz >= zmin - 0.1 && lz <= zmax + 1.1) {
              // We are inside the horizontal bounds of the solid part.
              // If the solid part goes below water, then it blocks water.
-             if (chunk_origin_y + ymin <= camera.water_level) {
+             if (chunk_origin_y + ymin <= camera.sun_color_water_level.w) {
                  return false;
              }
         }
@@ -297,13 +317,13 @@ fn is_water_visible_at_chunk(chunk_i: vec3<i32>, world_grid_origin: vec3<f32>, w
 fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<f32>) -> vec4<f32> {
     let dims = vec3<f32>(camera.gi_grid_dims);
     let world_grid_origin = vec3<f32>(camera.gi_grid_origin) * 16.0;
-    let sun_dir = normalize(camera.sun_direction);
+    let sun_dir = normalize(camera.sun_direction_intensity.xyz);
     let brightness = camera.skybox_brightness;
 
     // Water plane intersection
     var t_water = -1.0;
     if (abs(reflect_dir.y) > 0.001) {
-        t_water = (camera.water_level - world_pos.y) / reflect_dir.y;
+        t_water = (camera.sun_color_water_level.w - world_pos.y) / reflect_dir.y;
     }
 
     // Water color - blend skybox reflection for visual structure
@@ -394,7 +414,7 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                 let aabb_max = chunk_origin + vec3<f32>(xmax + 1.0, ymax + 1.0, zmax + 1.0);
                 
                 // Skip submerged chunks
-                if (aabb_max.y >= camera.water_level) {
+                if (aabb_max.y >= camera.sun_color_water_level.w) {
                     let hit = ray_aabb_intersection(world_pos, reflect_dir, aabb_min, aabb_max);
                     
                     // Only enforce the large bias (0.1) if we are in the same chunk as the origin.
@@ -442,8 +462,8 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                         }
                         
                         // Hit below water
-                        if (hit_point.y < camera.water_level) {
-                            accumulated_color += water_color * remaining_alpha;
+                        if (hit_point.y < camera.sun_color_water_level.w) {
+                            accumulated_color += camera.water_color.rgb * remaining_alpha;
                             remaining_alpha = 0.0;
                             break;
                         }
@@ -495,8 +515,9 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                             let hit_data = textureLoad(gi_probe_color, current_i, 0);
                             let rad = sample_radiance_int(current_i, reflect_dir);
 
+                            let sun_dir = normalize(camera.sun_direction_intensity.xyz);
                             let dot_sun = saturate(dot(hit_normal, sun_dir));
-                            let sun_lit = camera.sun_color * camera.sun_intensity * dot_sun * 1.5;
+                            let sun_lit = camera.sun_color_water_level.xyz * camera.sun_direction_intensity.w * dot_sun * 1.5;
                             let base_color = hit_data.rgb * (rad * 2.5 + sun_lit);
                             
                             // Secondary reflection (simplified Fresnel, reuse sky_color)
@@ -514,8 +535,11 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                             }
 
                             let final_color = mix(lit_color, mesh_color, mesh_blend);
+                            
+                            // Fog the reflected object based on its distance from the reflection point
+                            let fogged_reflection = apply_fog(final_color, t_current, reflect_dir);
 
-                            accumulated_color += final_color * remaining_alpha;
+                            accumulated_color += fogged_reflection * remaining_alpha;
                             remaining_alpha = 0.0;
                             break;
                         }
@@ -524,7 +548,8 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                         // Bizarre case: Dense chunk, solid bbox, but ray missed bbox face or started inside.
                         // Implies empty space inside bbox (or precision issue).
                         // Since we are "inside" the bounding volume, assume we are seeing water.
-                        accumulated_color += water_color * remaining_alpha;
+                        let water_fogged = apply_fog(water_color, t_current, reflect_dir);
+                        accumulated_color += water_fogged * remaining_alpha;
                         remaining_alpha = 0.0;
                         break;
                     }
@@ -532,14 +557,15 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                     // Chunk submerged fully or partially -> but we had an opportunity?
                     // If AABB is submerged, geometry check is skipped.
                     // Water wins.
-                    accumulated_color += water_color * remaining_alpha;
+                    let water_fogged = apply_fog(water_color, t_current, reflect_dir);
+                    accumulated_color += water_fogged * remaining_alpha;
                     remaining_alpha = 0.0;
                     break;
                 }
             } else {
                 // Fallback: semi-transparent volume
                 let chunk_min_y = f32(current_i.y) * 16.0 + world_grid_origin.y;
-                if (chunk_min_y + 16.0 >= camera.water_level) {
+                if (chunk_min_y + 16.0 >= camera.sun_color_water_level.w) {
                     // Use discrete probe lookup to avoid trilinear bleeding at chunk boundaries
                     let entry_uvw = (start_pos + safe_dir * t_current - world_grid_origin) / (dims * 16.0);
                     let entry_chunk_f = entry_uvw * vec3<f32>(camera.gi_grid_dims);
@@ -548,11 +574,14 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                     if (all(entry_chunk_i >= vec3<i32>(0)) && all(entry_chunk_i < camera.gi_grid_dims)) {
                         let hit_data = textureLoad(gi_probe_color, entry_chunk_i, 0);
                         let rad = sample_radiance_int(entry_chunk_i, reflect_dir);
-                        let sun_lit = camera.sun_color * camera.sun_intensity * 0.5;
+                        let sun_lit = camera.sun_color_water_level.xyz * camera.sun_direction_intensity.w * 0.5;
                         let lit_color = hit_data.rgb * (rad * 2.5 + sun_lit);
 
+                        // Fog the reflected object
+                        let fogged_lit = apply_fog(lit_color, t_current, reflect_dir);
+
                         let alpha = saturate(hit_data.a * 2.0) * remaining_alpha;
-                        accumulated_color += lit_color * alpha;
+                        accumulated_color += fogged_lit * alpha;
                         remaining_alpha -= alpha;
 
                         if (remaining_alpha < 0.1) {
@@ -626,9 +655,10 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     let world_pos = reconstruct_world_pos(input.uv, depth);
+    let dist_to_cam = distance(camera.camera_pos, world_pos);
 
     // Skip submerged surfaces
-    if (camera.water_visibility > 0.0 && world_pos.y < camera.water_level) {
+    if (camera.water_vis_fog_density.x > 0.0 && world_pos.y < camera.sun_color_water_level.w) {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
     
@@ -660,6 +690,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     
     let out_color = mix(sky_color, gi_res.rgb, gi_res.a);
 
-    return vec4<f32>(out_color, reflectivity);
+    // Attenuate reflection by transmittance based on distance to surface.
+    // This ensures reflections fade into the fog along with the surface they are on.
+    let transmittance = exp(-camera.water_vis_fog_density.y * dist_to_cam);
+    return vec4<f32>(out_color * transmittance, reflectivity);
 }
 

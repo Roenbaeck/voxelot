@@ -609,13 +609,11 @@ struct SsrCameraUniforms {
     gi_grid_dims: [i32; 3],
     _pad_gi2: i32,
     // Dynamic sunlight for reflections
-    sun_direction: [f32; 3],
-    sun_intensity: f32,
-    sun_color: [f32; 3],
-    water_level: f32,
-    water_visibility: f32,
+    sun_direction_intensity: [f32; 4],
+    sun_color_water_level: [f32; 4],
+    water_vis_fog_density: [f32; 4],
     water_color: [f32; 4],
-    _pad_end: [f32; 3],
+    ambient_color: [f32; 4],
 }
 
 /// Depth-of-field runtime settings (CPU-side convenience)
@@ -11949,17 +11947,16 @@ impl App {
                     self.gi_grid_dims.z,
                 ],
                 _pad_gi2: 0,
-                sun_direction: [
+                sun_direction_intensity: [
                     sun_direction_vec.x,
                     sun_direction_vec.y,
                     sun_direction_vec.z,
+                    sun_fade,
                 ],
-                sun_intensity: sun_fade,
-                sun_color: [sun_color[0], sun_color[1], sun_color[2]],
-                water_level: self.water_level,
-                water_visibility: self.water_visibility,
+                sun_color_water_level: [sun_color[0], sun_color[1], sun_color[2], self.water_level],
+                water_vis_fog_density: [self.water_visibility, self.fog_density, 0.0, 0.0],
                 water_color: [0.0, 0.3, 0.5, 0.6],
-                _pad_end: [0.0, 0.0, 0.0],
+                ambient_color: [ambient_color[0], ambient_color[1], ambient_color[2], 0.0],
             };
             queue.write_buffer(ssr_cam_buf, 0, bytemuck::bytes_of(&ssr_cam));
 
