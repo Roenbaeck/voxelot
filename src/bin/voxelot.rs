@@ -665,6 +665,8 @@ struct CompositeUniforms {
     near: f32,
     far: f32,
     ssr_enabled: f32, // Whether to apply SSR reflections (1.0 = enabled)
+    gi_combined_debug: f32,
+    radiance_cascades_debug: f32,
     _pad: [f32; 2],
     uv_scale: [f32; 2],
     uv_offset: [f32; 2],
@@ -1468,9 +1470,8 @@ struct App {
     reflection_probe_crossfade_alpha: f32,
     reflection_probe_valid: [bool; 2],
     reflection_probe_anchor: [[f32; 3]; 2],
-    reflection_probe_debug: bool,
-    reflection_probe_probe_only: bool,
-    reflection_probe_flip_y: bool,
+    gi_combined_debug: bool,
+    radiance_cascades_debug: bool,
     probe_uniform_buffer: Option<wgpu::Buffer>,
 
     // Scene color copy for water reflections (avoids read-while-write conflict)
@@ -2756,9 +2757,8 @@ impl App {
                 ];
                 [snapped, snapped]
             },
-            reflection_probe_debug: false,
-            reflection_probe_probe_only: false,
-            reflection_probe_flip_y: true,
+            gi_combined_debug: false,
+            radiance_cascades_debug: false,
             probe_uniform_buffer: None,
 
             scene_copy_texture: None,
@@ -3053,6 +3053,12 @@ impl App {
             near: self.camera_controller.camera.near,
             far: self.camera_controller.camera.far,
             ssr_enabled: if self.ssr_settings.enabled { 1.0 } else { 0.0 },
+            gi_combined_debug: if self.gi_combined_debug { 1.0 } else { 0.0 },
+            radiance_cascades_debug: if self.radiance_cascades_debug {
+                1.0
+            } else {
+                0.0
+            },
             _pad: [0.0; 2],
             uv_scale: [crop_scale, crop_scale],
             uv_offset: [crop_offset, crop_offset],
@@ -3165,8 +3171,8 @@ impl App {
                 self.ssao_debug = false;
                 self.ssr_debug = false;
                 self.hzb_debug = false;
-                self.reflection_probe_debug = false;
-                self.reflection_probe_probe_only = false;
+                self.gi_combined_debug = false;
+                self.radiance_cascades_debug = false;
 
                 // Set the appropriate flag based on active view
                 match self.input_manager.active_debug_view {
@@ -3181,11 +3187,11 @@ impl App {
                         self.hzb_debug = true;
                         self.pending_recreate_offscreen = true;
                     }
-                    DebugView::ReflectionProbe => {
-                        self.reflection_probe_debug = true;
+                    DebugView::GiCombined => {
+                        self.gi_combined_debug = true;
                     }
-                    DebugView::ProbeOnly => {
-                        self.reflection_probe_probe_only = true;
+                    DebugView::RadianceCascades => {
+                        self.radiance_cascades_debug = true;
                     }
                 }
                 log::info!(

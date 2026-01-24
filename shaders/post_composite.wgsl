@@ -13,6 +13,8 @@ struct CompositeUniforms {
     near: f32,
     far: f32,
     ssr_enabled: f32,  // Whether to apply SSR reflections
+    gi_combined_debug: f32,
+    radiance_cascades_debug: f32,
     _pad: vec2<f32>,
     uv_scale: vec2<f32>,
     uv_offset: vec2<f32>,
@@ -99,6 +101,7 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
         return vec4<f32>(ssr_col.rgb, 1.0);
     }
 
+
     // HZB debug grid: splits screen into 4x4 tiles showing mip 0..15
     if (composite.hzb_debug > 0.5) {
         let tiles: f32 = 4.0;
@@ -150,6 +153,16 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
 
     // Sample Radiance Cascades (RC) high-frequency GI
     let rc_light = textureSample(rc_texture, post_sampler, sample_uv).rgb;
+
+    // GI/SSGI Debug overlay: show combined indirect light
+    if (composite.gi_combined_debug > 0.5) {
+        return vec4<f32>(indirect_light * composite.indirect_light_scale, 1.0);
+    }
+
+    // RC Debug overlay: show Radiance Cascades light
+    if (composite.radiance_cascades_debug > 0.5) {
+        return vec4<f32>(rc_light * composite.indirect_light_scale, 1.0);
+    }
 
     // Note: direct emissive is already included in 'base' (added in DoF CoC pass)
     // Apply AO to all lighting (direct + bloom + GI)

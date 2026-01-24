@@ -7,8 +7,8 @@ pub enum DebugView {
     Ssao,
     Ssr,
     Hzb,
-    ReflectionProbe,
-    ProbeOnly,
+    GiCombined,
+    RadianceCascades,
 }
 
 impl DebugView {
@@ -17,9 +17,9 @@ impl DebugView {
             DebugView::None => DebugView::Ssao,
             DebugView::Ssao => DebugView::Ssr,
             DebugView::Ssr => DebugView::Hzb,
-            DebugView::Hzb => DebugView::ReflectionProbe,
-            DebugView::ReflectionProbe => DebugView::ProbeOnly,
-            DebugView::ProbeOnly => DebugView::None,
+            DebugView::Hzb => DebugView::GiCombined,
+            DebugView::GiCombined => DebugView::RadianceCascades,
+            DebugView::RadianceCascades => DebugView::None,
         }
     }
 
@@ -29,8 +29,8 @@ impl DebugView {
             DebugView::Ssao => "SSAO",
             DebugView::Ssr => "SSR",
             DebugView::Hzb => "HZB",
-            DebugView::ReflectionProbe => "Refl Probe",
-            DebugView::ProbeOnly => "Probe Only",
+            DebugView::GiCombined => "GI Combined",
+            DebugView::RadianceCascades => "Radiance Cascades",
         }
     }
 }
