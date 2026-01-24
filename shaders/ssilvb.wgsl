@@ -16,7 +16,7 @@ struct SsaoUniforms {
     grid_origin: vec3<i32>,
     _pad3: i32,
     grid_dims: vec3<i32>,
-    _pad4: i32,
+    debug_mode: u32,
 };
 
 @group(0) @binding(0) var<uniform> ssao: SsaoUniforms;
@@ -368,8 +368,16 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let camera_pos = ssao.inverse_view[3].xyz;
     
     // Sample GI from probes
-    // Scale factor is configurable (gi_indirect_scale in config.toml)
-    var indirect_light = (sample_grid_irradiance(world_pos, world_normal, camera_pos) + ssgi_irradiance) * ssao.gi_indirect_scale;
+    let grid_gi = sample_grid_irradiance(world_pos, world_normal, camera_pos);
+    
+    var indirect_light = vec3<f32>(0.0);
+    if (ssao.debug_mode == 1u) {
+        indirect_light = grid_gi;
+    } else if (ssao.debug_mode == 2u) {
+        indirect_light = ssgi_irradiance;
+    } else {
+        indirect_light = grid_gi + ssgi_irradiance;
+    }
     
     // Fade AO and GI for underwater surfaces to prevent them being visible through water
     let underwater_depth = ssao.water_level - world_pos.y;

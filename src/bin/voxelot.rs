@@ -34,8 +34,8 @@ use std::collections::VecDeque;
 use sysinfo::{Pid, ProcessExt, System, SystemExt};
 use voxelot::SlabAllocator;
 use voxelot::{
-    bbox_local_to_world, cull_visible_voxels_parallel, Camera, Chunk, ChunkMesh, CullStats,
-    Palette, RenderConfig, VoxelInstance, World, WorldPos,
+    bbox_local_to_world, cull_visible_voxels_parallel, input::DebugView, Camera, Chunk, ChunkMesh,
+    CullStats, Palette, RenderConfig, VoxelInstance, World, WorldPos,
 };
 
 macro_rules! viewer_debug {
@@ -667,6 +667,8 @@ struct CompositeUniforms {
     ssr_enabled: f32, // Whether to apply SSR reflections (1.0 = enabled)
     gi_combined_debug: f32,
     radiance_cascades_debug: f32,
+    gi_probes_debug: f32,
+    gi_ssgi_debug: f32,
     _pad: [f32; 2],
     uv_scale: [f32; 2],
     uv_offset: [f32; 2],
@@ -757,7 +759,7 @@ struct SsaoUniformsRaw {
     grid_origin: [i32; 3],
     _pad3: i32,
     grid_dims: [i32; 3],
-    _pad4: i32,
+    debug_mode: u32,
 }
 
 #[repr(C)]
@@ -1471,6 +1473,8 @@ struct App {
     reflection_probe_valid: [bool; 2],
     reflection_probe_anchor: [[f32; 3]; 2],
     gi_combined_debug: bool,
+    gi_probes_debug: bool,
+    gi_ssgi_debug: bool,
     radiance_cascades_debug: bool,
     probe_uniform_buffer: Option<wgpu::Buffer>,
 
@@ -2758,6 +2762,8 @@ impl App {
                 [snapped, snapped]
             },
             gi_combined_debug: false,
+            gi_probes_debug: false,
+            gi_ssgi_debug: false,
             radiance_cascades_debug: false,
             probe_uniform_buffer: None,
 
@@ -2992,7 +2998,11 @@ impl App {
             grid_origin: self.gi_grid_origin.into(),
             _pad3: 0,
             grid_dims: self.gi_grid_dims.into(),
-            _pad4: 0,
+            debug_mode: match self.input_manager.active_debug_view {
+                DebugView::GiProbes => 1,
+                DebugView::GiSsgi => 2,
+                _ => 0,
+            },
         }
     }
 
@@ -3007,7 +3017,7 @@ impl App {
             t * t * (3.0 - 2.0 * t)
         };
 
-        let indirect_light_scale = if t < 0.20 {
+        let mut indirect_light_scale = if t < 0.20 {
             // Midnight to dawn: full visibility ramping down
             1.0 - smoothstep(0.0, 0.20, t) * 0.5
         } else if t < 0.25 {
@@ -3023,6 +3033,7 @@ impl App {
             // Dusk to midnight: ramp to full visibility
             0.5 + 0.5 * smoothstep(0.80, 1.0, t)
         };
+        indirect_light_scale *= self.gi_settings.indirect_scale;
 
         let hdr_exposure_boost = if self.hdr_active {
             self.user_config.rendering.macos_hdr_exposure_boost
@@ -3059,6 +3070,8 @@ impl App {
             } else {
                 0.0
             },
+            gi_probes_debug: if self.gi_probes_debug { 1.0 } else { 0.0 },
+            gi_ssgi_debug: if self.gi_ssgi_debug { 1.0 } else { 0.0 },
             _pad: [0.0; 2],
             uv_scale: [crop_scale, crop_scale],
             uv_offset: [crop_offset, crop_offset],
@@ -3172,6 +3185,8 @@ impl App {
                 self.ssr_debug = false;
                 self.hzb_debug = false;
                 self.gi_combined_debug = false;
+                self.gi_probes_debug = false;
+                self.gi_ssgi_debug = false;
                 self.radiance_cascades_debug = false;
 
                 // Set the appropriate flag based on active view
@@ -3189,6 +3204,12 @@ impl App {
                     }
                     DebugView::GiCombined => {
                         self.gi_combined_debug = true;
+                    }
+                    DebugView::GiProbes => {
+                        self.gi_probes_debug = true;
+                    }
+                    DebugView::GiSsgi => {
+                        self.gi_ssgi_debug = true;
                     }
                     DebugView::RadianceCascades => {
                         self.radiance_cascades_debug = true;

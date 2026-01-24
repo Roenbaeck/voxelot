@@ -15,6 +15,8 @@ struct CompositeUniforms {
     ssr_enabled: f32,  // Whether to apply SSR reflections
     gi_combined_debug: f32,
     radiance_cascades_debug: f32,
+    gi_probes_debug: f32,
+    gi_ssgi_debug: f32,
     _pad: vec2<f32>,
     uv_scale: vec2<f32>,
     uv_offset: vec2<f32>,
@@ -87,8 +89,8 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
         let viewport_uv = (sample_uv - composite.uv_offset) / composite.uv_scale;
         
         if (viewport_uv.x < 0.5) {
-            // Show accumulated indirect light (SSGI) on the left
-            return vec4<f32>(indirect_light * composite.indirect_light_scale, 1.0);
+            // Show accumulated indirect light (SSGI) on the left (unscaled for debug visibility)
+            return vec4<f32>(indirect_light, 1.0);
         } else {
             // Show raw AO as greyscale on the right
             return vec4<f32>(vec3<f32>(raw_ao), 1.0);
@@ -154,14 +156,24 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     // Sample Radiance Cascades (RC) high-frequency GI
     let rc_light = textureSample(rc_texture, post_sampler, sample_uv).rgb;
 
-    // GI/SSGI Debug overlay: show combined indirect light
+    // GI Combined Debug overlay: show combined indirect light (scaled to match scene)
     if (composite.gi_combined_debug > 0.5) {
         return vec4<f32>(indirect_light * composite.indirect_light_scale, 1.0);
     }
 
+    // GI Probes Debug overlay: show only probe contribution
+    if (composite.gi_probes_debug > 0.5) {
+        return vec4<f32>(indirect_light, 1.0);
+    }
+
+    // GI SSGI Debug overlay: show only SSGI contribution
+    if (composite.gi_ssgi_debug > 0.5) {
+        return vec4<f32>(indirect_light, 1.0);
+    }
+
     // RC Debug overlay: show Radiance Cascades light
     if (composite.radiance_cascades_debug > 0.5) {
-        return vec4<f32>(rc_light * composite.indirect_light_scale, 1.0);
+        return vec4<f32>(rc_light, 1.0);
     }
 
     // Note: direct emissive is already included in 'base' (added in DoF CoC pass)

@@ -8,6 +8,8 @@ pub enum DebugView {
     Ssr,
     Hzb,
     GiCombined,
+    GiProbes,
+    GiSsgi,
     RadianceCascades,
 }
 
@@ -18,7 +20,9 @@ impl DebugView {
             DebugView::Ssao => DebugView::Ssr,
             DebugView::Ssr => DebugView::Hzb,
             DebugView::Hzb => DebugView::GiCombined,
-            DebugView::GiCombined => DebugView::RadianceCascades,
+            DebugView::GiCombined => DebugView::GiProbes,
+            DebugView::GiProbes => DebugView::GiSsgi,
+            DebugView::GiSsgi => DebugView::RadianceCascades,
             DebugView::RadianceCascades => DebugView::None,
         }
     }
@@ -30,6 +34,8 @@ impl DebugView {
             DebugView::Ssr => "SSR",
             DebugView::Hzb => "HZB",
             DebugView::GiCombined => "GI Combined",
+            DebugView::GiProbes => "GI Probes",
+            DebugView::GiSsgi => "GI SSGI",
             DebugView::RadianceCascades => "Radiance Cascades",
         }
     }
