@@ -31,6 +31,7 @@ struct SsaoUniforms {
 @group(0) @binding(7) var gi_probe_pz: texture_3d<f32>;
 @group(0) @binding(8) var gi_probe_nz: texture_3d<f32>;
 @group(0) @binding(9) var normal_tex: texture_2d<f32>;
+@group(0) @binding(10) var screen_color_tex: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -243,6 +244,7 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let radius = ssao.sample_radius;
     
     var visibility = 0.0;
+    var ssgi_irradiance = vec3<f32>(0.0);
     
     let proj_scale = inv_proj_11 * ssao.screen_height;
     let screen_radius = (radius * proj_scale) / -view_pos.z;
@@ -271,6 +273,7 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
         }
         
         var occlusion_bits = 0u;
+        var slice_irradiance = vec3<f32>(0.0);
         
         for (var side = 0u; side < 2u; side = side + 1u) {
             if (occlusion_bits == 0xFFFFFFFFu) { break; }
@@ -330,6 +333,11 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
                     let count = min(end_bit - start_bit, 32u - start_bit);
                     if (count > 0u) {
                         let mask = (0xFFFFFFFFu >> (32u - count)) << start_bit;
+                        let new_bits = mask & (~occlusion_bits);
+                        if (new_bits != 0u) {
+                            let sample_color = textureSampleLevel(screen_color_tex, post_sampler, sample_uv, 0.0).rgb;
+                            slice_irradiance += sample_color * f32(count_bits(new_bits));
+                        }
                         occlusion_bits = occlusion_bits | mask;
                     }
                 }
@@ -342,9 +350,11 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
         
         let occluded_fraction = f32(count_bits(occlusion_bits)) / 32.0;
         visibility += 1.0 - occluded_fraction;
+        ssgi_irradiance += slice_irradiance / 32.0;
     }
     
     visibility /= f32(ssao.slice_count);
+    ssgi_irradiance /= f32(ssao.slice_count);
 
     // Softer AO exponent (was 2.0)
     visibility = pow(visibility, 1.3);
@@ -359,7 +369,7 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     
     // Sample GI from probes
     // Scale factor is configurable (gi_indirect_scale in config.toml)
-    var indirect_light = sample_grid_irradiance(world_pos, world_normal, camera_pos) * ssao.gi_indirect_scale;
+    var indirect_light = (sample_grid_irradiance(world_pos, world_normal, camera_pos) + ssgi_irradiance) * ssao.gi_indirect_scale;
     
     // Fade AO and GI for underwater surfaces to prevent them being visible through water
     let underwater_depth = ssao.water_level - world_pos.y;

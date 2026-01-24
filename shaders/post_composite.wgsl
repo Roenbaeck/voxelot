@@ -79,10 +79,18 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
         ao = 1.0 - composite.ssao_strength * (1.0 - raw_ao);
     }
 
-    // Optional debug overlay: show SSAO in greyscale when ssao_debug is set
+    // Optional debug overlay: show SSAO/SSGI when ssao_debug is set
     if (composite.ssao_debug > 0.5) {
-        // Show raw AO as greyscale (white = occluded) for easier debugging.
-        return vec4<f32>(vec3<f32>(raw_ao), 1.0);
+        // Map sample_uv (0..1 over whole texture) to viewport_uv (0..1 over viewport)
+        let viewport_uv = (sample_uv - composite.uv_offset) / composite.uv_scale;
+        
+        if (viewport_uv.x < 0.5) {
+            // Show accumulated indirect light (SSGI) on the left
+            return vec4<f32>(indirect_light * composite.indirect_light_scale, 1.0);
+        } else {
+            // Show raw AO as greyscale on the right
+            return vec4<f32>(vec3<f32>(raw_ao), 1.0);
+        }
     }
 
     // SSR Debug overlay: show SSR texture directly when enabled

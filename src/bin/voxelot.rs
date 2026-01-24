@@ -5256,6 +5256,10 @@ impl App {
                                 binding: 9,
                                 resource: wgpu::BindingResource::TextureView(normal_view),
                             },
+                            wgpu::BindGroupEntry {
+                                binding: 10,
+                                resource: wgpu::BindingResource::TextureView(offscreen_view),
+                            },
                         ],
                     }));
             }
@@ -8656,6 +8660,17 @@ impl App {
                     // G-Buffer normal texture
                     wgpu::BindGroupLayoutEntry {
                         binding: 9,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // Offscreen color texture for SSGI
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 10,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
                             sample_type: wgpu::TextureSampleType::Float { filterable: true },
