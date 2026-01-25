@@ -8,6 +8,7 @@ struct CompositeUniforms {
     ssr_debug: f32,
     indirect_light_scale: f32,
     hdr_highlight_compression: f32,
+    sdr_tonemap_mode: f32, // 0 = Reinhard, 1 = ACES-like (default)
     hzb_debug: f32,
     hzb_mips: f32,
     near: f32,
@@ -34,6 +35,37 @@ fn compress_highlights_hdr(color: vec3<f32>) -> vec3<f32> {
     let max_hi = vec3<f32>(16.0);
     let hi_comp = (hi * max_hi) / (max_hi + hi);
     return base + hi_comp;
+}
+
+// Simple global Reinhard tone-mapper for SDR/sRGB presentation.
+// This is used when HDR presentation is not active (i.e., we are rendering
+// to an sRGB swapchain and need to compress HDR-range colors to [0,1].)
+fn tone_map_sdr(color: vec3<f32>) -> vec3<f32> {
+    // Luma-based Reinhard to preserve chroma:
+    // - map luminance with Reinhard
+    // - scale RGB by the luminance ratio
+    // This avoids the common “gray filter” look of per-channel Reinhard.
+    let luma_weights = vec3<f32>(0.2126, 0.7152, 0.0722);
+    let y = max(dot(color, luma_weights), 1e-6);
+    let y_mapped = y / (1.0 + y);
+    let scale = y_mapped / y;
+    return color * scale;
+}
+
+// ACES-like filmic curve (more punchy, preserves saturation and highlights).
+// Uses a simple rational polynomial approximation that's inexpensive and
+// produces similar results to common ACES approximations.
+fn tone_map_aces(color: vec3<f32>) -> vec3<f32> {
+    // Uncharted2 / ACES-like approximation constants
+    let a: f32 = 2.51;
+    let b: f32 = 0.03;
+    let c: f32 = 2.43;
+    let d: f32 = 0.59;
+    let e: f32 = 0.14;
+    let x = color;
+    let num = x * (a * x + vec3<f32>(b));
+    let den = x * (c * x + vec3<f32>(d)) + vec3<f32>(e);
+    return clamp(num / den, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
 struct VertexOutput {
@@ -149,54 +181,73 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
         }
     }
 
-    let luma = dot(base, vec3<f32>(0.299, 0.587, 0.114));
-    let balance = base - vec3<f32>(luma, luma, luma);
-    let saturated = vec3<f32>(luma, luma, luma) + balance * composite.saturation_boost;
+    let luma_weights = vec3<f32>(0.2126, 0.7152, 0.0722);
 
     // Sample Radiance Cascades (RC) high-frequency GI
     let rc_light = textureSample(rc_texture, post_sampler, sample_uv).rgb;
 
-    // GI Combined Debug overlay: show combined indirect light (scaled to match scene)
+    // Sum everything before saturation and tonemapping to match old "punchy" look
+    // Note: direct emissive is already included in 'base' (added in DoF CoC pass)
+    var color = base + bloom * composite.bloom_strength + (indirect_light + rc_light) * composite.indirect_light_scale;
+    
+    // Apply AO to the radiance sum
+    color = color * ao;
+
+    // Sample Radiance Cascades (RC) high-frequency GI for debug overlays (redundant but kept for structure)
+    // let rc_light is already sampled above
+
+    // GI Combined Debug overlay
     if (composite.gi_combined_debug > 0.5) {
         return vec4<f32>(indirect_light * composite.indirect_light_scale, 1.0);
     }
 
-    // GI Probes Debug overlay: show only probe contribution
+    // GI Probes Debug overlay
     if (composite.gi_probes_debug > 0.5) {
         return vec4<f32>(indirect_light, 1.0);
     }
 
-    // GI SSGI Debug overlay: show only SSGI contribution
+    // GI SSGI Debug overlay
     if (composite.gi_ssgi_debug > 0.5) {
         return vec4<f32>(indirect_light, 1.0);
     }
 
-    // RC Debug overlay: show Radiance Cascades light
+    // RC Debug overlay
     if (composite.radiance_cascades_debug > 0.5) {
         return vec4<f32>(rc_light, 1.0);
     }
 
-    // Note: direct emissive is already included in 'base' (added in DoF CoC pass)
-    // Apply AO to all lighting (direct + bloom + GI)
-    // AO represents how much ambient light reaches a surface, affecting both direct and indirect
-    var color = (saturated + bloom * composite.bloom_strength + (indirect_light + rc_light) * composite.indirect_light_scale) * ao;
-
     // Apply SSR reflections if enabled
-    // The SSR texture contains (reflection_color.rgb, reflectivity * edge_fade)
     if (composite.ssr_enabled > 0.5) {
         let ssr_sample = textureSample(ssr_debug_texture, post_sampler, sample_uv);
         let ssr_reflection = ssr_sample.rgb;
         let ssr_strength = ssr_sample.a;
-        // Add reflections on top of the base color, scaled by strength
-        // This gives partial reflections for lower reflectivity materials
         color = color + ssr_reflection * ssr_strength;
     }
+
+    // SATURATION BOOST (Applied to the final light sum)
+    // IMPORTANT: preserve luminance even when saturation_boost > 1.0.
+    // Using mix(gray, color, t) with t>1 brightens the image by extrapolation.
+    let luma = dot(color, luma_weights);
+    let gray = vec3<f32>(luma);
+    color = gray + (color - gray) * composite.saturation_boost;
 
     color = color * composite.exposure;
     color = max(color, vec3<f32>(0.0));
 
     if (composite.hdr_highlight_compression > 0.5) {
+        // Preserve HDR headroom and apply a soft shoulder for EDR/HDR presentation.
         color = compress_highlights_hdr(color);
+    } else {
+        // SDR path: choose the tonemapper per uniform.
+        // 0.0 = None (Clamp), 1.0 = Reinhard, 2.0 = ACES-like
+        if (composite.sdr_tonemap_mode > 1.5) {
+            color = tone_map_aces(color);
+        } else if (composite.sdr_tonemap_mode > 0.5) {
+            color = tone_map_sdr(color);
+        } else {
+            // No tonemapping (clamping only), matches very early project look
+            color = clamp(color, vec3<f32>(0.0), vec3<f32>(1.0));
+        }
     }
 
     return vec4<f32>(color, 1.0);

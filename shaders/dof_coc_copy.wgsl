@@ -6,7 +6,8 @@ struct DoFUniforms {
     blur_strength: f32,
     near_plane: f32,
     far_plane: f32,
-    _padding: vec3<f32>,
+    ssr_enabled: f32,
+    _padding: vec2<f32>,
 };
 
 @group(0) @binding(0)
@@ -23,6 +24,10 @@ var color_sampler: sampler;
 
 @group(0) @binding(4)
 var emissive_texture: texture_2d<f32>;
+
+// SSR buffer: RGB = reflection color, A = reflection strength
+@group(0) @binding(5)
+var ssr_texture: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -66,7 +71,13 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Sample base color and emissive
     let base_color = textureSample(color_texture, color_sampler, base_uv).rgb;
     let emissive_color = textureSample(emissive_texture, color_sampler, base_uv).rgb;
-    let final_color = base_color + emissive_color; // Add emissive before blur
+    var final_color = base_color + emissive_color; // Add emissive before blur
+
+    // SSR reflections must participate in DoF blur; otherwise reflective surfaces stay sharp.
+    if (dof_uniforms.ssr_enabled > 0.5) {
+        let ssr = textureSample(ssr_texture, color_sampler, base_uv);
+        final_color = final_color + ssr.rgb * ssr.a;
+    }
     
     if (abs(distance_from_focus) < focal_range) || (dof_uniforms.blur_strength <= 0.01) {
         return vec4<f32>(final_color, 0.0);

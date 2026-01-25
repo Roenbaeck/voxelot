@@ -660,6 +660,7 @@ struct CompositeUniforms {
     ssr_debug: f32,
     indirect_light_scale: f32, // Modulates emissive bounce light by ambient darkness (0=day, 1=night)
     hdr_highlight_compression: f32,
+    sdr_tonemap_mode: f32, // 0 = None, 1 = Reinhard, 2 = ACES
     hzb_debug: f32,
     hzb_mips: f32,
     near: f32,
@@ -669,7 +670,7 @@ struct CompositeUniforms {
     radiance_cascades_debug: f32,
     gi_probes_debug: f32,
     gi_ssgi_debug: f32,
-    _pad: [f32; 2],
+    _pad: [f32; 3],
     uv_scale: [f32; 2],
     uv_offset: [f32; 2],
 }
@@ -1412,6 +1413,7 @@ struct App {
     composite_uniform_buffer: Option<wgpu::Buffer>,
     ssao_enabled: bool,
     ssao_debug: bool,
+    sdr_tonemap_mode: f32, // 0.0=None, 1.0=Reinhard, 2.0=ACES
 
     // DoF color buffer that stores blurred result before combine
     dof_color_texture: Option<wgpu::Texture>,
@@ -2771,6 +2773,7 @@ impl App {
             scene_copy_view: None,
             ssao_enabled: cfg.effects.ssao.enabled,
             ssao_debug: false,
+            sdr_tonemap_mode: 0.0, // Default to None (Clamp) to match historical look
             shadow_map_size: cfg.shadows.map_size,
             shadow_darkness: cfg.shadows.darkness,
             shadow_backface_scale: cfg.shadows.backface_ambient_scale,
@@ -2919,6 +2922,13 @@ impl App {
         data[2] = blur_strength;
         data[3] = self.camera_controller.camera.near;
         data[4] = self.camera_controller.camera.far;
+        data[5] = if self.ssr_settings.enabled
+            && (self.ssr_blur_ping_view.is_some() || self.ssr_texture_view.is_some())
+        {
+            1.0
+        } else {
+            0.0
+        };
         data
     }
 
@@ -3045,6 +3055,12 @@ impl App {
         let crop_scale = 1.0 / (1.0 + overscan);
         let crop_offset = (1.0 - crop_scale) * 0.5;
 
+        // If DoF runs, SSR reflections are already added in the DoF CoC copy pass so they blur correctly.
+        // If DoF is skipped, composite must apply SSR.
+        let skip_dof = !self.dof_enabled
+            || self.dof_settings.blur_strength < 0.05
+            || self.dof_settings.focal_range > 450.0;
+
         CompositeUniforms {
             bloom_strength: if self.bloom_enabled && self.bloom_settings.kawase_enabled {
                 self.bloom_settings.bloom_strength
@@ -3059,11 +3075,16 @@ impl App {
             ssr_debug: if self.ssr_debug { 1.0 } else { 0.0 },
             indirect_light_scale,
             hdr_highlight_compression: if self.hdr_active { 1.0 } else { 0.0 },
+            sdr_tonemap_mode: self.sdr_tonemap_mode,
             hzb_debug: if self.hzb_debug { 1.0 } else { 0.0 },
             hzb_mips: self.hzb_mip_levels as f32,
             near: self.camera_controller.camera.near,
             far: self.camera_controller.camera.far,
-            ssr_enabled: if self.ssr_settings.enabled { 1.0 } else { 0.0 },
+            ssr_enabled: if self.ssr_settings.enabled && skip_dof {
+                1.0
+            } else {
+                0.0
+            },
             gi_combined_debug: if self.gi_combined_debug { 1.0 } else { 0.0 },
             radiance_cascades_debug: if self.radiance_cascades_debug {
                 1.0
@@ -3072,7 +3093,7 @@ impl App {
             },
             gi_probes_debug: if self.gi_probes_debug { 1.0 } else { 0.0 },
             gi_ssgi_debug: if self.gi_ssgi_debug { 1.0 } else { 0.0 },
-            _pad: [0.0; 2],
+            _pad: [0.0; 3],
             uv_scale: [crop_scale, crop_scale],
             uv_offset: [crop_offset, crop_offset],
         }
@@ -3303,6 +3324,18 @@ impl App {
                     }
                 );
             }
+            ConfigurableSetting::SdrTonemap => {
+                self.sdr_tonemap_mode = (self.sdr_tonemap_mode + direction as f32).clamp(0.0, 2.0);
+                log::info!(
+                    "SDR Tonemap: {}",
+                    match self.sdr_tonemap_mode as i32 {
+                        0 => "None (Clamp)",
+                        1 => "Reinhard",
+                        2 => "ACES",
+                        _ => "Unknown",
+                    }
+                );
+            }
             ConfigurableSetting::DofEnabled => {
                 self.dof_enabled = direction > 0;
                 self.composite_bind_group = None;
@@ -3423,6 +3456,12 @@ impl App {
                     "OFF".into()
                 }
             }
+            ConfigurableSetting::SdrTonemap => match self.sdr_tonemap_mode as i32 {
+                0 => "NONE".into(),
+                1 => "REINHARD".into(),
+                2 => "ACES".into(),
+                _ => "UNK".into(),
+            },
             ConfigurableSetting::DofEnabled => {
                 if self.dof_enabled {
                     "ON".into()
@@ -4993,6 +5032,14 @@ impl App {
             return;
         };
 
+        // SSR is optional; bind a fallback view but gate contribution via dof_uniforms.ssr_enabled.
+        // Prefer the pre-blurred SSR (matches composite), then raw SSR, else any valid view.
+        let ssr_view = self
+            .ssr_blur_ping_view
+            .as_ref()
+            .or(self.ssr_texture_view.as_ref())
+            .unwrap_or(color_view);
+
         self.dof_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("DoF Bind Group"),
             layout,
@@ -5016,6 +5063,10 @@ impl App {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::TextureView(emissive_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(ssr_view),
                 },
             ],
         }));
@@ -8101,6 +8152,17 @@ impl App {
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // SSR texture (Rgba16Float, rgb=reflection, a=strength)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
                             sample_type: wgpu::TextureSampleType::Float { filterable: true },
