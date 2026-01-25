@@ -5073,15 +5073,31 @@ impl App {
     }
 
     fn update_dof_combine_bind_group(&mut self) {
-        let (Some(device), Some(layout), Some(dof_color_view), Some(source_view), Some(sampler)) = (
+        let (
+            Some(device),
+            Some(layout),
+            Some(dof_color_view),
+            Some(source_view),
+            Some(sampler),
+            Some(dof_ubo),
+        ) = (
             self.device.as_ref(),
             self.dof_combine_bind_group_layout.as_ref(),
             self.dof_color_view.as_ref(),
             self.offscreen_color_view.as_ref(),
             self.post_sampler.as_ref(),
+            self.dof_uniform_buffer.as_ref(),
         ) else {
             return;
         };
+
+        // Prefer unblurred SSR for sharp reflections; fall back to blurred if needed.
+        // When SSR is disabled, the shader gates sampling via dof_uniforms.ssr_enabled.
+        let ssr_view = self
+            .ssr_texture_view
+            .as_ref()
+            .or(self.ssr_blur_ping_view.as_ref())
+            .unwrap_or(source_view);
 
         self.dof_combine_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("DoF Combine Bind Group"),
@@ -5098,6 +5114,14 @@ impl App {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: dof_ubo.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(ssr_view),
                 },
             ],
         }));
@@ -8205,6 +8229,28 @@ impl App {
                         binding: 2,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    // DoF uniforms (includes ssr_enabled gate)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // SSR texture (Rgba16Float, rgb=reflection, a=strength)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
                         count: None,
                     },
                 ],

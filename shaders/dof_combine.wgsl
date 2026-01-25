@@ -11,6 +11,24 @@ var source_texture: texture_2d<f32>;
 @group(0) @binding(2)
 var linear_sampler: sampler;
 
+// Reuse DoF uniforms so we can gate SSR mixing without needing extra state.
+struct DoFUniforms {
+    focal_distance: f32,
+    focal_range: f32,
+    blur_strength: f32,
+    near_plane: f32,
+    far_plane: f32,
+    ssr_enabled: f32,
+    _padding: vec2<f32>,
+};
+
+@group(0) @binding(3)
+var<uniform> dof_uniforms: DoFUniforms;
+
+// SSR buffer: RGB = reflection color, A = reflection strength
+@group(0) @binding(4)
+var ssr_texture: texture_2d<f32>;
+
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
@@ -38,13 +56,22 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let source = textureSample(source_texture, linear_sampler, uv);
     let fused = textureSample(dof_fused_texture, linear_sampler, uv);
     let coc_norm = fused.a; // normalized CoC magnitude from fused pass
+
+    // IMPORTANT: When DoF is enabled, the composite pass disables SSR to avoid double-adding.
+    // That means DoF combine must include SSR in the *sharp* branch too, otherwise near/in-focus
+    // reflective surfaces lose reflections.
+    var source_rgb = source.rgb;
+    if (dof_uniforms.ssr_enabled > 0.5) {
+        let ssr = textureSample(ssr_texture, linear_sampler, uv);
+        source_rgb = source_rgb + ssr.rgb * ssr.a;
+    }
     
     // Use sharp cutoff for very low CoC to avoid half-res color bleeding at focus boundaries
     if coc_norm < 0.05 {
-        return vec4<f32>(source.rgb, 1.0);
+        return vec4<f32>(source_rgb, 1.0);
     }
     
     let strength = smoothstep(0.05, 0.5, coc_norm);
-    let color = mix(source.rgb, fused.rgb, strength);
+    let color = mix(source_rgb, fused.rgb, strength);
     return vec4<f32>(color, 1.0);
 }
