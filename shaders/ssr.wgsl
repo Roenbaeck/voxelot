@@ -617,6 +617,16 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
     let world_pos = reconstruct_world_pos(input.uv, depth);
 
+    // Distance-based reflection fade: keeps far reflections from looking overly punchy/noisy.
+    // This scales the returned alpha (reflectivity), so downstream passes (DoF/composite)
+    // automatically blend less SSR with distance.
+    let dist_to_cam = distance(camera.camera_pos, world_pos);
+    let dist_fade = 1.0 - smoothstep(400.0, 2000.0, dist_to_cam);
+    let reflectivity_faded = reflectivity * clamp(dist_fade, 0.0, 1.0);
+    if (reflectivity_faded < 0.005) {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+
     // Skip submerged surfaces
     if (camera.water_vis_fog_density.x > 0.0 && world_pos.y < camera.sun_color_water_level.w) {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
@@ -650,6 +660,6 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     
     let out_color = mix(sky_color, gi_res.rgb, gi_res.a);
 
-    return vec4<f32>(out_color, reflectivity);
+    return vec4<f32>(out_color, reflectivity_faded);
 }
 
