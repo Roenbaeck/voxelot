@@ -21,3 +21,4 @@ target
 #.idea/
 render_config.txt
 src/.DS_Store
+/vendor
