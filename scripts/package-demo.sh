@@ -42,7 +42,32 @@ echo "Packaged binary size:"
 du -h "$STAGEDIR/$(basename "$BIN_PATH")" || true
 
 pushd "$TMPDIR" >/dev/null
-zip -r "$OUT_ZIP" demo >/dev/null
+# Try native zip first, then fall back to PowerShell Compress-Archive, 7z, or Python
+if command -v zip >/dev/null 2>&1; then
+  echo "Creating zip with zip..."
+  zip -r "$OUT_ZIP" demo >/dev/null
+elif command -v pwsh >/dev/null 2>&1 || command -v powershell >/dev/null 2>&1; then
+  echo "Creating zip with PowerShell Compress-Archive..."
+  if command -v pwsh >/dev/null 2>&1; then
+    pwsh -NoProfile -Command "Compress-Archive -Path 'demo/*' -DestinationPath '$OUT_ZIP' -Force"
+  else
+    powershell -NoProfile -Command "Compress-Archive -Path 'demo/*' -DestinationPath '$OUT_ZIP' -Force"
+  fi
+elif command -v 7z >/dev/null 2>&1; then
+  echo "Creating zip with 7z..."
+  7z a -tzip "$OUT_ZIP" demo >/dev/null
+elif command -v python3 >/dev/null 2>&1; then
+  echo "Creating zip with Python shutil..."
+  python3 - <<PY >/dev/null
+import shutil
+shutil.make_archive('$OUT_ZIP'.replace('.zip',''), 'zip', 'demo')
+PY
+else
+  echo "No zip tool found (tried: zip, pwsh/powershell, 7z, python3); cannot create $OUT_ZIP"
+  popd >/dev/null
+  rm -rf "$TMPDIR"
+  exit 127
+fi
 popd >/dev/null
 
 # Move zip to cwd
