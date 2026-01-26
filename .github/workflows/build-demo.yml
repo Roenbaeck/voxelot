@@ -94,6 +94,27 @@ jobs:
           ./scripts/package-demo.sh "$BIN" "demo-${{ matrix.os }}.zip"
         shell: bash
 
+      - name: Windows: Dump environment & workspace (always)
+        if: ${{ matrix.os == 'windows-latest' && always() }}
+        shell: pwsh
+        run: |
+          Write-Host "=== Environment Variables ==="
+          Get-ChildItem Env: | Sort-Object Name | Out-File env.txt
+          Write-Host "=== Disk usage (CWD) ==="
+          Get-ChildItem -Recurse . | Measure-Object -Property Length -Sum | Out-File disk_usage.txt
+          Write-Host "=== Files (top 500 lines) ==="
+          Get-ChildItem -Recurse | Select-Object FullName, @{Name='Length';Expression={$_.Length}} | Out-File files.txt
+
+      - name: Windows: Upload debug artifact (always)
+        if: ${{ matrix.os == 'windows-latest' && always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-debug-${{ github.run_id }}
+          path: |
+            env.txt
+            disk_usage.txt
+            files.txt
+
       - name: Upload demo artifact
         uses: actions/upload-artifact@v4
         with:
