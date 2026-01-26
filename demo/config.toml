@@ -4,10 +4,14 @@
 file = "worlds/flat_city_test.vhc"
 palette = "worlds/palette.txt"
 skybox = "worlds/skybox.hdr"
-camera_position = [861.74445, 78.97289, 335.7365]
+camera_position = [
+    868.4974,
+    77.79922,
+    455.88226,
+]
 water_level = 20.0
 water_visibility = 15.0
-start_mode = "boat"
+start_mode = "camera"
 
 [rendering]
 chunk_lod_distance = 1500.0
