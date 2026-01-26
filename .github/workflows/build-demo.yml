@@ -98,8 +98,8 @@ jobs:
           bash ./scripts/package-demo.sh "$BIN" "demo-${{ matrix.os }}.zip"
         shell: bash
 
-      - name: Windows: Dump environment & workspace (always)
-        if: ${{ matrix.os == 'windows-latest' && always() }}
+      - name: "Windows: Dump environment & workspace (always)"
+        if: matrix.os == 'windows-latest' && always()
         shell: pwsh
         run: |
           Write-Host "=== Environment Variables ==="
@@ -111,8 +111,8 @@ jobs:
           Write-Host "=== Cargo Lock ==="
           if (Test-Path "Cargo.lock") { Get-Content "Cargo.lock" -Head 100 | Out-File locks.txt }
 
-      - name: Windows: Upload debug artifact (always)
-        if: ${{ matrix.os == 'windows-latest' && always() }}
+      - name: "Windows: Upload debug artifact (always)"
+        if: matrix.os == 'windows-latest' && always()
         uses: actions/upload-artifact@v4
         with:
           name: windows-debug-${{ github.run_id }}
