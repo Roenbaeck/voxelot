@@ -1,0 +1,9 @@
+[world]
+file = "flat_city_test.vhc"
+palette = "palette.txt"
+# start camera pos & other defaults are fine — this file keeps things minimal
+
+[rendering]
+window_width = 1280
+window_height = 720
+fov_degrees = 70.0
