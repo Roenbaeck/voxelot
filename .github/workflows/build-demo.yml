@@ -37,32 +37,43 @@ jobs:
         run: |
           cargo build --release --bin voxelot
 
-      - name: Strip binary (reduce size)
+      - name: Strip binary (macOS)
+        if: ${{ matrix.os == 'macos-latest' }}
         run: |
           set -euo pipefail
-          echo "Attempting to strip binary (best-effort)..."
-          if [[ "${{ matrix.os }}" == "macos-latest" ]]; then
-            xcrun strip -x target/release/voxelot || true
-          elif [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            if command -v llvm-strip >/dev/null 2>&1; then
-              llvm-strip target/release/voxelot.exe || true
-            elif command -v strip >/dev/null 2>&1; then
-              strip --strip-all target/release/voxelot.exe || true
-            else
-              echo "No strip tool available on Windows runner; skipping strip"
-            fi
+          echo "Stripping macOS binary..."
+          xcrun strip -x target/release/voxelot || true
+
+      - name: Strip binary (Windows)
+        if: ${{ matrix.os == 'windows-latest' }}
+        run: |
+          set -euo pipefail
+          echo "Stripping Windows binary..."
+          if command -v llvm-strip >/dev/null 2>&1; then
+            llvm-strip target/release/voxelot.exe || true
+          elif command -v strip >/dev/null 2>&1; then
+            strip --strip-all target/release/voxelot.exe || true
           else
-            strip --strip-all target/release/voxelot || true
+            echo "No strip tool available on Windows runner; skipping strip"
           fi
+        shell: bash
+
+      - name: Strip binary (Linux)
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        run: |
+          set -euo pipefail
+          echo "Stripping Linux binary..."
+          strip --strip-all target/release/voxelot || true
 
       - name: Show binary sizes
         run: |
           echo "Binary sizes after strip (if applied):"
-          du -h target/release/voxelot* || true
+          du -h target/release/*voxelot* || true
           if [[ "${{ matrix.os }}" == "macos-latest" ]]; then
             echo "Checking for .dSYM bundles:"
             ls -la target/release/*.dSYM || true
           fi
+        shell: bash
 
       - name: macOS code sign & notarize (disabled)
         if: ${{ matrix.os == 'macos-latest' }}
