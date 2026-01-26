@@ -6,12 +6,21 @@ What the workflow does
 
 - Builds demo zips for Linux, macOS, and Windows on push (or workflow_dispatch).
 - If a push is a tag (e.g., `v1.2.3`), the workflow will collect the three `demo-*.zip` artifacts and create a GitHub Release with those assets.
-- If macOS signing/notarization secrets are provided in the repository, the macOS job will:
-  1. Decode and install the provided signing identity (PKCS#12) into a temporary keychain.
-  2. Strip the built `target/release/voxelot` binary (to reduce size) before signing.
-  3. Codesign the stripped binary.
-  4. Submit the binary to Apple's notarization service using `xcrun notarytool`.
-  5. Staple the notarization ticket if available.
+The macOS signing/notarization step is **disabled by default** in CI due to a validation issue when referencing secrets directly in workflow expressions.
+
+Recommended re-enable approach (safe in-step secret check):
+
+- Replace the disabled step with a macOS-only step (no secrets referenced in `if:`), e.g.:
+
+  - name: macOS code sign & notarize
+    if: ${{ matrix.os == 'macos-latest' }}
+    run: |
+      # Check for required secrets inside the step (secrets are OK to use in the shell)
+      if [ -z "${{ secrets.MACOS_SIGNING_CERT }}" ] || [ -z "${{ secrets.APPLE_API_KEY }}" ]; then
+        echo "Mac signing secrets missing; skipping code signing/notarization"
+        exit 0
+      fi
+      # ... proceed with decoding, codesign, notarytool, staple as before
 
 Notes:
 - The CI now performs a best-effort strip step for each platform before packaging. On Windows, available strip tools vary, so the step is optional and may be skipped if not present on the runner.
