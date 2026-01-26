@@ -84,7 +84,8 @@ jobs:
       - name: Make packaging script executable
         run: |
           # Remove CRLF line endings if present (prevents script failure on Windows runners)
-          sed -i 's/\r$//' scripts/package-demo.sh
+          # Using perl for cross-platform compatibility between BSD (macOS) and GNU (Linux/Windows)
+          perl -pi -e 's/\r//g' scripts/package-demo.sh
           chmod +x scripts/package-demo.sh
         shell: bash
 
