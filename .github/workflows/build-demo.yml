@@ -82,7 +82,10 @@ jobs:
           echo "To re-enable signing, see demo/RELEASE_SIGNING.md for a safe in-step secrets check pattern."
 
       - name: Make packaging script executable
-        run: chmod +x scripts/package-demo.sh
+        run: |
+          # Remove CRLF line endings if present (prevents script failure on Windows runners)
+          sed -i 's/\r$//' scripts/package-demo.sh
+          chmod +x scripts/package-demo.sh
         shell: bash
 
       - name: Package demo
@@ -91,7 +94,8 @@ jobs:
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
             BIN="target/release/voxelot.exe"
           fi
-          ./scripts/package-demo.sh "$BIN" "demo-${{ matrix.os }}.zip"
+          # Use bash explicitly to avoid shebang issues on Windows runners (CRLF)
+          bash ./scripts/package-demo.sh "$BIN" "demo-${{ matrix.os }}.zip"
         shell: bash
 
       - name: Windows: Dump environment & workspace (always)
@@ -100,10 +104,12 @@ jobs:
         run: |
           Write-Host "=== Environment Variables ==="
           Get-ChildItem Env: | Sort-Object Name | Out-File env.txt
-          Write-Host "=== Disk usage (CWD) ==="
-          Get-ChildItem -Recurse . | Measure-Object -Property Length -Sum | Out-File disk_usage.txt
-          Write-Host "=== Files (top 500 lines) ==="
-          Get-ChildItem -Recurse | Select-Object FullName, @{Name='Length';Expression={$_.Length}} | Out-File files.txt
+          Write-Host "=== Disk usage ==="
+          Get-PSDrive C | Select-Object Used, Free | Out-File disk_usage.txt
+          Write-Host "=== Files (top level) ==="
+          Get-ChildItem -Recurse -Depth 2 | Select-Object FullName, Length | Out-File files.txt
+          Write-Host "=== Cargo Lock ==="
+          if (Test-Path "Cargo.lock") { Get-Content "Cargo.lock" -Head 100 | Out-File locks.txt }
 
       - name: Windows: Upload debug artifact (always)
         if: ${{ matrix.os == 'windows-latest' && always() }}
@@ -114,6 +120,7 @@ jobs:
             env.txt
             disk_usage.txt
             files.txt
+            locks.txt
 
       - name: Upload demo artifact
         uses: actions/upload-artifact@v4
@@ -131,7 +138,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download demo artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: ./downloaded
 
@@ -160,7 +167,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url || steps.set_upload_url.outputs.upload_url }}
-          asset_path: ./downloaded/demo-ubuntu-latest.zip
+          asset_path: ./downloaded/demo-ubuntu-latest/demo-ubuntu-latest.zip
           asset_name: demo-ubuntu-latest.zip
           asset_content_type: application/zip
 
@@ -170,7 +177,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url || steps.set_upload_url.outputs.upload_url }}
-          asset_path: ./downloaded/demo-macos-latest.zip
+          asset_path: ./downloaded/demo-macos-latest/demo-macos-latest.zip
           asset_name: demo-macos-latest.zip
           asset_content_type: application/zip
 
@@ -180,6 +187,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url || steps.set_upload_url.outputs.upload_url }}
-          asset_path: ./downloaded/demo-windows-latest.zip
+          asset_path: ./downloaded/demo-windows-latest/demo-windows-latest.zip
           asset_name: demo-windows-latest.zip
           asset_content_type: application/zip

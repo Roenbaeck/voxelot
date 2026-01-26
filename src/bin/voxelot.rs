@@ -6252,8 +6252,8 @@ impl App {
         _config: &wgpu::SurfaceConfiguration,
         main_bind_group_layout: &wgpu::BindGroupLayout,
     ) {
-        // Load HDR image
-        let hdr_path = "worlds/skybox.hdr";
+        // Load HDR image from config
+        let hdr_path = &self.user_config.world.skybox;
         // Load HDR image using image crate
         let hdr_image = match image::open(hdr_path) {
             Ok(img) => img,

@@ -56,9 +56,9 @@ if command -v zip >/dev/null 2>&1; then
 elif command -v pwsh >/dev/null 2>&1 || command -v powershell >/dev/null 2>&1; then
   echo "Creating zip with PowerShell Compress-Archive..."
   if command -v pwsh >/dev/null 2>&1; then
-    pwsh -NoProfile -Command "Compress-Archive -Path 'demo/*' -DestinationPath '$OUT_ZIP' -Force"
+    pwsh -NoProfile -Command "Compress-Archive -Path 'demo' -DestinationPath '$OUT_ZIP' -Force"
   else
-    powershell -NoProfile -Command "Compress-Archive -Path 'demo/*' -DestinationPath '$OUT_ZIP' -Force"
+    powershell -NoProfile -Command "Compress-Archive -Path 'demo' -DestinationPath '$OUT_ZIP' -Force"
   fi
 elif command -v 7z >/dev/null 2>&1; then
   echo "Creating zip with 7z..."

@@ -38,6 +38,8 @@ pub struct WorldConfig {
     pub file: String,
     #[serde(default = "default_palette_file")]
     pub palette: String,
+    #[serde(default = "default_skybox_file")]
+    pub skybox: String,
     #[serde(default = "default_camera_position")]
     pub camera_position: [f32; 3],
     #[serde(default = "default_water_level")]
@@ -359,6 +361,10 @@ fn default_world_file() -> String {
 
 fn default_palette_file() -> String {
     "worlds/palette.txt".to_string()
+}
+
+fn default_skybox_file() -> String {
+    "worlds/skybox.hdr".to_string()
 }
 
 fn default_camera_position() -> [f32; 3] {
