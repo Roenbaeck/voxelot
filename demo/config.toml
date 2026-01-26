@@ -1,9 +1,110 @@
+# Tuned demo configuration lifted from `worlds/flat_city_test.toml`.
+# Paths are relative and expect a `worlds/` directory next to this config.
 [world]
-file = "flat_city_test.vhc"
-palette = "palette.txt"
-# start camera pos & other defaults are fine — this file keeps things minimal
+file = "worlds/flat_city_test.vhc"
+palette = "worlds/palette.txt"
+camera_position = [861.74445, 78.97289, 335.7365]
+water_level = 20.0
+water_visibility = 15.0
+start_mode = "boat"
 
 [rendering]
-window_width = 1280
-window_height = 720
+chunk_lod_distance = 1500.0
 fov_degrees = 70.0
+near_plane = 0.1
+far_plane = 8500.0
+camera_speed_multiplier = 2.147484
+window_width = 1728
+window_height = 1018
+culling_overscan = 0.2
+render_overscan = 0.2
+macos_hdr = true
+macos_hdr_exposure_boost = 1.0
+macos_hdr_colorspace = "extended_linear_itur2020"
+
+[atmosphere]
+fog_density = 0.0009999999
+time_of_day = 0.28020766
+time_paused = true
+night_skybox_brightness = 0.02
+horizon_fade_up = 0.05
+horizon_fade_down = 0.25
+skybox_fade_up = 0.05
+skybox_fade_down = 0.95
+skybox_min_saturation = 0.16
+skybox_night_tint = [0.09, 0.12, 0.8]
+skybox_tint_strength = 0.5
+
+[effects.depth_of_field]
+enabled = true
+focal_distance = 180.0
+focal_range = 60.0
+blur_strength = 2.5
+kawase_iterations = 2
+kawase_offset = 0.75
+kawase_enabled = true
+
+[effects.bloom]
+enabled = true
+threshold = 0.7
+knee = 0.6
+intensity = 1.8
+bloom_strength = 1.6
+saturation_boost = 1.5
+exposure = 1.18
+blur_radius = 3.8
+kawase_enabled = true
+kawase_iterations = 2
+kawase_offset = 0.5
+
+[effects.ssao]
+enabled = true
+sample_count = 4
+slice_count = 2
+radius = 5.0
+thickness = 8.0
+strength = 1.0
+blur_enabled = true
+blur_radius = 1.0
+max_ao_distance = 450.0
+
+[effects.radiance_cascades]
+enabled = true
+
+[effects.gi]
+enabled = true
+indirect_scale = 0.003
+fade_distance = 400.0
+fade_range = 100.0
+grid_dims = [42, 42, 42]
+
+[effects.ssr]
+enabled = true
+max_steps = 32
+max_binary_steps = 4
+step_size = 0.5
+thickness = 0.5
+
+[shadows]
+map_size = 8192
+darkness = 3.0
+backface_ambient_scale = 0.25
+pcf_radius = 3.0
+pcf_poisson_samples = 8
+
+[performance]
+mesh_cache_budget_mb = 256
+mesh_worker_count = 6
+mesh_upload_baseline = 4
+envelope_distance = 500.0
+envelope_fade_range = 200.0
+max_envelope_distance = 1000.0
+hzb_enabled = true
+fallback_detail_distance = 500.0
+mesh_priority_sort_interval_frames = 30
+mesh_buffer_pool_entries = 256
+mega_vertex_buffer_mb = 512
+mega_index_buffer_mb = 256
+max_draw_capacity = 10000
+render_scale = 1.42
+max_gpu_instances = 6000000

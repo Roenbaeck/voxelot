@@ -26,10 +26,17 @@ if [ "${INCLUDE_DSYM:-0}" = "1" ] && [ -d "$DSYM_DIR" ]; then
   cp -R "$DSYM_DIR" "$STAGEDIR/"
 fi
 
-# Copy world and palette
-cp "worlds/flat_city_test.vhc" "$STAGEDIR/flat_city_test.vhc"
-cp "worlds/palette.txt" "$STAGEDIR/palette.txt"
-# Copy demo config (relative paths in package)
+# Create worlds directory inside the demo package (preserves original config paths)
+mkdir -p "$STAGEDIR/worlds"
+# Copy world and palette into worlds/
+cp "worlds/flat_city_test.vhc" "$STAGEDIR/worlds/flat_city_test.vhc"
+cp "worlds/palette.txt" "$STAGEDIR/worlds/palette.txt"
+# Copy skybox into worlds/
+if [ -f "worlds/skybox.hdr" ]; then
+  cp "worlds/skybox.hdr" "$STAGEDIR/worlds/skybox.hdr"
+fi
+
+# Copy demo config (we'll replace this file with the tuned config)
 cp "demo/config.toml" "$STAGEDIR/config.toml"
 # Optionally include README
 cp "demo/README.md" "$STAGEDIR/README.md" || true
