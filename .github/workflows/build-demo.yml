@@ -83,6 +83,7 @@ jobs:
 
       - name: Make packaging script executable
         run: chmod +x scripts/package-demo.sh
+        shell: bash
 
       - name: Package demo
         run: |
@@ -91,6 +92,7 @@ jobs:
             BIN="target/release/voxelot.exe"
           fi
           ./scripts/package-demo.sh "$BIN" "demo-${{ matrix.os }}.zip"
+        shell: bash
 
       - name: Upload demo artifact
         uses: actions/upload-artifact@v4
