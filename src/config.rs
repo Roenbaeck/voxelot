@@ -662,6 +662,7 @@ impl Default for WorldConfig {
         Self {
             file: default_world_file(),
             palette: default_palette_file(),
+            skybox: default_skybox_file(),
             camera_position: default_camera_position(),
             water_level: default_water_level(),
             water_visibility: default_water_visibility(),
