@@ -2,6 +2,8 @@
 
 Brief actionable notes to help an AI agent be productive immediately in this repo.
 
+See `REPO_MAP.md` for a machine-readable per-path map with short descriptions and quick pointers for agents and maintainers.
+
 ## Quick entry points ✅
 - Build & run viewer (recommended):
   - cargo run --release --bin voxelot -- worlds/flat_city_test.toml
