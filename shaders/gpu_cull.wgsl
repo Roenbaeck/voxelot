@@ -39,6 +39,8 @@ struct CullParams {
     aspect : f32,
     screen_width : f32,
     screen_height : f32,
+    impostor_pixel_threshold : f32,
+    impostor_pixel_size : f32,
     lod_render_distance : f32,
     detail_cull_distance : f32,
     envelope_distance : f32,
@@ -77,7 +79,20 @@ var<storage, read_write> fallback_instances : array<VoxelInstanceRaw>;
 @group(0) @binding(5)
 var<storage, read_write> envelope_indirect : array<DrawIndexedIndirectArgs>;
 
+struct ImpostorInstance {
+    position : vec3<f32>,
+    _pad0 : f32,
+    color : vec4<f32>,
+    emissive : vec4<f32>,
+};
+
 @group(0) @binding(6)
+var<storage, read_write> impostor_indirect : DrawIndirectArgs;
+
+@group(0) @binding(7)
+var<storage, read_write> impostor_instances : array<ImpostorInstance>;
+
+@group(0) @binding(8)
 var hzb_tex : texture_2d<f32>;
 
 @compute @workgroup_size(64)
@@ -98,14 +113,13 @@ fn cs_main(@builtin(global_invocation_id) global_id : vec3<u32>) {
     let lod_sq = params.lod_render_distance * params.lod_render_distance;
 
     let within_depth = dist_sq >= near_sq && dist_sq <= far_sq;
-    let within_lod = dist_sq <= lod_sq;
 
     // Assume camera_forward is normalized by CPU-side camera; avoid normalize() in shader
     // Project half_scale onto forward vector to get effective radius along view direction
     let radius = dot(abs(params.camera_forward), half_scale);
     let in_front = dot(params.camera_forward, to_instance) > -radius;
 
-    var visible = within_depth && within_lod && in_front;
+    var visible = within_depth && in_front;
 
     if (visible) {
         candidates[index].flags = candidates[index].flags | 4u; // Mark visible for debug
@@ -124,7 +138,8 @@ fn cs_main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         // Priority:
         // 1. Detail Mesh (if near enough AND exists)
         // 2. Envelope Mesh (if exists AND (far enough OR detail missing))
-        // 3. Fallback (if neither exists)
+        // 3. Impostor (if projected size is tiny)
+        // 4. Fallback (if neither exists)
         
         // Revised logic: extend detail usage out to (env + fade) so the detail mesh
         // can smoothly fade towards envelope shading over the configured fade range.
@@ -150,8 +165,14 @@ fn cs_main(@builtin(global_invocation_id) global_id : vec3<u32>) {
             use_envelope = false;
         }
 
-        // Always cull chunks behind the camera (regardless of HZB)
+        // Approximate projected size in pixels for impostor decision.
         let z_cam = dot(to_instance, params.camera_forward);
+        let approx_radius = max(half_scale.x, max(half_scale.y, half_scale.z));
+        let denom = max(z_cam * params.fov_tan, 1e-4);
+        let diameter_px = (approx_radius * params.screen_height) / denom;
+        let use_impostor = (diameter_px <= params.impostor_pixel_threshold) && !use_detail && !use_envelope && !cpu_prepopulated;
+
+        // Always cull chunks behind the camera (regardless of HZB)
         if (z_cam <= 0.0) {
             visible = false;
         }
@@ -243,6 +264,17 @@ fn cs_main(@builtin(global_invocation_id) global_id : vec3<u32>) {
             envelope_indirect[instance.envelope_index].instance_count = 1u;
             if (has_mesh) {
                 mesh_indirect[instance.mesh_index].instance_count = 0u;
+            }
+        } else if (use_impostor) {
+            if (!cpu_prepopulated) {
+                let idx = atomicAdd(&impostor_indirect.instance_count, 1u);
+                var imp : ImpostorInstance;
+                let has_color = instance.custom_color.a > 0.0;
+                imp.position = instance.position + half_scale;
+                imp._pad0 = 0.0;
+                imp.color = select(vec4<f32>(0.4, 0.4, 0.45, 0.8), instance.custom_color, has_color);
+                imp.emissive = instance.emissive;
+                impostor_instances[idx] = imp;
             }
         } else {
             // Add to fallback instances

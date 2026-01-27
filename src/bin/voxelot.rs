@@ -186,6 +186,16 @@ struct VoxelInstanceRaw {
     emissive: [f32; 4],
 }
 
+/// Impostor instance data for ultra-distant chunks (single-pixel quads)
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct ImpostorInstanceRaw {
+    position: [f32; 3],
+    _pad0: f32,
+    color: [f32; 4],
+    emissive: [f32; 4],
+}
+
 /// Input layout for GPU culling compute pass (std430-friendly)
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -221,6 +231,8 @@ struct GpuCullParams {
     aspect: f32,
     screen_width: f32,
     screen_height: f32,
+    impostor_pixel_threshold: f32,
+    impostor_pixel_size: f32,
     lod_render_distance: f32,
     detail_cull_distance: f32,
     envelope_distance: f32,
@@ -228,7 +240,7 @@ struct GpuCullParams {
     hzb_enabled: u32,
     max_hzb_mip: u32,
     _pad3: f32,
-    _pad_align2: [u32; 2],    // Align view_proj to 16 bytes
+    _pad_align2: [u32; 3],    // Align view_proj to 16 bytes
     view_proj: [[f32; 4]; 4], // 4x4 matrix (column-major)
 }
 
@@ -1146,6 +1158,9 @@ struct App {
     render_pipeline: Option<wgpu::RenderPipeline>,
     ui_pipeline: Option<wgpu::RenderPipeline>,
     mesh_pipeline: Option<wgpu::RenderPipeline>,
+    impostor_pipeline: Option<wgpu::RenderPipeline>,
+    impostor_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    impostor_bind_group: Option<wgpu::BindGroup>,
     shadow_pipeline: Option<wgpu::RenderPipeline>,
     shadow_mesh_pipeline: Option<wgpu::RenderPipeline>,
     uniform_buffer: Option<wgpu::Buffer>,
@@ -1179,6 +1194,9 @@ struct App {
     fallback_indirect_buffer: Option<wgpu::Buffer>,
     fallback_instance_buffer: Option<wgpu::Buffer>,
     fallback_instance_capacity: usize,
+    impostor_indirect_buffer: Option<wgpu::Buffer>,
+    impostor_instance_buffer: Option<wgpu::Buffer>,
+    impostor_instance_capacity: usize,
     // Mesh cache: per-leaf-chunk mesh GPU buffers and metadata
     mesh_cache: FxHashMap<(i64, i64, i64), MeshCacheEntry>,
     /// Cache of surface voxels for un-meshed chunks (for optimized fallback rendering)
@@ -1224,6 +1242,8 @@ struct App {
     envelope_distance: f32,
     envelope_fade_range: f32,
     max_envelope_distance: f32,
+    impostor_pixel_threshold: f32,
+    impostor_pixel_size: f32,
     /// Cached Arc<Chunk> snapshots for mesher jobs to avoid repeated deep clones
     mesh_chunk_arc_cache: FxHashMap<(i64, i64, i64), Arc<Chunk>>,
     /// Count of mesh jobs executed per second by worker threads (reset on FPS print)
@@ -1560,6 +1580,8 @@ struct App {
     gpu_input_buffer_bytes: u64,
     fallback_instance_buffer_bytes: u64,
     fallback_indirect_bytes: u64,
+    impostor_instance_buffer_bytes: u64,
+    impostor_indirect_bytes: u64,
     mesh_indirect_bytes: u64,
     envelope_indirect_bytes: u64,
     cull_params_buffer_bytes: u64,
@@ -2362,6 +2384,9 @@ impl App {
             render_pipeline: None,
             ui_pipeline: None,
             mesh_pipeline: None,
+            impostor_pipeline: None,
+            impostor_bind_group_layout: None,
+            impostor_bind_group: None,
             shadow_pipeline: None,
             shadow_mesh_pipeline: None,
             uniform_buffer: None,
@@ -2398,6 +2423,9 @@ impl App {
             fallback_indirect_buffer: None,
             fallback_instance_buffer: None,
             fallback_instance_capacity: 0,
+            impostor_indirect_buffer: None,
+            impostor_instance_buffer: None,
+            impostor_instance_capacity: 0,
             mesh_cache: FxHashMap::default(),
             shell_cache: FxHashMap::default(),
             mesh_jobs_executed: mesh_jobs_executed.clone(),
@@ -2410,6 +2438,8 @@ impl App {
             envelope_distance: cfg.performance.envelope_distance,
             envelope_fade_range: cfg.performance.envelope_fade_range,
             max_envelope_distance: cfg.performance.max_envelope_distance,
+            impostor_pixel_threshold: cfg.rendering.impostor_pixel_threshold,
+            impostor_pixel_size: cfg.rendering.impostor_pixel_size,
             mega_vertex_buffer: None,
             mega_index_buffer: None,
             vertex_allocator: SlabAllocator::new(
@@ -2798,6 +2828,8 @@ impl App {
             gpu_input_buffer_bytes: 0,
             fallback_instance_buffer_bytes: 0,
             fallback_indirect_bytes: 0,
+            impostor_instance_buffer_bytes: 0,
+            impostor_indirect_bytes: 0,
             mesh_indirect_bytes: 0,
             envelope_indirect_bytes: 0,
             cull_params_buffer_bytes: 0,
@@ -2833,6 +2865,8 @@ impl App {
             full_cfg.rendering.fov_degrees = self.camera_controller.camera.config.fov_degrees;
             full_cfg.rendering.near_plane = self.camera_controller.camera.config.near_plane;
             full_cfg.rendering.far_plane = self.camera_controller.camera.config.far_plane;
+            full_cfg.rendering.impostor_pixel_threshold = self.impostor_pixel_threshold;
+            full_cfg.rendering.impostor_pixel_size = self.impostor_pixel_size;
             full_cfg.rendering.camera_speed_multiplier = self.camera_controller.speed_multiplier;
             if let Some(window) = self.window.as_ref() {
                 let size = window.inner_size();
@@ -4928,6 +4962,30 @@ impl App {
         self.bind_group = Some(bind_group);
     }
 
+    fn ensure_impostor_bind_group(&mut self, device: &wgpu::Device) {
+        if self.impostor_bind_group.is_some() {
+            return;
+        }
+
+        let (Some(layout), Some(params_buffer)) = (
+            self.impostor_bind_group_layout.as_ref(),
+            self.cull_params_buffer.as_ref(),
+        ) else {
+            return;
+        };
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Impostor Bind Group"),
+            layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: params_buffer.as_entire_binding(),
+            }],
+        });
+
+        self.impostor_bind_group = Some(bind_group);
+    }
+
     fn update_voxel_gi_bind_group(&mut self) {
         let (
             Some(device),
@@ -5940,6 +5998,23 @@ impl App {
             );
             self.fallback_instance_capacity = needed_capacity;
 
+            // Create Impostor Instance Buffer
+            self.impostor_instance_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Impostor Instance Buffer"),
+                size: (needed_capacity * std::mem::size_of::<ImpostorInstanceRaw>()) as u64,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::VERTEX
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            App::replace_buffer_bytes_static(
+                &mut self.impostor_instance_buffer_bytes,
+                (needed_capacity * std::mem::size_of::<ImpostorInstanceRaw>()) as u64,
+                &mut self.gpu_buffer_bytes,
+            );
+            self.impostor_instance_capacity = needed_capacity;
+
             self.cull_bind_group = None; // Force rebuild with new buffer
         }
 
@@ -5959,6 +6034,23 @@ impl App {
                 &mut self.gpu_buffer_bytes,
             );
         }
+
+        // Impostor Indirect Args Buffer (fixed size)
+        if self.impostor_indirect_buffer.is_none() {
+            self.impostor_indirect_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Impostor Indirect Args Buffer"),
+                size: std::mem::size_of::<wgpu::util::DrawIndirectArgs>() as u64,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::INDIRECT
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            App::replace_buffer_bytes_static(
+                &mut self.impostor_indirect_bytes,
+                std::mem::size_of::<wgpu::util::DrawIndirectArgs>() as u64,
+                &mut self.gpu_buffer_bytes,
+            );
+        }
     }
 
     fn ensure_cull_bind_group(&mut self, device: &wgpu::Device) {
@@ -5974,6 +6066,8 @@ impl App {
             Some(fallback_indirect),
             Some(fallback_instances),
             Some(envelope_indirect),
+            Some(impostor_indirect),
+            Some(impostor_instances),
             Some(hzb_view),
         ) = (
             self.cull_bind_group_layout.as_ref(),
@@ -5983,6 +6077,8 @@ impl App {
             self.fallback_indirect_buffer.as_ref(),
             self.fallback_instance_buffer.as_ref(),
             self.envelope_indirect_buffer.as_ref(),
+            self.impostor_indirect_buffer.as_ref(),
+            self.impostor_instance_buffer.as_ref(),
             self.hzb_view.as_ref(),
         )
         else {
@@ -6039,6 +6135,22 @@ impl App {
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: impostor_indirect,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: impostor_instances,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
                     resource: wgpu::BindingResource::TextureView(hzb_view),
                 },
             ],
@@ -7146,6 +7258,10 @@ impl App {
         // Reset fallback indirect buffer (seed instance count = initial_fallback_instances)
         if let Some(buffer) = &self.fallback_indirect_buffer {
             let reset_data = [36u32, initial_fallback_instances, 0, 0];
+            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&reset_data));
+        }
+        if let Some(buffer) = &self.impostor_indirect_buffer {
+            let reset_data = [6u32, 0u32, 0u32, 0u32];
             queue.write_buffer(buffer, 0, bytemuck::cast_slice(&reset_data));
         }
 
@@ -9386,9 +9502,29 @@ impl App {
                         },
                         count: None,
                     },
-                    // Optional HZB texture for GPU cull tests
                     wgpu::BindGroupLayoutEntry {
                         binding: 6,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // Optional HZB texture for GPU cull tests
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 8,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Texture {
                             multisampled: false,
@@ -9521,6 +9657,8 @@ impl App {
             aspect: 1.0,
             screen_width: 1280.0,
             screen_height: 720.0,
+            impostor_pixel_threshold: 1.5,
+            impostor_pixel_size: 1.0,
             lod_render_distance: 1000.0,
             detail_cull_distance: 100.0,
             envelope_distance: 1000.0,
@@ -9528,7 +9666,7 @@ impl App {
             hzb_enabled: 0,
             max_hzb_mip: 0,
             _pad3: 0.0,
-            _pad_align2: [0; 2],
+            _pad_align2: [0; 3],
             view_proj: [
                 [1.0, 0.0, 0.0, 0.0],
                 [0.0, 1.0, 0.0, 0.0],
@@ -9580,6 +9718,109 @@ impl App {
             size: (self.boat_vertex_capacity as u64) * boat_vertex_stride,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
+        });
+        // Impostor pipeline (single-pixel quads for ultra-distant chunks)
+        let impostor_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Impostor Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/impostor.wgsl").into()),
+        });
+        let impostor_bind_group_layout = device.create_bind_group_layout(
+            &wgpu::BindGroupLayoutDescriptor {
+                label: Some("Impostor Bind Group Layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            },
+        );
+        let impostor_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Impostor Pipeline Layout"),
+            bind_group_layouts: &[&impostor_bind_group_layout],
+            immediate_size: 0,
+        });
+        let impostor_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Impostor Pipeline"),
+            layout: Some(&impostor_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &impostor_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<ImpostorInstanceRaw>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x3,
+                                offset: 0,
+                                shader_location: 0,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: 16,
+                                shader_location: 1,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: 32,
+                                shader_location: 2,
+                            },
+                        ],
+                    },
+                ],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &impostor_shader,
+                entry_point: Some("fs_main"),
+                targets: &[
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rg16Float,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::R8Unorm,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                ],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
         });
 
         // Create Mega Buffers and multi-draw buffers
@@ -9788,6 +10029,9 @@ impl App {
         self.render_pipeline = Some(render_pipeline);
         self.ui_pipeline = Some(ui_pipeline);
         self.mesh_pipeline = Some(mesh_pipeline);
+        self.impostor_pipeline = Some(impostor_pipeline);
+        self.impostor_bind_group_layout = Some(impostor_bind_group_layout);
+        self.impostor_bind_group = None;
         self.shadow_pipeline = Some(shadow_pipeline);
         self.shadow_mesh_pipeline = Some(shadow_mesh_pipeline);
         self.uniform_buffer = Some(uniform_buffer);
@@ -10830,6 +11074,16 @@ impl App {
                 };
                 queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[reset_args]));
             }
+
+            if let Some(buffer) = self.impostor_indirect_buffer.as_ref() {
+                let reset_args = wgpu::util::DrawIndirectArgs {
+                    vertex_count: 6,
+                    instance_count: 0,
+                    first_vertex: 0,
+                    first_instance: 0,
+                };
+                queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[reset_args]));
+            }
         }
 
         if let Some(params_buffer) = self.cull_params_buffer.as_ref() {
@@ -10855,6 +11109,8 @@ impl App {
                 // These must match the offscreen depth/color sizes used for HZB and projection.
                 screen_width: self.render_target_width.max(1) as f32,
                 screen_height: self.render_target_height.max(1) as f32,
+                impostor_pixel_threshold: self.impostor_pixel_threshold,
+                impostor_pixel_size: self.impostor_pixel_size,
                 lod_render_distance: self.lod_distance,
                 detail_cull_distance: self.fallback_detail_distance,
                 envelope_distance: self.envelope_distance,
@@ -10862,7 +11118,7 @@ impl App {
                 hzb_enabled: if self.hzb_enabled { 1 } else { 0 },
                 max_hzb_mip: self.hzb_mip_levels.saturating_sub(1),
                 _pad3: 0.0,
-                _pad_align2: [0; 2],
+                _pad_align2: [0; 3],
                 view_proj: {
                     // Build view matrix
                     let cam_pos = glam::Vec3::from_array(self.camera_controller.camera.position);
@@ -10893,6 +11149,7 @@ impl App {
 
         if gpu_candidate_count > 0 {
             self.ensure_cull_bind_group(&device);
+            self.ensure_impostor_bind_group(&device);
         }
 
         let grouping_start = Instant::now();
@@ -12522,6 +12779,19 @@ impl App {
                     self.fallback_instance_buffer.as_ref().unwrap().slice(..),
                 );
                 render_pass.draw_indirect(fallback_indirect, 0);
+                draw_calls += 1;
+            }
+
+            if let (Some(impostor_pipeline), Some(impostor_indirect), Some(impostor_instances), Some(impostor_bg)) = (
+                self.impostor_pipeline.as_ref(),
+                self.impostor_indirect_buffer.as_ref(),
+                self.impostor_instance_buffer.as_ref(),
+                self.impostor_bind_group.as_ref(),
+            ) {
+                render_pass.set_pipeline(impostor_pipeline);
+                render_pass.set_bind_group(0, impostor_bg, &[]);
+                render_pass.set_vertex_buffer(0, impostor_instances.slice(..));
+                render_pass.draw_indirect(impostor_indirect, 0);
                 draw_calls += 1;
             }
         }

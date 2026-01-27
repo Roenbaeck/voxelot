@@ -392,11 +392,14 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     let emissive_rgb = input.emissive.rgb * emissive_strength;
     let final_color = fogged_color + emissive_rgb;
 
-    // Distance-based alpha fade to hide pop-in at far distances
-    // Start fading at 80% of LOD distance, fully transparent at 95%
-    let fade_start = uniforms.lod_distance * 0.80;
-    let fade_end = uniforms.lod_distance * 0.95;
-    let fade_factor = smoothstep(fade_start, fade_end, distance);
+    // Distance-based alpha fade to hide pop-in at far distances.
+    // Skip fade for fallback bounding boxes (scale > 15) so ultra-distant LODs remain visible.
+    var fade_factor = 0.0;
+    if (input.scale <= 15.0) {
+        let fade_start = uniforms.lod_distance * 0.80;
+        let fade_end = uniforms.lod_distance * 0.95;
+        fade_factor = smoothstep(fade_start, fade_end, distance);
+    }
     
     // NOTE: Dither-based discard removed. The stipple pattern was visible in SSR and
     // water reflections as "black noise". We now rely solely on alpha-based fading

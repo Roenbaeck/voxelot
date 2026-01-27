@@ -69,6 +69,12 @@ pub struct RenderingConfig {
     pub near_plane: f32,
     #[serde(default = "default_far_plane")]
     pub far_plane: f32,
+    /// Pixel-size threshold below which distant chunks are rendered as impostors.
+    #[serde(default = "default_impostor_pixel_threshold")]
+    pub impostor_pixel_threshold: f32,
+    /// Pixel size used when rendering impostors (single-pixel by default).
+    #[serde(default = "default_impostor_pixel_size")]
+    pub impostor_pixel_size: f32,
     #[serde(default = "default_camera_speed")]
     pub camera_speed_multiplier: f32,
     #[serde(default = "default_window_width")]
@@ -398,6 +404,14 @@ fn default_far_plane() -> f32 {
     5000.0
 }
 
+fn default_impostor_pixel_threshold() -> f32 {
+    1.5
+}
+
+fn default_impostor_pixel_size() -> f32 {
+    1.0
+}
+
 fn default_camera_speed() -> f32 {
     1.0
 }
@@ -679,6 +693,8 @@ impl Default for RenderingConfig {
             fov_degrees: default_fov(),
             near_plane: default_near_plane(),
             far_plane: default_far_plane(),
+            impostor_pixel_threshold: default_impostor_pixel_threshold(),
+            impostor_pixel_size: default_impostor_pixel_size(),
             camera_speed_multiplier: default_camera_speed(),
             window_width: default_window_width(),
             window_height: default_window_height(),

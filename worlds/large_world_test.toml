@@ -1,10 +1,11 @@
 [world]
 file = "worlds/large_world_test.vhc"
 palette = "worlds/palette.txt"
+skybox = "worlds/skybox.hdr"
 camera_position = [
-    1668.324,
-    110.680336,
-    743.6562,
+    243.58957,
+    154.58139,
+    277.53253,
 ]
 water_level = 20.0
 water_visibility = 5.0
@@ -15,9 +16,11 @@ chunk_lod_distance = 3000.0
 fov_degrees = 70.0
 near_plane = 0.1
 far_plane = 30000.0
+impostor_pixel_threshold = 1.5
+impostor_pixel_size = 1.0
 camera_speed_multiplier = 5.9604645
-window_width = 1728
-window_height = 1018
+window_width = 955
+window_height = 667
 culling_overscan = 0.4
 render_overscan = 0.4
 macos_hdr = false
@@ -26,7 +29,7 @@ macos_hdr_colorspace = "extended_linear_srgb"
 
 [atmosphere]
 fog_density = 0.00059999997
-time_of_day = 0.40655345
+time_of_day = 0.6598731
 time_paused = false
 night_skybox_brightness = 0.01
 horizon_fade_up = 0.05
