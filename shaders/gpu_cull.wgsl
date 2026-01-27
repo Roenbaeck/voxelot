@@ -39,6 +39,8 @@ struct CullParams {
     aspect : f32,
     screen_width : f32,
     screen_height : f32,
+    fog_density : f32,
+    skybox_brightness : f32,
     impostor_pixel_threshold : f32,
     impostor_pixel_size : f32,
     lod_render_distance : f32,

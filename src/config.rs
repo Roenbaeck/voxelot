@@ -69,6 +69,9 @@ pub struct RenderingConfig {
     pub near_plane: f32,
     #[serde(default = "default_far_plane")]
     pub far_plane: f32,
+    /// Enables the visual LOD refinement pass that updates average colors from hierarchy shells.
+    #[serde(default = "default_visual_lod_enabled")]
+    pub visual_lod_enabled: bool,
     /// Pixel-size threshold below which distant chunks are rendered as impostors.
     #[serde(default = "default_impostor_pixel_threshold")]
     pub impostor_pixel_threshold: f32,
@@ -404,6 +407,10 @@ fn default_far_plane() -> f32 {
     5000.0
 }
 
+fn default_visual_lod_enabled() -> bool {
+    true
+}
+
 fn default_impostor_pixel_threshold() -> f32 {
     1.5
 }
@@ -693,6 +700,7 @@ impl Default for RenderingConfig {
             fov_degrees: default_fov(),
             near_plane: default_near_plane(),
             far_plane: default_far_plane(),
+            visual_lod_enabled: default_visual_lod_enabled(),
             impostor_pixel_threshold: default_impostor_pixel_threshold(),
             impostor_pixel_size: default_impostor_pixel_size(),
             camera_speed_multiplier: default_camera_speed(),

@@ -148,10 +148,35 @@ fn load_chunk(chunk: &mut Chunk, reader: &mut impl Read) -> io::Result<()> {
 
     // Reserve capacity and then commit entries into presence/voxels in order
     chunk.voxels.reserve(entries.len());
+    let mut solid_count: u32 = 0;
+    let mut xmin: u8 = 16;
+    let mut ymin: u8 = 16;
+    let mut zmin: u8 = 16;
+    let mut xmax: u8 = 0;
+    let mut ymax: u8 = 0;
+    let mut zmax: u8 = 0;
+    let mut bbox_found = false;
     for (pos_encoded, voxel) in entries {
         let x = (pos_encoded & 0xF) as u8;
         let y = ((pos_encoded >> 4) & 0xF) as u8;
         let z = ((pos_encoded >> 8) & 0xF) as u8;
+
+        bbox_found = true;
+        xmin = xmin.min(x);
+        ymin = ymin.min(y);
+        zmin = zmin.min(z);
+        xmax = xmax.max(x);
+        ymax = ymax.max(y);
+        zmax = zmax.max(z);
+
+        match &voxel {
+            Voxel::Solid(_) => {
+                solid_count = solid_count.saturating_add(1);
+            }
+            Voxel::Chunk(sub_chunk) => {
+                solid_count = solid_count.saturating_add(sub_chunk.voxel_count);
+            }
+        }
 
         // Append presence and voxel in rank order
         chunk.presence.add(pos_encoded as u32);
@@ -168,6 +193,15 @@ fn load_chunk(chunk: &mut Chunk, reader: &mut impl Read) -> io::Result<()> {
             chunk.py |= sub_chunk.py;
             chunk.pz |= sub_chunk.pz;
         }
+    }
+
+    // Cache aggregate counts and bbox for faster LOD init
+    chunk.voxel_count = solid_count;
+    chunk.solid_ratio = solid_count as f32 / (16.0 * 16.0 * 16.0);
+    if bbox_found {
+        chunk.bounding_box = Some([xmin, ymin, zmin, xmax, ymax, zmax]);
+    } else {
+        chunk.bounding_box = None;
     }
 
     Ok(())

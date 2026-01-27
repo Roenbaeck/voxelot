@@ -231,6 +231,8 @@ struct GpuCullParams {
     aspect: f32,
     screen_width: f32,
     screen_height: f32,
+    fog_density: f32,
+    skybox_brightness: f32,
     impostor_pixel_threshold: f32,
     impostor_pixel_size: f32,
     lod_render_distance: f32,
@@ -2145,7 +2147,7 @@ impl App {
 
             log::info!("Updating LOD metadata...");
             let lod_start = Instant::now();
-            temp_world.update_all_lod_metadata(&temp_palette);
+            temp_world.update_all_lod_metadata_preserve_bounds(&temp_palette);
             log::info!(
                 "LOD metadata updated (took {:.3}s)",
                 lod_start.elapsed().as_secs_f32()
@@ -2154,11 +2156,22 @@ impl App {
             log::info!("Generating hierarchy shells...");
             let shell_start = Instant::now();
             temp_world.generate_all_hierarchy_shells();
-            temp_world.update_all_visual_lod_metadata(&temp_palette);
             log::info!(
                 "Hierarchy shells generated (took {:.3}s)",
                 shell_start.elapsed().as_secs_f32()
             );
+
+            if cfg.rendering.visual_lod_enabled {
+                log::info!("Updating visual LOD metadata...");
+                let visual_start = Instant::now();
+                temp_world.update_all_visual_lod_metadata(&temp_palette);
+                log::info!(
+                    "Visual LOD metadata updated (took {:.3}s)",
+                    visual_start.elapsed().as_secs_f32()
+                );
+            } else {
+                log::info!("Skipping visual LOD metadata (visual_lod_enabled = false)");
+            }
 
             world = Arc::new(temp_world);
         } else {
@@ -2194,7 +2207,7 @@ impl App {
             // Update LOD metadata and generate hierarchy shells BEFORE wrapping in Arc
             log::info!("Updating LOD metadata...");
             let lod_start = Instant::now();
-            temp_world.update_all_lod_metadata(&temp_palette);
+            temp_world.update_all_lod_metadata_preserve_bounds(&temp_palette);
             log::info!(
                 "LOD metadata updated (took {:.3}s)",
                 lod_start.elapsed().as_secs_f32()
@@ -2203,11 +2216,22 @@ impl App {
             log::info!("Generating hierarchy shells...");
             let shell_start = Instant::now();
             temp_world.generate_all_hierarchy_shells();
-            temp_world.update_all_visual_lod_metadata(&temp_palette);
             log::info!(
                 "Hierarchy shells generated (took {:.3}s)",
                 shell_start.elapsed().as_secs_f32()
             );
+
+            if cfg.rendering.visual_lod_enabled {
+                log::info!("Updating visual LOD metadata...");
+                let visual_start = Instant::now();
+                temp_world.update_all_visual_lod_metadata(&temp_palette);
+                log::info!(
+                    "Visual LOD metadata updated (took {:.3}s)",
+                    visual_start.elapsed().as_secs_f32()
+                );
+            } else {
+                log::info!("Skipping visual LOD metadata (visual_lod_enabled = false)");
+            }
 
             world = Arc::new(temp_world);
         }
@@ -9658,6 +9682,8 @@ impl App {
             aspect: 1.0,
             screen_width: 1280.0,
             screen_height: 720.0,
+            fog_density: 0.001,
+            skybox_brightness: 1.0,
             impostor_pixel_threshold: 1.5,
             impostor_pixel_size: 1.0,
             lod_render_distance: 1000.0,
@@ -9730,7 +9756,7 @@ impl App {
                 label: Some("Impostor Bind Group Layout"),
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -11223,6 +11249,14 @@ impl App {
         }
 
         if let Some(params_buffer) = self.cull_params_buffer.as_ref() {
+            let time_angle = (self.time_of_day - 0.25) * std::f32::consts::TAU;
+            let sun_height = time_angle.sin();
+            let sbu = self.skybox_fade_up;
+            let sbd = self.skybox_fade_down;
+            let sky_fade_raw = ((sun_height + sbd) / (sbu + sbd)).clamp(0.0, 1.0);
+            let sky_fade = sky_fade_raw * sky_fade_raw * (3.0 - 2.0 * sky_fade_raw);
+            let night_min = self.night_skybox_brightness;
+            let skybox_brightness = night_min + (1.0 - night_min) * sky_fade;
             let gpu_params = GpuCullParams {
                 camera_position: self.camera_controller.camera.position,
                 candidate_count: gpu_candidate_count as u32,
@@ -11245,6 +11279,8 @@ impl App {
                 // These must match the offscreen depth/color sizes used for HZB and projection.
                 screen_width: self.render_target_width.max(1) as f32,
                 screen_height: self.render_target_height.max(1) as f32,
+                fog_density: self.fog_density,
+                skybox_brightness,
                 impostor_pixel_threshold: self.impostor_pixel_threshold,
                 impostor_pixel_size: self.impostor_pixel_size,
                 lod_render_distance: self.lod_distance,

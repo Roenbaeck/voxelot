@@ -349,18 +349,38 @@ impl Chunk {
     /// If mask is 0, falls back to the internal "any surface" shell heuristic.
     /// Uses the MODE (most common type) for color to better represent prominent facades.
     pub fn update_lod_metadata_with_mask(&mut self, palette: &Palette, mask: u8) {
+        self.update_lod_metadata_with_mask_internal(palette, mask, false);
+    }
+    
+
+    /// Update LOD metadata but preserve precomputed voxel_count/bounding_box if available.
+    /// Useful when counts/bounds were computed during file load.
+    pub fn update_lod_metadata_with_mask_preserve_bounds(&mut self, palette: &Palette, mask: u8) {
+        self.update_lod_metadata_with_mask_internal(palette, mask, true);
+    }
+
+    fn update_lod_metadata_with_mask_internal(
+        &mut self,
+        palette: &Palette,
+        mask: u8,
+        preserve_bounds: bool,
+    ) {
         const TOTAL_SLOTS: f32 = (16 * 16 * 16) as f32; // 4096
 
         let mut emissive_sum = [0.0f32; 3];
         let mut emissive_power = 0.0f32;
         let mut emissive_voxels = 0u32;
-        let mut solid_count = 0u32;
 
-        // 1. Accumulate totals for voxel_count and emissive stats across ALL voxels
+        let reuse_counts = preserve_bounds && self.voxel_count > 0;
+        let mut solid_count = if reuse_counts { self.voxel_count } else { 0u32 };
+
+        // 1. Accumulate emissive stats across ALL voxels
         for voxel in &self.voxels {
             match voxel {
                 Voxel::Solid(voxel_type) => {
-                    solid_count += 1;
+                    if !reuse_counts {
+                        solid_count = solid_count.saturating_add(1);
+                    }
                     let (em_color, em_strength) = palette.emissive(*voxel_type as u32);
                     if em_strength > 0.0 {
                         emissive_sum[0] += em_color[0] * em_strength;
@@ -371,7 +391,9 @@ impl Chunk {
                     }
                 }
                 Voxel::Chunk(sub_chunk) => {
-                    solid_count = solid_count.saturating_add(sub_chunk.voxel_count);
+                    if !reuse_counts {
+                        solid_count = solid_count.saturating_add(sub_chunk.voxel_count);
+                    }
                     // Propagate recursive emissive stats
                     emissive_sum[0] += sub_chunk.emissive_sum[0];
                     emissive_sum[1] += sub_chunk.emissive_sum[1];
@@ -382,9 +404,10 @@ impl Chunk {
             }
         }
 
-        self.voxel_count = solid_count;
-        self.solid_ratio = solid_count as f32 / TOTAL_SLOTS;
-
+        if !reuse_counts {
+            self.voxel_count = solid_count;
+        }
+        self.solid_ratio = self.voxel_count as f32 / TOTAL_SLOTS;
         // 2. Compute dominant type and average color based on the visual shell only.
         let use_any_shell = mask == 0;
         let mut color_sum = [0.0f32; 3];
@@ -488,16 +511,18 @@ impl Chunk {
 
         // 3. Compute per-chunk bounding box (covers all solid content)
         // Use marginal bitmasks for O(16) bounds instead of scanning all voxels.
-        if solid_count == 0 || self.px == 0 || self.py == 0 || self.pz == 0 {
-            self.bounding_box = None;
-        } else {
-            let xmin = self.px.trailing_zeros() as u8;
-            let xmax = 15u8.saturating_sub(self.px.leading_zeros() as u8);
-            let ymin = self.py.trailing_zeros() as u8;
-            let ymax = 15u8.saturating_sub(self.py.leading_zeros() as u8);
-            let zmin = self.pz.trailing_zeros() as u8;
-            let zmax = 15u8.saturating_sub(self.pz.leading_zeros() as u8);
-            self.bounding_box = Some([xmin, ymin, zmin, xmax, ymax, zmax]);
+        if !preserve_bounds || self.bounding_box.is_none() {
+            if self.voxel_count == 0 || self.px == 0 || self.py == 0 || self.pz == 0 {
+                self.bounding_box = None;
+            } else {
+                let xmin = self.px.trailing_zeros() as u8;
+                let xmax = 15u8.saturating_sub(self.px.leading_zeros() as u8);
+                let ymin = self.py.trailing_zeros() as u8;
+                let ymax = 15u8.saturating_sub(self.py.leading_zeros() as u8);
+                let zmin = self.pz.trailing_zeros() as u8;
+                let zmax = 15u8.saturating_sub(self.pz.leading_zeros() as u8);
+                self.bounding_box = Some([xmin, ymin, zmin, xmax, ymax, zmax]);
+            }
         }
 
         self.emissive_sum = emissive_sum;
@@ -1578,11 +1603,18 @@ impl World {
     /// and emissive aggregates using the provided palette.
     pub fn update_all_lod_metadata(&mut self, palette: &Palette) {
         let root_mut = Arc::make_mut(&mut self.root);
-        Self::update_chunk_lod_recursive(root_mut, palette);
+        Self::update_chunk_lod_recursive(root_mut, palette, false);
+    }
+
+    /// Update LOD metadata while preserving precomputed voxel_count/bounding_box.
+    /// Useful after loading from file when counts/bounds are already cached.
+    pub fn update_all_lod_metadata_preserve_bounds(&mut self, palette: &Palette) {
+        let root_mut = Arc::make_mut(&mut self.root);
+        Self::update_chunk_lod_recursive(root_mut, palette, true);
     }
 
     /// Recursive helper to update LOD metadata bottom-up
-    fn update_chunk_lod_recursive(chunk: &mut Chunk, palette: &Palette) {
+    fn update_chunk_lod_recursive(chunk: &mut Chunk, palette: &Palette, preserve_bounds: bool) {
         // First, recursively update all sub-chunks. Use Rayon to parallelize recursion across
         // different sub-chunks where possible - this gives a large speedup for deep/large worlds.
         use rayon::prelude::*;
@@ -1590,12 +1622,16 @@ impl World {
             if let Voxel::Chunk(sub_chunk_arc) = voxel {
                 // Use Arc::make_mut to get exclusive access for mutation
                 let sub_chunk = Arc::make_mut(sub_chunk_arc);
-                Self::update_chunk_lod_recursive(sub_chunk, palette);
+                Self::update_chunk_lod_recursive(sub_chunk, palette, preserve_bounds);
             }
         });
 
         // Then update this chunk's metadata
-        chunk.update_lod_metadata(palette);
+        if preserve_bounds {
+            chunk.update_lod_metadata_with_mask_preserve_bounds(palette, 0);
+        } else {
+            chunk.update_lod_metadata(palette);
+        }
     }
 
     /// Generate hierarchical shells for all non-leaf chunks

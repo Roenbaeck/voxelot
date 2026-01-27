@@ -13,6 +13,8 @@ struct CullParams {
     aspect : f32,
     screen_width : f32,
     screen_height : f32,
+    fog_density : f32,
+    skybox_brightness : f32,
     impostor_pixel_threshold : f32,
     impostor_pixel_size : f32,
     lod_render_distance : f32,
@@ -84,7 +86,14 @@ struct FragmentOut {
 fn fs_main(input : VertexOut) -> FragmentOut {
     var out : FragmentOut;
     let alpha = select(1.0, input.color.a, input.color.a > 0.0);
-    out.color = vec4<f32>(input.color.rgb, alpha);
+    let base_color = input.color.rgb * params.skybox_brightness;
+    let fog_density = max(params.fog_density, 0.0);
+    let dist = length(params.camera_position - input.position.xyz);
+    let transmittance = exp(-fog_density * dist);
+    let fog_base = mix(vec3<f32>(0.02, 0.02, 0.03), vec3<f32>(0.7, 0.8, 0.9), params.skybox_brightness);
+    let fog_color = fog_base * vec3<f32>(1.0, 1.0, 1.0);
+    let fogged = mix(base_color, fog_color, 1.0 - transmittance);
+    out.color = vec4<f32>(fogged, alpha);
     out.emissive = vec4<f32>(input.emissive.rgb * input.emissive.a, 1.0);
     out.normal = vec2<f32>(0.0, 0.0);
     out.material = 0.0;

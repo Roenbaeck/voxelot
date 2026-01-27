@@ -16,6 +16,7 @@ chunk_lod_distance = 3000.0
 fov_degrees = 70.0
 near_plane = 0.1
 far_plane = 30000.0
+visual_lod_enabled = true
 impostor_pixel_threshold = 1.5
 impostor_pixel_size = 1.0
 camera_speed_multiplier = 5.9604645
@@ -29,7 +30,7 @@ macos_hdr_colorspace = "extended_linear_srgb"
 
 [atmosphere]
 fog_density = 0.00059999997
-time_of_day = 0.5003697
+time_of_day = 0.9826972
 time_paused = false
 night_skybox_brightness = 0.01
 horizon_fade_up = 0.05
