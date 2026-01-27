@@ -3266,6 +3266,7 @@ impl App {
                     DebugView::GiSsgi => {
                         self.gi_ssgi_debug = true;
                     }
+                    DebugView::Lod => {}
                     DebugView::RadianceCascades => {
                         self.radiance_cascades_debug = true;
                     }
@@ -10518,11 +10519,146 @@ impl App {
         self.gpu_inputs.clear();
         // Reserve visibility-derived capacities for fewer reallocations
         self.gpu_inputs.reserve(visible.len());
+        let lod_debug = self.input_manager.active_debug_view == voxelot::input::DebugView::Lod;
         for v in visible.iter() {
             let key = (v.position[0], v.position[1], v.position[2]);
             let has_mesh = v.is_leaf_chunk && self.mesh_cache.contains_key(&key);
             let has_envelope = v.is_leaf_chunk && self.envelope_mesh_cache.contains_key(&key);
             let mut cpu_prepop = false;
+
+            if lod_debug {
+                let cam_pos = self.camera_controller.camera.position;
+                let half_scale = [v.scale[0] * 0.5, v.scale[1] * 0.5, v.scale[2] * 0.5];
+                let center = [
+                    v.position[0] as f32 + half_scale[0],
+                    v.position[1] as f32 + half_scale[1],
+                    v.position[2] as f32 + half_scale[2],
+                ];
+                let to_instance = [
+                    center[0] - cam_pos[0],
+                    center[1] - cam_pos[1],
+                    center[2] - cam_pos[2],
+                ];
+                let z_cam = to_instance[0] * self.camera_controller.camera.forward[0]
+                    + to_instance[1] * self.camera_controller.camera.forward[1]
+                    + to_instance[2] * self.camera_controller.camera.forward[2];
+
+                if z_cam > 0.0 {
+                    let dist_sq = to_instance[0] * to_instance[0]
+                        + to_instance[1] * to_instance[1]
+                        + to_instance[2] * to_instance[2];
+                    let lod_sq = self.lod_distance * self.lod_distance;
+                    let env = self.envelope_distance;
+                    let fade = self.envelope_fade_range;
+                    let env_plus = env + fade;
+                    let env_plus_sq = env_plus * env_plus;
+
+                    let mut use_detail = has_mesh && dist_sq <= env_plus_sq;
+                    let mut use_envelope = has_envelope && !use_detail;
+                    if !has_mesh && has_envelope {
+                        use_envelope = true;
+                        use_detail = false;
+                    }
+                    if !has_envelope && has_mesh && dist_sq <= lod_sq {
+                        use_detail = true;
+                        use_envelope = false;
+                    }
+
+                    let fov_tan = (self.render_fov_radians() * 0.5).tan().max(1e-4);
+                    let approx_radius = half_scale[0].max(half_scale[1]).max(half_scale[2]);
+                    let diameter_px =
+                        (approx_radius * self.render_target_height.max(1) as f32)
+                            / (z_cam * fov_tan).max(1e-4);
+                    let use_impostor = diameter_px <= self.impostor_pixel_threshold
+                        && !use_detail
+                        && !use_envelope;
+
+                    let debug_color = if use_detail {
+                        [0.1, 0.9, 0.2, 1.0] // Mesh
+                    } else if use_envelope {
+                        [1.0, 0.8, 0.1, 1.0] // Envelope
+                    } else if use_impostor {
+                        [0.1, 0.4, 1.0, 1.0] // Impostor
+                    } else {
+                        [0.9, 0.2, 0.2, 1.0] // Fallback bbox
+                    };
+
+                    let (pos, scale) = if v.is_leaf_chunk {
+                        if let Some(chunk) = self
+                            .world
+                            .get_leaf_chunk_at_origin(WorldPos::new(key.0, key.1, key.2))
+                        {
+                            if let Some(bbox) = chunk.bounding_box {
+                                let (pos_i64, size) =
+                                    bbox_local_to_world([key.0, key.1, key.2], 16, bbox);
+                                (
+                                    [pos_i64[0] as f32, pos_i64[1] as f32, pos_i64[2] as f32],
+                                    size,
+                                )
+                            } else {
+                                (
+                                    [v.position[0] as f32, v.position[1] as f32, v.position[2] as f32],
+                                    v.scale,
+                                )
+                            }
+                        } else {
+                            (
+                                [v.position[0] as f32, v.position[1] as f32, v.position[2] as f32],
+                                v.scale,
+                            )
+                        }
+                    } else {
+                        (
+                            [v.position[0] as f32, v.position[1] as f32, v.position[2] as f32],
+                            v.scale,
+                        )
+                    };
+
+                    if self.cpu_prepopulated_instances.len() < self.max_gpu_instances {
+                        self.cpu_prepopulated_instances.push(VoxelInstanceRaw {
+                            position: pos,
+                            voxel_type: v.voxel_type as u32,
+                            scale,
+                            ao_factor: 1.0,
+                            custom_color: debug_color,
+                            emissive: [0.0, 0.0, 0.0, 0.0],
+                        });
+                        cpu_prepop = true;
+                    }
+                }
+
+                let mut flags = 0u32;
+                if has_mesh {
+                    flags |= 1;
+                }
+                if has_envelope {
+                    flags |= 2;
+                }
+                if cpu_prepop {
+                    flags |= 4;
+                }
+
+                if self.gpu_inputs.len() < self.max_gpu_instances {
+                    self.gpu_inputs.push(GpuInstanceInput {
+                        position: [
+                            v.position[0] as f32,
+                            v.position[1] as f32,
+                            v.position[2] as f32,
+                        ],
+                        _pad0: 0,
+                        scale: v.scale,
+                        _pad1: 0,
+                        custom_color: [0.0, 0.0, 0.0, 0.0],
+                        emissive: [0.0, 0.0, 0.0, 0.0],
+                        voxel_type: v.voxel_type as u32,
+                        flags,
+                        mesh_index: self.gpu_inputs.len() as u32,
+                        envelope_index: self.gpu_inputs.len() as u32,
+                    });
+                }
+
+                continue;
+            }
 
             let cam_pos = self.camera_controller.camera.position;
             let chunk_center = [key.0 as f32 + 8.0, key.1 as f32 + 8.0, key.2 as f32 + 8.0];
