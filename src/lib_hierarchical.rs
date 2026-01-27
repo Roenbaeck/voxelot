@@ -487,35 +487,17 @@ impl Chunk {
         }
 
         // 3. Compute per-chunk bounding box (covers all solid content)
-        let mut xmin: u8 = 16;
-        let mut ymin: u8 = 16;
-        let mut zmin: u8 = 16;
-        let mut xmax: u8 = 0;
-        let mut ymax: u8 = 0;
-        let mut zmax: u8 = 0;
-        let mut bbox_found = false;
-
-        for ((x, y, z), voxel) in self.iter() {
-            let is_occupied = match voxel {
-                Voxel::Solid(_) => true,
-                Voxel::Chunk(c) => !c.is_empty(),
-            };
-
-            if is_occupied {
-                bbox_found = true;
-                xmin = xmin.min(x);
-                ymin = ymin.min(y);
-                zmin = zmin.min(z);
-                xmax = xmax.max(x);
-                ymax = ymax.max(y);
-                zmax = zmax.max(z);
-            }
-        }
-
-        if bbox_found {
-            self.bounding_box = Some([xmin, ymin, zmin, xmax, ymax, zmax]);
-        } else {
+        // Use marginal bitmasks for O(16) bounds instead of scanning all voxels.
+        if solid_count == 0 || self.px == 0 || self.py == 0 || self.pz == 0 {
             self.bounding_box = None;
+        } else {
+            let xmin = self.px.trailing_zeros() as u8;
+            let xmax = 15u8.saturating_sub(self.px.leading_zeros() as u8);
+            let ymin = self.py.trailing_zeros() as u8;
+            let ymax = 15u8.saturating_sub(self.py.leading_zeros() as u8);
+            let zmin = self.pz.trailing_zeros() as u8;
+            let zmax = 15u8.saturating_sub(self.pz.leading_zeros() as u8);
+            self.bounding_box = Some([xmin, ymin, zmin, xmax, ymax, zmax]);
         }
 
         self.emissive_sum = emissive_sum;

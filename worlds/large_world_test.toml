@@ -29,7 +29,7 @@ macos_hdr_colorspace = "extended_linear_srgb"
 
 [atmosphere]
 fog_density = 0.00059999997
-time_of_day = 0.4541821
+time_of_day = 0.5003697
 time_paused = false
 night_skybox_brightness = 0.01
 horizon_fade_up = 0.05
