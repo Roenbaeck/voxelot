@@ -332,8 +332,8 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
     var remaining_alpha = 1.0;
     var t_current = 0.0;
 
-    // Cap iterations for performance
-    let max_iter = min(params.max_steps, 20u);
+    // Cap iterations for performance: increase for GI DDA to allow longer reflections
+    let max_iter = min(params.max_steps, 128u);
 
     for (var i = 0u; i < max_iter; i++) {
         // Bounds check
@@ -396,10 +396,13 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                     let is_self = all(current_i == origin_chunk_i);
                     let min_dist = select(0.001, 0.1, is_self);
 
-                    if (hit.t_near <= hit.t_far && hit.t_far > 0.0 && hit.t_near > min_dist) {
-                        let hit_point_raw = world_pos + reflect_dir * hit.t_near;
-                        var hit_point = hit_point_raw;
-                        var mesh_color = vec3<f32>(0.0);
+                    if (hit.t_near <= hit.t_far && hit.t_far > 0.0) {
+                        // If we are not in the self-chunk and we are already inside the AABB, accept the hit.
+                        // Otherwise, enforce min_dist to prevent surface acne.
+                        if (!is_self || hit.t_near > min_dist) {
+                            let hit_point_raw = world_pos + reflect_dir * max(hit.t_near, 0.0);
+                            var hit_point = hit_point_raw;
+                            var mesh_color = vec3<f32>(0.0);
                         var mesh_blend = 0.0;
                         var hit_normal = hit.normal;
 
@@ -442,7 +445,7 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                         }
 
                         // Decide whether to accept a coarse AABB/probe hit, or skip it and continue DDA.
-                        let dim = textureDimensions(scene_depth);
+                        let dim_for_disprove = textureDimensions(scene_depth);
                         var screen_disproved = false;
                         var is_on_screen = false;
 
@@ -453,7 +456,7 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                                 if (abs(ndc.x) < 0.99 && abs(ndc.y) < 0.99) {
                                     is_on_screen = true;
                                     let screen_uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-                                    let px = vec2<i32>(screen_uv * vec2<f32>(dim));
+                                    let px = vec2<i32>(screen_uv * vec2<f32>(dim_for_disprove));
                                     let d_raw = textureLoad(scene_depth, px, 0);
                                     
                                     // DISPROVE: If the depth buffer shows something clearly behind our hit,
@@ -462,8 +465,10 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                                     let mesh_dist_to_cam = distance(camera.camera_pos, mesh_pos);
                                     let hit_dist_to_cam = distance(camera.camera_pos, hit_point);
                                     
-                                    // Disprove if the screen depth is significantly behind the hit point
-                                    if (d_raw >= 0.999999 || mesh_dist_to_cam > hit_dist_to_cam + 1.0) {
+                                    // Disprove only if the screen depth is significantly behind the hit point.
+                                    // we no longer disprove with sky (d_raw >= 0.999999) because windows or gaps 
+                                    // on screen shouldn't block distant coarse reflections.
+                                    if (d_raw < 0.999999 && mesh_dist_to_cam > hit_dist_to_cam + 2.0) {
                                         screen_disproved = true;
                                     }
                                 }
@@ -474,14 +479,14 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                         let hit_dot = abs(dot(reflect_dir, hit_normal));
                         
                         // Grazing rejection: kills "H-shapes" on side-faces of AABBs
-                        let is_grazing = (hit_dot < 0.04); 
+                        let is_grazing = (hit_dot < 0.035); 
 
                         // Accept if: 
                         // 1. Strong mesh snap (always reliable)
                         // 2. Off-screen (cannot disprove, so trust probe)
                         // 3. On-screen and not disproved by depth
                         // AND it's not a grazing artifact.
-                        let accept_aabb = (mesh_blend >= 0.25) || (!is_grazing && (!is_on_screen || !screen_disproved) && probe_alpha > 0.1);
+                        let accept_aabb = (mesh_blend >= 0.25) || (!is_grazing && (!is_on_screen || !screen_disproved) && probe_alpha > 0.05);
 
                         if (accept_aabb) {
                             // Use exact chunk color to avoid bleeding dark edges from empty neighbors
@@ -513,8 +518,9 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                             break;
                         }
                     }
-                    else if (water_opportunity) {
-                        // Bizarre case: Dense chunk, solid bbox, but ray missed bbox face or started inside.
+                }
+                else if (water_opportunity) {
+                    // Bizarre case: Dense chunk, solid bbox, but ray missed bbox face or started inside.
                         // Implies empty space inside bbox (or precision issue).
                         // Since we are "inside" the bounding volume, assume we are seeing water.
                         accumulated_color += water_color * remaining_alpha;
