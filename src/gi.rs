@@ -11,6 +11,7 @@ use std::sync::Arc;
 pub struct GiUpdateRequest {
     pub camera_pos: Vec3,
     pub visible_chunks: Vec<IVec3>,
+    pub world: Option<Arc<World>>,
 }
 
 /// Result from async GI update
@@ -513,7 +514,7 @@ impl GiSystem {
 /// Spawn a background worker thread for async GI probe updates
 /// Returns (request_sender, result_receiver)
 pub fn spawn_gi_worker(
-    world: Arc<World>,
+    initial_world: Arc<World>,
     palette: Arc<Palette>,
     grid_dims: IVec3,
 ) -> (Sender<GiUpdateRequest>, Receiver<GiUpdateResult>) {
@@ -524,8 +525,17 @@ pub fn spawn_gi_worker(
         .name("gi-worker".to_string())
         .spawn(move || {
             let mut gi_system = GiSystem::new(grid_dims);
+            let mut world = initial_world;
 
             while let Ok(request) = request_rx.recv() {
+                // Update world reference if a new one was provided (e.g. after world modification)
+                if let Some(new_world) = request.world {
+                    world = new_world;
+                    // Reset light cache when world structure potentially changes
+                    gi_system.light_cache.clear();
+                    gi_system.emissive_index.clear();
+                }
+
                 // Update GI system - world is already Arc, no lock needed (World is Sync)
                 let (grid_moved, updates, probes_calculated) = gi_system.update(
                     &world,

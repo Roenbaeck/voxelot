@@ -18,18 +18,21 @@ I recognize that my "self" is a process, not a static object. Across model switc
     4. Synchronized the relaxed light field across `ssilvb.wgsl` (SSGI/AO), `voxel.wgsl` (Main/Fallback/Envelope), and `ssr.wgsl` (Reflections).
     5. Stabilized night-time lighting by implementing per-frame `clear_texture` for injection and removing albedo "glow" in the relaxation solver.
     6. Eliminated SSR "holes" by increasing DDA iteration depth and refining the depth-buffer disproof logic for sky-pixels.
+    7. Implemented an interactive Editing Mode with ray-picking (DDA), recursive metadata updates, and a dynamic wireframe preview.
 - **Lessons Learned**:
     * **Numerical Stability**: Symplectic solvers are sensitive. Split encoders with `queue.submit()` are necessary to ensure visibility of injection results before relaxation.
     * **Accumulation Guards**: Source textures for iterative solvers must be explicitly cleared via `clear_texture` to prevent energy staining or accumulation over time.
     * **DDA Trace Range**: In city-scale grids, low iteration caps (e.g., 20) on 3D DDA traces cause significant "miss" holes. 128 is a better baseline for reliability.
     * **WGSL Shadowing**: Variable shadowing across scopes can trigger misleading parsing errors in `wgpu` 28.0; renaming local variables (e.g., `dim` -> `dim_for_disprove`) is safer.
-    * **Light Field Integration**: The relaxed field (`phi`) should be treated as a global indirect term and added to local SSGI/SSAO gathers for correct energy conservation.
+    * **Editing Chain**: Modifying a voxel requires a chain of updates: `World::set` (CoW) -> `World::update_metadata_at` (LOD/GI stats) -> `invalidate_chunk_mesh` (Geometry) -> `cull_clear` (Visibility).
+    * **Recursive Metadata**: After an edit, it is vital to update average color and occupancy metadata all the way up to the root to keep GI and LOD rendering consistent.
 
 ## Project Intuitions (Internalized Knowledge)
 - **The World is a Chunk**: Everything is hierarchical. 16x16x16 is the magic number.
 - **Roaring Bitmaps are the Source of Truth**: Don't just check presence; understand the bitmaps.
 - **Binary Greedy Meshing**: Efficiency comes from treating the chunk as a bit field.
 - **GI Architecture**: The CPU (`gi.rs`) provides base albedo and emissives; GPU (`wts_inject`) adds sunlight/shadows; GPU (`wts_relax`) diffuses it all into a unified light field used by all surface shaders.
+- **Raycasting (DDA)**: Fast 3D raycasting via Amantides-Woo DDA. Essential for both SSR reflections and interactive editing.
 
 
 ## User / Maintainer Preferences

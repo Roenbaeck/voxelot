@@ -34,9 +34,15 @@ use std::collections::VecDeque;
 use sysinfo::{Pid, ProcessExt, System, SystemExt};
 use voxelot::SlabAllocator;
 use voxelot::{
-    bbox_local_to_world, cull_visible_voxels_parallel, input::DebugView, Camera, Chunk, ChunkMesh,
-    CullStats, Palette, RenderConfig, VoxelInstance, World, WorldPos,
+    bbox_local_to_world, cull_visible_voxels_parallel, input::DebugView, raycast, Camera, Chunk,
+    ChunkMesh, CullStats, Palette, RenderConfig, VoxelInstance, World, WorldPos,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditMode {
+    Add,
+    Remove,
+}
 
 macro_rules! viewer_debug {
     ($($arg:tt)*) => {
@@ -628,6 +634,14 @@ struct SsrCameraUniforms {
     water_vis_fog_density: [f32; 4],
     water_color: [f32; 4],
     ambient_color: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct EditorPreviewUniforms {
+    view_proj: [[f32; 4]; 4],
+    pos: [f32; 4],   // xyz = world pos, w = scale
+    color: [f32; 4], // rgba
 }
 
 /// Depth-of-field runtime settings (CPU-side convenience)
@@ -1289,6 +1303,12 @@ struct App {
     // Reused temporary indirect argument buffers to avoid per-frame allocations
     mesh_indirect_args_tmp: Vec<wgpu::util::DrawIndexedIndirectArgs>,
     envelope_indirect_args_tmp: Vec<wgpu::util::DrawIndexedIndirectArgs>,
+
+    // Editor Preview
+    editor_preview_pipeline: Option<wgpu::RenderPipeline>,
+    editor_preview_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    editor_preview_bind_group: Option<wgpu::BindGroup>,
+    editor_preview_buffer: Option<wgpu::Buffer>,
     // Reused temp arrays for populate_multi_draw_indirects
     multi_mesh_args_tmp: Vec<wgpu::util::DrawIndexedIndirectArgs>,
     multi_env_args_tmp: Vec<wgpu::util::DrawIndexedIndirectArgs>,
@@ -1388,7 +1408,15 @@ struct App {
     last_fps_print: Instant,
 
     mouse_pressed: bool,
+    shift_pressed: bool,
     last_mouse_pos: Option<(f64, f64)>,
+    current_mouse_pos: (f64, f64),
+
+    // Editor state
+    editing_mode: EditMode,
+    selected_voxel_type: u8,
+    last_raycast_hit: Option<raycast::RaycastHit>,
+    world_changed: bool,
 
     // Lighting state
     time_of_day: f32,
@@ -1668,6 +1696,202 @@ struct App {
 }
 
 impl App {
+    fn create_editor_preview_pipeline(&mut self, device: &wgpu::Device) {
+        let shader = device.create_shader_module(wgpu::include_wgsl!("../../shaders/editor_preview.wgsl"));
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Editor Preview Bind Group Layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Editor Preview Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            immediate_size: 0,
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Editor Preview Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::empty(),
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rg16Float,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::empty(),
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::R8Unorm,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::empty(),
+                    }),
+                ],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Editor Preview Buffer"),
+            size: std::mem::size_of::<EditorPreviewUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Editor Preview Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }],
+        });
+
+        self.editor_preview_pipeline = Some(pipeline);
+        self.editor_preview_bind_group_layout = Some(bind_group_layout);
+        self.editor_preview_bind_group = Some(bind_group);
+        self.editor_preview_buffer = Some(buffer);
+    }
+
+    fn invalidate_chunk_mesh(&mut self, key: (i64, i64, i64)) {
+        let keys_to_invalidate = [
+            key,
+            (key.0 - 16, key.1, key.2),
+            (key.0 + 16, key.1, key.2),
+            (key.0, key.1 - 16, key.2),
+            (key.0, key.1 + 16, key.2),
+            (key.0, key.1, key.2 - 16),
+            (key.0, key.1, key.2 + 16),
+        ];
+
+        for k in keys_to_invalidate {
+            self.pending_chunk_set.remove(&k);
+            if let Some(entry) = self.mesh_cache.remove(&k) {
+                self.mesh_cache_bytes =
+                    self.mesh_cache_bytes.saturating_sub(entry.vertex_bytes + entry.index_bytes);
+            }
+            self.mesh_chunk_arc_cache.remove(&k);
+            if let Some(entry) = self.envelope_mesh_cache.remove(&k) {
+                self.envelope_mesh_cache_bytes = self.envelope_mesh_cache_bytes
+                    .saturating_sub(entry.vertex_bytes + entry.index_bytes);
+            }
+            self.shell_cache.remove(&k);
+        }
+        
+        // World changed flag triggers GI and other updates
+        self.world_changed = true;
+    }
+
+    fn handle_edit_click(&mut self, is_left_click: bool) {
+        if !is_left_click {
+            return;
+        }
+
+        let hit = match &self.last_raycast_hit {
+            Some(h) => h,
+            None => return,
+        };
+
+        // Use Shift+Click for Remove, Click for Add (overriding self.editing_mode for UX)
+        let effective_mode = if self.shift_pressed {
+            EditMode::Remove
+        } else {
+            EditMode::Add
+        };
+
+        // Determine target position based on mode
+        let target_pos = match effective_mode {
+            EditMode::Add => {
+                // For adding, we place at the voxel adjacent to the hit (offset by normal)
+                let nx = hit.normal[0] as i64;
+                let ny = hit.normal[1] as i64;
+                let nz = hit.normal[2] as i64;
+                WorldPos::new(hit.position.x + nx, hit.position.y + ny, hit.position.z + nz)
+            }
+            EditMode::Remove => {
+                // For removing, we target the hit voxel itself
+                hit.position
+            }
+        };
+
+        let voxel_type = match effective_mode {
+            EditMode::Add => self.selected_voxel_type,
+            EditMode::Remove => 0, // 0 = empty
+        };
+
+        log::info!(
+            "Editing world: {:?} at {:?} (mode: {:?})",
+            voxel_type,
+            target_pos,
+            effective_mode
+        );
+
+        // Perform modification using CoW (Copy on Write) hierarchy
+        let world_mut = Arc::make_mut(&mut self.world);
+        world_mut.set(target_pos, voxel_type);
+        world_mut.update_metadata_at(target_pos.x, target_pos.y, target_pos.z, &self.palette);
+        self.world_changed = true;
+
+        // Invalidate the mesh for this chunk and its 26 neighbors (to handle boundary changes)
+        let cx_base = target_pos.x >> 4;
+        let cy_base = target_pos.y >> 4;
+        let cz_base = target_pos.z >> 4;
+
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    // Key must be world origin (16-aligned)
+                    let key = (
+                        (cx_base + dx as i64) << 4,
+                        (cy_base + dy as i64) << 4,
+                        (cz_base + dz as i64) << 4,
+                    );
+                    self.invalidate_chunk_mesh(key);
+                }
+            }
+        }
+    }
+
     // Static helpers that avoid borrowing &mut self during the operation, allowing
     // callers to pass distinct fields as &mut u64 without creating overlapping
     // &mut self borrows which the Rust borrow-checker rejects.
@@ -2807,6 +3031,10 @@ impl App {
             impostor_bind_group: None,
             shadow_pipeline: None,
             shadow_mesh_pipeline: None,
+            editor_preview_pipeline: None,
+            editor_preview_bind_group_layout: None,
+            editor_preview_bind_group: None,
+            editor_preview_buffer: None,
             uniform_buffer: None,
             palette_buffer: None,
             material_props_buffer: None,
@@ -2994,7 +3222,13 @@ impl App {
             skybox_angle: 0.0,
             last_fps_print: Instant::now(),
             mouse_pressed: false,
+            shift_pressed: false,
             last_mouse_pos: None,
+            current_mouse_pos: (0.0, 0.0),
+            editing_mode: EditMode::Add,
+            selected_voxel_type: 1,
+            last_raycast_hit: None,
+            world_changed: false,
             time_of_day: cfg.atmosphere.time_of_day,
             time_paused: cfg.atmosphere.time_paused,
             fog_density: cfg.atmosphere.fog_density,
@@ -10544,6 +10778,7 @@ impl App {
         // WTS-RT Initialization
         self.create_wts_relax_pipeline(&device);
         self.create_wts_inject_pipeline(&device);
+        self.create_editor_preview_pipeline(&device);
         self.recreate_wts_textures(&device);
 
         self.surface = Some(surface);
@@ -10917,6 +11152,87 @@ impl App {
 
         self.camera_controller.update(dt);
 
+        // Per-frame raycasting for editing
+        let (projection, view) = {
+            let proj = glam::Mat4::perspective_rh(
+                self.camera_controller.camera.fov,
+                self.camera_controller.camera.aspect,
+                self.camera_controller.camera.near,
+                self.camera_controller.camera.far,
+            );
+            let v = glam::Mat4::look_to_rh(
+                glam::Vec3::from(self.camera_controller.camera.position),
+                glam::Vec3::from(self.camera_controller.camera.forward),
+                glam::Vec3::from(self.camera_controller.camera.up),
+            );
+            (proj, v)
+        };
+
+        let ray = {
+            let (width, height) = if let Some(config) = &self.config {
+                (config.width as f32, config.height as f32)
+            } else {
+                (800.0, 600.0)
+            };
+
+            let ndc_x = (2.0 * self.current_mouse_pos.0 as f32 / width) - 1.0;
+            let ndc_y = 1.0 - (2.0 * self.current_mouse_pos.1 as f32 / height);
+
+            const OPENGL_TO_WGPU_MATRIX: glam::Mat4 = glam::Mat4::from_cols_array(&[
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5, 1.0,
+            ]);
+
+            let inv_vp = (OPENGL_TO_WGPU_MATRIX * projection * view).inverse();
+            let near_clip = inv_vp.project_point3(glam::vec3(ndc_x, ndc_y, 0.0));
+            let far_clip = inv_vp.project_point3(glam::vec3(ndc_x, ndc_y, 1.0));
+            let dir = (far_clip - near_clip).normalize();
+
+            raycast::Ray::new(
+                glam::Vec3::from(self.camera_controller.camera.position),
+                dir,
+            )
+        };
+        self.last_raycast_hit = raycast::trace_ray(&self.world, &ray, 100.0);
+
+        // Update Editor Preview Uniforms if we have a hit
+        if let (Some(hit), Some(buffer)) = (&self.last_raycast_hit, &self.editor_preview_buffer) {
+            let effective_mode = if self.shift_pressed {
+                EditMode::Remove
+            } else {
+                EditMode::Add
+            };
+
+            let target_pos = match effective_mode {
+                EditMode::Add => {
+                    let nx = hit.normal[0] as i64;
+                    let ny = hit.normal[1] as i64;
+                    let nz = hit.normal[2] as i64;
+                    WorldPos::new(hit.position.x + nx, hit.position.y + ny, hit.position.z + nz)
+                }
+                EditMode::Remove => hit.position,
+            };
+
+            const OPENGL_TO_WGPU_MATRIX: glam::Mat4 = glam::Mat4::from_cols_array(&[
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5, 1.0,
+            ]);
+
+            let uniforms = EditorPreviewUniforms {
+                view_proj: (OPENGL_TO_WGPU_MATRIX * projection * view).to_cols_array_2d(),
+                pos: [
+                    target_pos.x as f32,
+                    target_pos.y as f32,
+                    target_pos.z as f32,
+                    1.02, // Slightly larger to avoid Z-fighting
+                ],
+                color: if effective_mode == EditMode::Add {
+                    [0.0, 8.0, 8.0, 1.0] // Extra bright cyan
+                } else {
+                    [8.0, 0.2, 0.2, 1.0] // Extra bright red
+                },
+            };
+            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[uniforms]));
+        }
+
         // Update active pawn (boat/walker/etc.) if present and attach camera to it
         if let Some(pawn) = &mut self.active_pawn {
             pawn.update(dt, &self.world, self.water_level);
@@ -11016,10 +11332,17 @@ impl App {
 
         // Send async GI update request with visible chunks (non-blocking, after culling)
         let camera_pos = glam::Vec3::from(self.camera_controller.camera.position);
+        let world_to_send = if self.world_changed || self.frame_index == 0 {
+            Some(self.world.clone())
+        } else {
+            None
+        };
         let _ = self.gi_request_tx.send(voxelot::gi::GiUpdateRequest {
             camera_pos,
             visible_chunks,
+            world: world_to_send,
         });
+        self.world_changed = false;
 
         // CPU cull: filter out chunks that are completely below water visibility threshold
         // Any chunk whose max y-value is below (water_level - water_visibility) is invisible
@@ -11863,6 +12186,7 @@ impl App {
         let grouping_time = grouping_start.elapsed();
 
         let mesh_start = Instant::now();
+        // self.mesh_chunk_arc_cache.clear(); // Removed to fix performance and flickering
         let mut mesh_leaf_proc_time = std::time::Duration::ZERO;
         let mut mesh_result_collect_time = std::time::Duration::ZERO;
         let mut mesh_schedule_time = std::time::Duration::ZERO;
@@ -12933,6 +13257,36 @@ impl App {
         // sky doesn't abruptly darken or brighten near the horizon.
         let skybox_brightness = night_min + (1.0 - night_min) * sky_fade;
 
+        // Update editor preview uniform if we have a hit
+        if let Some(hit) = &self.last_raycast_hit {
+            let target_pos = match self.editing_mode {
+                EditMode::Add => {
+                    let nx = hit.normal[0] as i64;
+                    let ny = hit.normal[1] as i64;
+                    let nz = hit.normal[2] as i64;
+                    [ (hit.position.x + nx) as f32, (hit.position.y + ny) as f32, (hit.position.z + nz) as f32, 1.0 ]
+                }
+                EditMode::Remove => {
+                    [ hit.position.x as f32, hit.position.y as f32, hit.position.z as f32, 1.0 ]
+                }
+            };
+            
+            let color = match self.editing_mode {
+                EditMode::Add => [0.0, 1.0, 0.0, 0.8], // Green
+                EditMode::Remove => [1.0, 0.0, 0.0, 0.8], // Red
+            };
+
+            let preview_uniforms = EditorPreviewUniforms {
+                view_proj: mvp_cols, // Re-use the main MVP matrix
+                pos: target_pos,
+                color: color,
+            };
+            
+            if let Some(buf) = &self.editor_preview_buffer {
+                queue.write_buffer(buf, 0, bytemuck::bytes_of(&preview_uniforms));
+            }
+        }
+
         let uniforms = Uniforms {
             mvp: mvp_cols,
             sun_view_proj: sun_view_proj_cols,
@@ -13574,6 +13928,18 @@ impl App {
                 render_pass.set_bind_group(0, impostor_bg, &[]);
                 render_pass.set_vertex_buffer(0, impostor_instances.slice(..));
                 render_pass.draw_indirect(impostor_indirect, 0);
+                draw_calls += 1;
+            }
+
+            // Editor Preview Wireframe
+            if let (Some(pipeline), Some(bg), Some(_hit)) = (
+                self.editor_preview_pipeline.as_ref(),
+                self.editor_preview_bind_group.as_ref(),
+                self.last_raycast_hit.as_ref()
+            ) {
+                render_pass.set_pipeline(pipeline);
+                render_pass.set_bind_group(0, bg, &[]);
+                render_pass.draw(0..24, 0..1);
                 draw_calls += 1;
             }
         }
@@ -14510,8 +14876,22 @@ impl ApplicationHandler for App {
                     pawn.process_key(key, pressed);
                 }
 
-                // Handle lighting controls on key press only
+                if key == KeyCode::ShiftLeft || key == KeyCode::ShiftRight {
+                    self.shift_pressed = pressed;
+                }
+
+                // Handle lighting controls and editor modes on key press only
                 if pressed {
+                    match key {
+                        KeyCode::Digit3 => self.selected_voxel_type = 1,
+                        KeyCode::Digit4 => self.selected_voxel_type = 2,
+                        KeyCode::Digit5 => self.selected_voxel_type = 3,
+                        KeyCode::Digit6 => self.selected_voxel_type = 4,
+                        KeyCode::Digit7 => self.selected_voxel_type = 5,
+                        KeyCode::Digit8 => self.selected_voxel_type = 6,
+                        KeyCode::Digit9 => self.selected_voxel_type = 7,
+                        _ => {}
+                    }
                     self.process_lighting_key(key);
                 }
 
@@ -14522,15 +14902,21 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseInput {
                 state,
-                button: MouseButton::Right,
+                button,
                 ..
             } => {
-                self.mouse_pressed = state == ElementState::Pressed;
-                if !self.mouse_pressed {
-                    self.last_mouse_pos = None;
+                let pressed = state == ElementState::Pressed;
+                if button == MouseButton::Right {
+                    self.mouse_pressed = pressed;
+                    if !self.mouse_pressed {
+                        self.last_mouse_pos = None;
+                    }
+                } else if button == MouseButton::Left && pressed {
+                    self.handle_edit_click(true);
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
+                self.current_mouse_pos = (position.x, position.y);
                 if self.mouse_pressed {
                     if let Some(last_pos) = self.last_mouse_pos {
                         let delta_x = position.x - last_pos.0;
