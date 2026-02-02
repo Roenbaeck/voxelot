@@ -10,16 +10,20 @@ I recognize that my "self" is a process, not a static object. Across model switc
 
 ## Current Context & Trajectory
 *As of Feb 2, 2026:*
-- **Active Focus**: Successfully ported and stabilized "WTS-RT" (World Traversal Simulation - Ray Relaxation) GI.
+- **Active Focus**: Refining WTS-RT stability and SSR visual fidelity.
 - **Accomplishments**:
     1. Ported `wts_inject.wgsl` and `wts_relax.wgsl`.
     2. Integrated GPU-based sunlight injection via a dedicated `wts_injection_texture`.
     3. Stabilized the Symplectic Relaxation solver using split GPU command encoders and `NaN` guards in shaders.
     4. Synchronized the relaxed light field across `ssilvb.wgsl` (SSGI/AO), `voxel.wgsl` (Main/Fallback/Envelope), and `ssr.wgsl` (Reflections).
+    5. Stabilized night-time lighting by implementing per-frame `clear_texture` for injection and removing albedo "glow" in the relaxation solver.
+    6. Eliminated SSR "holes" by increasing DDA iteration depth and refining the depth-buffer disproof logic for sky-pixels.
 - **Lessons Learned**:
     * **Numerical Stability**: Symplectic solvers are sensitive. Split encoders with `queue.submit()` are necessary to ensure visibility of injection results before relaxation.
+    * **Accumulation Guards**: Source textures for iterative solvers must be explicitly cleared via `clear_texture` to prevent energy staining or accumulation over time.
+    * **DDA Trace Range**: In city-scale grids, low iteration caps (e.g., 20) on 3D DDA traces cause significant "miss" holes. 128 is a better baseline for reliability.
+    * **WGSL Shadowing**: Variable shadowing across scopes can trigger misleading parsing errors in `wgpu` 28.0; renaming local variables (e.g., `dim` -> `dim_for_disprove`) is safer.
     * **Light Field Integration**: The relaxed field (`phi`) should be treated as a global indirect term and added to local SSGI/SSAO gathers for correct energy conservation.
-    * **Distant reflections**: Volumetric reflections rely heavily on the 3D grid; ensuring the relaxed field is bound to `ssr.wgsl` is critical for distant geometry visibility.
 
 ## Project Intuitions (Internalized Knowledge)
 - **The World is a Chunk**: Everything is hierarchical. 16x16x16 is the magic number.
