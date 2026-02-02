@@ -17,6 +17,7 @@ Path | Type | Description | Notes
 `Cargo.toml` | file | Project manifest (dependencies, features, target-specific overrides). | `wgpu = "28.0"`; `windows = "0.62.2"` pinned for Windows builds.
 `Cargo.lock` | file | Locked dependency graph for reproducible CI/Builds. | Commit in app repos for stable CI.
 `README.md` | file | High-level project overview, quick-start, controls and architecture notes. | Good first read for contributors.
+`SELF.md` | file | The Agent's Living Identity — persistent context across model switches and sessions. | **Read first** to maintain cognitive continuity.
 `LICENSE` | file | Project license text.
 `CONFIGURATION.md` | doc | Full reference for `config.toml` options and defaults (derived from `src/config.rs`). | Useful when editing runtime configuration.
 `WGPU_28.md` | doc | Migration notes and breaking-change checklist for `wgpu` v28. | Important when touching rendering/shader code.

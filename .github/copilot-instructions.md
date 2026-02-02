@@ -12,6 +12,12 @@ See `REPO_MAP.md` for a machine-readable per-path map with short descriptions an
   - cargo run --bin generate_world -- <flags> (see README "Data Generation")
 - Run tests: cargo test
 
+## The Agent's Self & Continuity (SELF.md) 🧠
+- `SELF.md` is a living document representing the agent's identity, trajectory, and internalized project knowledge. 
+- **Read it early**: Always check `SELF.md` at the start of a session or after a model switch to maintain cognitive continuity.
+- **Update it**: If you learn something fundamental about the code (e.g., a "why" that isn't in comments) or if the user's preferences shift, update `SELF.md`.
+- **Handoff**: When finishing a task or feeling a "context wall" approaching, summarize your current trajectory in `SELF.md` for your future self.
+
 ## High-level architecture (read before editing) 🔎
 - "Chunks all the way": the **World is a Chunk**, and every node uses the same Chunk layout (see `src/lib_hierarchical.rs`). Chunk side length is fixed at 16 — do not change it lightly.
 - Presence & culling pipeline:
