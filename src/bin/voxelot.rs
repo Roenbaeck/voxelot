@@ -535,6 +535,16 @@ impl MeshCacheEntry {
         }
     }
 }
+
+#[derive(Clone, Copy, Debug)]
+struct DeferredFree {
+    vertex_offset: u64,
+    vertex_bytes: u64,
+    index_offset: u64,
+    index_bytes: u64,
+    free_after_frame: u64,
+    is_envelope: bool,
+}
 // Ensure impl CameraController is properly closed (fix potential brace mismatch introduced by refactor)
 
 #[derive(Clone, Debug)]
@@ -1240,6 +1250,10 @@ struct App {
     impostor_instance_capacity: usize,
     // Mesh cache: per-leaf-chunk mesh GPU buffers and metadata
     mesh_cache: FxHashMap<(i64, i64, i64), MeshCacheEntry>,
+    /// Chunks that need remeshing even if a cached mesh exists
+    dirty_meshes: FxHashSet<(i64, i64, i64)>,
+    /// Mesh allocations to free after the GPU-safe window
+    deferred_frees: Vec<DeferredFree>,
     /// Cache of surface voxels for un-meshed chunks (for optimized fallback rendering)
     shell_cache: FxHashMap<(i64, i64, i64), Vec<voxelot::ShellVoxel>>,
     mesh_cache_bytes: u64,
@@ -1804,20 +1818,23 @@ impl App {
             (key.0, key.1, key.2 + 16),
         ];
 
-        for k in keys_to_invalidate {
-            self.pending_chunk_set.remove(&k);
-            if let Some(entry) = self.mesh_cache.remove(&k) {
-                self.mesh_cache_bytes =
-                    self.mesh_cache_bytes.saturating_sub(entry.vertex_bytes + entry.index_bytes);
-            }
+        for (i, k) in keys_to_invalidate.iter().copied().enumerate() {
+            // Drop cached Arc<Chunk> snapshots so meshing re-reads the latest world data.
             self.mesh_chunk_arc_cache.remove(&k);
-            if let Some(entry) = self.envelope_mesh_cache.remove(&k) {
-                self.envelope_mesh_cache_bytes = self.envelope_mesh_cache_bytes
-                    .saturating_sub(entry.vertex_bytes + entry.index_bytes);
+
+            // Mark dirty so we remesh even if a cached mesh exists.
+            self.dirty_meshes.insert(k);
+
+            // Queue remesh without clearing existing mesh to avoid visible "blink".
+            if self.pending_chunk_set.insert(k) {
+                if i == 0 {
+                    self.pending_chunk_meshes.push_front(k);
+                } else {
+                    self.pending_chunk_meshes.push_back(k);
+                }
             }
-            self.shell_cache.remove(&k);
         }
-        
+
         // World changed flag triggers GI and other updates
         self.world_changed = true;
     }
@@ -3073,6 +3090,8 @@ impl App {
             impostor_instance_buffer: None,
             impostor_instance_capacity: 0,
             mesh_cache: FxHashMap::default(),
+            dirty_meshes: FxHashSet::default(),
+            deferred_frees: Vec::new(),
             shell_cache: FxHashMap::default(),
             mesh_jobs_executed: mesh_jobs_executed.clone(),
             mesh_cache_bytes: 0,
@@ -6997,6 +7016,21 @@ impl App {
         // Also drop any cached Arc<Chunk> snapshot for this chunk to free memory
         self.mesh_chunk_arc_cache.remove(&key);
         entry_bytes
+    }
+
+    fn defer_free_entry(&mut self, entry: MeshCacheEntry, is_envelope: bool) {
+        if entry.is_placeholder {
+            return;
+        }
+        let free_after_frame = self.frame_index.saturating_add(GPU_EVICTION_SAFE_FRAMES);
+        self.deferred_frees.push(DeferredFree {
+            vertex_offset: entry.vertex_offset,
+            vertex_bytes: entry.vertex_bytes,
+            index_offset: entry.index_offset,
+            index_bytes: entry.index_bytes,
+            free_after_frame,
+            is_envelope,
+        });
     }
 
     fn force_evict_lru(&mut self) -> bool {
@@ -11131,6 +11165,28 @@ impl App {
         self.elapsed_time += dt;
         self.frame_index = self.frame_index.wrapping_add(1);
 
+        // Free deferred mesh allocations after the GPU-safe window to avoid reuse flashes.
+        let safe_before = self.frame_index.saturating_sub(GPU_EVICTION_SAFE_FRAMES);
+        let mut i = 0usize;
+        while i < self.deferred_frees.len() {
+            if self.deferred_frees[i].free_after_frame <= safe_before {
+                let df = self.deferred_frees.swap_remove(i);
+                self.vertex_allocator.free(df.vertex_offset, df.vertex_bytes);
+                self.index_allocator.free(df.index_offset, df.index_bytes);
+                if df.is_envelope {
+                    self.envelope_mesh_cache_bytes = self
+                        .envelope_mesh_cache_bytes
+                        .saturating_sub(df.vertex_bytes + df.index_bytes);
+                } else {
+                    self.mesh_cache_bytes = self
+                        .mesh_cache_bytes
+                        .saturating_sub(df.vertex_bytes + df.index_bytes);
+                }
+            } else {
+                i += 1;
+            }
+        }
+
         let fps = if dt > 0.0 { 1.0 / dt } else { f32::INFINITY };
         // Exponential moving average for FPS (cheap, always enabled)
         const FPS_ALPHA: f32 = 0.10;
@@ -12392,12 +12448,14 @@ impl App {
 
             // Check if we already have the desired mesh type (it might have been completed since queuing)
             if use_envelope {
-                if self.envelope_mesh_cache.contains_key(&key) {
+                if self.envelope_mesh_cache.contains_key(&key)
+                    && !self.dirty_meshes.contains(&key)
+                {
                     self.pending_chunk_set.remove(&key);
                     continue;
                 }
             } else {
-                if self.mesh_cache.contains_key(&key) {
+                if self.mesh_cache.contains_key(&key) && !self.dirty_meshes.contains(&key) {
                     self.pending_chunk_set.remove(&key);
                     continue;
                 }
@@ -12468,6 +12526,7 @@ impl App {
                 None => {
                     self.pending_chunk_set.remove(&key);
                     self.chunk_emitters.remove(&key);
+                    self.dirty_meshes.remove(&key);
                     chunks_not_found += 1;
                 }
             }
@@ -12548,6 +12607,7 @@ impl App {
                     // Mesh is ready, so we don't need the shell fallback anymore
                     self.shell_cache.remove(&key);
                 }
+                self.dirty_meshes.remove(&key);
 
                 new_meshes_created += 1;
                 self.stat_empty_meshes += 1;
@@ -12594,6 +12654,68 @@ impl App {
                 material: v.material,
             }));
             mesh_build_vb_time += vb_build_start.elapsed();
+
+            // Fast path: reuse existing mesh allocation if it can fit the new data.
+            let vb_bytes = (vb_local.len() * std::mem::size_of::<MeshVertexRaw>()) as u64;
+            let ib_bytes = (mesh.indices.len() * std::mem::size_of::<u32>()) as u64;
+            if let (Some(vbuf), Some(ibuf)) = (
+                self.mega_vertex_buffer.as_ref(),
+                self.mega_index_buffer.as_ref(),
+            ) {
+                if is_envelope {
+                    if let Some(entry) = self.envelope_mesh_cache.get_mut(&key) {
+                        if !entry.is_placeholder
+                            && vb_bytes <= entry.vertex_bytes
+                            && ib_bytes <= entry.index_bytes
+                        {
+                            queue.write_buffer(
+                                vbuf,
+                                entry.vertex_offset,
+                                bytemuck::cast_slice(&vb_local),
+                            );
+                            queue.write_buffer(
+                                ibuf,
+                                entry.index_offset,
+                                bytemuck::cast_slice(&mesh.indices),
+                            );
+                            entry.vertex_count = vb_local.len() as u32;
+                            entry.index_count = mesh.indices.len() as u32;
+                            entry.last_used_frame = self.frame_index;
+                            self.dirty_meshes.remove(&key);
+                            // Restore temp buffer and continue without reallocation
+                            self.vb_data_tmp = vb_local;
+                            new_meshes_created += 1;
+                            continue;
+                        }
+                    }
+                } else if let Some(entry) = self.mesh_cache.get_mut(&key) {
+                    if !entry.is_placeholder
+                        && vb_bytes <= entry.vertex_bytes
+                        && ib_bytes <= entry.index_bytes
+                    {
+                        queue.write_buffer(
+                            vbuf,
+                            entry.vertex_offset,
+                            bytemuck::cast_slice(&vb_local),
+                        );
+                        queue.write_buffer(
+                            ibuf,
+                            entry.index_offset,
+                            bytemuck::cast_slice(&mesh.indices),
+                        );
+                        entry.vertex_count = vb_local.len() as u32;
+                        entry.index_count = mesh.indices.len() as u32;
+                        entry.last_used_frame = self.frame_index;
+                        self.shell_cache.remove(&key);
+                        self.dirty_meshes.remove(&key);
+                        // Restore temp buffer and continue without reallocation
+                        self.vb_data_tmp = vb_local;
+                        new_meshes_created += 1;
+                        continue;
+                    }
+                }
+            }
+
             let vbuf_start = std::time::Instant::now();
             let mut alloc =
                 self.allocate_mesh_in_megabuffer(&device, &queue, &vb_local, &mesh.indices);
@@ -12669,13 +12791,21 @@ impl App {
             };
             let entry_start = std::time::Instant::now();
             if is_envelope {
+                if let Some(old) = self.envelope_mesh_cache.remove(&key) {
+                    self.defer_free_entry(old, true);
+                }
                 self.envelope_mesh_cache.insert(key, entry);
                 self.envelope_mesh_cache_bytes += vertex_bytes + index_bytes;
+                self.dirty_meshes.remove(&key);
             } else {
+                if let Some(old) = self.mesh_cache.remove(&key) {
+                    self.defer_free_entry(old, false);
+                }
                 self.mesh_cache.insert(key, entry);
                 // Mesh is ready, so we don't need the shell fallback anymore
                 self.shell_cache.remove(&key);
                 self.mesh_cache_bytes += vertex_bytes + index_bytes;
+                self.dirty_meshes.remove(&key);
             }
             mesh_upload_entry_time += entry_start.elapsed();
 
