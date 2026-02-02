@@ -64,13 +64,12 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
     let screen_term = phi_t.rgb / (beta + 1e-4);
     let relaxation = params.alpha * (laplacian - screen_term);
     
-    // Injection: Pull towards the seed and add sunlight flux
-    let seed_injection = params.gamma * (seed.rgb - phi_t.rgb);
-    let sun_flux = textureLoad(injection_texture, coord, 0).rgb;
+    // Injection: Sunlight/Emissive flux from injection_texture
+    let flux = textureLoad(injection_texture, coord, 0).rgb;
     
     // Update
-    // alpha * sun_flux treats sunlight as a source term for the diffusion equation.
-    var new_phi_rgb = phi_t.rgb + relaxation + seed_injection + params.alpha * sun_flux;
+    // alpha * flux treats injected light as a source term for the diffusion equation.
+    var new_phi_rgb = phi_t.rgb + relaxation + params.alpha * flux;
     
     // Clamp to prevent runaway/NaNs (limited for LDR/balanced HDR)
     new_phi_rgb = clamp(new_phi_rgb, vec3<f32>(0.0), vec3<f32>(8.0));

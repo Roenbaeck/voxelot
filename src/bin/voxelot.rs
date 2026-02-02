@@ -8066,6 +8066,9 @@ impl App {
         {
             req_features |= wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
         }
+        if adapter.features().contains(wgpu::Features::CLEAR_TEXTURE) {
+            req_features |= wgpu::Features::CLEAR_TEXTURE;
+        }
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -13260,6 +13263,20 @@ impl App {
             let mut wts_inject_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("WTS Inject Encoder"),
             });
+
+            // Clear injection texture before each pass to prevent sunlight "staining" or accumulation
+            if let Some(injection_texture) = self.wts_injection_texture.as_ref() {
+                wts_inject_encoder.clear_texture(
+                    injection_texture,
+                    &wgpu::ImageSubresourceRange {
+                        aspect: wgpu::TextureAspect::All,
+                        base_mip_level: 0,
+                        mip_level_count: None,
+                        base_array_layer: 0,
+                        array_layer_count: None,
+                    },
+                );
+            }
 
             // Drop any existing borrows by using local variables
             self.update_wts_inject_bind_group(&device);
