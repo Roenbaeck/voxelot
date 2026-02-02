@@ -80,6 +80,7 @@ struct LightProbe {
 @group(1) @binding(7) var gi_probe_color: texture_3d<f32>;
 @group(1) @binding(8) var gi_probe_bbox: texture_3d<u32>;
 @group(1) @binding(9) var linear_sampler: sampler;
+@group(1) @binding(10) var gi_relaxed_phi: texture_3d<f32>;
 
 
 struct VertexOutputInstanced {
@@ -340,9 +341,10 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
         
         if (all(chunk_coord >= vec3<i32>(0)) && all(chunk_coord < camera.gi_grid_dims)) {
             let probe_color = textureLoad(gi_probe_color, chunk_coord, 0).rgb;
+            let relaxed_phi = textureLoad(gi_relaxed_phi, chunk_coord, 0).rgb;
             let radiance = sample_radiance_int(chunk_coord, input.normal);
             // Re-integrate sun/moon for fallbacks to avoid "flat" look
-            let total_lighting = sun_contribution + moon_light + (radiance * uniforms.gi_scale) + uniforms.ambient_color_pad.xyz * 0.1;
+            let total_lighting = sun_contribution + moon_light + (relaxed_phi + radiance * uniforms.gi_scale) + uniforms.ambient_color_pad.xyz * 0.1;
             
             // Simplified distant reflection
             var reflection = vec3<f32>(0.0);
@@ -422,9 +424,10 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
         var env_lit: vec3<f32>;
         if (all(chunk_coord >= vec3<i32>(0)) && all(chunk_coord < camera.gi_grid_dims)) {
             let probe_color = textureLoad(gi_probe_color, chunk_coord, 0).rgb;
+            let relaxed_phi = textureLoad(gi_relaxed_phi, chunk_coord, 0).rgb;
             let radiance = sample_radiance_int(chunk_coord, input.normal);
             // Re-integrate sun/moon for envelopes
-            let total_lighting = sun_contribution + moon_light + (radiance * uniforms.gi_scale) + uniforms.ambient_color_pad.xyz * 0.1;
+            let total_lighting = sun_contribution + moon_light + (relaxed_phi + radiance * uniforms.gi_scale) + uniforms.ambient_color_pad.xyz * 0.1;
             
             // Simplified distant reflection for envelopes
             var reflection = vec3<f32>(0.0);
@@ -575,7 +578,16 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     // Keep it subtle but visible for testing (increased from 0.03)
     indirect_light = min(indirect_light, vec3<f32>(0.5, 0.5, 0.5));
     
-    let lighting = ambient + sun_contribution + moon_light + indirect_light;
+    var lighting = ambient + sun_contribution + moon_light + indirect_light;
+    
+    let chunk_coord = vec3<i32>(floor(input.world_pos / 16.0)) - camera.gi_grid_origin;
+    if (all(chunk_coord >= vec3<i32>(0)) && all(chunk_coord < camera.gi_grid_dims)) {
+        let relaxed_phi = textureLoad(gi_relaxed_phi, chunk_coord, 0).rgb;
+        let radiance = sample_radiance_int(chunk_coord, input.normal);
+        // Reduce the weight of relaxed_phi when added to direct sun to prevent extreme overexposure.
+        // It should act as an ambient/indirect term. 
+        lighting += (relaxed_phi * 0.4 + (radiance * uniforms.gi_scale));
+    }
     
     // emissive_strength is already defined above
     var color = input.color.rgb * lighting * input.color.a;
@@ -635,10 +647,11 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
         var env_lit: vec3<f32>;
         if (all(chunk_coord >= vec3<i32>(0)) && all(chunk_coord < camera.gi_grid_dims)) {
             let probe_color = textureLoad(gi_probe_color, chunk_coord, 0).rgb;
+            let relaxed_phi = textureLoad(gi_relaxed_phi, chunk_coord, 0).rgb;
             let radiance = sample_radiance_int(chunk_coord, input.normal);
             // Re-integrate sun/moon for envelopes
-            let total_lighting = sun_contribution + moon_light + (radiance * uniforms.gi_scale) + uniforms.ambient_color_pad.xyz * 0.1;
-            
+            let total_lighting = sun_contribution + moon_light + (relaxed_phi + radiance * uniforms.gi_scale) + uniforms.ambient_color_pad.xyz * 0.1;
+
             // Simplified distant reflection for envelopes
             var reflection = vec3<f32>(0.0);
             if (reflectivity > 0.001) {

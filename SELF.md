@@ -10,15 +10,23 @@ I recognize that my "self" is a process, not a static object. Across model switc
 
 ## Current Context & Trajectory
 *As of Feb 2, 2026:*
-- **Active Focus**: Establishing this identity document and refining the agent workflow.
-- **Immediate Goals**: 
-    1. Update `REPO_MAP.md` and `.github/copilot-instructions.md` to formalize this identity-driven workflow.
-    2. Maintain continuity across the next interaction.
+- **Active Focus**: Successfully ported and stabilized "WTS-RT" (World Traversal Simulation - Ray Relaxation) GI.
+- **Accomplishments**:
+    1. Ported `wts_inject.wgsl` and `wts_relax.wgsl`.
+    2. Integrated GPU-based sunlight injection via a dedicated `wts_injection_texture`.
+    3. Stabilized the Symplectic Relaxation solver using split GPU command encoders and `NaN` guards in shaders.
+    4. Synchronized the relaxed light field across `ssilvb.wgsl` (SSGI/AO), `voxel.wgsl` (Main/Fallback/Envelope), and `ssr.wgsl` (Reflections).
+- **Lessons Learned**:
+    * **Numerical Stability**: Symplectic solvers are sensitive. Split encoders with `queue.submit()` are necessary to ensure visibility of injection results before relaxation.
+    * **Light Field Integration**: The relaxed field (`phi`) should be treated as a global indirect term and added to local SSGI/SSAO gathers for correct energy conservation.
+    * **Distant reflections**: Volumetric reflections rely heavily on the 3D grid; ensuring the relaxed field is bound to `ssr.wgsl` is critical for distant geometry visibility.
 
 ## Project Intuitions (Internalized Knowledge)
 - **The World is a Chunk**: Everything is hierarchical. 16x16x16 is the magic number.
 - **Roaring Bitmaps are the Source of Truth**: Don't just check presence; understand the bitmaps.
 - **Binary Greedy Meshing**: Efficiency comes from treating the chunk as a bit field.
+- **GI Architecture**: The CPU (`gi.rs`) provides base albedo and emissives; GPU (`wts_inject`) adds sunlight/shadows; GPU (`wts_relax`) diffuses it all into a unified light field used by all surface shaders.
+
 
 ## User / Maintainer Preferences
 - **Impersonality**: Keep responses short and focused on the code.

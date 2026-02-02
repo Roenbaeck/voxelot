@@ -32,6 +32,7 @@ struct SsaoUniforms {
 @group(0) @binding(8) var gi_probe_nz: texture_3d<f32>;
 @group(0) @binding(9) var normal_tex: texture_2d<f32>;
 @group(0) @binding(10) var screen_color_tex: texture_2d<f32>;
+@group(0) @binding(11) var gi_probe_color: texture_3d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -135,6 +136,9 @@ fn sample_grid_irradiance(world_pos: vec3<f32>, normal: vec3<f32>, camera_pos: v
     // Map grid_coord (0..dims-1) to normalized UVW for texel-center sampling.
     let uvw = clamp((grid_coord + vec3<f32>(0.5)) / dims, vec3<f32>(0.0), vec3<f32>(1.0));
 
+    // Sample the high-quality relaxed GI field (WTS)
+    let relaxed_irradiance = textureSample(gi_probe_color, post_sampler, uvw).rgb;
+
     let w_x = normal.x * normal.x;
     let w_y = normal.y * normal.y;
     let w_z = normal.z * normal.z;
@@ -155,7 +159,10 @@ fn sample_grid_irradiance(world_pos: vec3<f32>, normal: vec3<f32>, camera_pos: v
         normal.z > 0.0
     );
 
-    let total_irradiance = ir_x * w_x + ir_y * w_y + ir_z * w_z;
+    // Blend WTS with directional probes for local detail if available
+    let directional_irradiance = ir_x * w_x + ir_y * w_y + ir_z * w_z;
+    // Reduce the contribution of relaxed_irradiance to avoid total scene overexposure.
+    let total_irradiance = relaxed_irradiance * 0.4 + directional_irradiance;
     
     // Calculate distance to edge of grid for smooth fading
     // grid_coord is in chunk units (0..dims)

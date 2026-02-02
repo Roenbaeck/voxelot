@@ -722,6 +722,31 @@ struct GiSettings {
     fade_range: f32,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct WtsParamsRaw {
+    alpha: f32,
+    gamma: f32,
+    beta_diffuse: f32,
+    beta_air: f32,
+    max_occupancy: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct InjectParams {
+    candidate_count: u32,
+    gi_grid_origin: [i32; 3],
+    gi_grid_dims: [i32; 3],
+    _pad0: u32,
+    sun_dir_intensity: [f32; 4], // xyz: dir, w: intensity
+    sun_color_pad: [f32; 4],      // xyz: color, w: pad
+    shadow_matrix: [[f32; 4]; 4],
+}
+
 #[derive(Copy, Clone, Debug)]
 struct SSRSettings {
     max_steps: u32,
@@ -1311,6 +1336,25 @@ struct App {
     gi_probe_view_nz: Option<wgpu::TextureView>,
     gi_probe_view_color: Option<wgpu::TextureView>,
     gi_probe_view_bbox: Option<wgpu::TextureView>,
+
+    // WTS-RT (Symplectic Ray Relaxation)
+    wts_relax_pipeline: Option<wgpu::ComputePipeline>,
+    wts_relax_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    wts_relax_bind_groups: [Option<wgpu::BindGroup>; 2],
+    wts_params_buffer: Option<wgpu::Buffer>,
+    wts_phi_textures: [Option<wgpu::Texture>; 2],
+    wts_phi_views: [Option<wgpu::TextureView>; 2],
+    wts_phi_storage_views: [Option<wgpu::TextureView>; 2],
+    wts_injection_texture: Option<wgpu::Texture>,
+    wts_injection_view: Option<wgpu::TextureView>,
+    wts_injection_storage_view: Option<wgpu::TextureView>,
+    wts_ping_pong: usize,
+    // WTS Inject
+    wts_inject_pipeline: Option<wgpu::ComputePipeline>,
+    wts_inject_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    wts_inject_bind_group: Option<wgpu::BindGroup>,
+    wts_inject_params_buffer: Option<wgpu::Buffer>,
+
     camera_controller: CameraController,
     pending_chunk_meshes: VecDeque<(i64, i64, i64)>,
     pending_chunk_set: FxHashSet<(i64, i64, i64)>,
@@ -1945,6 +1989,356 @@ impl App {
         }
     }
 
+    fn create_wts_relax_pipeline(&mut self, device: &wgpu::Device) {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("WTS Relax Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/wts_relax.wgsl").into()),
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("WTS Relax Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("WTS Relax Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            immediate_size: 0,
+        });
+
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("WTS Relax Pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        self.wts_relax_bind_group_layout = Some(bind_group_layout);
+        self.wts_relax_pipeline = Some(pipeline);
+    }
+
+    fn create_wts_inject_pipeline(&mut self, device: &wgpu::Device) {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("WTS Inject Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/wts_inject.wgsl").into()),
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("WTS Inject Bind Group Layout"),
+            entries: &[
+                // 0: Candidates Buffer (Storage Read)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // 1: Params (Uniform)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZeroU64::new(
+                            std::mem::size_of::<InjectParams>() as u64,
+                        ),
+                    },
+                    count: None,
+                },
+                // 2: Seed Texture (Storage Write)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                    },
+                    count: None,
+                },
+                // 3: Shadow Map (Texture Depth)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // 4: Shadow Sampler (Comparison)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("WTS Inject Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            immediate_size: 0,
+        });
+
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("WTS Inject Pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        self.wts_inject_bind_group_layout = Some(bind_group_layout);
+        self.wts_inject_pipeline = Some(pipeline);
+    }
+
+    fn recreate_wts_textures(&mut self, device: &wgpu::Device) {
+        let extent = wgpu::Extent3d {
+            width: self.gi_grid_dims.x.max(1) as u32,
+            height: self.gi_grid_dims.y.max(1) as u32,
+            depth_or_array_layers: self.gi_grid_dims.z.max(1) as u32,
+        };
+
+        let desc = wgpu::TextureDescriptor {
+            label: Some("WTS Phi Texture"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        };
+
+        for i in 0..2 {
+            let tex = device.create_texture(&desc);
+            let view = tex.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D3),
+                ..Default::default()
+            });
+            self.wts_phi_textures[i] = Some(tex);
+            self.wts_phi_views[i] = Some(view);
+            // Storage view
+            self.wts_phi_storage_views[i] =
+                Some(self.wts_phi_textures[i].as_ref().unwrap().create_view(
+                    &wgpu::TextureViewDescriptor {
+                        dimension: Some(wgpu::TextureViewDimension::D3),
+                        ..Default::default()
+                    },
+                ));
+        }
+
+        // New injection texture
+        let injection_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("WTS Injection Texture"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.wts_injection_view = Some(injection_texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            ..Default::default()
+        }));
+        self.wts_injection_storage_view = Some(injection_texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("WTS Injection Storage View"),
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            ..Default::default()
+        }));
+        self.wts_injection_texture = Some(injection_texture);
+
+        if self.wts_params_buffer.is_none() {
+            self.wts_params_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("WTS Params Buffer"),
+                size: std::mem::size_of::<WtsParamsRaw>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+
+        if self.wts_inject_params_buffer.is_none() {
+            self.wts_inject_params_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("WTS Inject Params Buffer"),
+                size: std::mem::size_of::<InjectParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+
+        self.recreate_wts_bind_groups(device);
+    }
+
+    fn update_wts_inject_bind_group(&mut self, device: &wgpu::Device) {
+        if self.wts_inject_bind_group.is_some() {
+            return;
+        }
+
+        let (
+            Some(layout),
+            Some(input_buf),
+            Some(params_buf),
+            Some(injection_view),
+            Some(shadow_view),
+            Some(shadow_sampler),
+        ) = (
+            self.wts_inject_bind_group_layout.as_ref(),
+            self.gpu_input_buffer.as_ref(), // Matches current field name
+            self.wts_inject_params_buffer.as_ref(),
+            self.wts_injection_storage_view.as_ref(),
+            self.shadow_view.as_ref(),
+            self.shadow_sampler.as_ref(),
+        )
+        else {
+            return;
+        };
+
+        let r0 = input_buf.as_entire_binding();
+        let r1 = params_buf.as_entire_binding();
+        let r2 = wgpu::BindingResource::TextureView(injection_view);
+        let r3 = wgpu::BindingResource::TextureView(shadow_view);
+        let r4 = wgpu::BindingResource::Sampler(shadow_sampler);
+
+        self.wts_inject_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("WTS Inject Bind Group"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: r0,
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: r1,
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: r2,
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: r3,
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: r4,
+                },
+            ],
+        }));
+    }
+
+    fn recreate_wts_bind_groups(&mut self, device: &wgpu::Device) {
+        if self.wts_relax_bind_group_layout.is_none() || self.gi_probe_view_color.is_none() {
+            return;
+        }
+
+        let layout = self.wts_relax_bind_group_layout.as_ref().unwrap();
+        let params_buffer = self.wts_params_buffer.as_ref().unwrap();
+        let seed_view = self.gi_probe_view_color.as_ref().unwrap();
+        let injection_view = self.wts_injection_view.as_ref().unwrap();
+
+        for i in 0..2 {
+            let phi_in = self.wts_phi_views[i].as_ref().unwrap();
+            let phi_out = self.wts_phi_storage_views[1 - i].as_ref().unwrap();
+
+            self.wts_relax_bind_groups[i] =
+                Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&format!("WTS Relax Bind Group {}", i)),
+                    layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: params_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(seed_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(phi_in),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(phi_out),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::TextureView(injection_view),
+                        },
+                    ],
+                }));
+        }
+    }
+
     fn upload_gi_probe_textures(&self, queue: &wgpu::Queue) {
         let Some(tex_px) = self.gi_probe_tex_px.as_ref() else {
             return;
@@ -2570,6 +2964,23 @@ impl App {
             gi_probe_view_nz: None,
             gi_probe_view_color: None,
             gi_probe_view_bbox: None,
+
+            // WTS-RT
+            wts_relax_pipeline: None,
+            wts_relax_bind_group_layout: None,
+            wts_relax_bind_groups: [None, None],
+            wts_params_buffer: None,
+            wts_phi_textures: [None, None],
+            wts_phi_views: [None, None],
+            wts_phi_storage_views: [None, None],
+            wts_injection_texture: None,
+            wts_injection_view: None,
+            wts_injection_storage_view: None,
+            wts_ping_pong: 0,
+            wts_inject_pipeline: None,
+            wts_inject_bind_group_layout: None,
+            wts_inject_bind_group: None,
+            wts_inject_params_buffer: None,
 
             input_manager: voxelot::input::InputManager::new(),
 
@@ -5011,6 +5422,102 @@ impl App {
         self.impostor_bind_group = Some(bind_group);
     }
 
+    fn update_ssilvb_bind_group(&mut self) {
+        if self.ssilvb_bind_group.is_some() {
+            return;
+        }
+
+        let Some(offscreen_view) = self.offscreen_color_view.as_ref() else {
+            return;
+        };
+
+        if let (
+            Some(device),
+            Some(ssao_ubo),
+            Some(depth_view),
+            Some(psampler),
+            Some(gi_view_px),
+            Some(gi_view_nx),
+            Some(gi_view_py),
+            Some(gi_view_ny),
+            Some(gi_view_pz),
+            Some(gi_view_nz),
+            Some(normal_view),
+            Some(gi_color),
+        ) = (
+            self.device.as_ref(),
+            self.ssilvb_uniform_buffer.as_ref(),
+            self.offscreen_depth_view.as_ref(),
+            self.post_sampler.as_ref(),
+            self.gi_probe_view_px.as_ref(),
+            self.gi_probe_view_nx.as_ref(),
+            self.gi_probe_view_py.as_ref(),
+            self.gi_probe_view_ny.as_ref(),
+            self.gi_probe_view_pz.as_ref(),
+            self.gi_probe_view_nz.as_ref(),
+            self.normal_view.as_ref(),
+            self.gi_probe_view_color.as_ref(),
+        ) {
+            // Select WTS view if available, otherwise fallback to raw probe color
+            let wts_view = self.wts_phi_views[self.wts_ping_pong].as_ref().unwrap_or(gi_color);
+
+            self.ssilvb_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("SSILVB Bind Group"),
+                layout: self.ssilvb_bind_group_layout.as_ref().unwrap(),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: ssao_ubo.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(depth_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(psampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(gi_view_px),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(gi_view_nx),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(gi_view_py),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::TextureView(gi_view_ny),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: wgpu::BindingResource::TextureView(gi_view_pz),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: wgpu::BindingResource::TextureView(gi_view_nz),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: wgpu::BindingResource::TextureView(normal_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 10,
+                        resource: wgpu::BindingResource::TextureView(offscreen_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 11,
+                        resource: wgpu::BindingResource::TextureView(wts_view),
+                    },
+                ],
+            }));
+        }
+    }
+
     fn update_voxel_gi_bind_group(&mut self) {
         let (
             Some(device),
@@ -5086,6 +5593,16 @@ impl App {
                 wgpu::BindGroupEntry {
                     binding: 9,
                     resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::TextureView(
+                        if let Some(wts_view) = self.wts_phi_views[self.wts_ping_pong].as_ref() {
+                            wts_view
+                        } else {
+                            gi_color
+                        }
+                    ),
                 },
             ] as &[wgpu::BindGroupEntry],
         });
@@ -5289,6 +5806,9 @@ impl App {
     }
 
     fn update_bloom_bind_groups(&mut self) {
+        // SSAO bind group uses uniform 0, offscreen depth (1), and post sampler (2)
+        self.update_ssilvb_bind_group();
+
         if self.offscreen_color_view.is_none()
             || self.post_color_view.is_none()
             || self.bloom_ping_view.is_none()
@@ -5370,83 +5890,6 @@ impl App {
                             ],
                         }));
                 }
-            }
-
-            // SSAO bind group uses uniform 0, offscreen depth (1), and post sampler (2)
-            if let (
-                Some(ssao_ubo),
-                Some(depth_view),
-                Some(psampler),
-                Some(gi_view_px),
-                Some(gi_view_nx),
-                Some(gi_view_py),
-                Some(gi_view_ny),
-                Some(gi_view_pz),
-                Some(gi_view_nz),
-                Some(normal_view),
-            ) = (
-                self.ssilvb_uniform_buffer.as_ref(),
-                self.offscreen_depth_view.as_ref(),
-                self.post_sampler.as_ref(),
-                self.gi_probe_view_px.as_ref(),
-                self.gi_probe_view_nx.as_ref(),
-                self.gi_probe_view_py.as_ref(),
-                self.gi_probe_view_ny.as_ref(),
-                self.gi_probe_view_pz.as_ref(),
-                self.gi_probe_view_nz.as_ref(),
-                self.normal_view.as_ref(),
-            ) {
-                self.ssilvb_bind_group =
-                    Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("SSILVB Bind Group"),
-                        layout: self.ssilvb_bind_group_layout.as_ref().unwrap(),
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: ssao_ubo.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::TextureView(depth_view),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: wgpu::BindingResource::Sampler(psampler),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 3,
-                                resource: wgpu::BindingResource::TextureView(gi_view_px),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 4,
-                                resource: wgpu::BindingResource::TextureView(gi_view_nx),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 5,
-                                resource: wgpu::BindingResource::TextureView(gi_view_py),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 6,
-                                resource: wgpu::BindingResource::TextureView(gi_view_ny),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 7,
-                                resource: wgpu::BindingResource::TextureView(gi_view_pz),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 8,
-                                resource: wgpu::BindingResource::TextureView(gi_view_nz),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 9,
-                                resource: wgpu::BindingResource::TextureView(normal_view),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 10,
-                                resource: wgpu::BindingResource::TextureView(offscreen_view),
-                            },
-                        ],
-                    }));
             }
 
             // Separable bloom bloom vertical bind group removed (using Kawase instead)
@@ -5930,6 +6373,16 @@ impl App {
                 wgpu::BindGroupEntry {
                     binding: 18,
                     resource: wgpu::BindingResource::TextureView(offscreen_color_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 19,
+                    resource: wgpu::BindingResource::TextureView(
+                        if let Some(wts_view) = self.wts_phi_views[self.wts_ping_pong].as_ref() {
+                            wts_view
+                        } else {
+                            gi_color
+                        }
+                    ),
                 },
             ],
         });
@@ -7055,6 +7508,17 @@ impl App {
                     },
                     count: None,
                 },
+                // WTS relaxed light field
+                wgpu::BindGroupLayoutEntry {
+                    binding: 19,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -7896,6 +8360,17 @@ impl App {
                         binding: 9,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    // WTS relaxed radiance
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 10,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
+                        },
                         count: None,
                     },
                 ],
@@ -8955,6 +9430,17 @@ impl App {
                         },
                         count: None,
                     },
+                    // GI relaxed light field (WTS)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 11,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -9367,7 +9853,10 @@ impl App {
         let gi_tex_ny = device.create_texture(&gi_tex_desc("GI Probe -Y 3D"));
         let gi_tex_pz = device.create_texture(&gi_tex_desc("GI Probe +Z 3D"));
         let gi_tex_nz = device.create_texture(&gi_tex_desc("GI Probe -Z 3D"));
-        let gi_tex_color = device.create_texture(&gi_tex_desc("GI Color 3D"));
+        
+        let mut gi_color_desc = gi_tex_desc("GI Color 3D");
+        gi_color_desc.usage |= wgpu::TextureUsages::STORAGE_BINDING;
+        let gi_tex_color = device.create_texture(&gi_color_desc);
 
         let gi_bbox_tex_desc = wgpu::TextureDescriptor {
             label: Some("GI BBox 3D"),
@@ -10048,6 +10537,11 @@ impl App {
         if self.user_config.effects.ssr.enabled {
             self.create_ssr_pipeline(&device);
         }
+
+        // WTS-RT Initialization
+        self.create_wts_relax_pipeline(&device);
+        self.create_wts_inject_pipeline(&device);
+        self.recreate_wts_textures(&device);
 
         self.surface = Some(surface);
         self.device = Some(device);
@@ -12756,6 +13250,105 @@ impl App {
                 );
                 shadow_pass.draw_indirect(fallback_indirect, 0);
                 draw_calls += 1;
+            }
+        }
+
+        // WTS-RT: GPU Light Injection & Relaxation Passes
+        // -----------------------------------------------------------------------------------------
+        if self.wts_inject_pipeline.is_some() && self.wts_relax_pipeline.is_some() {
+            // Re-bind to local name to avoid move issues
+            let mut wts_inject_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("WTS Inject Encoder"),
+            });
+
+            // Drop any existing borrows by using local variables
+            self.update_wts_inject_bind_group(&device);
+            self.recreate_wts_bind_groups(&device);
+
+            let inject_params_buf = self.wts_inject_params_buffer.as_ref().unwrap();
+            let relax_params_buf = self.wts_params_buffer.as_ref().unwrap();
+            let inject_pipeline = self.wts_inject_pipeline.as_ref().unwrap();
+            let relax_pipeline = self.wts_relax_pipeline.as_ref().unwrap();
+
+            let _wts_scope = self.profiler.scope("wts_gi");
+
+            // 1. Update Inject Params
+            let inject_params = InjectParams {
+                candidate_count: self.gpu_inputs.len() as u32,
+                gi_grid_origin: self.gi_grid_origin.to_array(),
+                gi_grid_dims: self.gi_grid_dims.to_array(),
+                _pad0: 0,
+                sun_dir_intensity: [sun_direction[0], sun_direction[1], sun_direction[2], 1.5 * sun_fade],
+                sun_color_pad: [sun_color[0], sun_color[1], sun_color[2], 0.0],
+                shadow_matrix: sun_view_proj.to_cols_array_2d(),
+            };
+            queue.write_buffer(inject_params_buf, 0, bytemuck::bytes_of(&inject_params));
+
+            // 2. Run Inject Pass
+            if let Some(inject_bg) = self.wts_inject_bind_group.as_ref() {
+                let mut cpass = wts_inject_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("WTS Inject Pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(inject_pipeline);
+                cpass.set_bind_group(0, inject_bg, &[]);
+                let groups = (inject_params.candidate_count + 63) / 64;
+                if groups > 0 {
+                    cpass.dispatch_workgroups(groups, 1, 1);
+                }
+            }
+            queue.submit(std::iter::once(wts_inject_encoder.finish()));
+
+            let mut wts_relax_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("WTS Relax Encoder"),
+            });
+
+            // 3. Update Relax Params
+            let relax_params = WtsParamsRaw {
+                alpha: 0.05,          // Lower alpha for temporal stability
+                gamma: 0.1,           // Higher gamma to seed injection quickly
+                beta_diffuse: 0.01,   // Very low stiffness for solid surfaces
+                beta_air: 100.0,      // High stiffness for air
+                max_occupancy: 1.0,   // Alpha is 0..1
+                _pad0: 0.0,
+                _pad1: 0.0,
+                _pad2: 0.0,
+            };
+            queue.write_buffer(relax_params_buf, 0, bytemuck::bytes_of(&relax_params));
+
+            // 4. Run Relax Pass
+            if let Some(relax_bg) = self.wts_relax_bind_groups[self.wts_ping_pong].as_ref() {
+                {
+                    let mut cpass = wts_relax_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("WTS Relax Pass"),
+                        timestamp_writes: None,
+                    });
+                    cpass.set_pipeline(relax_pipeline);
+                    cpass.set_bind_group(0, relax_bg, &[]);
+
+                    let wg_size = [8, 8, 4];
+                    let dispatch_x = (self.gi_grid_dims.x as u32 + wg_size[0] - 1) / wg_size[0];
+                    let dispatch_y = (self.gi_grid_dims.y as u32 + wg_size[1] - 1) / wg_size[1];
+                    let dispatch_z = (self.gi_grid_dims.z as u32 + wg_size[2] - 1) / wg_size[2];
+
+                    cpass.dispatch_workgroups(dispatch_x, dispatch_y, dispatch_z);
+                }
+            }
+            queue.submit(std::iter::once(wts_relax_encoder.finish()));
+            
+            // Toggle ping-pong for next frame
+            self.wts_ping_pong = 1 - self.wts_ping_pong;
+
+            // Re-create bind groups that use the WTS output (SSR, Voxel fallback, and SSGI)
+            self.voxel_gi_bind_group = None;
+            self.update_voxel_gi_bind_group();
+            if self.user_config.effects.ssr.enabled {
+                self.ssr_bind_group = None;
+                self.update_ssr_bind_group();
+            }
+            if self.ssao_enabled {
+                self.ssilvb_bind_group = None;
+                self.update_ssilvb_bind_group();
             }
         }
 

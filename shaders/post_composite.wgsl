@@ -198,7 +198,8 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
 
     // GI Combined Debug overlay
     if (composite.gi_combined_debug > 0.5) {
-        return vec4<f32>(indirect_light * composite.indirect_light_scale, 1.0);
+        // Show raw indirect light (probes + ssgi) in debug mode to ensure visibility
+        return vec4<f32>(indirect_light, 1.0);
     }
 
     // GI Probes Debug overlay

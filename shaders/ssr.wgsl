@@ -62,6 +62,7 @@ struct SSRParams {
 @group(0) @binding(16) var gi_probe_color: texture_3d<f32>;
 @group(0) @binding(17) var gi_probe_bbox: texture_3d<u32>;
 @group(0) @binding(18) var scene_color: texture_2d<f32>;
+@group(0) @binding(19) var gi_relaxed_phi: texture_3d<f32>;
 
 
 struct VertexOutput {
@@ -203,7 +204,8 @@ fn sample_radiance_int(pos: vec3<i32>, dir: vec3<f32>) -> vec3<f32> {
                          textureLoad(gi_probe_py, pos, 0).rgb, dir.y > 0.0);
     let color_z = select(textureLoad(gi_probe_nz, pos, 0).rgb,
                          textureLoad(gi_probe_pz, pos, 0).rgb, dir.z > 0.0);
-    return (color_x * w.x + color_y * w.y + color_z * w.z) * params.gi_scale;
+    let relaxed = textureLoad(gi_relaxed_phi, pos, 0).rgb;
+    return (color_x * w.x + color_y * w.y + color_z * w.z) * params.gi_scale + relaxed * 0.5;
 }
 
 // Optimized radiance: 3 samples with branchless selection
@@ -215,7 +217,8 @@ fn sample_radiance(uvw: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
                          textureSampleLevel(gi_probe_py, linear_sampler, uvw, 0.0).rgb, dir.y > 0.0);
     let color_z = select(textureSampleLevel(gi_probe_nz, linear_sampler, uvw, 0.0).rgb,
                          textureSampleLevel(gi_probe_pz, linear_sampler, uvw, 0.0).rgb, dir.z > 0.0);
-    return (color_x * w.x + color_y * w.y + color_z * w.z) * params.gi_scale;
+    let relaxed = textureSampleLevel(gi_relaxed_phi, linear_sampler, uvw, 0.0).rgb;
+    return (color_x * w.x + color_y * w.y + color_z * w.z) * params.gi_scale + relaxed * 0.5;
 }
 
 struct RayHit {
