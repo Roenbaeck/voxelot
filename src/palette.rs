@@ -201,7 +201,6 @@ impl Palette {
         }
     }
 
-    /// Get reflectivity coefficient for a voxel type (0.0 = matte, 1.0 = fully reflective)
     pub fn reflectivity(&self, index: u32) -> f32 {
         let idx = index as usize;
         if let Some(material) = self.materials.get(idx) {

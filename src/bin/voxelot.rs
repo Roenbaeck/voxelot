@@ -662,6 +662,14 @@ struct EditorPreviewUniforms {
     color1: [f32; 4], // rgba (outer)
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct PaletteUiInstance {
+    pos: [f32; 2],
+    size: [f32; 2],
+    color: [f32; 4],
+}
+
 /// Depth-of-field runtime settings (CPU-side convenience)
 #[derive(Copy, Clone, Debug)]
 struct DoFSettings {
@@ -1216,6 +1224,7 @@ struct App {
     hdr_active: bool,
     render_pipeline: Option<wgpu::RenderPipeline>,
     ui_pipeline: Option<wgpu::RenderPipeline>,
+    palette_ui_pipeline: Option<wgpu::RenderPipeline>,
     mesh_pipeline: Option<wgpu::RenderPipeline>,
     impostor_pipeline: Option<wgpu::RenderPipeline>,
     impostor_bind_group_layout: Option<wgpu::BindGroupLayout>,
@@ -1654,6 +1663,16 @@ struct App {
     debug_instance_buffer: Option<wgpu::Buffer>,
     debug_instance_count: u32,
     debug_ui_instances: Vec<VoxelInstanceRaw>,
+    palette_ui_buffer: Option<wgpu::Buffer>,
+    palette_ui_count: u32,
+    palette_ui_instances: Vec<PaletteUiInstance>,
+    palette_ui_visible: bool,
+    palette_ui_origin_px: [f32; 2],
+    palette_ui_cell_px: f32,
+    palette_ui_gap_px: f32,
+    palette_ui_cols: usize,
+    palette_ui_rows: usize,
+    palette_ui_first_index: usize,
 
     // Culling statistics
     cull_stats: CullStats,
@@ -1725,6 +1744,55 @@ impl App {
             buffer,
             free_after_frame,
         });
+    }
+
+    fn handle_palette_click(&mut self, mouse_x: f32, mouse_y: f32) -> bool {
+        if !self.palette_ui_visible || self.palette_ui_count == 0 {
+            return false;
+        }
+
+        let origin = self.palette_ui_origin_px;
+        let cell = self.palette_ui_cell_px;
+        let gap = self.palette_ui_gap_px;
+        let cols = self.palette_ui_cols.max(1);
+        let rows = self.palette_ui_rows.max(1);
+
+        let grid_w = cols as f32 * cell + (cols.saturating_sub(1) as f32) * gap;
+        let grid_h = rows as f32 * cell + (rows.saturating_sub(1) as f32) * gap;
+
+        if mouse_x < origin[0]
+            || mouse_x > origin[0] + grid_w
+            || mouse_y < origin[1]
+            || mouse_y > origin[1] + grid_h
+        {
+            return false;
+        }
+
+        let local_x = mouse_x - origin[0];
+        let local_y = mouse_y - origin[1];
+
+        let col = (local_x / (cell + gap)).floor() as usize;
+        let row = (local_y / (cell + gap)).floor() as usize;
+
+        if col >= cols || row >= rows {
+            return false;
+        }
+
+        if local_x - (col as f32 * (cell + gap)) > cell {
+            return false;
+        }
+        if local_y - (row as f32 * (cell + gap)) > cell {
+            return false;
+        }
+
+        let idx = row * cols + col;
+        if idx >= self.palette_ui_count as usize {
+            return false;
+        }
+
+        let palette_index = self.palette_ui_first_index + idx;
+        self.selected_voxel_type = palette_index as u8;
+        true
     }
     fn create_editor_preview_pipeline(&mut self, device: &wgpu::Device) {
         let shader = device.create_shader_module(wgpu::include_wgsl!("../../shaders/editor_preview.wgsl"));
@@ -3307,6 +3375,7 @@ impl App {
             hdr_active: false,
             render_pipeline: None,
             ui_pipeline: None,
+            palette_ui_pipeline: None,
             mesh_pipeline: None,
             impostor_pipeline: None,
             impostor_bind_group_layout: None,
@@ -3390,6 +3459,16 @@ impl App {
             debug_instance_buffer: None,
             debug_instance_count: 0,
             debug_ui_instances: Vec::new(),
+            palette_ui_buffer: None,
+            palette_ui_count: 0,
+            palette_ui_instances: Vec::new(),
+            palette_ui_visible: false,
+            palette_ui_origin_px: [0.0, 0.0],
+            palette_ui_cell_px: 0.0,
+            palette_ui_gap_px: 0.0,
+            palette_ui_cols: 0,
+            palette_ui_rows: 0,
+            palette_ui_first_index: 1,
             cull_stats: CullStats::default(),
             mesh_chunk_arc_cache: FxHashMap::default(),
             // empty_mesh buffers removed; placeholders use offsets into mega buffers
@@ -9096,6 +9175,61 @@ impl App {
             cache: None,
         });
 
+        // Create 2D Palette UI pipeline (screen-space quads)
+        let palette_shader =
+            device.create_shader_module(wgpu::include_wgsl!("../../shaders/palette_ui.wgsl"));
+        let palette_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Palette UI Pipeline Layout"),
+                bind_group_layouts: &[],
+                immediate_size: 0,
+            });
+        let palette_ui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Palette UI Pipeline"),
+            layout: Some(&palette_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &palette_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<PaletteUiInstance>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![
+                        0 => Float32x2, // pos
+                        1 => Float32x2, // size
+                        2 => Float32x4  // color
+                    ],
+                }],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &palette_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview_mask: None,
+            cache: None,
+        });
+
         // Create mesh pipeline (non-instanced, per-vertex position/normal/color)
         let mesh_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Mesh Pipeline"),
@@ -11097,6 +11231,7 @@ impl App {
         self.config = Some(config);
         self.render_pipeline = Some(render_pipeline);
         self.ui_pipeline = Some(ui_pipeline);
+        self.palette_ui_pipeline = Some(palette_ui_pipeline);
         self.mesh_pipeline = Some(mesh_pipeline);
         self.impostor_pipeline = Some(impostor_pipeline);
         self.impostor_bind_group_layout = Some(impostor_bind_group_layout);
@@ -11292,6 +11427,15 @@ impl App {
             );
         }
 
+        self.render_palette_ui(
+            cam_pos,
+            cam_forward,
+            cam_right,
+            cam_up,
+            overscan,
+            char_size,
+        );
+
         // Update the GPU buffer
         if !self.debug_ui_instances.is_empty() {
             let data = bytemuck::cast_slice(&self.debug_ui_instances);
@@ -11323,6 +11467,161 @@ impl App {
             self.debug_instance_count = self.debug_ui_instances.len() as u32;
         } else {
             self.debug_instance_count = 0;
+        }
+    }
+
+    fn render_palette_ui(
+        &mut self,
+        _cam_pos: [f32; 3],
+        _cam_forward: [f32; 3],
+        _cam_right: [f32; 3],
+        _cam_up: [f32; 3],
+        _overscan: f32,
+        _char_size: f32,
+    ) {
+        self.palette_ui_instances.clear();
+        self.palette_ui_count = 0;
+        if !self.palette_ui_visible {
+            return;
+        }
+
+        let (width, height) = if let Some(config) = &self.config {
+            (config.width as f32, config.height as f32)
+        } else {
+            (800.0, 600.0)
+        };
+
+        let colors: Vec<[f32; 4]> = self.palette.colors().to_vec();
+        let mut emissive_intensity: Vec<f32> = Vec::with_capacity(colors.len());
+        let mut reflectivity: Vec<f32> = Vec::with_capacity(colors.len());
+        for idx in 0..colors.len() {
+            let (_, intensity) = self.palette.emissive(idx as u32);
+            emissive_intensity.push(intensity);
+            reflectivity.push(self.palette.reflectivity(idx as u32));
+        }
+        let total_colors = colors.len().saturating_sub(1);
+        if total_colors == 0 {
+            return;
+        }
+
+        let margin_px = (width * 0.02).clamp(12.0, 32.0);
+        let gap_px = (width * 0.004).clamp(3.0, 8.0);
+        let cell_px = (width * 0.03).clamp(18.0, 34.0);
+        let cols = ((width - margin_px * 2.0 + gap_px) / (cell_px + gap_px))
+            .floor()
+            .max(1.0) as usize;
+        let rows_needed = (total_colors + cols - 1) / cols;
+        let max_rows =
+            ((height * 0.22) / (cell_px + gap_px)).floor().max(1.0) as usize;
+        let rows = rows_needed.min(max_rows);
+        let count_shown = (cols * rows).min(total_colors);
+
+        let _grid_w = cols as f32 * cell_px + (cols.saturating_sub(1)) as f32 * gap_px;
+        let grid_h = rows as f32 * cell_px + (rows.saturating_sub(1)) as f32 * gap_px;
+        let origin_px = [
+            margin_px,
+            height - margin_px - grid_h,
+        ];
+
+        self.palette_ui_origin_px = origin_px;
+        self.palette_ui_cell_px = cell_px;
+        self.palette_ui_gap_px = gap_px;
+        self.palette_ui_cols = cols;
+        self.palette_ui_rows = rows;
+        self.palette_ui_first_index = 1;
+        self.palette_ui_count = count_shown as u32;
+
+        let selected = self.selected_voxel_type as usize;
+        for i in 0..count_shown {
+            let palette_index = i + 1;
+            let row = i / cols;
+            let col = i % cols;
+            let px = origin_px[0] + col as f32 * (cell_px + gap_px);
+            let py = origin_px[1] + row as f32 * (cell_px + gap_px);
+
+            let ndc_x = (px / width) * 2.0 - 1.0;
+            let ndc_y = 1.0 - (py / height) * 2.0;
+            let ndc_w = (cell_px / width) * 2.0;
+            let ndc_h = -(cell_px / height) * 2.0;
+
+            if palette_index == selected {
+                let pad_px = cell_px * 0.1;
+                let pad_w = (pad_px / width) * 2.0;
+                let pad_h = -(pad_px / height) * 2.0;
+                self.palette_ui_instances.push(PaletteUiInstance {
+                    pos: [ndc_x - pad_w, ndc_y - pad_h],
+                    size: [ndc_w + pad_w * 2.0, ndc_h + pad_h * 2.0],
+                    color: [1.0, 1.0, 1.0, 0.35],
+                });
+            }
+
+            let mut color = colors.get(palette_index).copied().unwrap_or([1.0, 1.0, 1.0, 1.0]);
+            // Slight gamma lift for UI so colors match perceived in-world brightness.
+            color[0] = color[0].powf(1.0 / 2.2);
+            color[1] = color[1].powf(1.0 / 2.2);
+            color[2] = color[2].powf(1.0 / 2.2);
+            self.palette_ui_instances.push(PaletteUiInstance {
+                pos: [ndc_x, ndc_y],
+                size: [ndc_w, ndc_h],
+                color,
+            });
+
+            let emissive = *emissive_intensity.get(palette_index).unwrap_or(&0.0);
+            if emissive > 0.01 {
+                let badge = cell_px * 0.28;
+                let badge_w = (badge / width) * 2.0;
+                let badge_h = -(badge / height) * 2.0;
+                let badge_x = ndc_x + (cell_px * 0.06 / width) * 2.0;
+                let badge_y = ndc_y + (cell_px * 0.06 / height) * -2.0;
+                self.palette_ui_instances.push(PaletteUiInstance {
+                    pos: [badge_x, badge_y],
+                    size: [badge_w, badge_h],
+                    color: [1.0, 0.9, 0.2, 0.85],
+                });
+            }
+
+            let reflectivity = *reflectivity.get(palette_index).unwrap_or(&0.0);
+            if reflectivity > 0.01 {
+                let badge = cell_px * 0.28;
+                let badge_w = (badge / width) * 2.0;
+                let badge_h = -(badge / height) * 2.0;
+                let badge_x = ndc_x + ndc_w - badge_w - (cell_px * 0.06 / width) * 2.0;
+                let badge_y = ndc_y + (cell_px * 0.06 / height) * -2.0;
+                let intensity = (0.4 + 0.6 * reflectivity).min(1.0);
+                self.palette_ui_instances.push(PaletteUiInstance {
+                    pos: [badge_x, badge_y],
+                    size: [badge_w, badge_h],
+                    color: [0.6, 0.85, 1.0, intensity],
+                });
+            }
+        }
+
+        if !self.palette_ui_instances.is_empty() {
+            let data = bytemuck::cast_slice(&self.palette_ui_instances);
+            let device = self.device.as_ref().unwrap();
+            let needed_size = data.len() as u64;
+            let mut recreate = true;
+            if let Some(buf) = &self.palette_ui_buffer {
+                if buf.size() >= needed_size {
+                    recreate = false;
+                }
+            }
+            if recreate {
+                self.palette_ui_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Palette UI Instance Buffer"),
+                    size: needed_size,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+            self.queue.as_ref().unwrap().write_buffer(
+                self.palette_ui_buffer.as_ref().unwrap(),
+                0,
+                data,
+            );
+            self.palette_ui_count = self.palette_ui_instances.len() as u32;
+        } else {
+            self.palette_ui_count = 0;
         }
     }
 
@@ -15089,6 +15388,18 @@ impl App {
                         .draw(0..CUBE_VERTICES.len() as u32, 0..self.debug_instance_count);
                 }
             }
+
+            // Palette UI (2D overlay)
+            if self.palette_ui_visible && self.palette_ui_count > 0 {
+                if let (Some(pipeline), Some(buf)) = (
+                    self.palette_ui_pipeline.as_ref(),
+                    self.palette_ui_buffer.as_ref(),
+                ) {
+                    composite_pass.set_pipeline(pipeline);
+                    composite_pass.set_vertex_buffer(0, buf.slice(..));
+                    composite_pass.draw(0..6, 0..self.palette_ui_count);
+                }
+            }
         } else {
             eprintln!("Composite resources unavailable; skipping final pass!");
         }
@@ -15320,13 +15631,9 @@ impl ApplicationHandler for App {
                 // Handle lighting controls and editor modes on key press only
                 if pressed {
                     match key {
-                        KeyCode::Digit3 => self.selected_voxel_type = 1,
-                        KeyCode::Digit4 => self.selected_voxel_type = 2,
-                        KeyCode::Digit5 => self.selected_voxel_type = 3,
-                        KeyCode::Digit6 => self.selected_voxel_type = 4,
-                        KeyCode::Digit7 => self.selected_voxel_type = 5,
-                        KeyCode::Digit8 => self.selected_voxel_type = 6,
-                        KeyCode::Digit9 => self.selected_voxel_type = 7,
+                        KeyCode::Digit3 => {
+                            self.palette_ui_visible = !self.palette_ui_visible;
+                        }
                         _ => {}
                     }
                     self.process_lighting_key(key);
@@ -15349,6 +15656,11 @@ impl ApplicationHandler for App {
                         self.last_mouse_pos = None;
                     }
                 } else if button == MouseButton::Left && pressed {
+                    if self.palette_ui_visible {
+                        if self.handle_palette_click(self.current_mouse_pos.0 as f32, self.current_mouse_pos.1 as f32) {
+                            return;
+                        }
+                    }
                     self.handle_edit_click(true);
                 }
             }
