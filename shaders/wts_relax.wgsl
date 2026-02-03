@@ -1,5 +1,7 @@
 // WTS-RT: Symplectic Ray Relaxation Compute Shader
 // Solves: Phi_{t+1} = Phi_t + alpha * (Grad^2 Phi - Phi/Beta) + gamma * (Seed - Phi)
+// Inspired by: Aaron M. Schutza, "Symplectic Ray Relaxation: An O(1) Global Illumination Method
+// via Geometric Stress Minimization on Tensor Architecture" (Jan 7, 2026).
 
 struct WtsParams {
     alpha: f32,          // Relaxation rate (diffusion speed)

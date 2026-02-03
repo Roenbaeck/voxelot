@@ -210,10 +210,11 @@ impl GiSystem {
         let mut probes_calculated = 0;
         let mut updates: Vec<GiProbeUpdate> = Vec::new();
         if !self.missing_probes.is_empty() {
-            // Throttle: only process up to 64 probes per update to prevent frame drops
-            // Since GI runs async on background thread, this won't impact frame rate
+            // Process a batch of probes per update. 
+            // 256 probes at 16,384 probes per grid means the whole grid can be refreshed in 64 updates.
+            // Since this runs on a background thread pool, it won't stall the main loop.
             let probes_to_process: Vec<IVec3> =
-                self.missing_probes.iter().take(64).cloned().collect();
+                self.missing_probes.iter().take(256).cloned().collect();
             probes_calculated = probes_to_process.len();
 
             // Remove processed probes from missing list

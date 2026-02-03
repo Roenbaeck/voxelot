@@ -3,6 +3,7 @@
 Brief actionable notes to help an AI agent be productive immediately in this repo.
 
 See `REPO_MAP.md` for a machine-readable per-path map with short descriptions and quick pointers for agents and maintainers.
+Keep `REPO_MAP.md` updated when you add/remove important files or change resource locations.
 
 ## Quick entry points ✅
 - Build & run viewer (recommended):
@@ -27,6 +28,8 @@ See `REPO_MAP.md` for a machine-readable per-path map with short descriptions an
 - Meshing & rendering:
   - Binary greedy meshing is implemented in `src/meshing_optimized.rs` (bitwise face detection + quad merging).
   - Meshes are streamed and stored in a shared Mega VB/IB; buffer logic in `src/buffer_allocator.rs`.
+  - **Memory Safety**: Use the `DeferredFree` mechanism in `src/bin/voxelot.rs` when freeing slab offsets. Immediate reuse causes geometry flashes in the multi-draw indirect pipeline. Wait at least 2 frames (`GPU_EVICTION_SAFE_FRAMES`).
+  - **Cache Management**: Avoid global mesh cache clears during world edits. Use `invalidate_chunk_mesh` to incrementally update the edited chunk and its immediate neighbors to maintain visual continuity.
   - GPU code and shaders live under `shaders/` (WGSL) and are tied to `wgpu` runtime code.
 
 ## Files & features to inspect for common tasks 🧭
