@@ -668,6 +668,7 @@ struct PaletteUiInstance {
     pos: [f32; 2],
     size: [f32; 2],
     color: [f32; 4],
+    shape: f32,
 }
 
 /// Depth-of-field runtime settings (CPU-side convenience)
@@ -9210,7 +9211,8 @@ impl App {
                     attributes: &wgpu::vertex_attr_array![
                         0 => Float32x2, // pos
                         1 => Float32x2, // size
-                        2 => Float32x4  // color
+                        2 => Float32x4, // color
+                        3 => Float32    // shape
                     ],
                 }],
                 compilation_options: Default::default(),
@@ -11566,46 +11568,58 @@ impl App {
                     pos: [ndc_x - pad_w, ndc_y - pad_h],
                     size: [ndc_w + pad_w * 2.0, ndc_h + pad_h * 2.0],
                     color: [1.0, 1.0, 1.0, 0.35],
+                    shape: 0.0,
                 });
             }
 
             let mut color = colors.get(palette_index).copied().unwrap_or([1.0, 1.0, 1.0, 1.0]);
-            // Slight gamma lift for UI so colors match perceived in-world brightness.
-            color[0] = color[0].powf(1.0 / 2.2);
-            color[1] = color[1].powf(1.0 / 2.2);
-            color[2] = color[2].powf(1.0 / 2.2);
+            // Boost perceived UI vibrancy: saturation + mild exposure + sRGB-ish gamma.
+            let luma = 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2];
+            let sat = 1.25;
+            color[0] = (luma + (color[0] - luma) * sat).clamp(0.0, 1.0);
+            color[1] = (luma + (color[1] - luma) * sat).clamp(0.0, 1.0);
+            color[2] = (luma + (color[2] - luma) * sat).clamp(0.0, 1.0);
+            let exposure = 1.1;
+            color[0] = (color[0] * exposure).clamp(0.0, 1.0).powf(1.0 / 2.2);
+            color[1] = (color[1] * exposure).clamp(0.0, 1.0).powf(1.0 / 2.2);
+            color[2] = (color[2] * exposure).clamp(0.0, 1.0).powf(1.0 / 2.2);
             self.palette_ui_instances.push(PaletteUiInstance {
                 pos: [ndc_x, ndc_y],
                 size: [ndc_w, ndc_h],
                 color,
+                shape: 0.0,
             });
 
             let emissive = *emissive_intensity.get(palette_index).unwrap_or(&0.0);
             if emissive > 0.01 {
-                let badge = cell_px * 0.28;
-                let badge_w = (badge / width) * 2.0;
-                let badge_h = -(badge / height) * 2.0;
-                let badge_x = ndc_x + (cell_px * 0.06 / width) * 2.0;
-                let badge_y = ndc_y + (cell_px * 0.06 / height) * -2.0;
+                let arrow_px = (cell_px * 0.4).max(6.0);
+                let arrow_w = (arrow_px / width) * 2.0;
+                let arrow_h = -(arrow_px / height) * 2.0;
+                let arrow_x = ndc_x + ndc_w * 0.25 - arrow_w * 0.5;
+                let gap_ndc = (cell_px * 0.1 / height) * 2.0;
+                let arrow_y = ndc_y - arrow_h - gap_ndc + (8.0 / height) * 2.0;
                 self.palette_ui_instances.push(PaletteUiInstance {
-                    pos: [badge_x, badge_y],
-                    size: [badge_w, badge_h],
-                    color: [1.0, 0.9, 0.2, 0.85],
+                    pos: [arrow_x, arrow_y],
+                    size: [arrow_w, arrow_h],
+                    color: [1.0, 1.0, 1.0, 0.9],
+                    shape: 1.0,
                 });
             }
 
             let reflectivity = *reflectivity.get(palette_index).unwrap_or(&0.0);
             if reflectivity > 0.01 {
-                let badge = cell_px * 0.28;
-                let badge_w = (badge / width) * 2.0;
-                let badge_h = -(badge / height) * 2.0;
-                let badge_x = ndc_x + ndc_w - badge_w - (cell_px * 0.06 / width) * 2.0;
-                let badge_y = ndc_y + (cell_px * 0.06 / height) * -2.0;
-                let intensity = (0.4 + 0.6 * reflectivity).min(1.0);
+                let arrow_px = (cell_px * 0.4).max(6.0);
+                let arrow_w = (arrow_px / width) * 2.0;
+                let arrow_h = -(arrow_px / height) * 2.0;
+                let arrow_x = ndc_x + ndc_w * 0.75 - arrow_w * 0.5;
+                let gap_ndc = (cell_px * 0.1 / height) * 2.0;
+                let arrow_y = ndc_y - arrow_h - gap_ndc + (8.0 / height) * 2.0;
+                let intensity = (0.6 + 0.4 * reflectivity).min(1.0);
                 self.palette_ui_instances.push(PaletteUiInstance {
-                    pos: [badge_x, badge_y],
-                    size: [badge_w, badge_h],
-                    color: [0.6, 0.85, 1.0, intensity],
+                    pos: [arrow_x, arrow_y],
+                    size: [arrow_w, arrow_h],
+                    color: [1.0, 1.0, 1.0, intensity],
+                    shape: 2.0,
                 });
             }
         }
