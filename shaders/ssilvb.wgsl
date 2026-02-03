@@ -176,14 +176,15 @@ fn sample_grid_irradiance(world_pos: vec3<f32>, normal: vec3<f32>, camera_pos: v
     
     // Calculate distance to edge of grid for smooth fading
     // grid_coord is in chunk units (0..dims)
-    // We fade out over the last 2 chunks (32 units) to avoid popping
+    // Fade width scales with gi_fade_range to reduce hard cutoffs.
     let dist_to_edge = min(
         min(grid_coord.x, f32(dims.x) - grid_coord.x),
         min(min(grid_coord.y, f32(dims.y) - grid_coord.y),
             min(grid_coord.z, f32(dims.z) - grid_coord.z))
     );
     
-    let fade = smoothstep(0.0, 2.0, dist_to_edge);
+    let edge_fade_chunks = max(2.0, ssao.gi_fade_range / 16.0);
+    let fade = smoothstep(0.0, edge_fade_chunks, dist_to_edge);
     
     // Distance-based fade to prevent popping when entering lit areas
     // Fade GI to zero as we approach the fade distance

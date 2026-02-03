@@ -3,9 +3,9 @@ file = "worlds/flat_city_test.vhc"
 palette = "worlds/palette.txt"
 skybox = "worlds/skybox.hdr"
 camera_position = [
-    574.70404,
-    122.546745,
-    297.16656,
+    675.4839,
+    120.90021,
+    361.37424,
 ]
 water_level = 20.0
 water_visibility = 15.0
@@ -84,12 +84,12 @@ enabled = true
 [effects.gi]
 enabled = true
 indirect_scale = 0.003
-fade_distance = 400.0
-fade_range = 100.0
+fade_distance = 900.0
+fade_range = 180.0
 grid_dims = [
+    100,
     42,
-    42,
-    42,
+    100,
 ]
 
 [effects.ssr]

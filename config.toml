@@ -79,12 +79,12 @@ enabled = true
 [effects.gi]
 enabled = true
 indirect_scale = 0.003
-fade_distance = 640.0
-fade_range = 120.0
+fade_distance = 900.0
+fade_range = 180.0
 grid_dims = [
-    80,
+    120,
     16,
-    80,
+    120,
 ]
 
 [effects.ssr]
