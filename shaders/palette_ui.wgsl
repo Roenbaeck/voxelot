@@ -53,5 +53,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let keep = select(0.0, 1.0, in.uv.y <= (1.0 - dx));
         return vec4<f32>(in.color.rgb, in.color.a * keep);
     }
-    return in.color;
+    // Swatch: apply simple faux lighting to feel closer to in-world shading.
+    let light = 0.85 + 0.2 * (1.0 - in.uv.y) + 0.1 * (1.0 - in.uv.x);
+    let rim = smoothstep(0.0, 0.08, in.uv.x)
+        * smoothstep(0.0, 0.08, in.uv.y)
+        * smoothstep(0.0, 0.08, 1.0 - in.uv.x)
+        * smoothstep(0.0, 0.08, 1.0 - in.uv.y);
+    let shaded = in.color.rgb * light + vec3<f32>(0.08) * (1.0 - rim);
+    return vec4<f32>(shaded, in.color.a);
 }

@@ -1743,6 +1743,14 @@ struct App {
 }
 
 impl App {
+    fn ui_hdr_boost(&self) -> f32 {
+        if self.user_config.rendering.macos_hdr {
+            (1.5 * self.user_config.rendering.macos_hdr_exposure_boost).max(1.0)
+        } else {
+            1.0
+        }
+    }
+
     fn defer_buffer(&mut self, buffer: wgpu::Buffer) {
         let free_after_frame = self.frame_index.saturating_add(GPU_EVICTION_SAFE_FRAMES);
         self.deferred_buffers.push(DeferredBuffer {
@@ -11462,6 +11470,8 @@ impl App {
         };
 
         let pixel_px = char_px / 8.0;
+        let boost = self.ui_hdr_boost();
+        let boosted = [color[0] * boost, color[1] * boost, color[2] * boost, color[3]];
         let text_len = text.len() as f32;
         let text_w = text_len * (char_px + pixel_px);
         let text_h = char_px;
@@ -11497,7 +11507,7 @@ impl App {
                     if (row_bits & (1 << col)) != 0 {
                         let px = origin_x_px + x_offset + col as f32 * pixel_px;
                         let py = origin_y_px + row as f32 * pixel_px;
-                        self.push_ui_quad(px, py, pixel_px, pixel_px, color);
+                        self.push_ui_quad(px, py, pixel_px, pixel_px, boosted);
                     }
                 }
             }
@@ -11547,6 +11557,7 @@ impl App {
         };
 
         let colors: Vec<[f32; 4]> = self.palette.colors().to_vec();
+        let boost = self.ui_hdr_boost();
         let mut emissive_intensity: Vec<f32> = Vec::with_capacity(colors.len());
         let mut reflectivity: Vec<f32> = Vec::with_capacity(colors.len());
         for idx in 0..colors.len() {
@@ -11612,16 +11623,9 @@ impl App {
             }
 
             let mut color = colors.get(palette_index).copied().unwrap_or([1.0, 1.0, 1.0, 1.0]);
-            // Boost perceived UI vibrancy: saturation + mild exposure + sRGB-ish gamma.
-            let luma = 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2];
-            let sat = 1.25;
-            color[0] = (luma + (color[0] - luma) * sat).clamp(0.0, 1.0);
-            color[1] = (luma + (color[1] - luma) * sat).clamp(0.0, 1.0);
-            color[2] = (luma + (color[2] - luma) * sat).clamp(0.0, 1.0);
-            let exposure = 1.1;
-            color[0] = (color[0] * exposure).clamp(0.0, 1.0).powf(1.0 / 2.2);
-            color[1] = (color[1] * exposure).clamp(0.0, 1.0).powf(1.0 / 2.2);
-            color[2] = (color[2] * exposure).clamp(0.0, 1.0).powf(1.0 / 2.2);
+            color[0] *= boost;
+            color[1] *= boost;
+            color[2] *= boost;
             self.palette_ui_instances.push(PaletteUiInstance {
                 pos: [ndc_x, ndc_y],
                 size: [ndc_w, ndc_h],
@@ -11640,7 +11644,7 @@ impl App {
                 self.palette_ui_instances.push(PaletteUiInstance {
                     pos: [arrow_x, arrow_y],
                     size: [arrow_w, arrow_h],
-                    color: [1.0, 1.0, 1.0, 0.9],
+                    color: [1.0 * boost, 1.0 * boost, 1.0 * boost, 0.9],
                     shape: 1.0,
                 });
             }
@@ -11657,7 +11661,7 @@ impl App {
                 self.palette_ui_instances.push(PaletteUiInstance {
                     pos: [arrow_x, arrow_y],
                     size: [arrow_w, arrow_h],
-                    color: [1.0, 1.0, 1.0, intensity],
+                    color: [1.0 * boost, 1.0 * boost, 1.0 * boost, intensity],
                     shape: 2.0,
                 });
             }
