@@ -79,11 +79,21 @@ fn fetch_depth(coord: vec2<i32>) -> f32 {
     return textureLoad(depth_tex, coord, 0);
 }
 
+// Fetch depth with manual bilinear filtering to reduce banding/aliasing on flat surfaces
 fn load_depth_at_uv(uv: vec2<f32>) -> f32 {
-    let dims = vec2<i32>(textureDimensions(depth_tex));
-    let xy = vec2<i32>(uv * vec2<f32>(dims));
-    let clamped = clamp(xy, vec2<i32>(0, 0), dims - vec2<i32>(1, 1));
-    return textureLoad(depth_tex, clamped, 0);
+    let dims = vec2<f32>(textureDimensions(depth_tex));
+    let pixel_pos = uv * dims - 0.5;
+    let base_coord = vec2<i32>(floor(pixel_pos));
+    let fract_pos = pixel_pos - vec2<f32>(base_coord);
+
+    let d00 = textureLoad(depth_tex, clamp(base_coord + vec2<i32>(0, 0), vec2<i32>(0), vec2<i32>(dims) - 1), 0);
+    let d10 = textureLoad(depth_tex, clamp(base_coord + vec2<i32>(1, 0), vec2<i32>(0), vec2<i32>(dims) - 1), 0);
+    let d01 = textureLoad(depth_tex, clamp(base_coord + vec2<i32>(0, 1), vec2<i32>(0), vec2<i32>(dims) - 1), 0);
+    let d11 = textureLoad(depth_tex, clamp(base_coord + vec2<i32>(1, 1), vec2<i32>(0), vec2<i32>(dims) - 1), 0);
+
+    let d0 = mix(d00, d10, fract_pos.x);
+    let d1 = mix(d01, d11, fract_pos.x);
+    return mix(d0, d1, fract_pos.y);
 }
 
 // Interleaved Gradient Noise
@@ -188,8 +198,8 @@ fn sample_grid_irradiance(world_pos: vec3<f32>, normal: vec3<f32>, camera_pos: v
 }
 
 @fragment
-fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    // Reconstruct linear depth from depth texture (previously stored in normal.w)
+fn fs_main(@location(0) uv: vec2<f32>, @builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
+    // Reconstruct linear depth from depth texture
     let raw_depth = load_depth_at_uv(uv);
     if (raw_depth >= 1.0) {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
@@ -203,8 +213,9 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
 
-    // Sample Octahedral-encoded world-space normal from G-buffer and decode
-    let normal_data = textureSample(normal_tex, post_sampler, uv).xy;
+    // Use textureLoad for normal G-buffer to avoid linear filtering artifacts on Oct-encoded data
+    let normal_dims = vec2<i32>(textureDimensions(normal_tex));
+    let normal_data = textureLoad(normal_tex, clamp(vec2<i32>(uv * vec2<f32>(normal_dims)), vec2<i32>(0), normal_dims - 1), 0).xy;
     let world_normal = oct_decode(normal_data);
 
     // Cheap "Sky AO" fallback for distant pixels to avoid flat/washed out look
@@ -236,14 +247,9 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     
     let screen_size = vec2<f32>(ssao.screen_width, ssao.screen_height);
     let inv_screen_size = 1.0 / screen_size;
-    let frag_coord = uv * screen_size;
+    let frag_coord = frag_pos.xy;
 
-    // Integer screen bounds for fast clamping checks (avoid runtime texture size queries)
-    let screen_w_i = i32(ssao.screen_width);
-    let screen_h_i = i32(ssao.screen_height);
-    let max_screen_dim_i = max(screen_w_i, screen_h_i);
-    
-    // Random rotation
+    // Random rotation using absolute pixel coordinates
     let noise = ign(frag_coord);
     
     let sample_count = f32(ssao.sample_count);
@@ -327,8 +333,11 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
                 let back_horizon_cos = back_horizon_num * inverseSqrt(back_horizon_den_sq);
                 let back_horizon_angle = fast_acos(back_horizon_cos) * direction;
                 
-                let h1 = clamp((horizon_angle_rel + n_angle) / PI + 0.5, 0.0, 1.0);
-                let h2 = clamp((back_horizon_angle + n_angle) / PI + 0.5, 0.0, 1.0);
+                // Add dither to horizon angles to break up bitmask banding artifacts.
+                // This turns discrete angular steps into noise that the blur pass can remove.
+                let dither = (noise - 0.5) * 0.035;
+                let h1 = clamp((horizon_angle_rel + n_angle + dither) / PI + 0.5, 0.0, 1.0);
+                let h2 = clamp((back_horizon_angle + n_angle + dither) / PI + 0.5, 0.0, 1.0);
                 
                 let min_h = min(h1, h2);
                 let max_h = max(h1, h2);
