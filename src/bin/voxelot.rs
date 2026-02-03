@@ -1370,6 +1370,7 @@ struct App {
     gi_probes: Vec<voxelot::gi::GiProbe>,
     gi_grid_origin: glam::IVec3,
     gi_grid_dims: glam::IVec3,
+    gi_dirty_chunks: FxHashSet<glam::IVec3>,
 
     // SSILVB GI probe 3D textures (6 faces: +X, -X, +Y, -Y, +Z, -Z, and a color/occupancy volume)
     gi_probe_tex_px: Option<wgpu::Texture>,
@@ -1959,6 +1960,18 @@ impl App {
             EditMode::Add => self.selected_voxel_type,
             EditMode::Remove => 0, // 0 = empty
         };
+
+        let old_voxel_type = self.world.get(target_pos).unwrap_or(0);
+        let old_emissive = self.palette.emissive(old_voxel_type as u32).1;
+        let new_emissive = self.palette.emissive(voxel_type as u32).1;
+        if (old_emissive > 0.0) || (new_emissive > 0.0) {
+            let chunk_coord = glam::IVec3::new(
+                (target_pos.x >> 4) as i32,
+                (target_pos.y >> 4) as i32,
+                (target_pos.z >> 4) as i32,
+            );
+            self.gi_dirty_chunks.insert(chunk_coord);
+        }
 
         log::info!(
             "Editing world: {:?} at {:?} (mode: {:?})",
@@ -3539,6 +3552,7 @@ impl App {
             ],
             gi_grid_origin: glam::IVec3::ZERO,
             gi_grid_dims: glam::IVec3::from_array(cfg.effects.gi.grid_dims),
+            gi_dirty_chunks: FxHashSet::default(),
 
             gi_probe_tex_px: None,
             gi_probe_tex_nx: None,
@@ -12013,9 +12027,11 @@ impl App {
         } else {
             None
         };
+        let dirty_chunks: Vec<glam::IVec3> = self.gi_dirty_chunks.drain().collect();
         let _ = self.gi_request_tx.send(voxelot::gi::GiUpdateRequest {
             camera_pos,
             visible_chunks,
+            dirty_chunks,
             world: world_to_send,
         });
         self.world_changed = false;

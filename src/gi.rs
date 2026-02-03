@@ -11,6 +11,7 @@ use std::sync::Arc;
 pub struct GiUpdateRequest {
     pub camera_pos: Vec3,
     pub visible_chunks: Vec<IVec3>,
+    pub dirty_chunks: Vec<IVec3>,
     pub world: Option<Arc<World>>,
 }
 
@@ -153,7 +154,30 @@ impl GiSystem {
         palette: &Palette,
         camera_pos: Vec3,
         visible_chunks: &[IVec3],
+        dirty_chunks: &[IVec3],
     ) -> (bool, Vec<GiProbeUpdate>, usize) {
+        if !dirty_chunks.is_empty() {
+            let light_radius = 4;
+            let mut missing_set: HashSet<IVec3> = self.missing_probes.iter().copied().collect();
+
+            for &dirty in dirty_chunks {
+                self.emissive_index.remove(&dirty);
+                self.light_cache.remove(&dirty);
+
+                for z in -light_radius..=light_radius {
+                    for y in -light_radius..=light_radius {
+                        for x in -light_radius..=light_radius {
+                            let probe_coord = dirty + IVec3::new(x, y, z);
+                            if self.local_index_for_coord(probe_coord).is_some()
+                                && missing_set.insert(probe_coord)
+                            {
+                                self.missing_probes.push(probe_coord);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // 1. Determine new grid origin (centered on camera, snapped to chunk size)
         // Use a hysteresis margin so the grid doesn't recentre on every small movement.
         let chunk_size = 16.0;
@@ -562,6 +586,7 @@ pub fn spawn_gi_worker(
                     &palette,
                     request.camera_pos,
                     &request.visible_chunks,
+                    &request.dirty_chunks,
                 );
 
                 let grid_origin = gi_system.grid_origin;
