@@ -1668,6 +1668,9 @@ struct App {
     palette_ui_buffer: Option<wgpu::Buffer>,
     palette_ui_count: u32,
     palette_ui_instances: Vec<PaletteUiInstance>,
+    ui_quad_buffer: Option<wgpu::Buffer>,
+    ui_quad_count: u32,
+    ui_quad_instances: Vec<PaletteUiInstance>,
     palette_ui_visible: bool,
     palette_ui_origin_px: [f32; 2],
     palette_ui_cell_px: f32,
@@ -3476,6 +3479,9 @@ impl App {
             palette_ui_buffer: None,
             palette_ui_count: 0,
             palette_ui_instances: Vec::new(),
+            ui_quad_buffer: None,
+            ui_quad_count: 0,
+            ui_quad_instances: Vec::new(),
             palette_ui_visible: false,
             palette_ui_origin_px: [0.0, 0.0],
             palette_ui_cell_px: 0.0,
@@ -11361,129 +11367,162 @@ impl App {
 
     fn draw_debug_voxels(&mut self) {
         self.debug_ui_instances.clear();
+        self.debug_instance_count = 0;
+        self.ui_quad_instances.clear();
+        self.ui_quad_count = 0;
 
-        // Screen-space position (rough approximation for now)
-        // We'll render these at a fixed Z near the camera or using a separate pass later.
-        let cam_pos = self.camera_controller.camera.position;
-        let cam_forward = self.camera_controller.camera.forward;
-        let cam_right = self.camera_controller.camera.right();
-        let cam_up = self.camera_controller.camera.up;
+        let (width, height) = if let Some(config) = &self.config {
+            (config.width as f32, config.height as f32)
+        } else {
+            (800.0, 600.0)
+        };
 
-        // When overscan is enabled, the projection matrix uses a wider FOV.
-        // Since the UI is rendered directly into the final swapchain (after the crop),
-        // we must scale its world-space size and offsets to compensate for the wider FOV
-        // so it appears at the same screen-space size and position.
-        let overscan = self.render_overscan_factor();
+        let margin_px = 18.0;
+        let char_px = (width * 0.018).clamp(12.0, 20.0);
+        let line_gap = (char_px * 0.9).max(12.0);
+        let mut cursor_y = margin_px;
 
-        // Position text in the top-left corner
-        // Distance 0.5 to allow more room for offsets without clipping
-        let ui_origin = [
-            cam_pos[0] + cam_forward[0] * 0.5 - cam_right[0] * 0.45 * overscan
-                + cam_up[0] * 0.3 * overscan,
-            cam_pos[1] + cam_forward[1] * 0.5 - cam_right[1] * 0.45 * overscan
-                + cam_up[1] * 0.3 * overscan,
-            cam_pos[2] + cam_forward[2] * 0.5 - cam_right[2] * 0.45 * overscan
-                + cam_up[2] * 0.3 * overscan,
-        ];
-
-        let char_size = 0.0012 * overscan;
-        let white = [1.0, 1.0, 1.0, 1.0];
-        let glow = [1.0, 1.0, 1.0, 2.0];
-
-        let fps_text = format!("FPS: {}", self.last_fps);
-        self.render_voxel_text(&fps_text, ui_origin, char_size, white, glow, true);
-
-        let mut current_y = 0.015 * overscan;
-        let line_spacing = 0.015 * overscan;
-
-        let stats = [
+        let lines = [
+            format!("FPS: {}", self.last_fps),
             format!("MESH JOBS/S: {}", self.jobs_per_sec_snapshot),
             format!("GI PROBES/S: {}", self.gi_jobs_per_sec_snapshot),
             format!("MEM: {:.0} MIB", self.process_mem_mib),
+            format!("DEBUG: {}", self.input_manager.active_debug_view.name()),
         ];
 
-        for stat in stats {
-            let pos = [
-                ui_origin[0] - cam_up[0] * current_y,
-                ui_origin[1] - cam_up[1] * current_y,
-                ui_origin[2] - cam_up[2] * current_y,
-            ];
-            self.render_voxel_text(&stat, pos, char_size, white, glow, true);
-            current_y += line_spacing;
+        for line in lines {
+            self.render_ui_text_2d(
+                &line,
+                margin_px,
+                cursor_y,
+                char_px,
+                [1.0, 1.0, 1.0, 1.0],
+                true,
+            );
+            cursor_y += char_px + line_gap;
         }
 
-        // Display current debug view (F3 cycles)
-        let debug_view_text = format!("DEBUG: {}", self.input_manager.active_debug_view.name());
-        let debug_pos = [
-            ui_origin[0] - cam_up[0] * current_y,
-            ui_origin[1] - cam_up[1] * current_y,
-            ui_origin[2] - cam_up[2] * current_y,
-        ];
-        self.render_voxel_text(&debug_view_text, debug_pos, char_size, white, glow, true);
-        current_y += line_spacing;
-
-        // Display current selected setting (Tab cycles, 1/2 adjusts)
         if let Some(setting) = self.input_manager.selected_setting {
             let setting_val = self.get_setting_value_string(setting);
             let setting_text = format!("SET: {} = {}", setting.name(), setting_val);
-            let setting_pos = [
-                ui_origin[0] - cam_up[0] * current_y,
-                ui_origin[1] - cam_up[1] * current_y,
-                ui_origin[2] - cam_up[2] * current_y,
-            ];
-            let yellow = [1.0, 1.0, 0.3, 1.0];
-            let yellow_glow = [1.0, 1.0, 0.3, 2.0];
-            self.render_voxel_text(
+            self.render_ui_text_2d(
                 &setting_text,
-                setting_pos,
-                char_size,
-                yellow,
-                yellow_glow,
+                margin_px,
+                cursor_y,
+                char_px,
+                [1.0, 1.0, 0.3, 1.0],
                 true,
             );
         }
 
-        self.render_palette_ui(
-            cam_pos,
-            cam_forward,
-            cam_right,
-            cam_up,
-            overscan,
-            char_size,
-        );
+        self.render_palette_ui([0.0; 3], [0.0; 3], [0.0; 3], [0.0; 3], 0.0, 0.0);
 
-        // Update the GPU buffer
-        if !self.debug_ui_instances.is_empty() {
-            let data = bytemuck::cast_slice(&self.debug_ui_instances);
+        if !self.ui_quad_instances.is_empty() {
+            let data = bytemuck::cast_slice(&self.ui_quad_instances);
             let device = self.device.as_ref().unwrap();
-
-            // Recreate or update the buffer
             let needed_size = data.len() as u64;
             let mut recreate = true;
-            if let Some(buf) = &self.debug_instance_buffer {
+            if let Some(buf) = &self.ui_quad_buffer {
                 if buf.size() >= needed_size {
                     recreate = false;
                 }
             }
-
             if recreate {
-                self.debug_instance_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("Debug UI Instance Buffer"),
+                self.ui_quad_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("UI Quad Buffer"),
                     size: needed_size,
                     usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 }));
             }
-
             self.queue.as_ref().unwrap().write_buffer(
-                self.debug_instance_buffer.as_ref().unwrap(),
+                self.ui_quad_buffer.as_ref().unwrap(),
                 0,
                 data,
             );
-            self.debug_instance_count = self.debug_ui_instances.len() as u32;
+            self.ui_quad_count = self.ui_quad_instances.len() as u32;
         } else {
-            self.debug_instance_count = 0;
+            self.ui_quad_count = 0;
         }
+    }
+
+    fn render_ui_text_2d(
+        &mut self,
+        text: &str,
+        origin_x_px: f32,
+        origin_y_px: f32,
+        char_px: f32,
+        color: [f32; 4],
+        draw_background: bool,
+    ) {
+        let (width, height) = if let Some(config) = &self.config {
+            (config.width as f32, config.height as f32)
+        } else {
+            (800.0, 600.0)
+        };
+
+        let pixel_px = char_px / 8.0;
+        let text_len = text.len() as f32;
+        let text_w = text_len * (char_px + pixel_px);
+        let text_h = char_px;
+
+        if draw_background {
+            let pad_x = pixel_px * 2.0;
+            let pad_y = pixel_px * 1.5;
+            self.push_ui_quad(
+                origin_x_px - pad_x,
+                origin_y_px - pad_y,
+                text_w + pad_x * 2.0,
+                text_h + pad_y * 2.0,
+                [0.0, 0.0, 0.0, 0.75],
+            );
+        }
+
+        let mut x_offset = 0.0;
+        for c in text.to_ascii_uppercase().chars() {
+            let glyph_idx = (c as u32).min(127) as usize;
+            let font_idx = if glyph_idx > 90 {
+                if glyph_idx >= 123 {
+                    glyph_idx - 32
+                } else {
+                    32
+                }
+            } else {
+                glyph_idx
+            };
+            let glyph_offset = font_idx * 8;
+            for row in 0..8 {
+                let row_bits = VOXEL_FONT_BASIC[glyph_offset + row];
+                for col in 0..8 {
+                    if (row_bits & (1 << col)) != 0 {
+                        let px = origin_x_px + x_offset + col as f32 * pixel_px;
+                        let py = origin_y_px + row as f32 * pixel_px;
+                        self.push_ui_quad(px, py, pixel_px, pixel_px, color);
+                    }
+                }
+            }
+            x_offset += char_px + pixel_px;
+        }
+
+        let _ = (width, height);
+    }
+
+    fn push_ui_quad(&mut self, x_px: f32, y_px: f32, w_px: f32, h_px: f32, color: [f32; 4]) {
+        let (width, height) = if let Some(config) = &self.config {
+            (config.width as f32, config.height as f32)
+        } else {
+            (800.0, 600.0)
+        };
+        let ndc_x = (x_px / width) * 2.0 - 1.0;
+        let ndc_y = 1.0 - (y_px / height) * 2.0;
+        let ndc_w = (w_px / width) * 2.0;
+        let ndc_h = -(h_px / height) * 2.0;
+        self.ui_quad_instances.push(PaletteUiInstance {
+            pos: [ndc_x, ndc_y],
+            size: [ndc_w, ndc_h],
+            color,
+            shape: 0.0,
+        });
     }
 
     fn render_palette_ui(
@@ -15397,28 +15436,6 @@ impl App {
             composite_pass.set_bind_group(0, composite_bind_group, &[]);
             composite_pass.draw(0..3, 0..1);
 
-            // Custom Voxel UI (Overlay)
-            if self.gui_visible && self.debug_instance_count > 0 {
-                if let (Some(pipeline), Some(buf), Some(bind_group)) = (
-                    self.ui_pipeline.as_ref(),
-                    self.debug_instance_buffer.as_ref(),
-                    self.bind_group.as_ref(), // Bind group 0 has common uniforms/palette
-                ) {
-                    composite_pass.set_pipeline(pipeline);
-                    composite_pass.set_bind_group(0, bind_group, &[]);
-                    composite_pass.set_bind_group(
-                        1,
-                        self.voxel_gi_bind_group.as_ref().unwrap(),
-                        &[],
-                    );
-                    composite_pass
-                        .set_vertex_buffer(0, self.cube_vertex_buffer.as_ref().unwrap().slice(..));
-                    composite_pass.set_vertex_buffer(1, buf.slice(..));
-                    composite_pass
-                        .draw(0..CUBE_VERTICES.len() as u32, 0..self.debug_instance_count);
-                }
-            }
-
             // Palette UI (2D overlay)
             if self.palette_ui_visible && self.palette_ui_count > 0 {
                 if let (Some(pipeline), Some(buf)) = (
@@ -15428,6 +15445,18 @@ impl App {
                     composite_pass.set_pipeline(pipeline);
                     composite_pass.set_vertex_buffer(0, buf.slice(..));
                     composite_pass.draw(0..6, 0..self.palette_ui_count);
+                }
+            }
+
+            // Metrics UI (2D overlay)
+            if self.gui_visible && self.ui_quad_count > 0 {
+                if let (Some(pipeline), Some(buf)) = (
+                    self.palette_ui_pipeline.as_ref(),
+                    self.ui_quad_buffer.as_ref(),
+                ) {
+                    composite_pass.set_pipeline(pipeline);
+                    composite_pass.set_vertex_buffer(0, buf.slice(..));
+                    composite_pass.draw(0..6, 0..self.ui_quad_count);
                 }
             }
         } else {
