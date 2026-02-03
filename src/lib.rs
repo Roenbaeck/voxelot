@@ -11,6 +11,7 @@ pub mod meshing_optimized;
 pub mod palette;
 pub mod pawn;
 pub mod profiling;
+pub mod raycast;
 
 // Re-export main types
 pub use buffer_allocator::{AllocationError, SlabAllocator};

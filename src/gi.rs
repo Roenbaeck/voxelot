@@ -11,6 +11,8 @@ use std::sync::Arc;
 pub struct GiUpdateRequest {
     pub camera_pos: Vec3,
     pub visible_chunks: Vec<IVec3>,
+    pub dirty_chunks: Vec<IVec3>,
+    pub world: Option<Arc<World>>,
 }
 
 /// Result from async GI update
@@ -152,12 +154,54 @@ impl GiSystem {
         palette: &Palette,
         camera_pos: Vec3,
         visible_chunks: &[IVec3],
+        dirty_chunks: &[IVec3],
     ) -> (bool, Vec<GiProbeUpdate>, usize) {
+        if !dirty_chunks.is_empty() {
+            let light_radius = 4;
+            let mut missing_set: HashSet<IVec3> = self.missing_probes.iter().copied().collect();
+
+            for &dirty in dirty_chunks {
+                self.emissive_index.remove(&dirty);
+                self.light_cache.remove(&dirty);
+
+                for z in -light_radius..=light_radius {
+                    for y in -light_radius..=light_radius {
+                        for x in -light_radius..=light_radius {
+                            let probe_coord = dirty + IVec3::new(x, y, z);
+                            if self.local_index_for_coord(probe_coord).is_some()
+                                && missing_set.insert(probe_coord)
+                            {
+                                self.missing_probes.push(probe_coord);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // 1. Determine new grid origin (centered on camera, snapped to chunk size)
+        // Use a hysteresis margin so the grid doesn't recentre on every small movement.
         let chunk_size = 16.0;
         let cam_chunk = (camera_pos / chunk_size).floor().as_ivec3();
         let half_dims = self.grid_dims / 2;
-        let new_origin = cam_chunk - half_dims;
+
+        const GI_RECENTER_MARGIN_CHUNKS: i32 = 4;
+        let max_margin = ((self.grid_dims - IVec3::ONE).max(IVec3::ZERO)) / 2;
+        let margin = IVec3::splat(GI_RECENTER_MARGIN_CHUNKS).min(max_margin);
+
+        let min_allowed = self.grid_origin + margin;
+        let max_allowed = self.grid_origin + self.grid_dims - margin - IVec3::ONE;
+        let needs_recentering = cam_chunk.x < min_allowed.x
+            || cam_chunk.y < min_allowed.y
+            || cam_chunk.z < min_allowed.z
+            || cam_chunk.x > max_allowed.x
+            || cam_chunk.y > max_allowed.y
+            || cam_chunk.z > max_allowed.z;
+
+        let new_origin = if needs_recentering {
+            cam_chunk - half_dims
+        } else {
+            self.grid_origin
+        };
 
         self.grid_origin = new_origin;
 
@@ -209,10 +253,11 @@ impl GiSystem {
         let mut probes_calculated = 0;
         let mut updates: Vec<GiProbeUpdate> = Vec::new();
         if !self.missing_probes.is_empty() {
-            // Throttle: only process up to 64 probes per update to prevent frame drops
-            // Since GI runs async on background thread, this won't impact frame rate
+            // Process a batch of probes per update. 
+            // 256 probes at 16,384 probes per grid means the whole grid can be refreshed in 64 updates.
+            // Since this runs on a background thread pool, it won't stall the main loop.
             let probes_to_process: Vec<IVec3> =
-                self.missing_probes.iter().take(64).cloned().collect();
+                self.missing_probes.iter().take(256).cloned().collect();
             probes_calculated = probes_to_process.len();
 
             // Remove processed probes from missing list
@@ -513,7 +558,7 @@ impl GiSystem {
 /// Spawn a background worker thread for async GI probe updates
 /// Returns (request_sender, result_receiver)
 pub fn spawn_gi_worker(
-    world: Arc<World>,
+    initial_world: Arc<World>,
     palette: Arc<Palette>,
     grid_dims: IVec3,
 ) -> (Sender<GiUpdateRequest>, Receiver<GiUpdateResult>) {
@@ -524,14 +569,24 @@ pub fn spawn_gi_worker(
         .name("gi-worker".to_string())
         .spawn(move || {
             let mut gi_system = GiSystem::new(grid_dims);
+            let mut world = initial_world;
 
             while let Ok(request) = request_rx.recv() {
+                // Update world reference if a new one was provided (e.g. after world modification)
+                if let Some(new_world) = request.world {
+                    world = new_world;
+                    // Reset light cache when world structure potentially changes
+                    gi_system.light_cache.clear();
+                    gi_system.emissive_index.clear();
+                }
+
                 // Update GI system - world is already Arc, no lock needed (World is Sync)
                 let (grid_moved, updates, probes_calculated) = gi_system.update(
                     &world,
                     &palette,
                     request.camera_pos,
                     &request.visible_chunks,
+                    &request.dirty_chunks,
                 );
 
                 let grid_origin = gi_system.grid_origin;

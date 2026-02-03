@@ -74,7 +74,27 @@ Binaries & tools (src/bin)
 `src/bin/compress_worlds.rs` | tool | Utility to recompress or batch-compress `.vhc` files. |
 
 Shaders (shaders/)
-`shaders/*.wgsl` | dir | WGSL shaders embedded and compiled at runtime by `wgpu`. | Examples: `voxel.wgsl`, `skybox.wgsl`, `gpu_cull.wgsl`, `ssr.wgsl`, `water.wgsl`.
+`shaders/` | dir | WGSL shaders embedded and compiled at runtime by `wgpu`. |
+`shaders/bloom_extract.wgsl` | file | Bloom extraction pass. |
+`shaders/dof_coc_copy.wgsl` | file | Depth-of-field circle-of-confusion copy pass. |
+`shaders/dof_combine.wgsl` | file | Depth-of-field combine pass. |
+`shaders/dual_kawase_down.wgsl` | file | Dual Kawase downsample blur. |
+`shaders/dual_kawase_up.wgsl` | file | Dual Kawase upsample blur. |
+`shaders/editor_preview.wgsl` | file | Editor preview/wireframe rendering. |
+`shaders/gpu_cull.wgsl` | file | GPU culling and visibility. |
+`shaders/hzb_gen.wgsl` | file | Hierarchical Z-buffer generation. |
+`shaders/impostor.wgsl` | file | Impostor rendering. |
+`shaders/post_composite.wgsl` | file | Post-processing composite pass. |
+`shaders/radiance_cascades.wgsl` | file | Radiance cascade lighting. |
+`shaders/skybox.wgsl` | file | Skybox shader implementing HDR sampling/compositing. |
+`shaders/ssao_blur.wgsl` | file | SSAO blur pass. |
+`shaders/ssilvb.wgsl` | file | SSGI/AO lighting (SSILVB). |
+`shaders/ssr.wgsl` | file | Screen-space reflections. |
+`shaders/ssr_kawase_blur.wgsl` | file | SSR blur pass. |
+`shaders/voxel.wgsl` | file | Main voxel rendering pipeline. |
+`shaders/water.wgsl` | file | Water rendering. |
+`shaders/wts_inject.wgsl` | file | WTS sunlight injection. |
+`shaders/wts_relax.wgsl` | file | WTS relaxation/diffusion. |
 
 Other files of interest
 `demo/config.toml` | file | Tuned demo configuration (camera, rendering, world/palette paths). |

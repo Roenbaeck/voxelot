@@ -174,6 +174,24 @@ impl Chunk {
         }
     }
 
+    /// Create a chunk filled with a single voxel type
+    pub fn full(voxel_type: VoxelType) -> Self {
+        let mut chunk = Self::new();
+        if voxel_type == 0 {
+            return chunk;
+        }
+
+        chunk.px = 0xFFFF;
+        chunk.py = 0xFFFF;
+        chunk.pz = 0xFFFF;
+        chunk.presence = Bitmap::from_range(0..4096);
+        chunk.voxels = vec![Voxel::Solid(voxel_type); 4096];
+        chunk.voxel_count = 4096;
+        chunk.solid_ratio = 1.0;
+        chunk.dominant_type = voxel_type;
+        chunk
+    }
+
     /// Convert (x, y, z) coordinates to flat index
     /// x, y, z must be in range [0, 15]
     #[inline]
@@ -248,6 +266,18 @@ impl Chunk {
         debug_assert!(x < 16 && y < 16 && z < 16);
 
         let idx = Self::flat_index(x, y, z);
+
+        if voxel_type == 0 {
+            if self.presence.contains(idx) {
+                let rank = self.presence.rank(idx) as usize;
+                self.presence.remove(idx);
+                self.voxels.remove(rank - 1);
+
+                // Note: updating px, py, pz marginals is hard when removing,
+                // so we leave them set (over-conservative but correct).
+            }
+            return;
+        }
 
         if self.presence.contains(idx) {
             // Update existing voxel
@@ -562,15 +592,8 @@ impl Chunk {
             Voxel::Chunk(_) => return Err("Already subdivided"),
         };
 
-        // Create a new chunk filled with voxels of the same type
-        let mut sub_chunk = Chunk::new();
-        for sx in 0..16 {
-            for sy in 0..16 {
-                for sz in 0..16 {
-                    sub_chunk.set(sx, sy, sz, voxel_type);
-                }
-            }
-        }
+        // Create a new chunk filled with voxels of the same type using Chunk::full
+        let sub_chunk = Chunk::full(voxel_type);
 
         // Replace the solid voxel with the chunk
         // This also updates parent's projection bits to reflect sub-chunk contents
@@ -1024,6 +1047,7 @@ impl WorldPos {
 /// - depth 2: 256³ = 16,777,216 voxels  
 /// - depth 3: 4,096³ = 68,719,476,736 voxels
 /// - depth 4: 65,536³ = 281,474,976,710,656 voxels
+#[derive(Clone, Debug)]
 pub struct World {
     /// The root chunk - everything is a chunk!
     root: Arc<Chunk>,
@@ -1234,16 +1258,25 @@ impl World {
             let idx = Chunk::flat_index(x, y, z);
 
             // Check if voxel exists and what type it is
-            let needs_chunk = if current.presence.contains(idx) {
+            let existing_voxel = if current.presence.contains(idx) {
                 let rank = current.presence.rank(idx) as usize;
-                !matches!(current.voxels[rank - 1], Voxel::Chunk(_))
+                Some(current.voxels[rank - 1].clone())
             } else {
-                true
+                None
+            };
+
+            let needs_chunk = match &existing_voxel {
+                Some(Voxel::Chunk(_)) => false,
+                _ => true,
             };
 
             // Create or ensure it's a chunk
             if needs_chunk {
-                current.set_chunk(x, y, z, Chunk::new());
+                let new_chunk = match existing_voxel {
+                    Some(Voxel::Solid(t)) => Chunk::full(t),
+                    _ => Chunk::new(),
+                };
+                current.set_chunk(x, y, z, new_chunk);
             }
 
             // Navigate into the chunk - need to use Arc::make_mut
@@ -1529,16 +1562,25 @@ impl World {
         let idx = Chunk::flat_index(lx, ly, lz);
 
         // Check if we need to create or replace with a chunk
-        let needs_chunk = if grandparent.presence.contains(idx) {
+        let existing_voxel = if grandparent.presence.contains(idx) {
             let rank = grandparent.presence.rank(idx) as usize;
-            !matches!(&grandparent.voxels[rank - 1], Voxel::Chunk(_))
+            Some(grandparent.voxels[rank - 1].clone())
         } else {
-            true
+            None
+        };
+
+        let needs_chunk = match &existing_voxel {
+            Some(Voxel::Chunk(_)) => false,
+            _ => true,
         };
 
         if needs_chunk {
-            // Create the leaf chunk (this will replace any existing Solid voxel)
-            grandparent.set_chunk(lx, ly, lz, Chunk::new());
+            // Create the leaf chunk (splitting a Solid voxel if it exists)
+            let new_chunk = match existing_voxel {
+                Some(Voxel::Solid(t)) => Chunk::full(t),
+                _ => Chunk::new(),
+            };
+            grandparent.set_chunk(lx, ly, lz, new_chunk);
         }
 
         // Now get the leaf chunk and set the voxel in it
@@ -1697,6 +1739,57 @@ impl World {
 
     /// Second pass of LOD updates: Propagate visibility masks top-down to refine average colors.
     /// This ensures chunks on building facades don't have their average color diluted by buried faces.
+    pub fn update_metadata_at(&mut self, world_x: i64, world_y: i64, world_z: i64, palette: &Palette) {
+        let mut path = Vec::new();
+        let mut cur_x = world_x;
+        let mut cur_y = world_y;
+        let mut cur_z = world_z;
+
+        // Trace the path from leaf up to root, then reverse to go root -> leaf
+        for _ in 0..self.hierarchy_depth {
+            path.push(((cur_x & 15) as u8, (cur_y & 15) as u8, (cur_z & 15) as u8));
+            cur_x >>= 4;
+            cur_y >>= 4;
+            cur_z >>= 4;
+        }
+        path.reverse();
+
+        let root_mut = Arc::make_mut(&mut self.root);
+        Self::update_metadata_recursive(root_mut, &path, 0, palette);
+    }
+
+    fn update_metadata_recursive(
+        chunk: &mut Chunk,
+        path: &[(u8, u8, u8)],
+        depth_idx: usize,
+        palette: &Palette,
+    ) {
+        // If we are not at the leaf level, descend
+        if depth_idx < path.len() - 1 {
+            let (x, y, z) = path[depth_idx];
+            let pos = (x as u16) | ((y as u16) << 4) | ((z as u16) << 8);
+
+            if chunk.presence.contains(pos as u32) {
+                let rank = chunk.presence.rank(pos as u32) as usize;
+                if rank > 0 {
+                    if let Voxel::Chunk(sub_chunk_arc) = &mut chunk.voxels[rank - 1] {
+                        Self::update_metadata_recursive(
+                            Arc::make_mut(sub_chunk_arc),
+                            path,
+                            depth_idx + 1,
+                            palette,
+                        );
+                    }
+                }
+            }
+        }
+
+        // After updating children (or if we are the leaf), update this chunk's metadata
+        chunk.update_lod_metadata(palette);
+        // Refresh hierarchy shell for culling after edits
+        chunk.generate_hierarchy_shell();
+    }
+
     pub fn update_all_visual_lod_metadata(&mut self, palette: &Palette) {
         let root_mut = Arc::make_mut(&mut self.root);
         // Root is visible from all sides in the world view

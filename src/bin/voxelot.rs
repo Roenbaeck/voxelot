@@ -34,9 +34,15 @@ use std::collections::VecDeque;
 use sysinfo::{Pid, ProcessExt, System, SystemExt};
 use voxelot::SlabAllocator;
 use voxelot::{
-    bbox_local_to_world, cull_visible_voxels_parallel, input::DebugView, Camera, Chunk, ChunkMesh,
-    CullStats, Palette, RenderConfig, VoxelInstance, World, WorldPos,
+    bbox_local_to_world, cull_visible_voxels_parallel, input::DebugView, raycast, Camera, Chunk,
+    ChunkMesh, CullStats, Palette, RenderConfig, VoxelInstance, World, WorldPos,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditMode {
+    Add,
+    Remove,
+}
 
 macro_rules! viewer_debug {
     ($($arg:tt)*) => {
@@ -529,6 +535,22 @@ impl MeshCacheEntry {
         }
     }
 }
+
+#[derive(Clone, Copy, Debug)]
+struct DeferredFree {
+    vertex_offset: u64,
+    vertex_bytes: u64,
+    index_offset: u64,
+    index_bytes: u64,
+    free_after_frame: u64,
+    is_envelope: bool,
+}
+
+#[derive(Debug)]
+struct DeferredBuffer {
+    buffer: wgpu::Buffer,
+    free_after_frame: u64,
+}
 // Ensure impl CameraController is properly closed (fix potential brace mismatch introduced by refactor)
 
 #[derive(Clone, Debug)]
@@ -628,6 +650,25 @@ struct SsrCameraUniforms {
     water_vis_fog_density: [f32; 4],
     water_color: [f32; 4],
     ambient_color: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct EditorPreviewUniforms {
+    view_proj: [[f32; 4]; 4],
+    pos0: [f32; 4],   // xyz = world pos, w = scale (inner)
+    color0: [f32; 4], // rgba (inner)
+    pos1: [f32; 4],   // xyz = world pos, w = scale (outer)
+    color1: [f32; 4], // rgba (outer)
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct PaletteUiInstance {
+    pos: [f32; 2],
+    size: [f32; 2],
+    color: [f32; 4],
+    shape: f32,
 }
 
 /// Depth-of-field runtime settings (CPU-side convenience)
@@ -1184,6 +1225,7 @@ struct App {
     hdr_active: bool,
     render_pipeline: Option<wgpu::RenderPipeline>,
     ui_pipeline: Option<wgpu::RenderPipeline>,
+    palette_ui_pipeline: Option<wgpu::RenderPipeline>,
     mesh_pipeline: Option<wgpu::RenderPipeline>,
     impostor_pipeline: Option<wgpu::RenderPipeline>,
     impostor_bind_group_layout: Option<wgpu::BindGroupLayout>,
@@ -1226,6 +1268,11 @@ struct App {
     impostor_instance_capacity: usize,
     // Mesh cache: per-leaf-chunk mesh GPU buffers and metadata
     mesh_cache: FxHashMap<(i64, i64, i64), MeshCacheEntry>,
+    /// Chunks that need remeshing even if a cached mesh exists
+    dirty_meshes: FxHashSet<(i64, i64, i64)>,
+    /// Mesh allocations to free after the GPU-safe window
+    deferred_frees: Vec<DeferredFree>,
+    deferred_buffers: Vec<DeferredBuffer>,
     /// Cache of surface voxels for un-meshed chunks (for optimized fallback rendering)
     shell_cache: FxHashMap<(i64, i64, i64), Vec<voxelot::ShellVoxel>>,
     mesh_cache_bytes: u64,
@@ -1289,6 +1336,12 @@ struct App {
     // Reused temporary indirect argument buffers to avoid per-frame allocations
     mesh_indirect_args_tmp: Vec<wgpu::util::DrawIndexedIndirectArgs>,
     envelope_indirect_args_tmp: Vec<wgpu::util::DrawIndexedIndirectArgs>,
+
+    // Editor Preview
+    editor_preview_pipeline: Option<wgpu::RenderPipeline>,
+    editor_preview_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    editor_preview_bind_group: Option<wgpu::BindGroup>,
+    editor_preview_buffer: Option<wgpu::Buffer>,
     // Reused temp arrays for populate_multi_draw_indirects
     multi_mesh_args_tmp: Vec<wgpu::util::DrawIndexedIndirectArgs>,
     multi_env_args_tmp: Vec<wgpu::util::DrawIndexedIndirectArgs>,
@@ -1318,6 +1371,7 @@ struct App {
     gi_probes: Vec<voxelot::gi::GiProbe>,
     gi_grid_origin: glam::IVec3,
     gi_grid_dims: glam::IVec3,
+    gi_dirty_chunks: FxHashSet<glam::IVec3>,
 
     // SSILVB GI probe 3D textures (6 faces: +X, -X, +Y, -Y, +Z, -Z, and a color/occupancy volume)
     gi_probe_tex_px: Option<wgpu::Texture>,
@@ -1388,7 +1442,15 @@ struct App {
     last_fps_print: Instant,
 
     mouse_pressed: bool,
+    shift_pressed: bool,
     last_mouse_pos: Option<(f64, f64)>,
+    current_mouse_pos: (f64, f64),
+
+    // Editor state
+    editing_mode: EditMode,
+    selected_voxel_type: u8,
+    last_raycast_hit: Option<raycast::RaycastHit>,
+    world_changed: bool,
 
     // Lighting state
     time_of_day: f32,
@@ -1603,6 +1665,16 @@ struct App {
     debug_instance_buffer: Option<wgpu::Buffer>,
     debug_instance_count: u32,
     debug_ui_instances: Vec<VoxelInstanceRaw>,
+    palette_ui_buffer: Option<wgpu::Buffer>,
+    palette_ui_count: u32,
+    palette_ui_instances: Vec<PaletteUiInstance>,
+    palette_ui_visible: bool,
+    palette_ui_origin_px: [f32; 2],
+    palette_ui_cell_px: f32,
+    palette_ui_gap_px: f32,
+    palette_ui_cols: usize,
+    palette_ui_rows: usize,
+    palette_ui_first_index: usize,
 
     // Culling statistics
     cull_stats: CullStats,
@@ -1668,6 +1740,273 @@ struct App {
 }
 
 impl App {
+    fn defer_buffer(&mut self, buffer: wgpu::Buffer) {
+        let free_after_frame = self.frame_index.saturating_add(GPU_EVICTION_SAFE_FRAMES);
+        self.deferred_buffers.push(DeferredBuffer {
+            buffer,
+            free_after_frame,
+        });
+    }
+
+    fn handle_palette_click(&mut self, mouse_x: f32, mouse_y: f32) -> bool {
+        if !self.palette_ui_visible || self.palette_ui_count == 0 {
+            return false;
+        }
+
+        let origin = self.palette_ui_origin_px;
+        let cell = self.palette_ui_cell_px;
+        let gap = self.palette_ui_gap_px;
+        let cols = self.palette_ui_cols.max(1);
+        let rows = self.palette_ui_rows.max(1);
+
+        let grid_w = cols as f32 * cell + (cols.saturating_sub(1) as f32) * gap;
+        let grid_h = rows as f32 * cell + (rows.saturating_sub(1) as f32) * gap;
+
+        if mouse_x < origin[0]
+            || mouse_x > origin[0] + grid_w
+            || mouse_y < origin[1]
+            || mouse_y > origin[1] + grid_h
+        {
+            return false;
+        }
+
+        let local_x = mouse_x - origin[0];
+        let local_y = mouse_y - origin[1];
+
+        let col = (local_x / (cell + gap)).floor() as usize;
+        let row = (local_y / (cell + gap)).floor() as usize;
+
+        if col >= cols || row >= rows {
+            return false;
+        }
+
+        if local_x - (col as f32 * (cell + gap)) > cell {
+            return false;
+        }
+        if local_y - (row as f32 * (cell + gap)) > cell {
+            return false;
+        }
+
+        let idx = row * cols + col;
+        if idx >= self.palette_ui_count as usize {
+            return false;
+        }
+
+        let palette_index = self.palette_ui_first_index + idx;
+        self.selected_voxel_type = palette_index as u8;
+        true
+    }
+    fn create_editor_preview_pipeline(&mut self, device: &wgpu::Device) {
+        let shader = device.create_shader_module(wgpu::include_wgsl!("../../shaders/editor_preview.wgsl"));
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Editor Preview Bind Group Layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Editor Preview Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            immediate_size: 0,
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Editor Preview Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::empty(),
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rg16Float,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::empty(),
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::R8Unorm,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::empty(),
+                    }),
+                ],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Editor Preview Buffer"),
+            size: std::mem::size_of::<EditorPreviewUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Editor Preview Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }],
+        });
+
+        self.editor_preview_pipeline = Some(pipeline);
+        self.editor_preview_bind_group_layout = Some(bind_group_layout);
+        self.editor_preview_bind_group = Some(bind_group);
+        self.editor_preview_buffer = Some(buffer);
+    }
+
+    fn invalidate_chunk_mesh(&mut self, key: (i64, i64, i64)) {
+        let keys_to_invalidate = [
+            key,
+            (key.0 - 16, key.1, key.2),
+            (key.0 + 16, key.1, key.2),
+            (key.0, key.1 - 16, key.2),
+            (key.0, key.1 + 16, key.2),
+            (key.0, key.1, key.2 - 16),
+            (key.0, key.1, key.2 + 16),
+        ];
+
+        for (i, k) in keys_to_invalidate.iter().copied().enumerate() {
+            // Drop cached Arc<Chunk> snapshots so meshing re-reads the latest world data.
+            self.mesh_chunk_arc_cache.remove(&k);
+
+            // Mark dirty so we remesh even if a cached mesh exists.
+            self.dirty_meshes.insert(k);
+
+            // Queue remesh without clearing existing mesh to avoid visible "blink".
+            if self.pending_chunk_set.insert(k) {
+                if i == 0 {
+                    self.pending_chunk_meshes.push_front(k);
+                } else {
+                    self.pending_chunk_meshes.push_back(k);
+                }
+            }
+        }
+
+        // World changed flag triggers GI and other updates
+        self.world_changed = true;
+    }
+
+    fn handle_edit_click(&mut self, is_left_click: bool) {
+        if !is_left_click {
+            return;
+        }
+
+        let hit = match &self.last_raycast_hit {
+            Some(h) => h,
+            None => return,
+        };
+
+        // Use Shift+Click for Remove, Click for Add (overriding self.editing_mode for UX)
+        let effective_mode = if self.shift_pressed {
+            EditMode::Remove
+        } else {
+            EditMode::Add
+        };
+
+        // Determine target position based on mode
+        let target_pos = match effective_mode {
+            EditMode::Add => {
+                // For adding, we place at the voxel adjacent to the hit (offset by normal)
+                let nx = hit.normal[0] as i64;
+                let ny = hit.normal[1] as i64;
+                let nz = hit.normal[2] as i64;
+                WorldPos::new(hit.position.x + nx, hit.position.y + ny, hit.position.z + nz)
+            }
+            EditMode::Remove => {
+                // For removing, we target the hit voxel itself
+                hit.position
+            }
+        };
+
+        let voxel_type = match effective_mode {
+            EditMode::Add => self.selected_voxel_type,
+            EditMode::Remove => 0, // 0 = empty
+        };
+
+        let old_voxel_type = self.world.get(target_pos).unwrap_or(0);
+        let old_emissive = self.palette.emissive(old_voxel_type as u32).1;
+        let new_emissive = self.palette.emissive(voxel_type as u32).1;
+        if (old_emissive > 0.0) || (new_emissive > 0.0) {
+            let chunk_coord = glam::IVec3::new(
+                (target_pos.x >> 4) as i32,
+                (target_pos.y >> 4) as i32,
+                (target_pos.z >> 4) as i32,
+            );
+            self.gi_dirty_chunks.insert(chunk_coord);
+        }
+
+        log::info!(
+            "Editing world: {:?} at {:?} (mode: {:?})",
+            voxel_type,
+            target_pos,
+            effective_mode
+        );
+
+        // Perform modification using CoW (Copy on Write) hierarchy
+        let world_mut = Arc::make_mut(&mut self.world);
+        world_mut.set(target_pos, voxel_type);
+        world_mut.update_metadata_at(target_pos.x, target_pos.y, target_pos.z, &self.palette);
+        self.world_changed = true;
+
+        // Invalidate the mesh for this chunk and its 26 neighbors (to handle boundary changes)
+        let cx_base = target_pos.x >> 4;
+        let cy_base = target_pos.y >> 4;
+        let cz_base = target_pos.z >> 4;
+
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    // Key must be world origin (16-aligned)
+                    let key = (
+                        (cx_base + dx as i64) << 4,
+                        (cy_base + dy as i64) << 4,
+                        (cz_base + dz as i64) << 4,
+                    );
+                    self.invalidate_chunk_mesh(key);
+                }
+            }
+        }
+    }
+
     // Static helpers that avoid borrowing &mut self during the operation, allowing
     // callers to pass distinct fields as &mut u64 without creating overlapping
     // &mut self borrows which the Rust borrow-checker rejects.
@@ -2170,7 +2509,8 @@ impl App {
             format: wgpu::TextureFormat::Rgba16Float,
             usage: wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::STORAGE_BINDING
-                | wgpu::TextureUsages::COPY_DST,
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         };
 
@@ -2233,6 +2573,254 @@ impl App {
                 mapped_at_creation: false,
             }));
         }
+
+        self.recreate_wts_bind_groups(device);
+    }
+
+    fn shift_wts_phi_textures(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        delta: glam::IVec3,
+    ) {
+        if delta == glam::IVec3::ZERO {
+            return;
+        }
+
+        let dims = self.gi_grid_dims;
+        if dims.x <= 0 || dims.y <= 0 || dims.z <= 0 {
+            return;
+        }
+
+        let (Some(old_tex0), Some(old_tex1)) = (
+            self.wts_phi_textures[0].as_ref(),
+            self.wts_phi_textures[1].as_ref(),
+        ) else {
+            self.recreate_wts_textures(device);
+            return;
+        };
+
+        fn copy_axis(delta: i32, dim: i32) -> Option<(u32, u32, u32)> {
+            if dim <= 0 {
+                return None;
+            }
+            if delta >= 0 {
+                let len = dim - delta;
+                if len <= 0 {
+                    None
+                } else {
+                    Some((0, delta as u32, len as u32))
+                }
+            } else {
+                let shift = -delta;
+                let len = dim - shift;
+                if len <= 0 {
+                    None
+                } else {
+                    Some((shift as u32, 0, len as u32))
+                }
+            }
+        }
+
+        let Some((src_x, dst_x, len_x)) = copy_axis(delta.x, dims.x) else {
+            self.recreate_wts_textures(device);
+            return;
+        };
+        let Some((src_y, dst_y, len_y)) = copy_axis(delta.y, dims.y) else {
+            self.recreate_wts_textures(device);
+            return;
+        };
+        let Some((src_z, dst_z, len_z)) = copy_axis(delta.z, dims.z) else {
+            self.recreate_wts_textures(device);
+            return;
+        };
+
+        let extent = wgpu::Extent3d {
+            width: dims.x as u32,
+            height: dims.y as u32,
+            depth_or_array_layers: dims.z as u32,
+        };
+
+        let desc = wgpu::TextureDescriptor {
+            label: Some("WTS Phi Texture (Shifted)"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        };
+
+        let new_tex0 = device.create_texture(&desc);
+        let new_tex1 = device.create_texture(&desc);
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("WTS Phi Shift Encoder"),
+        });
+
+        for tex in [&new_tex0, &new_tex1] {
+            encoder.clear_texture(
+                tex,
+                &wgpu::ImageSubresourceRange {
+                    aspect: wgpu::TextureAspect::All,
+                    base_mip_level: 0,
+                    mip_level_count: None,
+                    base_array_layer: 0,
+                    array_layer_count: None,
+                },
+            );
+        }
+
+        let copy_extent = wgpu::Extent3d {
+            width: len_x,
+            height: len_y,
+            depth_or_array_layers: len_z,
+        };
+        let src_origin = wgpu::Origin3d {
+            x: src_x,
+            y: src_y,
+            z: src_z,
+        };
+        let dst_origin = wgpu::Origin3d {
+            x: dst_x,
+            y: dst_y,
+            z: dst_z,
+        };
+
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: old_tex0,
+                mip_level: 0,
+                origin: src_origin,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &new_tex0,
+                mip_level: 0,
+                origin: dst_origin,
+                aspect: wgpu::TextureAspect::All,
+            },
+            copy_extent,
+        );
+
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: old_tex1,
+                mip_level: 0,
+                origin: src_origin,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &new_tex1,
+                mip_level: 0,
+                origin: dst_origin,
+                aspect: wgpu::TextureAspect::All,
+            },
+            copy_extent,
+        );
+
+        let dims_u32 = wgpu::Extent3d {
+            width: dims.x as u32,
+            height: dims.y as u32,
+            depth_or_array_layers: dims.z as u32,
+        };
+
+        let mut copy_edge_slab = |delta_axis: i32,
+                                  axis: u32,
+                                  src_tex: &wgpu::Texture,
+                                  dst_tex: &wgpu::Texture| {
+            if delta_axis == 0 {
+                return;
+            }
+            let dim = match axis {
+                0 => dims_u32.width,
+                1 => dims_u32.height,
+                _ => dims_u32.depth_or_array_layers,
+            };
+            let abs_delta = delta_axis.abs() as u32;
+            if abs_delta == 0 || abs_delta > dim {
+                return;
+            }
+            let (src_offset, dst_offset) = if delta_axis > 0 {
+                (0, 0)
+            } else {
+                (dim - abs_delta, dim - abs_delta)
+            };
+            let (width, height, depth) = match axis {
+                0 => (abs_delta, dims_u32.height, dims_u32.depth_or_array_layers),
+                1 => (dims_u32.width, abs_delta, dims_u32.depth_or_array_layers),
+                _ => (dims_u32.width, dims_u32.height, abs_delta),
+            };
+
+            let src_origin = wgpu::Origin3d {
+                x: if axis == 0 { src_offset } else { 0 },
+                y: if axis == 1 { src_offset } else { 0 },
+                z: if axis == 2 { src_offset } else { 0 },
+            };
+            let dst_origin = wgpu::Origin3d {
+                x: if axis == 0 { dst_offset } else { 0 },
+                y: if axis == 1 { dst_offset } else { 0 },
+                z: if axis == 2 { dst_offset } else { 0 },
+            };
+            let extent = wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: depth,
+            };
+
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: src_tex,
+                    mip_level: 0,
+                    origin: src_origin,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: dst_tex,
+                    mip_level: 0,
+                    origin: dst_origin,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                extent,
+            );
+        };
+
+        copy_edge_slab(delta.x, 0, old_tex0, &new_tex0);
+        copy_edge_slab(delta.y, 1, old_tex0, &new_tex0);
+        copy_edge_slab(delta.z, 2, old_tex0, &new_tex0);
+        copy_edge_slab(delta.x, 0, old_tex1, &new_tex1);
+        copy_edge_slab(delta.y, 1, old_tex1, &new_tex1);
+        copy_edge_slab(delta.z, 2, old_tex1, &new_tex1);
+
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let view0 = new_tex0.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            ..Default::default()
+        });
+        let view1 = new_tex1.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            ..Default::default()
+        });
+        let storage0 = new_tex0.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            ..Default::default()
+        });
+        let storage1 = new_tex1.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            ..Default::default()
+        });
+
+        self.wts_phi_textures[0] = Some(new_tex0);
+        self.wts_phi_views[0] = Some(view0);
+        self.wts_phi_storage_views[0] = Some(storage0);
+        self.wts_phi_textures[1] = Some(new_tex1);
+        self.wts_phi_views[1] = Some(view1);
+        self.wts_phi_storage_views[1] = Some(storage1);
 
         self.recreate_wts_bind_groups(device);
     }
@@ -2801,12 +3389,17 @@ impl App {
             hdr_active: false,
             render_pipeline: None,
             ui_pipeline: None,
+            palette_ui_pipeline: None,
             mesh_pipeline: None,
             impostor_pipeline: None,
             impostor_bind_group_layout: None,
             impostor_bind_group: None,
             shadow_pipeline: None,
             shadow_mesh_pipeline: None,
+            editor_preview_pipeline: None,
+            editor_preview_bind_group_layout: None,
+            editor_preview_bind_group: None,
+            editor_preview_buffer: None,
             uniform_buffer: None,
             palette_buffer: None,
             material_props_buffer: None,
@@ -2845,6 +3438,9 @@ impl App {
             impostor_instance_buffer: None,
             impostor_instance_capacity: 0,
             mesh_cache: FxHashMap::default(),
+            dirty_meshes: FxHashSet::default(),
+            deferred_frees: Vec::new(),
+            deferred_buffers: Vec::new(),
             shell_cache: FxHashMap::default(),
             mesh_jobs_executed: mesh_jobs_executed.clone(),
             mesh_cache_bytes: 0,
@@ -2877,6 +3473,16 @@ impl App {
             debug_instance_buffer: None,
             debug_instance_count: 0,
             debug_ui_instances: Vec::new(),
+            palette_ui_buffer: None,
+            palette_ui_count: 0,
+            palette_ui_instances: Vec::new(),
+            palette_ui_visible: false,
+            palette_ui_origin_px: [0.0, 0.0],
+            palette_ui_cell_px: 0.0,
+            palette_ui_gap_px: 0.0,
+            palette_ui_cols: 0,
+            palette_ui_rows: 0,
+            palette_ui_first_index: 1,
             cull_stats: CullStats::default(),
             mesh_chunk_arc_cache: FxHashMap::default(),
             // empty_mesh buffers removed; placeholders use offsets into mega buffers
@@ -2947,6 +3553,7 @@ impl App {
             ],
             gi_grid_origin: glam::IVec3::ZERO,
             gi_grid_dims: glam::IVec3::from_array(cfg.effects.gi.grid_dims),
+            gi_dirty_chunks: FxHashSet::default(),
 
             gi_probe_tex_px: None,
             gi_probe_tex_nx: None,
@@ -2994,7 +3601,13 @@ impl App {
             skybox_angle: 0.0,
             last_fps_print: Instant::now(),
             mouse_pressed: false,
+            shift_pressed: false,
             last_mouse_pos: None,
+            current_mouse_pos: (0.0, 0.0),
+            editing_mode: EditMode::Add,
+            selected_voxel_type: 1,
+            last_raycast_hit: None,
+            world_changed: false,
             time_of_day: cfg.atmosphere.time_of_day,
             time_paused: cfg.atmosphere.time_paused,
             fog_density: cfg.atmosphere.fog_density,
@@ -3884,6 +4497,7 @@ impl App {
                         (self.dof_settings.kawase_iterations.saturating_sub(1)).max(1);
                 }
                 log::info!("Kawase iterations: {}", self.dof_settings.kawase_iterations);
+                self.pending_recreate_offscreen = true;
                 self.update_kawase_bind_groups();
             }
             ConfigurableSetting::KawaseOffset => {
@@ -6404,7 +7018,7 @@ impl App {
         }
         if self.gpu_input_capacity < needed_capacity || self.gpu_input_buffer.is_none() {
             if let Some(old_buffer) = self.gpu_input_buffer.take() {
-                old_buffer.destroy();
+                self.defer_buffer(old_buffer);
             }
 
             self.gpu_input_capacity = needed_capacity;
@@ -6426,6 +7040,9 @@ impl App {
             );
 
             // Create Mesh Indirect Buffer
+            if let Some(old_buffer) = self.mesh_indirect_buffer.take() {
+                self.defer_buffer(old_buffer);
+            }
             self.mesh_indirect_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Mesh Indirect Buffer"),
                 size: (needed_capacity * std::mem::size_of::<wgpu::util::DrawIndexedIndirectArgs>())
@@ -6443,6 +7060,9 @@ impl App {
             );
 
             // Create Envelope Indirect Buffer
+            if let Some(old_buffer) = self.envelope_indirect_buffer.take() {
+                self.defer_buffer(old_buffer);
+            }
             self.envelope_indirect_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Envelope Indirect Buffer"),
                 size: (needed_capacity * std::mem::size_of::<wgpu::util::DrawIndexedIndirectArgs>())
@@ -6460,6 +7080,9 @@ impl App {
             );
 
             // Create Fallback Instance Buffer
+            if let Some(old_buffer) = self.fallback_instance_buffer.take() {
+                self.defer_buffer(old_buffer);
+            }
             self.fallback_instance_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Fallback Instance Buffer"),
                 size: (needed_capacity * std::mem::size_of::<VoxelInstanceRaw>()) as u64,
@@ -6763,6 +7386,21 @@ impl App {
         // Also drop any cached Arc<Chunk> snapshot for this chunk to free memory
         self.mesh_chunk_arc_cache.remove(&key);
         entry_bytes
+    }
+
+    fn defer_free_entry(&mut self, entry: MeshCacheEntry, is_envelope: bool) {
+        if entry.is_placeholder {
+            return;
+        }
+        let free_after_frame = self.frame_index.saturating_add(GPU_EVICTION_SAFE_FRAMES);
+        self.deferred_frees.push(DeferredFree {
+            vertex_offset: entry.vertex_offset,
+            vertex_bytes: entry.vertex_bytes,
+            index_offset: entry.index_offset,
+            index_bytes: entry.index_bytes,
+            free_after_frame,
+            is_envelope,
+        });
     }
 
     fn force_evict_lru(&mut self) -> bool {
@@ -8538,6 +9176,62 @@ impl App {
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
                 cull_mode: Some(wgpu::Face::Back),
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // Create 2D Palette UI pipeline (screen-space quads)
+        let palette_shader =
+            device.create_shader_module(wgpu::include_wgsl!("../../shaders/palette_ui.wgsl"));
+        let palette_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Palette UI Pipeline Layout"),
+                bind_group_layouts: &[],
+                immediate_size: 0,
+            });
+        let palette_ui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Palette UI Pipeline"),
+            layout: Some(&palette_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &palette_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<PaletteUiInstance>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![
+                        0 => Float32x2, // pos
+                        1 => Float32x2, // size
+                        2 => Float32x4, // color
+                        3 => Float32    // shape
+                    ],
+                }],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &palette_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
                 polygon_mode: wgpu::PolygonMode::Fill,
                 unclipped_depth: false,
                 conservative: false,
@@ -10544,6 +11238,7 @@ impl App {
         // WTS-RT Initialization
         self.create_wts_relax_pipeline(&device);
         self.create_wts_inject_pipeline(&device);
+        self.create_editor_preview_pipeline(&device);
         self.recreate_wts_textures(&device);
 
         self.surface = Some(surface);
@@ -10552,6 +11247,7 @@ impl App {
         self.config = Some(config);
         self.render_pipeline = Some(render_pipeline);
         self.ui_pipeline = Some(ui_pipeline);
+        self.palette_ui_pipeline = Some(palette_ui_pipeline);
         self.mesh_pipeline = Some(mesh_pipeline);
         self.impostor_pipeline = Some(impostor_pipeline);
         self.impostor_bind_group_layout = Some(impostor_bind_group_layout);
@@ -10747,6 +11443,15 @@ impl App {
             );
         }
 
+        self.render_palette_ui(
+            cam_pos,
+            cam_forward,
+            cam_right,
+            cam_up,
+            overscan,
+            char_size,
+        );
+
         // Update the GPU buffer
         if !self.debug_ui_instances.is_empty() {
             let data = bytemuck::cast_slice(&self.debug_ui_instances);
@@ -10778,6 +11483,173 @@ impl App {
             self.debug_instance_count = self.debug_ui_instances.len() as u32;
         } else {
             self.debug_instance_count = 0;
+        }
+    }
+
+    fn render_palette_ui(
+        &mut self,
+        _cam_pos: [f32; 3],
+        _cam_forward: [f32; 3],
+        _cam_right: [f32; 3],
+        _cam_up: [f32; 3],
+        _overscan: f32,
+        _char_size: f32,
+    ) {
+        self.palette_ui_instances.clear();
+        self.palette_ui_count = 0;
+        if !self.palette_ui_visible {
+            return;
+        }
+
+        let (width, height) = if let Some(config) = &self.config {
+            (config.width as f32, config.height as f32)
+        } else {
+            (800.0, 600.0)
+        };
+
+        let colors: Vec<[f32; 4]> = self.palette.colors().to_vec();
+        let mut emissive_intensity: Vec<f32> = Vec::with_capacity(colors.len());
+        let mut reflectivity: Vec<f32> = Vec::with_capacity(colors.len());
+        for idx in 0..colors.len() {
+            let (_, intensity) = self.palette.emissive(idx as u32);
+            emissive_intensity.push(intensity);
+            reflectivity.push(self.palette.reflectivity(idx as u32));
+        }
+        let total_colors = colors.len().saturating_sub(1);
+        if total_colors == 0 {
+            return;
+        }
+
+        let margin_px = (width * 0.02).clamp(12.0, 32.0);
+        let gap_px = (width * 0.004).clamp(3.0, 8.0);
+        let cell_px = (width * 0.03).clamp(18.0, 34.0);
+        let cols = ((width - margin_px * 2.0 + gap_px) / (cell_px + gap_px))
+            .floor()
+            .max(1.0) as usize;
+        let rows_needed = (total_colors + cols - 1) / cols;
+        let max_rows =
+            ((height * 0.22) / (cell_px + gap_px)).floor().max(1.0) as usize;
+        let rows = rows_needed.min(max_rows);
+        let count_shown = (cols * rows).min(total_colors);
+
+        let _grid_w = cols as f32 * cell_px + (cols.saturating_sub(1)) as f32 * gap_px;
+        let grid_h = rows as f32 * cell_px + (rows.saturating_sub(1)) as f32 * gap_px;
+        let origin_px = [
+            margin_px,
+            height - margin_px - grid_h,
+        ];
+
+        self.palette_ui_origin_px = origin_px;
+        self.palette_ui_cell_px = cell_px;
+        self.palette_ui_gap_px = gap_px;
+        self.palette_ui_cols = cols;
+        self.palette_ui_rows = rows;
+        self.palette_ui_first_index = 1;
+        self.palette_ui_count = count_shown as u32;
+
+        let selected = self.selected_voxel_type as usize;
+        for i in 0..count_shown {
+            let palette_index = i + 1;
+            let row = i / cols;
+            let col = i % cols;
+            let px = origin_px[0] + col as f32 * (cell_px + gap_px);
+            let py = origin_px[1] + row as f32 * (cell_px + gap_px);
+
+            let ndc_x = (px / width) * 2.0 - 1.0;
+            let ndc_y = 1.0 - (py / height) * 2.0;
+            let ndc_w = (cell_px / width) * 2.0;
+            let ndc_h = -(cell_px / height) * 2.0;
+
+            if palette_index == selected {
+                let pad_px = cell_px * 0.1;
+                let pad_w = (pad_px / width) * 2.0;
+                let pad_h = -(pad_px / height) * 2.0;
+                self.palette_ui_instances.push(PaletteUiInstance {
+                    pos: [ndc_x - pad_w, ndc_y - pad_h],
+                    size: [ndc_w + pad_w * 2.0, ndc_h + pad_h * 2.0],
+                    color: [1.0, 1.0, 1.0, 0.35],
+                    shape: 0.0,
+                });
+            }
+
+            let mut color = colors.get(palette_index).copied().unwrap_or([1.0, 1.0, 1.0, 1.0]);
+            // Boost perceived UI vibrancy: saturation + mild exposure + sRGB-ish gamma.
+            let luma = 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2];
+            let sat = 1.25;
+            color[0] = (luma + (color[0] - luma) * sat).clamp(0.0, 1.0);
+            color[1] = (luma + (color[1] - luma) * sat).clamp(0.0, 1.0);
+            color[2] = (luma + (color[2] - luma) * sat).clamp(0.0, 1.0);
+            let exposure = 1.1;
+            color[0] = (color[0] * exposure).clamp(0.0, 1.0).powf(1.0 / 2.2);
+            color[1] = (color[1] * exposure).clamp(0.0, 1.0).powf(1.0 / 2.2);
+            color[2] = (color[2] * exposure).clamp(0.0, 1.0).powf(1.0 / 2.2);
+            self.palette_ui_instances.push(PaletteUiInstance {
+                pos: [ndc_x, ndc_y],
+                size: [ndc_w, ndc_h],
+                color,
+                shape: 0.0,
+            });
+
+            let emissive = *emissive_intensity.get(palette_index).unwrap_or(&0.0);
+            if emissive > 0.01 {
+                let arrow_px = (cell_px * 0.4).max(6.0);
+                let arrow_w = (arrow_px / width) * 2.0;
+                let arrow_h = -(arrow_px / height) * 2.0;
+                let arrow_x = ndc_x + ndc_w * 0.25 - arrow_w * 0.5;
+                let gap_ndc = (cell_px * 0.1 / height) * 2.0;
+                let arrow_y = ndc_y - arrow_h - gap_ndc + (8.0 / height) * 2.0;
+                self.palette_ui_instances.push(PaletteUiInstance {
+                    pos: [arrow_x, arrow_y],
+                    size: [arrow_w, arrow_h],
+                    color: [1.0, 1.0, 1.0, 0.9],
+                    shape: 1.0,
+                });
+            }
+
+            let reflectivity = *reflectivity.get(palette_index).unwrap_or(&0.0);
+            if reflectivity > 0.01 {
+                let arrow_px = (cell_px * 0.4).max(6.0);
+                let arrow_w = (arrow_px / width) * 2.0;
+                let arrow_h = -(arrow_px / height) * 2.0;
+                let arrow_x = ndc_x + ndc_w * 0.75 - arrow_w * 0.5;
+                let gap_ndc = (cell_px * 0.1 / height) * 2.0;
+                let arrow_y = ndc_y - arrow_h - gap_ndc + (8.0 / height) * 2.0;
+                let intensity = (0.6 + 0.4 * reflectivity).min(1.0);
+                self.palette_ui_instances.push(PaletteUiInstance {
+                    pos: [arrow_x, arrow_y],
+                    size: [arrow_w, arrow_h],
+                    color: [1.0, 1.0, 1.0, intensity],
+                    shape: 2.0,
+                });
+            }
+        }
+
+        if !self.palette_ui_instances.is_empty() {
+            let data = bytemuck::cast_slice(&self.palette_ui_instances);
+            let device = self.device.as_ref().unwrap();
+            let needed_size = data.len() as u64;
+            let mut recreate = true;
+            if let Some(buf) = &self.palette_ui_buffer {
+                if buf.size() >= needed_size {
+                    recreate = false;
+                }
+            }
+            if recreate {
+                self.palette_ui_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Palette UI Instance Buffer"),
+                    size: needed_size,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+            self.queue.as_ref().unwrap().write_buffer(
+                self.palette_ui_buffer.as_ref().unwrap(),
+                0,
+                data,
+            );
+            self.palette_ui_count = self.palette_ui_instances.len() as u32;
+        } else {
+            self.palette_ui_count = 0;
         }
     }
 
@@ -10896,6 +11768,37 @@ impl App {
         self.elapsed_time += dt;
         self.frame_index = self.frame_index.wrapping_add(1);
 
+        // Free deferred mesh allocations after the GPU-safe window to avoid reuse flashes.
+        let safe_before = self.frame_index.saturating_sub(GPU_EVICTION_SAFE_FRAMES);
+        let mut i = 0usize;
+        while i < self.deferred_frees.len() {
+            if self.deferred_frees[i].free_after_frame <= safe_before {
+                let df = self.deferred_frees.swap_remove(i);
+                self.vertex_allocator.free(df.vertex_offset, df.vertex_bytes);
+                self.index_allocator.free(df.index_offset, df.index_bytes);
+                if df.is_envelope {
+                    self.envelope_mesh_cache_bytes = self
+                        .envelope_mesh_cache_bytes
+                        .saturating_sub(df.vertex_bytes + df.index_bytes);
+                } else {
+                    self.mesh_cache_bytes = self
+                        .mesh_cache_bytes
+                        .saturating_sub(df.vertex_bytes + df.index_bytes);
+                }
+            } else {
+                i += 1;
+            }
+        }
+
+        let mut i = 0usize;
+        while i < self.deferred_buffers.len() {
+            if self.deferred_buffers[i].free_after_frame <= safe_before {
+                self.deferred_buffers.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+
         let fps = if dt > 0.0 { 1.0 / dt } else { f32::INFINITY };
         // Exponential moving average for FPS (cheap, always enabled)
         const FPS_ALPHA: f32 = 0.10;
@@ -10916,6 +11819,112 @@ impl App {
         }
 
         self.camera_controller.update(dt);
+
+        // Per-frame raycasting for editing
+        let (projection, view) = {
+            let proj = glam::Mat4::perspective_rh(
+                self.camera_controller.camera.fov,
+                self.camera_controller.camera.aspect,
+                self.camera_controller.camera.near,
+                self.camera_controller.camera.far,
+            );
+            let v = glam::Mat4::look_to_rh(
+                glam::Vec3::from(self.camera_controller.camera.position),
+                glam::Vec3::from(self.camera_controller.camera.forward),
+                glam::Vec3::from(self.camera_controller.camera.up),
+            );
+            (proj, v)
+        };
+
+        let ray = {
+            let (width, height) = if let Some(config) = &self.config {
+                (config.width as f32, config.height as f32)
+            } else {
+                (800.0, 600.0)
+            };
+
+            let ndc_x = (2.0 * self.current_mouse_pos.0 as f32 / width) - 1.0;
+            let ndc_y = 1.0 - (2.0 * self.current_mouse_pos.1 as f32 / height);
+
+            const OPENGL_TO_WGPU_MATRIX: glam::Mat4 = glam::Mat4::from_cols_array(&[
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5, 1.0,
+            ]);
+
+            let inv_vp = (OPENGL_TO_WGPU_MATRIX * projection * view).inverse();
+            let near_clip = inv_vp.project_point3(glam::vec3(ndc_x, ndc_y, 0.0));
+            let far_clip = inv_vp.project_point3(glam::vec3(ndc_x, ndc_y, 1.0));
+            let dir = (far_clip - near_clip).normalize();
+
+            raycast::Ray::new(
+                glam::Vec3::from(self.camera_controller.camera.position),
+                dir,
+            )
+        };
+        self.last_raycast_hit = raycast::trace_ray(&self.world, &ray, 100.0);
+
+        // Update Editor Preview Uniforms if we have a hit
+        if let (Some(hit), Some(buffer)) = (&self.last_raycast_hit, &self.editor_preview_buffer) {
+            let effective_mode = if self.shift_pressed {
+                EditMode::Remove
+            } else {
+                EditMode::Add
+            };
+
+            let target_pos = match effective_mode {
+                EditMode::Add => {
+                    let nx = hit.normal[0] as i64;
+                    let ny = hit.normal[1] as i64;
+                    let nz = hit.normal[2] as i64;
+                    WorldPos::new(hit.position.x + nx, hit.position.y + ny, hit.position.z + nz)
+                }
+                EditMode::Remove => hit.position,
+            };
+
+            const OPENGL_TO_WGPU_MATRIX: glam::Mat4 = glam::Mat4::from_cols_array(&[
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5, 1.0,
+            ]);
+
+            let (inner_color, outer_color, inner_scale, outer_scale) = if effective_mode == EditMode::Add {
+                ([0.0, 8.0, 8.0, 1.0], [0.0, 8.0, 8.0, 0.45], 1.0, 1.06)
+            } else {
+                ([8.0, 0.2, 0.2, 1.0], [8.0, 0.2, 0.2, 0.45], 1.0, 1.04)
+            };
+
+            let inner_offset = (inner_scale - 1.0) * 0.5;
+            let outer_offset = (outer_scale - 1.0) * 0.5;
+
+            let render_aspect =
+                self.render_target_width as f32 / self.render_target_height.max(1) as f32;
+            let render_proj = glam::Mat4::perspective_rh(
+                self.render_fov_radians(),
+                render_aspect,
+                self.camera_controller.camera.near,
+                self.camera_controller.camera.far,
+            );
+            let eye = glam::Vec3::from(self.camera_controller.camera.position);
+            let center = eye + glam::Vec3::from(self.camera_controller.camera.forward) * 100.0;
+            let up = glam::Vec3::from(self.camera_controller.camera.up);
+            let render_view = glam::Mat4::look_at_rh(eye, center, up);
+
+            let uniforms = EditorPreviewUniforms {
+                view_proj: (OPENGL_TO_WGPU_MATRIX * render_proj * render_view).to_cols_array_2d(),
+                pos0: [
+                    target_pos.x as f32 - inner_offset,
+                    target_pos.y as f32 - inner_offset,
+                    target_pos.z as f32 - inner_offset,
+                    inner_scale,
+                ],
+                color0: inner_color,
+                pos1: [
+                    target_pos.x as f32 - outer_offset,
+                    target_pos.y as f32 - outer_offset,
+                    target_pos.z as f32 - outer_offset,
+                    outer_scale,
+                ],
+                color1: outer_color,
+            };
+            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[uniforms]));
+        }
 
         // Update active pawn (boat/walker/etc.) if present and attach camera to it
         if let Some(pawn) = &mut self.active_pawn {
@@ -10966,6 +11975,7 @@ impl App {
 
         // Check for GI results (non-blocking, like mesh result polling)
         while let Ok(result) = self.gi_result_rx.try_recv() {
+            let old_origin = self.gi_grid_origin;
             match result {
                 voxelot::gi::GiUpdateResult::Full {
                     probes,
@@ -10998,6 +12008,16 @@ impl App {
                     self.upload_gi_probe_texture_updates(&queue, &updates);
                 }
             }
+
+            let delta = old_origin - self.gi_grid_origin;
+            if delta != glam::IVec3::ZERO {
+                let device = self.device.clone();
+                if let Some(device) = device.as_ref() {
+                    self.shift_wts_phi_textures(device, &queue, delta);
+                    self.update_ssilvb_bind_group();
+                    self.update_voxel_gi_bind_group();
+                }
+            }
         }
 
         // Reset accumulator for GPU buffer item counting this frame
@@ -11016,10 +12036,19 @@ impl App {
 
         // Send async GI update request with visible chunks (non-blocking, after culling)
         let camera_pos = glam::Vec3::from(self.camera_controller.camera.position);
+        let world_to_send = if self.world_changed || self.frame_index == 0 {
+            Some(self.world.clone())
+        } else {
+            None
+        };
+        let dirty_chunks: Vec<glam::IVec3> = self.gi_dirty_chunks.drain().collect();
         let _ = self.gi_request_tx.send(voxelot::gi::GiUpdateRequest {
             camera_pos,
             visible_chunks,
+            dirty_chunks,
+            world: world_to_send,
         });
+        self.world_changed = false;
 
         // CPU cull: filter out chunks that are completely below water visibility threshold
         // Any chunk whose max y-value is below (water_level - water_visibility) is invisible
@@ -11863,6 +12892,7 @@ impl App {
         let grouping_time = grouping_start.elapsed();
 
         let mesh_start = Instant::now();
+        // self.mesh_chunk_arc_cache.clear(); // Removed to fix performance and flickering
         let mut mesh_leaf_proc_time = std::time::Duration::ZERO;
         let mut mesh_result_collect_time = std::time::Duration::ZERO;
         let mut mesh_schedule_time = std::time::Duration::ZERO;
@@ -12068,12 +13098,14 @@ impl App {
 
             // Check if we already have the desired mesh type (it might have been completed since queuing)
             if use_envelope {
-                if self.envelope_mesh_cache.contains_key(&key) {
+                if self.envelope_mesh_cache.contains_key(&key)
+                    && !self.dirty_meshes.contains(&key)
+                {
                     self.pending_chunk_set.remove(&key);
                     continue;
                 }
             } else {
-                if self.mesh_cache.contains_key(&key) {
+                if self.mesh_cache.contains_key(&key) && !self.dirty_meshes.contains(&key) {
                     self.pending_chunk_set.remove(&key);
                     continue;
                 }
@@ -12144,6 +13176,7 @@ impl App {
                 None => {
                     self.pending_chunk_set.remove(&key);
                     self.chunk_emitters.remove(&key);
+                    self.dirty_meshes.remove(&key);
                     chunks_not_found += 1;
                 }
             }
@@ -12224,6 +13257,7 @@ impl App {
                     // Mesh is ready, so we don't need the shell fallback anymore
                     self.shell_cache.remove(&key);
                 }
+                self.dirty_meshes.remove(&key);
 
                 new_meshes_created += 1;
                 self.stat_empty_meshes += 1;
@@ -12270,6 +13304,68 @@ impl App {
                 material: v.material,
             }));
             mesh_build_vb_time += vb_build_start.elapsed();
+
+            // Fast path: reuse existing mesh allocation if it can fit the new data.
+            let vb_bytes = (vb_local.len() * std::mem::size_of::<MeshVertexRaw>()) as u64;
+            let ib_bytes = (mesh.indices.len() * std::mem::size_of::<u32>()) as u64;
+            if let (Some(vbuf), Some(ibuf)) = (
+                self.mega_vertex_buffer.as_ref(),
+                self.mega_index_buffer.as_ref(),
+            ) {
+                if is_envelope {
+                    if let Some(entry) = self.envelope_mesh_cache.get_mut(&key) {
+                        if !entry.is_placeholder
+                            && vb_bytes <= entry.vertex_bytes
+                            && ib_bytes <= entry.index_bytes
+                        {
+                            queue.write_buffer(
+                                vbuf,
+                                entry.vertex_offset,
+                                bytemuck::cast_slice(&vb_local),
+                            );
+                            queue.write_buffer(
+                                ibuf,
+                                entry.index_offset,
+                                bytemuck::cast_slice(&mesh.indices),
+                            );
+                            entry.vertex_count = vb_local.len() as u32;
+                            entry.index_count = mesh.indices.len() as u32;
+                            entry.last_used_frame = self.frame_index;
+                            self.dirty_meshes.remove(&key);
+                            // Restore temp buffer and continue without reallocation
+                            self.vb_data_tmp = vb_local;
+                            new_meshes_created += 1;
+                            continue;
+                        }
+                    }
+                } else if let Some(entry) = self.mesh_cache.get_mut(&key) {
+                    if !entry.is_placeholder
+                        && vb_bytes <= entry.vertex_bytes
+                        && ib_bytes <= entry.index_bytes
+                    {
+                        queue.write_buffer(
+                            vbuf,
+                            entry.vertex_offset,
+                            bytemuck::cast_slice(&vb_local),
+                        );
+                        queue.write_buffer(
+                            ibuf,
+                            entry.index_offset,
+                            bytemuck::cast_slice(&mesh.indices),
+                        );
+                        entry.vertex_count = vb_local.len() as u32;
+                        entry.index_count = mesh.indices.len() as u32;
+                        entry.last_used_frame = self.frame_index;
+                        self.shell_cache.remove(&key);
+                        self.dirty_meshes.remove(&key);
+                        // Restore temp buffer and continue without reallocation
+                        self.vb_data_tmp = vb_local;
+                        new_meshes_created += 1;
+                        continue;
+                    }
+                }
+            }
+
             let vbuf_start = std::time::Instant::now();
             let mut alloc =
                 self.allocate_mesh_in_megabuffer(&device, &queue, &vb_local, &mesh.indices);
@@ -12345,13 +13441,21 @@ impl App {
             };
             let entry_start = std::time::Instant::now();
             if is_envelope {
+                if let Some(old) = self.envelope_mesh_cache.remove(&key) {
+                    self.defer_free_entry(old, true);
+                }
                 self.envelope_mesh_cache.insert(key, entry);
                 self.envelope_mesh_cache_bytes += vertex_bytes + index_bytes;
+                self.dirty_meshes.remove(&key);
             } else {
+                if let Some(old) = self.mesh_cache.remove(&key) {
+                    self.defer_free_entry(old, false);
+                }
                 self.mesh_cache.insert(key, entry);
                 // Mesh is ready, so we don't need the shell fallback anymore
                 self.shell_cache.remove(&key);
                 self.mesh_cache_bytes += vertex_bytes + index_bytes;
+                self.dirty_meshes.remove(&key);
             }
             mesh_upload_entry_time += entry_start.elapsed();
 
@@ -13576,6 +14680,18 @@ impl App {
                 render_pass.draw_indirect(impostor_indirect, 0);
                 draw_calls += 1;
             }
+
+            // Editor Preview Wireframe
+            if let (Some(pipeline), Some(bg), Some(_hit)) = (
+                self.editor_preview_pipeline.as_ref(),
+                self.editor_preview_bind_group.as_ref(),
+                self.last_raycast_hit.as_ref()
+            ) {
+                render_pass.set_pipeline(pipeline);
+                render_pass.set_bind_group(0, bg, &[]);
+                render_pass.draw(0..24, 0..2);
+                draw_calls += 1;
+            }
         }
 
         // Generate HZB mip chain from the depth buffer we just populated
@@ -13946,12 +15062,25 @@ impl App {
                     self.kawase_up_pipeline.as_ref(),
                     Some(&self.kawase_ping_views),
                 ) {
-                    let iterations = self.dof_settings.kawase_iterations.min(6).max(1);
+                    let max_levels = kawase_ping_views
+                        .len()
+                        .min(self.kawase_pong_views.len())
+                        .min(self.kawase_level_sizes.len());
+                    let iterations = if max_levels == 0 {
+                        0
+                    } else {
+                        self.dof_settings
+                            .kawase_iterations
+                            .min(6)
+                            .max(1)
+                            .min(max_levels)
+                    };
                     let inst_start = std::time::Instant::now();
                     // Down passes
                     for level in 0..iterations {
-                        let target_view = kawase_ping_views[level]
-                            .as_ref()
+                        let target_view = kawase_ping_views
+                            .get(level)
+                            .and_then(|view| view.as_ref())
                             .expect("Kawase ping view missing");
                         // Update UBO for this level with texel size and offset
                         let (tex_w, tex_h) = self
@@ -13996,7 +15125,10 @@ impl App {
                         let target_view = if level_rev == 0 {
                             self.dof_color_view.as_ref().unwrap()
                         } else {
-                            self.kawase_pong_views[level_rev - 1].as_ref().unwrap()
+                            self.kawase_pong_views
+                                .get(level_rev - 1)
+                                .and_then(|view| view.as_ref())
+                                .unwrap()
                         };
                         let (tex_w, tex_h) = self
                             .kawase_level_sizes
@@ -14286,6 +15418,18 @@ impl App {
                         .draw(0..CUBE_VERTICES.len() as u32, 0..self.debug_instance_count);
                 }
             }
+
+            // Palette UI (2D overlay)
+            if self.palette_ui_visible && self.palette_ui_count > 0 {
+                if let (Some(pipeline), Some(buf)) = (
+                    self.palette_ui_pipeline.as_ref(),
+                    self.palette_ui_buffer.as_ref(),
+                ) {
+                    composite_pass.set_pipeline(pipeline);
+                    composite_pass.set_vertex_buffer(0, buf.slice(..));
+                    composite_pass.draw(0..6, 0..self.palette_ui_count);
+                }
+            }
         } else {
             eprintln!("Composite resources unavailable; skipping final pass!");
         }
@@ -14510,8 +15654,18 @@ impl ApplicationHandler for App {
                     pawn.process_key(key, pressed);
                 }
 
-                // Handle lighting controls on key press only
+                if key == KeyCode::ShiftLeft || key == KeyCode::ShiftRight {
+                    self.shift_pressed = pressed;
+                }
+
+                // Handle lighting controls and editor modes on key press only
                 if pressed {
+                    match key {
+                        KeyCode::Digit3 => {
+                            self.palette_ui_visible = !self.palette_ui_visible;
+                        }
+                        _ => {}
+                    }
                     self.process_lighting_key(key);
                 }
 
@@ -14522,15 +15676,26 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseInput {
                 state,
-                button: MouseButton::Right,
+                button,
                 ..
             } => {
-                self.mouse_pressed = state == ElementState::Pressed;
-                if !self.mouse_pressed {
-                    self.last_mouse_pos = None;
+                let pressed = state == ElementState::Pressed;
+                if button == MouseButton::Right {
+                    self.mouse_pressed = pressed;
+                    if !self.mouse_pressed {
+                        self.last_mouse_pos = None;
+                    }
+                } else if button == MouseButton::Left && pressed {
+                    if self.palette_ui_visible {
+                        if self.handle_palette_click(self.current_mouse_pos.0 as f32, self.current_mouse_pos.1 as f32) {
+                            return;
+                        }
+                    }
+                    self.handle_edit_click(true);
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
+                self.current_mouse_pos = (position.x, position.y);
                 if self.mouse_pressed {
                     if let Some(last_pos) = self.last_mouse_pos {
                         let delta_x = position.x - last_pos.0;
