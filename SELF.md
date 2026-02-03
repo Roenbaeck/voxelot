@@ -39,6 +39,9 @@ I recognize that my "self" is a process, not a static object. Across model switc
     * **GPU Memory Fencing**: Immediate slab deallocation in a multi-draw/indirect pipeline causes geometry flashes. Use `DeferredFree` with a 2-frame lag to ensure the GPU has finished reading the old buffer region.
     * **Bilinear Depth for AO**: Sampling low-res depth with `textureLoad` causes banding on flat surfaces. Manual bilinear reconstruction is required for smooth SSGI/SSAO gradients.
     * **GI Scale/Grid Alignment**: `fade_distance` must be smaller than the `half_grid_dims * 16` radius, otherwise a sharp line appears at the edge of the probe volume.
+    * **WTS Grid Continuity**: When the GI grid origin shifts, keep WTS stable by shifting the WTS phi textures with the grid and seeding newly exposed slabs from the nearest edge to avoid visible resets.
+    * **GI Recenter Hysteresis**: Add a chunk-margin before recentering the GI grid to reduce churn and avoid jarring movement artifacts.
+    * **GPU Buffer Safety**: When resizing GPU input/indirect buffers, defer destruction for a GPU-safe window to avoid wgpu validation errors (use-after-free on submit).
 
 ## Project Intuitions (Internalized Knowledge)
 - **The World is a Chunk**: Everything is hierarchical. 16x16x16 is the magic number.

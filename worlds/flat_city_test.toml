@@ -3,9 +3,9 @@ file = "worlds/flat_city_test.vhc"
 palette = "worlds/palette.txt"
 skybox = "worlds/skybox.hdr"
 camera_position = [
-    547.3066,
-    79.31502,
-    787.4323,
+    410.36993,
+    68.26263,
+    366.47034,
 ]
 water_level = 20.0
 water_visibility = 15.0
@@ -15,7 +15,7 @@ start_mode = "boat"
 chunk_lod_distance = 1000.0
 fov_degrees = 70.0
 near_plane = 0.1
-far_plane = 8500.0
+far_plane = 7500.0
 visual_lod_enabled = true
 impostor_pixel_threshold = 1.5
 impostor_pixel_size = 1.0

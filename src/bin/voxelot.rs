@@ -656,8 +656,10 @@ struct SsrCameraUniforms {
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct EditorPreviewUniforms {
     view_proj: [[f32; 4]; 4],
-    pos: [f32; 4],   // xyz = world pos, w = scale
-    color: [f32; 4], // rgba
+    pos0: [f32; 4],   // xyz = world pos, w = scale (inner)
+    color0: [f32; 4], // rgba (inner)
+    pos1: [f32; 4],   // xyz = world pos, w = scale (outer)
+    color1: [f32; 4], // rgba (outer)
 }
 
 /// Depth-of-field runtime settings (CPU-side convenience)
@@ -1790,7 +1792,7 @@ impl App {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
                 depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_compare: wgpu::CompareFunction::Always,
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -11555,19 +11557,44 @@ impl App {
                 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5, 1.0,
             ]);
 
+            let (inner_color, outer_color, inner_scale, outer_scale) = if effective_mode == EditMode::Add {
+                ([0.0, 8.0, 8.0, 1.0], [0.0, 8.0, 8.0, 0.45], 1.0, 1.06)
+            } else {
+                ([8.0, 0.2, 0.2, 1.0], [8.0, 0.2, 0.2, 0.45], 1.0, 1.04)
+            };
+
+            let inner_offset = (inner_scale - 1.0) * 0.5;
+            let outer_offset = (outer_scale - 1.0) * 0.5;
+
+            let render_aspect =
+                self.render_target_width as f32 / self.render_target_height.max(1) as f32;
+            let render_proj = glam::Mat4::perspective_rh(
+                self.render_fov_radians(),
+                render_aspect,
+                self.camera_controller.camera.near,
+                self.camera_controller.camera.far,
+            );
+            let eye = glam::Vec3::from(self.camera_controller.camera.position);
+            let center = eye + glam::Vec3::from(self.camera_controller.camera.forward) * 100.0;
+            let up = glam::Vec3::from(self.camera_controller.camera.up);
+            let render_view = glam::Mat4::look_at_rh(eye, center, up);
+
             let uniforms = EditorPreviewUniforms {
-                view_proj: (OPENGL_TO_WGPU_MATRIX * projection * view).to_cols_array_2d(),
-                pos: [
-                    target_pos.x as f32,
-                    target_pos.y as f32,
-                    target_pos.z as f32,
-                    1.02, // Slightly larger to avoid Z-fighting
+                view_proj: (OPENGL_TO_WGPU_MATRIX * render_proj * render_view).to_cols_array_2d(),
+                pos0: [
+                    target_pos.x as f32 - inner_offset,
+                    target_pos.y as f32 - inner_offset,
+                    target_pos.z as f32 - inner_offset,
+                    inner_scale,
                 ],
-                color: if effective_mode == EditMode::Add {
-                    [0.0, 8.0, 8.0, 1.0] // Extra bright cyan
-                } else {
-                    [8.0, 0.2, 0.2, 1.0] // Extra bright red
-                },
+                color0: inner_color,
+                pos1: [
+                    target_pos.x as f32 - outer_offset,
+                    target_pos.y as f32 - outer_offset,
+                    target_pos.z as f32 - outer_offset,
+                    outer_scale,
+                ],
+                color1: outer_color,
             };
             queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[uniforms]));
         }
@@ -13681,36 +13708,6 @@ impl App {
         // sky doesn't abruptly darken or brighten near the horizon.
         let skybox_brightness = night_min + (1.0 - night_min) * sky_fade;
 
-        // Update editor preview uniform if we have a hit
-        if let Some(hit) = &self.last_raycast_hit {
-            let target_pos = match self.editing_mode {
-                EditMode::Add => {
-                    let nx = hit.normal[0] as i64;
-                    let ny = hit.normal[1] as i64;
-                    let nz = hit.normal[2] as i64;
-                    [ (hit.position.x + nx) as f32, (hit.position.y + ny) as f32, (hit.position.z + nz) as f32, 1.0 ]
-                }
-                EditMode::Remove => {
-                    [ hit.position.x as f32, hit.position.y as f32, hit.position.z as f32, 1.0 ]
-                }
-            };
-            
-            let color = match self.editing_mode {
-                EditMode::Add => [0.0, 1.0, 0.0, 0.8], // Green
-                EditMode::Remove => [1.0, 0.0, 0.0, 0.8], // Red
-            };
-
-            let preview_uniforms = EditorPreviewUniforms {
-                view_proj: mvp_cols, // Re-use the main MVP matrix
-                pos: target_pos,
-                color: color,
-            };
-            
-            if let Some(buf) = &self.editor_preview_buffer {
-                queue.write_buffer(buf, 0, bytemuck::bytes_of(&preview_uniforms));
-            }
-        }
-
         let uniforms = Uniforms {
             mvp: mvp_cols,
             sun_view_proj: sun_view_proj_cols,
@@ -14363,7 +14360,7 @@ impl App {
             ) {
                 render_pass.set_pipeline(pipeline);
                 render_pass.set_bind_group(0, bg, &[]);
-                render_pass.draw(0..24, 0..1);
+                render_pass.draw(0..24, 0..2);
                 draw_calls += 1;
             }
         }
