@@ -155,10 +155,29 @@ impl GiSystem {
         visible_chunks: &[IVec3],
     ) -> (bool, Vec<GiProbeUpdate>, usize) {
         // 1. Determine new grid origin (centered on camera, snapped to chunk size)
+        // Use a hysteresis margin so the grid doesn't recentre on every small movement.
         let chunk_size = 16.0;
         let cam_chunk = (camera_pos / chunk_size).floor().as_ivec3();
         let half_dims = self.grid_dims / 2;
-        let new_origin = cam_chunk - half_dims;
+
+        const GI_RECENTER_MARGIN_CHUNKS: i32 = 4;
+        let max_margin = ((self.grid_dims - IVec3::ONE).max(IVec3::ZERO)) / 2;
+        let margin = IVec3::splat(GI_RECENTER_MARGIN_CHUNKS).min(max_margin);
+
+        let min_allowed = self.grid_origin + margin;
+        let max_allowed = self.grid_origin + self.grid_dims - margin - IVec3::ONE;
+        let needs_recentering = cam_chunk.x < min_allowed.x
+            || cam_chunk.y < min_allowed.y
+            || cam_chunk.z < min_allowed.z
+            || cam_chunk.x > max_allowed.x
+            || cam_chunk.y > max_allowed.y
+            || cam_chunk.z > max_allowed.z;
+
+        let new_origin = if needs_recentering {
+            cam_chunk - half_dims
+        } else {
+            self.grid_origin
+        };
 
         self.grid_origin = new_origin;
 

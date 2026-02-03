@@ -545,6 +545,12 @@ struct DeferredFree {
     free_after_frame: u64,
     is_envelope: bool,
 }
+
+#[derive(Debug)]
+struct DeferredBuffer {
+    buffer: wgpu::Buffer,
+    free_after_frame: u64,
+}
 // Ensure impl CameraController is properly closed (fix potential brace mismatch introduced by refactor)
 
 #[derive(Clone, Debug)]
@@ -1254,6 +1260,7 @@ struct App {
     dirty_meshes: FxHashSet<(i64, i64, i64)>,
     /// Mesh allocations to free after the GPU-safe window
     deferred_frees: Vec<DeferredFree>,
+    deferred_buffers: Vec<DeferredBuffer>,
     /// Cache of surface voxels for un-meshed chunks (for optimized fallback rendering)
     shell_cache: FxHashMap<(i64, i64, i64), Vec<voxelot::ShellVoxel>>,
     mesh_cache_bytes: u64,
@@ -1710,6 +1717,13 @@ struct App {
 }
 
 impl App {
+    fn defer_buffer(&mut self, buffer: wgpu::Buffer) {
+        let free_after_frame = self.frame_index.saturating_add(GPU_EVICTION_SAFE_FRAMES);
+        self.deferred_buffers.push(DeferredBuffer {
+            buffer,
+            free_after_frame,
+        });
+    }
     fn create_editor_preview_pipeline(&mut self, device: &wgpu::Device) {
         let shader = device.create_shader_module(wgpu::include_wgsl!("../../shaders/editor_preview.wgsl"));
 
@@ -2411,7 +2425,8 @@ impl App {
             format: wgpu::TextureFormat::Rgba16Float,
             usage: wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::STORAGE_BINDING
-                | wgpu::TextureUsages::COPY_DST,
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         };
 
@@ -2474,6 +2489,254 @@ impl App {
                 mapped_at_creation: false,
             }));
         }
+
+        self.recreate_wts_bind_groups(device);
+    }
+
+    fn shift_wts_phi_textures(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        delta: glam::IVec3,
+    ) {
+        if delta == glam::IVec3::ZERO {
+            return;
+        }
+
+        let dims = self.gi_grid_dims;
+        if dims.x <= 0 || dims.y <= 0 || dims.z <= 0 {
+            return;
+        }
+
+        let (Some(old_tex0), Some(old_tex1)) = (
+            self.wts_phi_textures[0].as_ref(),
+            self.wts_phi_textures[1].as_ref(),
+        ) else {
+            self.recreate_wts_textures(device);
+            return;
+        };
+
+        fn copy_axis(delta: i32, dim: i32) -> Option<(u32, u32, u32)> {
+            if dim <= 0 {
+                return None;
+            }
+            if delta >= 0 {
+                let len = dim - delta;
+                if len <= 0 {
+                    None
+                } else {
+                    Some((0, delta as u32, len as u32))
+                }
+            } else {
+                let shift = -delta;
+                let len = dim - shift;
+                if len <= 0 {
+                    None
+                } else {
+                    Some((shift as u32, 0, len as u32))
+                }
+            }
+        }
+
+        let Some((src_x, dst_x, len_x)) = copy_axis(delta.x, dims.x) else {
+            self.recreate_wts_textures(device);
+            return;
+        };
+        let Some((src_y, dst_y, len_y)) = copy_axis(delta.y, dims.y) else {
+            self.recreate_wts_textures(device);
+            return;
+        };
+        let Some((src_z, dst_z, len_z)) = copy_axis(delta.z, dims.z) else {
+            self.recreate_wts_textures(device);
+            return;
+        };
+
+        let extent = wgpu::Extent3d {
+            width: dims.x as u32,
+            height: dims.y as u32,
+            depth_or_array_layers: dims.z as u32,
+        };
+
+        let desc = wgpu::TextureDescriptor {
+            label: Some("WTS Phi Texture (Shifted)"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        };
+
+        let new_tex0 = device.create_texture(&desc);
+        let new_tex1 = device.create_texture(&desc);
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("WTS Phi Shift Encoder"),
+        });
+
+        for tex in [&new_tex0, &new_tex1] {
+            encoder.clear_texture(
+                tex,
+                &wgpu::ImageSubresourceRange {
+                    aspect: wgpu::TextureAspect::All,
+                    base_mip_level: 0,
+                    mip_level_count: None,
+                    base_array_layer: 0,
+                    array_layer_count: None,
+                },
+            );
+        }
+
+        let copy_extent = wgpu::Extent3d {
+            width: len_x,
+            height: len_y,
+            depth_or_array_layers: len_z,
+        };
+        let src_origin = wgpu::Origin3d {
+            x: src_x,
+            y: src_y,
+            z: src_z,
+        };
+        let dst_origin = wgpu::Origin3d {
+            x: dst_x,
+            y: dst_y,
+            z: dst_z,
+        };
+
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: old_tex0,
+                mip_level: 0,
+                origin: src_origin,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &new_tex0,
+                mip_level: 0,
+                origin: dst_origin,
+                aspect: wgpu::TextureAspect::All,
+            },
+            copy_extent,
+        );
+
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: old_tex1,
+                mip_level: 0,
+                origin: src_origin,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &new_tex1,
+                mip_level: 0,
+                origin: dst_origin,
+                aspect: wgpu::TextureAspect::All,
+            },
+            copy_extent,
+        );
+
+        let dims_u32 = wgpu::Extent3d {
+            width: dims.x as u32,
+            height: dims.y as u32,
+            depth_or_array_layers: dims.z as u32,
+        };
+
+        let mut copy_edge_slab = |delta_axis: i32,
+                                  axis: u32,
+                                  src_tex: &wgpu::Texture,
+                                  dst_tex: &wgpu::Texture| {
+            if delta_axis == 0 {
+                return;
+            }
+            let dim = match axis {
+                0 => dims_u32.width,
+                1 => dims_u32.height,
+                _ => dims_u32.depth_or_array_layers,
+            };
+            let abs_delta = delta_axis.abs() as u32;
+            if abs_delta == 0 || abs_delta > dim {
+                return;
+            }
+            let (src_offset, dst_offset) = if delta_axis > 0 {
+                (0, 0)
+            } else {
+                (dim - abs_delta, dim - abs_delta)
+            };
+            let (width, height, depth) = match axis {
+                0 => (abs_delta, dims_u32.height, dims_u32.depth_or_array_layers),
+                1 => (dims_u32.width, abs_delta, dims_u32.depth_or_array_layers),
+                _ => (dims_u32.width, dims_u32.height, abs_delta),
+            };
+
+            let src_origin = wgpu::Origin3d {
+                x: if axis == 0 { src_offset } else { 0 },
+                y: if axis == 1 { src_offset } else { 0 },
+                z: if axis == 2 { src_offset } else { 0 },
+            };
+            let dst_origin = wgpu::Origin3d {
+                x: if axis == 0 { dst_offset } else { 0 },
+                y: if axis == 1 { dst_offset } else { 0 },
+                z: if axis == 2 { dst_offset } else { 0 },
+            };
+            let extent = wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: depth,
+            };
+
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: src_tex,
+                    mip_level: 0,
+                    origin: src_origin,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: dst_tex,
+                    mip_level: 0,
+                    origin: dst_origin,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                extent,
+            );
+        };
+
+        copy_edge_slab(delta.x, 0, old_tex0, &new_tex0);
+        copy_edge_slab(delta.y, 1, old_tex0, &new_tex0);
+        copy_edge_slab(delta.z, 2, old_tex0, &new_tex0);
+        copy_edge_slab(delta.x, 0, old_tex1, &new_tex1);
+        copy_edge_slab(delta.y, 1, old_tex1, &new_tex1);
+        copy_edge_slab(delta.z, 2, old_tex1, &new_tex1);
+
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let view0 = new_tex0.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            ..Default::default()
+        });
+        let view1 = new_tex1.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            ..Default::default()
+        });
+        let storage0 = new_tex0.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            ..Default::default()
+        });
+        let storage1 = new_tex1.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            ..Default::default()
+        });
+
+        self.wts_phi_textures[0] = Some(new_tex0);
+        self.wts_phi_views[0] = Some(view0);
+        self.wts_phi_storage_views[0] = Some(storage0);
+        self.wts_phi_textures[1] = Some(new_tex1);
+        self.wts_phi_views[1] = Some(view1);
+        self.wts_phi_storage_views[1] = Some(storage1);
 
         self.recreate_wts_bind_groups(device);
     }
@@ -3092,6 +3355,7 @@ impl App {
             mesh_cache: FxHashMap::default(),
             dirty_meshes: FxHashSet::default(),
             deferred_frees: Vec::new(),
+            deferred_buffers: Vec::new(),
             shell_cache: FxHashMap::default(),
             mesh_jobs_executed: mesh_jobs_executed.clone(),
             mesh_cache_bytes: 0,
@@ -4137,6 +4401,7 @@ impl App {
                         (self.dof_settings.kawase_iterations.saturating_sub(1)).max(1);
                 }
                 log::info!("Kawase iterations: {}", self.dof_settings.kawase_iterations);
+                self.pending_recreate_offscreen = true;
                 self.update_kawase_bind_groups();
             }
             ConfigurableSetting::KawaseOffset => {
@@ -6657,7 +6922,7 @@ impl App {
         }
         if self.gpu_input_capacity < needed_capacity || self.gpu_input_buffer.is_none() {
             if let Some(old_buffer) = self.gpu_input_buffer.take() {
-                old_buffer.destroy();
+                self.defer_buffer(old_buffer);
             }
 
             self.gpu_input_capacity = needed_capacity;
@@ -6679,6 +6944,9 @@ impl App {
             );
 
             // Create Mesh Indirect Buffer
+            if let Some(old_buffer) = self.mesh_indirect_buffer.take() {
+                self.defer_buffer(old_buffer);
+            }
             self.mesh_indirect_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Mesh Indirect Buffer"),
                 size: (needed_capacity * std::mem::size_of::<wgpu::util::DrawIndexedIndirectArgs>())
@@ -6696,6 +6964,9 @@ impl App {
             );
 
             // Create Envelope Indirect Buffer
+            if let Some(old_buffer) = self.envelope_indirect_buffer.take() {
+                self.defer_buffer(old_buffer);
+            }
             self.envelope_indirect_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Envelope Indirect Buffer"),
                 size: (needed_capacity * std::mem::size_of::<wgpu::util::DrawIndexedIndirectArgs>())
@@ -6713,6 +6984,9 @@ impl App {
             );
 
             // Create Fallback Instance Buffer
+            if let Some(old_buffer) = self.fallback_instance_buffer.take() {
+                self.defer_buffer(old_buffer);
+            }
             self.fallback_instance_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Fallback Instance Buffer"),
                 size: (needed_capacity * std::mem::size_of::<VoxelInstanceRaw>()) as u64,
@@ -11187,6 +11461,15 @@ impl App {
             }
         }
 
+        let mut i = 0usize;
+        while i < self.deferred_buffers.len() {
+            if self.deferred_buffers[i].free_after_frame <= safe_before {
+                self.deferred_buffers.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+
         let fps = if dt > 0.0 { 1.0 / dt } else { f32::INFINITY };
         // Exponential moving average for FPS (cheap, always enabled)
         const FPS_ALPHA: f32 = 0.10;
@@ -11338,6 +11621,7 @@ impl App {
 
         // Check for GI results (non-blocking, like mesh result polling)
         while let Ok(result) = self.gi_result_rx.try_recv() {
+            let old_origin = self.gi_grid_origin;
             match result {
                 voxelot::gi::GiUpdateResult::Full {
                     probes,
@@ -11368,6 +11652,16 @@ impl App {
 
                     // Sparse upload only changed texels to 3D textures
                     self.upload_gi_probe_texture_updates(&queue, &updates);
+                }
+            }
+
+            let delta = old_origin - self.gi_grid_origin;
+            if delta != glam::IVec3::ZERO {
+                let device = self.device.clone();
+                if let Some(device) = device.as_ref() {
+                    self.shift_wts_phi_textures(device, &queue, delta);
+                    self.update_ssilvb_bind_group();
+                    self.update_voxel_gi_bind_group();
                 }
             }
         }
@@ -14442,12 +14736,25 @@ impl App {
                     self.kawase_up_pipeline.as_ref(),
                     Some(&self.kawase_ping_views),
                 ) {
-                    let iterations = self.dof_settings.kawase_iterations.min(6).max(1);
+                    let max_levels = kawase_ping_views
+                        .len()
+                        .min(self.kawase_pong_views.len())
+                        .min(self.kawase_level_sizes.len());
+                    let iterations = if max_levels == 0 {
+                        0
+                    } else {
+                        self.dof_settings
+                            .kawase_iterations
+                            .min(6)
+                            .max(1)
+                            .min(max_levels)
+                    };
                     let inst_start = std::time::Instant::now();
                     // Down passes
                     for level in 0..iterations {
-                        let target_view = kawase_ping_views[level]
-                            .as_ref()
+                        let target_view = kawase_ping_views
+                            .get(level)
+                            .and_then(|view| view.as_ref())
                             .expect("Kawase ping view missing");
                         // Update UBO for this level with texel size and offset
                         let (tex_w, tex_h) = self
@@ -14492,7 +14799,10 @@ impl App {
                         let target_view = if level_rev == 0 {
                             self.dof_color_view.as_ref().unwrap()
                         } else {
-                            self.kawase_pong_views[level_rev - 1].as_ref().unwrap()
+                            self.kawase_pong_views
+                                .get(level_rev - 1)
+                                .and_then(|view| view.as_ref())
+                                .unwrap()
                         };
                         let (tex_w, tex_h) = self
                             .kawase_level_sizes
