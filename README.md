@@ -1,4 +1,6 @@
-![Voxelot viewer screenshot](voxelot.mp4)
+
+
+https://github.com/user-attachments/assets/022f6f2f-5cf4-4134-93d4-e8a825aabca3
 
 # voxelot
 
