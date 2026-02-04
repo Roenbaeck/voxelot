@@ -771,7 +771,7 @@ struct WtsParamsRaw {
     beta_diffuse: f32,
     beta_air: f32,
     max_occupancy: f32,
-    _pad0: f32,
+    decay: f32,
     _pad1: f32,
     _pad2: f32,
 }
@@ -14468,13 +14468,14 @@ impl App {
             });
 
             // 3. Update Relax Params
+            let decay = 0.0001 + 0.003 * (1.0 - sun_fade).powf(2.0);
             let relax_params = WtsParamsRaw {
                 alpha: 0.05,          // Lower alpha for temporal stability
                 gamma: 0.1,           // Higher gamma to seed injection quickly
                 beta_diffuse: 0.01,   // Very low stiffness for solid surfaces
                 beta_air: 100.0,      // High stiffness for air
                 max_occupancy: 1.0,   // Alpha is 0..1
-                _pad0: 0.0,
+                decay,                // Bleed off stale light over time (night-weighted)
                 _pad1: 0.0,
                 _pad2: 0.0,
             };

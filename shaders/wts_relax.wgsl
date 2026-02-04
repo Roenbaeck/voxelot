@@ -9,7 +9,7 @@ struct WtsParams {
     beta_diffuse: f32,   // Stiffness for diffuse surfaces (low)
     beta_air: f32,       // Stiffness for air (high)
     max_occupancy: f32,
-    _pad0: f32,
+    decay: f32,          // Per-step decay to bleed off stale light
     _pad1: f32,
     _pad2: f32,
 }
@@ -72,6 +72,7 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
     // Update
     // alpha * flux treats injected light as a source term for the diffusion equation.
     var new_phi_rgb = phi_t.rgb + relaxation + params.alpha * flux;
+    new_phi_rgb *= (1.0 - params.decay);
     
     // Clamp to prevent runaway/NaNs (limited for LDR/balanced HDR)
     new_phi_rgb = clamp(new_phi_rgb, vec3<f32>(0.0), vec3<f32>(8.0));
