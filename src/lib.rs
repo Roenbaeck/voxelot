@@ -26,4 +26,4 @@ pub use lib_hierarchical::bbox_local_to_world;
 pub use lib_hierarchical::{Chunk, ShellVoxel, Voxel, VoxelType, World, WorldPos};
 pub use meshing_optimized::{generate_chunk_mesh_optimized, ChunkEmitter, ChunkMesh, MeshVertex};
 pub use palette::Palette;
-pub use pawn::{BoatPawn, Pawn};
+pub use pawn::{BoatPawn, Pawn, PawnKind, WalkerPawn};

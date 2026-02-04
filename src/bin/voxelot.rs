@@ -272,9 +272,10 @@ struct MeshVertexRaw {
 }
 
 // -----------------------------------------------------------------------------
-// Simple low-poly boat mesh (CPU-skinned into world-space each frame)
+// Simple low-poly pawn meshes (CPU-skinned into world-space each frame)
 
 const BOAT_VERTEX_CAPACITY: usize = 192;
+const WALKER_VERTEX_CAPACITY: usize = 128;
 
 fn boat_push_tri(
     out: &mut Vec<MeshVertexRaw>,
@@ -434,6 +435,53 @@ fn boat_build_local_triangles(out: &mut Vec<MeshVertexRaw>) {
     boat_push_quad(out, seat1_a, seat1_b, seat1_c, seat1_d, seat);
 }
 
+fn pawn_push_box(
+    out: &mut Vec<MeshVertexRaw>,
+    min: [f32; 3],
+    max: [f32; 3],
+    color: [f32; 4],
+) {
+    let (x0, y0, z0) = (min[0], min[1], min[2]);
+    let (x1, y1, z1) = (max[0], max[1], max[2]);
+
+    let v000 = [x0, y0, z0];
+    let v001 = [x0, y0, z1];
+    let v010 = [x0, y1, z0];
+    let v011 = [x0, y1, z1];
+    let v100 = [x1, y0, z0];
+    let v101 = [x1, y0, z1];
+    let v110 = [x1, y1, z0];
+    let v111 = [x1, y1, z1];
+
+    // -X / +X
+    boat_push_quad(out, v000, v010, v011, v001, color);
+    boat_push_quad(out, v100, v101, v111, v110, color);
+
+    // -Y / +Y
+    boat_push_quad(out, v000, v001, v101, v100, color);
+    boat_push_quad(out, v010, v110, v111, v011, color);
+
+    // -Z / +Z
+    boat_push_quad(out, v000, v100, v110, v010, color);
+    boat_push_quad(out, v001, v011, v111, v101, color);
+}
+
+fn walker_build_local_triangles(out: &mut Vec<MeshVertexRaw>) {
+    out.clear();
+
+    let body_color = [0.2, 0.55, 0.85, 1.0];
+    let head_color = [0.85, 0.78, 0.62, 1.0];
+
+    // Centered around origin; total height ~1.8 voxels.
+    let body_min = [-0.25, -0.9, -0.18];
+    let body_max = [0.25, 0.4, 0.18];
+    pawn_push_box(out, body_min, body_max, body_color);
+
+    let head_min = [-0.18, 0.4, -0.18];
+    let head_max = [0.18, 0.9, 0.18];
+    pawn_push_box(out, head_min, head_max, head_color);
+}
+
 fn boat_transform_into_world(
     dst: &mut Vec<MeshVertexRaw>,
     src_local: &[MeshVertexRaw],
@@ -441,6 +489,7 @@ fn boat_transform_into_world(
     yaw: f32,
     pitch: f32,
     roll: f32,
+    y_offset: f32,
 ) {
     dst.clear();
     dst.reserve(src_local.len());
@@ -485,8 +534,7 @@ fn boat_transform_into_world(
         ];
 
         let wx = rxp[0] + pos[0];
-        // Visual-only submersion so the hull intersects the water plane a bit.
-        let wy = rxp[1] + pos[1] - 0.18;
+        let wy = rxp[1] + pos[1] + y_offset;
         let wz = rxp[2] + pos[2];
 
         let nlen = (rnp[0] * rnp[0] + rnp[1] * rnp[1] + rnp[2] * rnp[2])
@@ -1243,10 +1291,11 @@ struct App {
     shadow_bind_group: Option<wgpu::BindGroup>,
     cube_vertex_buffer: Option<wgpu::Buffer>,
 
-    // Simple dynamic mesh for the active pawn (e.g., boat)
+    // Simple dynamic mesh for the active pawn (e.g., boat/walker)
     boat_vertex_buffer: Option<wgpu::Buffer>,
     boat_vertex_capacity: usize,
     boat_local_vertices: Vec<MeshVertexRaw>,
+    walker_local_vertices: Vec<MeshVertexRaw>,
     boat_world_vertices: Vec<MeshVertexRaw>,
     boat_vertex_count: u32,
 
@@ -3389,6 +3438,8 @@ impl App {
 
         let mut boat_local_vertices = Vec::with_capacity(BOAT_VERTEX_CAPACITY);
         boat_build_local_triangles(&mut boat_local_vertices);
+        let mut walker_local_vertices = Vec::with_capacity(WALKER_VERTEX_CAPACITY);
+        walker_build_local_triangles(&mut walker_local_vertices);
 
         Self {
             window: None,
@@ -3423,9 +3474,10 @@ impl App {
             cube_vertex_buffer: None,
 
             boat_vertex_buffer: None,
-            boat_vertex_capacity: BOAT_VERTEX_CAPACITY,
+            boat_vertex_capacity: BOAT_VERTEX_CAPACITY.max(WALKER_VERTEX_CAPACITY),
             boat_local_vertices,
-            boat_world_vertices: Vec::with_capacity(BOAT_VERTEX_CAPACITY),
+            walker_local_vertices,
+            boat_world_vertices: Vec::with_capacity(BOAT_VERTEX_CAPACITY.max(WALKER_VERTEX_CAPACITY)),
             boat_vertex_count: 0,
 
             shadow_texture: None,
@@ -3515,7 +3567,7 @@ impl App {
             cull_bind_group_layout: None,
             cull_bind_group: None,
             cull_params_buffer: None,
-            world,
+            world: world.clone(),
             palette,
             mesh_job_tx,
             mesh_result_rx,
@@ -3639,19 +3691,23 @@ impl App {
             water_level: cfg.world.water_level,
             water_visibility: cfg.world.water_visibility,
 
-            // Spawn initial pawn based on configuration: camera (default) or a vessel
+            // Spawn initial pawn based on configuration: camera (default) or a vessel/walker
             active_pawn: if cfg.world.start_mode == "camera"
                 || cfg.world.start_mode == "free_camera"
                 || cfg.world.start_mode == "freecam"
             {
                 None
             } else {
-                // For now, any non-camera start mode spawns the default BoatPawn.
-                // In the future we can use `cfg.world.start_vessel` to select different vessel types.
-                Some(Box::new(voxelot::BoatPawn::new(
-                    cam_pos,
-                    cfg.world.water_level,
-                )))
+                match cfg.world.start_mode.as_str() {
+                    "walker" | "walk" | "character" => Some(Box::new(voxelot::WalkerPawn::new(
+                        cam_pos,
+                        &world,
+                    ))),
+                    _ => Some(Box::new(voxelot::BoatPawn::new(
+                        cam_pos,
+                        cfg.world.water_level,
+                    ))),
+                }
             },
 
             emissive_texture: None,
@@ -4279,10 +4335,27 @@ impl App {
                     if self.gui_visible { "ON" } else { "OFF" }
                 );
             }
-            InputAction::ToggleVessel => {
-                if self.active_pawn.is_some() {
-                    self.active_pawn = None;
-                    log::info!("Exited vessel: returning to free camera");
+            InputAction::CyclePawn => {
+                if let Some(pawn) = self.active_pawn.as_ref() {
+                    let spawn = pawn.position();
+                    match pawn.kind() {
+                        voxelot::PawnKind::Boat => {
+                            self.active_pawn = Some(Box::new(voxelot::WalkerPawn::new(
+                                spawn,
+                                &self.world,
+                            )));
+                            log::info!(
+                                "Switched to walker at ({:.1},{:.1},{:.1})",
+                                spawn[0],
+                                spawn[1],
+                                spawn[2]
+                            );
+                        }
+                        voxelot::PawnKind::Walker => {
+                            self.active_pawn = None;
+                            log::info!("Exited pawn: returning to free camera");
+                        }
+                    }
                 } else {
                     let spawn = self.camera_controller.camera.position;
                     self.active_pawn =
@@ -10929,11 +11002,12 @@ impl App {
             &mut self.gpu_buffer_bytes,
         );
 
-        // Create a small dynamic vertex buffer for the active pawn mesh (boat)
-        // (capacity must fit the generated local boat mesh)
+        // Create a small dynamic vertex buffer for the active pawn mesh (boat/walker)
+        // (capacity must fit the generated local meshes)
         self.boat_vertex_capacity = self
             .boat_vertex_capacity
             .max(self.boat_local_vertices.len())
+            .max(self.walker_local_vertices.len())
             .max(3);
         if self.boat_world_vertices.capacity() < self.boat_vertex_capacity {
             self.boat_world_vertices
@@ -11379,7 +11453,7 @@ impl App {
         self.ui_quad_instances.clear();
         self.ui_quad_count = 0;
 
-        let (width, height) = if let Some(config) = &self.config {
+        let (width, _height) = if let Some(config) = &self.config {
             (config.width as f32, config.height as f32)
         } else {
             (800.0, 600.0)
@@ -11861,7 +11935,9 @@ impl App {
             self.skybox_angle = (self.skybox_angle + dt * 0.005) % std::f32::consts::TAU;
         }
 
-        self.camera_controller.update(dt);
+        if self.active_pawn.is_none() {
+            self.camera_controller.update(dt);
+        }
 
         // Per-frame raycasting for editing
         let (projection, view) = {
@@ -11979,14 +12055,25 @@ impl App {
         self.boat_vertex_count = 0;
         if let (Some(pawn), Some(boat_buf)) = (&self.active_pawn, self.boat_vertex_buffer.as_ref())
         {
+            let local_vertices = match pawn.kind() {
+                voxelot::PawnKind::Boat => &self.boat_local_vertices,
+                voxelot::PawnKind::Walker => &self.walker_local_vertices,
+            };
+
             if let Some((pos, yaw, pitch, roll)) = pawn.debug_mesh_transform() {
+                let y_offset = if pawn.kind() == voxelot::PawnKind::Boat {
+                    -0.18
+                } else {
+                    0.0
+                };
                 boat_transform_into_world(
                     &mut self.boat_world_vertices,
-                    &self.boat_local_vertices,
+                    local_vertices,
                     pos,
                     yaw,
                     pitch,
                     roll,
+                    y_offset,
                 );
                 self.boat_vertex_count = self.boat_world_vertices.len() as u32;
                 if self.boat_vertex_count > 0 {
@@ -11997,13 +12084,19 @@ impl App {
                     );
                 }
             } else if let Some((pos, yaw)) = pawn.debug_mesh_pose() {
+                let y_offset = if pawn.kind() == voxelot::PawnKind::Boat {
+                    -0.18
+                } else {
+                    0.0
+                };
                 boat_transform_into_world(
                     &mut self.boat_world_vertices,
-                    &self.boat_local_vertices,
+                    local_vertices,
                     pos,
                     yaw,
                     0.0,
                     0.0,
+                    y_offset,
                 );
                 self.boat_vertex_count = self.boat_world_vertices.len() as u32;
                 if self.boat_vertex_count > 0 {
@@ -15681,11 +15774,10 @@ impl ApplicationHandler for App {
                 ..
             } => {
                 let pressed = state == ElementState::Pressed;
-                self.camera_controller.process_keyboard(key, pressed);
-
-                // Forward key events to active pawn (if any)
                 if let Some(pawn) = &mut self.active_pawn {
                     pawn.process_key(key, pressed);
+                } else {
+                    self.camera_controller.process_keyboard(key, pressed);
                 }
 
                 if key == KeyCode::ShiftLeft || key == KeyCode::ShiftRight {
@@ -15734,7 +15826,11 @@ impl ApplicationHandler for App {
                     if let Some(last_pos) = self.last_mouse_pos {
                         let delta_x = position.x - last_pos.0;
                         let delta_y = position.y - last_pos.1;
-                        self.camera_controller.process_mouse(delta_x, delta_y);
+                        if let Some(pawn) = &mut self.active_pawn {
+                            pawn.process_mouse(delta_x, delta_y);
+                        } else {
+                            self.camera_controller.process_mouse(delta_x, delta_y);
+                        }
                     }
                     self.last_mouse_pos = Some((position.x, position.y));
                 }

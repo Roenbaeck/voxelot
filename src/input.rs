@@ -116,7 +116,7 @@ impl ConfigurableSetting {
 pub enum InputAction {
     ToggleTimePause,
     ToggleGui,
-    ToggleVessel,
+    CyclePawn,
     ToggleFullscreen,
     SaveAndQuit,
     CycleDebugView,
@@ -146,7 +146,7 @@ impl InputManager {
         match key {
             KeyCode::KeyT => InputAction::ToggleTimePause,
             KeyCode::F5 => InputAction::ToggleGui,
-            KeyCode::KeyV => InputAction::ToggleVessel,
+            KeyCode::KeyV => InputAction::CyclePawn,
             KeyCode::F11 => InputAction::ToggleFullscreen,
             KeyCode::Escape => InputAction::SaveAndQuit,
             KeyCode::F3 => InputAction::CycleDebugView,
