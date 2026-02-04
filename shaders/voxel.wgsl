@@ -379,9 +379,9 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     // This prevents the fog from becoming brighter than the scene when the sky is bright
     // near the horizon during dawn/dusk.
     let fog_base = mix(vec3<f32>(0.02, 0.02, 0.03), uniforms.ambient_color_pad.xyz, skybox_brightness);
-    let fog_color = base_fog_color * fog_base;
+    let fog_color = min(base_fog_color * fog_base, vec3<f32>(0.12, 0.12, 0.16));
     let transmittance = exp(-uniforms.fog_time_pad.x * distance);
-    let fog_factor = 1.0 - transmittance;
+    let fog_factor = (1.0 - transmittance) * sqrt(skybox_brightness);
     // Add directional volumetric scattering from sun so the brightening only occurs
     // when looking toward the sun, and not globally. This prevents distant objects on
     // the horizon from being unnaturally lit when the sun is near the horizon.
@@ -608,9 +608,9 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     let base_fog_color = vec3<f32>(0.7, 0.8, 0.9);
     let skybox_brightness = uniforms.fog_time_pad.w;
     let fog_base = mix(vec3<f32>(0.02, 0.02, 0.03), uniforms.ambient_color_pad.xyz, skybox_brightness);
-    let fog_color = base_fog_color * fog_base;
+    let fog_color = min(base_fog_color * fog_base, vec3<f32>(0.12, 0.12, 0.16));
     let transmittance = exp(-uniforms.fog_time_pad.x * distance);
-    let fog_factor = 1.0 - transmittance;
+    let fog_factor = (1.0 - transmittance) * sqrt(skybox_brightness);
     // Add directional volumetric scattering from sun (towards sun only)
     let sun_dir_local = normalize(uniforms.sun_direction_shadow_bias.xyz);
     let sun_view_dot = max(dot(-ray_dir, -sun_dir_local), 0.0);

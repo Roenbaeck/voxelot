@@ -3,9 +3,9 @@ file = "worlds/flat_city_test.vhc"
 palette = "worlds/palette.txt"
 skybox = "worlds/skybox.hdr"
 camera_position = [
-    341.22577,
-    93.35741,
-    280.8705,
+    316.93915,
+    91.59554,
+    110.854164,
 ]
 water_level = 20.0
 water_visibility = 15.0
@@ -15,7 +15,7 @@ start_mode = "boat"
 chunk_lod_distance = 1000.0
 fov_degrees = 70.0
 near_plane = 0.1
-far_plane = 7500.0
+far_plane = 8000.0
 visual_lod_enabled = true
 impostor_pixel_threshold = 1.5
 impostor_pixel_size = 1.0
@@ -30,7 +30,7 @@ macos_hdr_colorspace = "extended_linear_itur2020"
 
 [atmosphere]
 fog_density = 0.0008
-time_of_day = 0.99278796
+time_of_day = 0.84476405
 time_paused = true
 night_skybox_brightness = 0.02
 horizon_fade_up = 0.05
@@ -48,7 +48,7 @@ skybox_tint_strength = 0.5
 [effects.depth_of_field]
 enabled = true
 focal_distance = 380.0
-focal_range = 80.0
+focal_range = 190.0
 blur_strength = 2.0000005
 kawase_iterations = 4
 kawase_offset = 0.75
