@@ -4339,29 +4339,29 @@ impl App {
                 if let Some(pawn) = self.active_pawn.as_ref() {
                     let spawn = pawn.position();
                     match pawn.kind() {
-                        voxelot::PawnKind::Boat => {
-                            self.active_pawn = Some(Box::new(voxelot::WalkerPawn::new(
-                                spawn,
-                                &self.world,
-                            )));
+                        voxelot::PawnKind::Walker => {
+                            self.active_pawn =
+                                Some(Box::new(voxelot::BoatPawn::new(spawn, self.water_level)));
                             log::info!(
-                                "Switched to walker at ({:.1},{:.1},{:.1})",
+                                "Switched to boat at ({:.1},{:.1},{:.1})",
                                 spawn[0],
                                 spawn[1],
                                 spawn[2]
                             );
                         }
-                        voxelot::PawnKind::Walker => {
+                        voxelot::PawnKind::Boat => {
                             self.active_pawn = None;
                             log::info!("Exited pawn: returning to free camera");
                         }
                     }
                 } else {
                     let spawn = self.camera_controller.camera.position;
-                    self.active_pawn =
-                        Some(Box::new(voxelot::BoatPawn::new(spawn, self.water_level)));
+                    self.active_pawn = Some(Box::new(voxelot::WalkerPawn::new(
+                        spawn,
+                        &self.world,
+                    )));
                     log::info!(
-                        "Spawned vessel at ({:.1},{:.1},{:.1})",
+                        "Spawned walker at ({:.1},{:.1},{:.1})",
                         spawn[0],
                         spawn[1],
                         spawn[2]
