@@ -1,6 +1,6 @@
-
-
-https://github.com/user-attachments/assets/022f6f2f-5cf4-4134-93d4-e8a825aabca3
+<video autoplay muted src="https://github.com/user-attachments/assets/022f6f2f-5cf4-4134-93d4-e8a825aabca3" type="video/mp4">
+    Small city rendered by voxelot
+</video>
 
 # voxelot
 
