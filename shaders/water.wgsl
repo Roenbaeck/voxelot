@@ -820,11 +820,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let base_fog_color = vec3<f32>(0.7, 0.8, 0.9);
     // Mix between a very dark night fog and the ambient color scaled by `brightness`.
     let fog_base = mix(vec3<f32>(0.02, 0.02, 0.03), camera.ambient_color_pad.xyz, brightness);
-    let fog_color = base_fog_color * fog_base * 2.0;
+    let fog_color = base_fog_color * fog_base * sqrt(brightness);
 
     let distance = t; // 't' is the world-space distance to water surface
     let transmittance = exp(-camera.fog_time_pad.x * distance);
-    let fog_factor = 1.0 - transmittance;
+    let fog_factor = min(1.0 - transmittance, 0.6);
     
     // Add directional volumetric scattering from sun (towards sun only)
     let sun_dir_local = normalize(camera.sun_direction_shadow_bias.xyz);
