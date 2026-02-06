@@ -1350,6 +1350,7 @@ struct App {
     pending_recreate_offscreen: bool,
     mesh_budget_mib: f64,
     envelope_cache_mib: f64,
+    frame_ms: f64,
     cull_ms: f64,
     grouping_ms: f64,
     mesh_ms: f64,
@@ -3231,7 +3232,7 @@ impl App {
                     eprintln!("Please check that the file path in your configuration is correct.");
                     std::process::exit(1);
                 });
-            let _load_elapsed = load_start.elapsed();
+            let load_elapsed = load_start.elapsed();
             #[cfg(feature = "cpu-profiling")]
             {
                 log::info!(
@@ -3588,6 +3589,7 @@ impl App {
             mesh_cache_mib: 0.0,
             mesh_budget_mib: 0.0,
             envelope_cache_mib: 0.0,
+            frame_ms: 0.0,
             cull_ms: 0.0,
             grouping_ms: 0.0,
             mesh_ms: 0.0,
@@ -11465,7 +11467,17 @@ impl App {
         let mut cursor_y = margin_px;
 
         let lines = [
-            format!("FPS: {}", self.last_fps),
+            format!("FPS: {} ({:.2} ms)", self.last_fps, self.frame_ms),
+            format!("CULL: {:.2} ms  GROUP: {:.2} ms", self.cull_ms, self.grouping_ms),
+            format!("MESH: {:.2} ms  INST: {:.2} ms", self.mesh_ms, self.instance_ms),
+            format!(
+                "VISIBLE: {}  LEAF: {}  MESHED: {}",
+                self.visible_count, self.leaf_chunk_count, self.meshed_chunk_count
+            ),
+            format!(
+                "DRAWS: {}  GPU ITEMS: {}",
+                self.draw_calls_count, self.gpu_buffer_items_count
+            ),
             format!("MESH JOBS/S: {}", self.jobs_per_sec_snapshot),
             format!("GI PROBES/S: {}", self.gi_jobs_per_sec_snapshot),
             format!("MEM: {:.0} MIB", self.process_mem_mib),
@@ -11881,6 +11893,7 @@ impl App {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
+        self.frame_ms = (dt as f64) * 1000.0;
         log::debug!("render: camera updated dt={}", dt);
         self.elapsed_time += dt;
         self.frame_index = self.frame_index.wrapping_add(1);
@@ -12169,6 +12182,7 @@ impl App {
             cull_visible_voxels_parallel(&self.world, &self.camera_controller.camera);
         self.cull_stats = cull_stats;
         let cull_time = cull_start.elapsed();
+        self.cull_ms = cull_time.as_secs_f64() * 1000.0;
 
         // Send async GI update request with visible chunks (non-blocking, after culling)
         let camera_pos = glam::Vec3::from(self.camera_controller.camera.position);
@@ -12199,7 +12213,7 @@ impl App {
                 max_y >= min_visible_y
             })
             .collect();
-        let _depth_culled_count = pre_depth_cull_count - visible.len();
+        let depth_culled_count = pre_depth_cull_count - visible.len();
 
         let mut _voxel_expansion_count = 0;
         // Reuse persistent allocation across frames to avoid heap churn
@@ -12855,6 +12869,16 @@ impl App {
                 }
             }
 
+            // When GPU culling is active, we can still use multi-draw indirect count.
+            // Populate the count buffer with the full candidate length; the shader sets instance_count.
+            if let Some(count_buf) = &self.multi_draw_count_buffer {
+                let counts = [
+                    self.mesh_indirect_args_tmp.len() as u32,
+                    self.envelope_indirect_args_tmp.len() as u32,
+                ];
+                queue.write_buffer(count_buf, 0, bytemuck::cast_slice(&counts));
+            }
+
             // Write any CPU prepopulated fallback instances and ensure the fallback instance buffer is large enough
             let cpu_prepopulated_count = self.cpu_prepopulated_instances.len();
             if cpu_prepopulated_count > 0 {
@@ -13026,6 +13050,7 @@ impl App {
             }
         }
         let grouping_time = grouping_start.elapsed();
+        self.grouping_ms = grouping_time.as_secs_f64() * 1000.0;
 
         let mesh_start = Instant::now();
         // self.mesh_chunk_arc_cache.clear(); // Removed to fix performance and flickering
@@ -13607,6 +13632,7 @@ impl App {
         }
         let mesh_upload_total_time = mesh_upload_total_start.elapsed();
         let mesh_time = mesh_start.elapsed();
+        self.mesh_ms = mesh_time.as_secs_f64() * 1000.0;
 
         if self.mesh_cache_bytes > self.mesh_cache_byte_budget() {
             self.evict_mesh_cache();
@@ -13654,6 +13680,7 @@ impl App {
         // reuse `cpu_prepopulated_instances` instead (already cleared earlier)
         // so there's no need for a separate `instances` Vec here.
         let instance_time = instance_start.elapsed();
+        self.instance_ms = instance_time.as_secs_f64() * 1000.0;
 
         self.active_emitters.clear();
         let mut draw_calls: usize = 0;
@@ -14002,6 +14029,12 @@ impl App {
         bounds_min.y = (bounds_min.y / texel_size_y).floor() * texel_size_y;
         bounds_max.x = (bounds_max.x / texel_size_x).ceil() * texel_size_x;
         bounds_max.y = (bounds_max.y / texel_size_y).ceil() * texel_size_y;
+
+        // Conservative shadow caster culling bounds in light space.
+        // Padding avoids edge shadow popping for near-frustum casters.
+        let shadow_cull_padding = 32.0;
+        let shadow_cull_min = bounds_min - Vec3::splat(shadow_cull_padding);
+        let shadow_cull_max = bounds_max + Vec3::splat(shadow_cull_padding);
 
         let light_proj = Mat4::orthographic_rh(
             bounds_min.x,
@@ -14377,6 +14410,31 @@ impl App {
             self.shadow_mesh_pipeline.as_ref(),
             self.shadow_bind_group.as_ref(),
         ) {
+            let chunk_in_shadow_frustum = |chunk_min: Vec3| -> bool {
+                // Chunk AABB in world space (leaf chunk size is 16).
+                let chunk_max = chunk_min + Vec3::splat(16.0);
+                // Project 8 corners into light space and compute bounds.
+                let mut ls_min = Vec3::splat(f32::INFINITY);
+                let mut ls_max = Vec3::splat(-f32::INFINITY);
+                for &dx in &[0.0, 16.0] {
+                    for &dy in &[0.0, 16.0] {
+                        for &dz in &[0.0, 16.0] {
+                            let world = Vec3::new(chunk_min.x + dx, chunk_min.y + dy, chunk_min.z + dz);
+                            let ls = (light_view * world.extend(1.0)).truncate();
+                            ls_min = ls_min.min(ls);
+                            ls_max = ls_max.max(ls);
+                        }
+                    }
+                }
+                // AABB overlap test in light space.
+                !(ls_max.x < shadow_cull_min.x
+                    || ls_min.x > shadow_cull_max.x
+                    || ls_max.y < shadow_cull_min.y
+                    || ls_min.y > shadow_cull_max.y
+                    || ls_max.z < shadow_cull_min.z
+                    || ls_min.z > shadow_cull_max.z)
+            };
+
             let mut shadow_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Shadow Pass"),
                 color_attachments: &[],
@@ -14448,7 +14506,12 @@ impl App {
                     // This ensures complete shadow coverage for all loaded geometry
 
                     // Draw all detail meshes
-                    for (_, entry) in self.mesh_cache.iter() {
+                    for (&key, entry) in self.mesh_cache.iter() {
+                        // Skip casters outside the shadow frustum bounds.
+                        let chunk_min = Vec3::new(key.0 as f32, key.1 as f32, key.2 as f32);
+                        if !chunk_in_shadow_frustum(chunk_min) {
+                            continue;
+                        }
                         let start_index = (entry.index_offset / 4) as u32;
                         let end_index = start_index + entry.index_count;
                         let base_vertex = (entry.vertex_offset
@@ -14459,7 +14522,11 @@ impl App {
                     }
 
                     // Draw all envelope meshes
-                    for (_, entry) in self.envelope_mesh_cache.iter() {
+                    for (&key, entry) in self.envelope_mesh_cache.iter() {
+                        let chunk_min = Vec3::new(key.0 as f32, key.1 as f32, key.2 as f32);
+                        if !chunk_in_shadow_frustum(chunk_min) {
+                            continue;
+                        }
                         let start_index = (entry.index_offset / 4) as u32;
                         let end_index = start_index + entry.index_count;
                         let base_vertex = (entry.vertex_offset
@@ -14706,16 +14773,12 @@ impl App {
                     wgpu::IndexFormat::Uint32,
                 );
 
-                let multi_draw_supported = device
-                    .features()
-                    .contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT)
-                    && self.cull_pipeline.is_none();
+                let multi_draw_supported =
+                    device.features().contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT);
 
                 if multi_draw_supported {
                     if cfg!(feature = "viewer-debug") {
-                        viewer_debug!(
-                            "Shader path: Using multi-draw indirect for scene pass (CPU path)"
-                        );
+                        viewer_debug!("Shader path: Using multi-draw indirect for scene pass");
                     }
                     if let (Some(count_buf), Some(mesh_indirect)) = (
                         self.multi_draw_count_buffer.as_ref(),

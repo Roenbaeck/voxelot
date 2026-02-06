@@ -3,9 +3,9 @@ file = "worlds/large_world_test.vhc"
 palette = "worlds/palette.txt"
 skybox = "worlds/skybox.hdr"
 camera_position = [
-    529.01117,
+    534.35986,
     101.96813,
-    942.5662,
+    943.8327,
 ]
 water_level = 20.0
 water_visibility = 5.0
@@ -30,7 +30,7 @@ macos_hdr_colorspace = "extended_linear_srgb"
 
 [atmosphere]
 fog_density = 0.0011999998
-time_of_day = 0.03018877
+time_of_day = 0.80476916
 time_paused = false
 night_skybox_brightness = 0.01
 horizon_fade_up = 0.05
