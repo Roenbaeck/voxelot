@@ -15169,17 +15169,19 @@ impl App {
                 self.ssilvb_bind_group.as_ref(),
                 self.ssao_ping_view.as_ref(),
             ) {
-                let mut ssao_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("SSILVB Pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: ssao_ping_view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                            store: wgpu::StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
+                    let mut ssao_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("SSILVB Pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: ssao_ping_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::DontCare(unsafe {
+                                    wgpu::LoadOpDontCare::enabled()
+                                }),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
                     occlusion_query_set: None,
@@ -15203,7 +15205,9 @@ impl App {
                             view: ssao_pong_view,
                             resolve_target: None,
                             ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                load: wgpu::LoadOp::DontCare(unsafe {
+                                    wgpu::LoadOpDontCare::enabled()
+                                }),
                                 store: wgpu::StoreOp::Store,
                             },
                             depth_slice: None,
@@ -15231,7 +15235,9 @@ impl App {
                             view: ssao_ping_view,
                             resolve_target: None,
                             ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                load: wgpu::LoadOp::DontCare(unsafe {
+                                    wgpu::LoadOpDontCare::enabled()
+                                }),
                                 store: wgpu::StoreOp::Store,
                             },
                             depth_slice: None,
@@ -15333,7 +15339,9 @@ impl App {
                             view: dst_view,
                             resolve_target: None,
                             ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                load: wgpu::LoadOp::DontCare(unsafe {
+                                    wgpu::LoadOpDontCare::enabled()
+                                }),
                                 store: wgpu::StoreOp::Store,
                             },
                             depth_slice: None,
@@ -15489,7 +15497,9 @@ impl App {
                         view: dof_color_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            load: wgpu::LoadOp::DontCare(unsafe {
+                                wgpu::LoadOpDontCare::enabled()
+                            }),
                             store: wgpu::StoreOp::Store,
                         },
                         depth_slice: None,
@@ -15645,7 +15655,9 @@ impl App {
                         view: post_color_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            load: wgpu::LoadOp::DontCare(unsafe {
+                                wgpu::LoadOpDontCare::enabled()
+                            }),
                             store: wgpu::StoreOp::Store,
                         },
                         depth_slice: None,
@@ -15702,7 +15714,9 @@ impl App {
                         view: bloom_ping_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            load: wgpu::LoadOp::DontCare(unsafe {
+                                wgpu::LoadOpDontCare::enabled()
+                            }),
                             store: wgpu::StoreOp::Store,
                         },
                         depth_slice: None,
@@ -15746,7 +15760,9 @@ impl App {
                                     view: dst_view,
                                     resolve_target: None,
                                     ops: wgpu::Operations {
-                                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                        load: wgpu::LoadOp::DontCare(unsafe {
+                                            wgpu::LoadOpDontCare::enabled()
+                                        }),
                                         store: wgpu::StoreOp::Store,
                                     },
                                     depth_slice: None,

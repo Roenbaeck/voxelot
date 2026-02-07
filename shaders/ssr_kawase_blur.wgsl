@@ -97,6 +97,10 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Important: make it alpha-aware so reflection color doesn't bleed past reflective geometry edges.
     // We weight each tap by its own SSR alpha and normalize by total alpha weight.
     let center_sample = textureSample(input_texture, input_sampler, uv);
+    // Fast early-out: if there's no reflection here, skip expensive depth/normal taps.
+    if (center_sample.a <= 0.0001) {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
     let depth0 = load_depth_at_uv(uv);
     let normal0 = load_normal_at_uv(uv);
 
