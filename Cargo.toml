@@ -10,6 +10,7 @@ mesh-debug = []
 test-block-world = []
 # Optional profiling features
 cpu-profiling = []
+gpu-profiling = []
 # Minimal runtime counters for overlays & headless builds
 perf-counters = []
 
@@ -66,4 +67,3 @@ split-debuginfo = "unpacked"
 
 # Note: these settings favor runtime performance. Build times may increase due
 # to LTO and single codegen unit.
-

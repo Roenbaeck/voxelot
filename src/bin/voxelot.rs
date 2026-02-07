@@ -174,11 +174,16 @@ const VOXEL_FONT_BASIC: [u8; 768] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 127
 ];
 const SHADOW_STRENGTH_MULTIPLIER: f32 = 1.75;
+const SSR_KAWASE_ITERATIONS: usize = 3;
 
 // Conservative estimate of how many frames can be in-flight on the GPU.
 // We avoid evicting (and therefore reusing) megabuffer regions that were used
 // within this window to prevent visible corruption/flicker when the mesh cache is full.
 const GPU_EVICTION_SAFE_FRAMES: u64 = 3;
+#[cfg(feature = "gpu-profiling")]
+const GPU_TIMESTAMP_QUERY_COUNT: u32 = 11;
+#[cfg(feature = "gpu-profiling")]
+const GPU_PROFILE_INTERVAL_FRAMES: u64 = 120;
 
 /// Voxel instance data for GPU
 #[repr(C)]
@@ -1673,6 +1678,7 @@ struct App {
     // SSR Kawase blur (uses Y-flipped UVs to match composite sampling)
     ssr_kawase_pipeline: Option<wgpu::RenderPipeline>,
     ssr_kawase_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    ssr_kawase_bind_groups: Vec<wgpu::BindGroup>,
     kawase_bind_group_layout: Option<wgpu::BindGroupLayout>,
     kawase_down_bind_groups: Vec<Option<wgpu::BindGroup>>,
     kawase_up_bind_groups: Vec<Option<wgpu::BindGroup>>,
@@ -1790,9 +1796,106 @@ struct App {
     config_path: String,
     // Profiling helper (CPU scopes). No-op if compiled without `cpu-profiling` feature.
     profiler: std::sync::Arc<voxelot::profiling::Profiler>,
+    #[cfg(feature = "gpu-profiling")]
+    gpu_timing_supported: bool,
+    #[cfg(feature = "gpu-profiling")]
+    gpu_query_set: Option<wgpu::QuerySet>,
+    #[cfg(feature = "gpu-profiling")]
+    gpu_query_buffer: Option<wgpu::Buffer>,
+    #[cfg(feature = "gpu-profiling")]
+    gpu_readback_buffer: Option<wgpu::Buffer>,
+    #[cfg(feature = "gpu-profiling")]
+    gpu_timestamp_period: f32,
+    #[cfg(feature = "gpu-profiling")]
+    gpu_pass_ms: [f64; (GPU_TIMESTAMP_QUERY_COUNT as usize) - 1],
+    #[cfg(feature = "gpu-profiling")]
+    gpu_last_total_ms: f64,
+    #[cfg(feature = "gpu-profiling")]
+    gpu_readback_pending: bool,
+    #[cfg(feature = "gpu-profiling")]
+    gpu_readback_rx: Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
 }
 
 impl App {
+    #[cfg(feature = "gpu-profiling")]
+    fn gpu_write_timestamp(&self, encoder: &mut wgpu::CommandEncoder, index: u32) {
+        if !self.gpu_timing_supported {
+            return;
+        }
+        if let Some(query_set) = self.gpu_query_set.as_ref() {
+            encoder.write_timestamp(query_set, index);
+        }
+    }
+
+    #[cfg(feature = "gpu-profiling")]
+    fn gpu_resolve_timestamps(&self, encoder: &mut wgpu::CommandEncoder) {
+        if !self.gpu_timing_supported {
+            return;
+        }
+        let (Some(query_set), Some(query_buffer), Some(readback_buffer)) = (
+            self.gpu_query_set.as_ref(),
+            self.gpu_query_buffer.as_ref(),
+            self.gpu_readback_buffer.as_ref(),
+        ) else {
+            return;
+        };
+        encoder.resolve_query_set(query_set, 0..GPU_TIMESTAMP_QUERY_COUNT, query_buffer, 0);
+        encoder.copy_buffer_to_buffer(
+            query_buffer,
+            0,
+            readback_buffer,
+            0,
+            (GPU_TIMESTAMP_QUERY_COUNT as u64) * 8,
+        );
+    }
+
+    #[cfg(feature = "gpu-profiling")]
+    fn gpu_collect_timestamps(&mut self, device: &wgpu::Device) {
+        if !self.gpu_timing_supported {
+            return;
+        }
+        if self.frame_index % GPU_PROFILE_INTERVAL_FRAMES != 0 {
+            return;
+        }
+        let Some(readback_buffer) = self.gpu_readback_buffer.as_ref() else {
+            return;
+        };
+        if !self.gpu_readback_pending {
+            let slice = readback_buffer.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |v| {
+                let _ = tx.send(v);
+            });
+            self.gpu_readback_pending = true;
+            self.gpu_readback_rx = Some(rx);
+        }
+
+        let _ = device.poll(wgpu::PollType::Poll);
+        let ready = self
+            .gpu_readback_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok());
+        if let Some(Ok(())) = ready {
+            let slice = readback_buffer.slice(..);
+            let data = slice.get_mapped_range();
+            let timestamps: &[u64] = bytemuck::cast_slice(&data);
+            if timestamps.len() >= GPU_TIMESTAMP_QUERY_COUNT as usize {
+                for i in 0..(GPU_TIMESTAMP_QUERY_COUNT as usize - 1) {
+                    let delta = timestamps[i + 1].saturating_sub(timestamps[i]) as f64;
+                    self.gpu_pass_ms[i] =
+                        delta * (self.gpu_timestamp_period as f64) / 1_000_000.0;
+                }
+                let total = timestamps[GPU_TIMESTAMP_QUERY_COUNT as usize - 1]
+                    .saturating_sub(timestamps[0]) as f64;
+                self.gpu_last_total_ms =
+                    total * (self.gpu_timestamp_period as f64) / 1_000_000.0;
+            }
+            drop(data);
+            readback_buffer.unmap();
+            self.gpu_readback_pending = false;
+            self.gpu_readback_rx = None;
+        }
+    }
     fn ui_hdr_boost(&self) -> f32 {
         if self.user_config.rendering.macos_hdr {
             (1.5 * self.user_config.rendering.macos_hdr_exposure_boost).max(1.0)
@@ -3232,7 +3335,7 @@ impl App {
                     eprintln!("Please check that the file path in your configuration is correct.");
                     std::process::exit(1);
                 });
-            let load_elapsed = load_start.elapsed();
+            let _load_elapsed = load_start.elapsed();
             #[cfg(feature = "cpu-profiling")]
             {
                 log::info!(
@@ -3723,6 +3826,24 @@ impl App {
             material_texture_bytes: 0,
             config_path: config_path.to_string(),
             profiler: voxelot::profiling::Profiler::new(),
+            #[cfg(feature = "gpu-profiling")]
+            gpu_timing_supported: false,
+            #[cfg(feature = "gpu-profiling")]
+            gpu_query_set: None,
+            #[cfg(feature = "gpu-profiling")]
+            gpu_query_buffer: None,
+            #[cfg(feature = "gpu-profiling")]
+            gpu_readback_buffer: None,
+            #[cfg(feature = "gpu-profiling")]
+            gpu_timestamp_period: 0.0,
+            #[cfg(feature = "gpu-profiling")]
+            gpu_pass_ms: [0.0; (GPU_TIMESTAMP_QUERY_COUNT as usize) - 1],
+            #[cfg(feature = "gpu-profiling")]
+            gpu_last_total_ms: 0.0,
+            #[cfg(feature = "gpu-profiling")]
+            gpu_readback_pending: false,
+            #[cfg(feature = "gpu-profiling")]
+            gpu_readback_rx: None,
             dof_coc_pipeline: None,
             dof_bind_group_layout: None,
             dof_bind_group: None,
@@ -3806,6 +3927,7 @@ impl App {
             kawase_up_pipeline: None,
             ssr_kawase_pipeline: None,
             ssr_kawase_bind_group_layout: None,
+            ssr_kawase_bind_groups: Vec::new(),
             kawase_bind_group_layout: None,
             kawase_down_bind_groups: Vec::new(),
             kawase_up_bind_groups: Vec::new(),
@@ -5636,6 +5758,7 @@ impl App {
         self.ssr_history_texture = ssr_history_texture_loc;
         self.ssr_history_view = ssr_history_view_loc;
         self.ssr_history_valid = false;
+        self.ssr_kawase_bind_groups.clear();
         self.scene_copy_texture = Some(scene_copy_texture_loc);
         self.scene_copy_view = Some(scene_copy_view_loc);
         self.emissive_texture = Some(emissive_texture_loc);
@@ -6812,6 +6935,71 @@ impl App {
         self.update_water_bind_group();
         // Ensure SSR bind group exists after recreating offscreen targets
         self.update_ssr_bind_group();
+    }
+
+    fn update_ssr_kawase_bind_groups(&mut self) {
+        if !self.ssr_settings.enabled {
+            return;
+        }
+        let (Some(device), Some(layout), Some(sampler)) = (
+            self.device.as_ref(),
+            self.ssr_kawase_bind_group_layout.as_ref(),
+            self.post_sampler.as_ref(),
+        ) else {
+            return;
+        };
+        let (Some(depth_view), Some(normal_view)) = (
+            self.offscreen_depth_view.as_ref(),
+            self.normal_view.as_ref(),
+        ) else {
+            return;
+        };
+        let Some(ssr_src_view) = self.ssr_texture_view.as_ref() else {
+            return;
+        };
+        let (Some(ssr_blur_ping_view), Some(ssr_blur_pong_view)) = (
+            self.ssr_blur_ping_view.as_ref(),
+            self.ssr_blur_pong_view.as_ref(),
+        ) else {
+            return;
+        };
+
+        self.ssr_kawase_bind_groups.clear();
+        self.ssr_kawase_bind_groups.reserve(SSR_KAWASE_ITERATIONS);
+
+        for level in 0..SSR_KAWASE_ITERATIONS {
+            let src_view = if level == 0 {
+                ssr_src_view
+            } else if level % 2 == 1 {
+                ssr_blur_ping_view
+            } else {
+                ssr_blur_pong_view
+            };
+
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&format!("SSR Kawase Bind Group L{}", level)),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(src_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(depth_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(normal_view),
+                    },
+                ],
+            });
+            self.ssr_kawase_bind_groups.push(bg);
+        }
     }
 
     // Readbacks are disabled — use the debug overlay for immediate inspection
@@ -8796,6 +8984,18 @@ impl App {
         if adapter.features().contains(wgpu::Features::CLEAR_TEXTURE) {
             req_features |= wgpu::Features::CLEAR_TEXTURE;
         }
+        #[cfg(not(target_os = "macos"))]
+        {
+            if adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+                req_features |= wgpu::Features::TIMESTAMP_QUERY;
+            }
+            if adapter
+                .features()
+                .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
+            {
+                req_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+            }
+        }
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -8808,6 +9008,46 @@ impl App {
             })
             .await
             .unwrap();
+
+        #[cfg(feature = "gpu-profiling")]
+        {
+            #[cfg(target_os = "macos")]
+            {
+                // Timestamp queries can stall on Apple Silicon; disable for now.
+                self.gpu_timing_supported = false;
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                self.gpu_timing_supported =
+                    device.features().contains(wgpu::Features::TIMESTAMP_QUERY)
+                        && device
+                            .features()
+                            .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
+                if self.gpu_timing_supported {
+                    let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+                        label: Some("GPU Timestamp QuerySet"),
+                        count: GPU_TIMESTAMP_QUERY_COUNT,
+                        ty: wgpu::QueryType::Timestamp,
+                    });
+                    let query_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("GPU Timestamp Query Buffer"),
+                        size: (GPU_TIMESTAMP_QUERY_COUNT as u64) * 8,
+                        usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                        mapped_at_creation: false,
+                    });
+                    let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("GPU Timestamp Readback Buffer"),
+                        size: (GPU_TIMESTAMP_QUERY_COUNT as u64) * 8,
+                        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    self.gpu_query_set = Some(query_set);
+                    self.gpu_query_buffer = Some(query_buffer);
+                    self.gpu_readback_buffer = Some(readback_buffer);
+                    self.gpu_timestamp_period = queue.get_timestamp_period();
+                }
+            }
+        }
 
         // Configure surface
         let surface_caps = surface.get_capabilities(&adapter);
@@ -11466,7 +11706,8 @@ impl App {
         let line_gap = (char_px * 0.9).max(12.0);
         let mut cursor_y = margin_px;
 
-        let lines = [
+        let mut lines = Vec::new();
+        lines.extend([
             format!("FPS: {} ({:.2} ms)", self.last_fps, self.frame_ms),
             format!("CULL: {:.2} ms  GROUP: {:.2} ms", self.cull_ms, self.grouping_ms),
             format!("MESH: {:.2} ms  INST: {:.2} ms", self.mesh_ms, self.instance_ms),
@@ -11482,7 +11723,24 @@ impl App {
             format!("GI PROBES/S: {}", self.gi_jobs_per_sec_snapshot),
             format!("MEM: {:.0} MIB", self.process_mem_mib),
             format!("DEBUG: {}", self.input_manager.active_debug_view.name()),
-        ];
+        ]);
+
+        #[cfg(feature = "gpu-profiling")]
+        if self.gpu_timing_supported {
+            let ms = &self.gpu_pass_ms;
+            lines.push(format!(
+                "GPU SHDW:{:.2} SCN:{:.2} HZB:{:.2} SSAO:{:.2} SSR:{:.2}",
+                ms[0], ms[1], ms[2], ms[3], ms[4]
+            ));
+            lines.push(format!(
+                "GPU WTR:{:.2} DOF/RC:{:.2} BLM:{:.2} CMP:{:.2} TOT:{:.2}",
+                ms[5],
+                ms[6],
+                ms[7],
+                ms[8],
+                self.gpu_last_total_ms
+            ));
+        }
 
         for line in lines {
             self.render_ui_text_2d(
@@ -12213,7 +12471,7 @@ impl App {
                 max_y >= min_visible_y
             })
             .collect();
-        let depth_culled_count = pre_depth_cull_count - visible.len();
+        let _depth_culled_count = pre_depth_cull_count - visible.len();
 
         let mut _voxel_expansion_count = 0;
         // Reuse persistent allocation across frames to avoid heap churn
@@ -14393,6 +14651,8 @@ impl App {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Render Encoder"),
         });
+        #[cfg(feature = "gpu-profiling")]
+        self.gpu_write_timestamp(&mut encoder, 0);
 
         // Update one face of the reflection probe per frame (used as SSR fallback).
         // self.render_reflection_probe_face(&mut encoder, &queue, uniforms);
@@ -14412,7 +14672,6 @@ impl App {
         ) {
             let chunk_in_shadow_frustum = |chunk_min: Vec3| -> bool {
                 // Chunk AABB in world space (leaf chunk size is 16).
-                let chunk_max = chunk_min + Vec3::splat(16.0);
                 // Project 8 corners into light space and compute bounds.
                 let mut ls_min = Vec3::splat(f32::INFINITY);
                 let mut ls_max = Vec3::splat(-f32::INFINITY);
@@ -14562,6 +14821,8 @@ impl App {
                 draw_calls += 1;
             }
         }
+        #[cfg(feature = "gpu-profiling")]
+        self.gpu_write_timestamp(&mut encoder, 1);
 
         // WTS-RT: GPU Light Injection & Relaxation Passes
         // -----------------------------------------------------------------------------------------
@@ -14893,9 +15154,13 @@ impl App {
                 draw_calls += 1;
             }
         }
+        #[cfg(feature = "gpu-profiling")]
+        self.gpu_write_timestamp(&mut encoder, 2);
 
         // Generate HZB mip chain from the depth buffer we just populated
         self.generate_hzb(&mut encoder);
+        #[cfg(feature = "gpu-profiling")]
+        self.gpu_write_timestamp(&mut encoder, 3);
 
         // SSILVB/SSAO: run before SSR so reflections can use AO
         if self.ssao_enabled {
@@ -14982,6 +15247,8 @@ impl App {
                 }
             }
         }
+        #[cfg(feature = "gpu-profiling")]
+        self.gpu_write_timestamp(&mut encoder, 4);
 
         // SSR Pass (if enabled) -> writes SSR texture
         // Placed BEFORE Water so water can sample SSR reflections
@@ -15016,33 +15283,36 @@ impl App {
 
             // Blur SSR for final compositing (buildings) using the existing Kawase blur pipeline.
             // Important: water samples the *unblurred* SSR texture, so we write into a separate ping/pong.
-            if let (
-                Some(ssr_kawase_pipeline),
-                Some(ssr_kawase_layout),
-                Some(sampler),
-                Some(ssr_src_view),
-                Some(ssr_blur_ping_view),
-                Some(ssr_blur_pong_view),
-                Some(depth_view),
-                Some(normal_view),
-            ) = (
-                self.ssr_kawase_pipeline.as_ref(),
-                self.ssr_kawase_bind_group_layout.as_ref(),
-                self.post_sampler.as_ref(),
-                self.ssr_texture_view.as_ref(),
-                self.ssr_blur_ping_view.as_ref(),
-                self.ssr_blur_pong_view.as_ref(),
-                self.offscreen_depth_view.as_ref(),
-                self.normal_view.as_ref(),
-            ) {
+            if self.ssr_kawase_bind_groups.is_empty() {
+                self.update_ssr_kawase_bind_groups();
+            }
+
+            let ssr_kawase_pipeline = match self.ssr_kawase_pipeline.as_ref() {
+                Some(p) => p,
+                None => return,
+            };
+            let ssr_src_view = match self.ssr_texture_view.as_ref() {
+                Some(v) => v,
+                None => return,
+            };
+            let ssr_blur_ping_view = match self.ssr_blur_ping_view.as_ref() {
+                Some(v) => v,
+                None => return,
+            };
+            let ssr_blur_pong_view = match self.ssr_blur_pong_view.as_ref() {
+                Some(v) => v,
+                None => return,
+            };
+
+            {
                 // Fixed parameters: tuned to approximate a Gaussian-like blur.
                 // Keep odd iterations so the final output ends up in ping (which the composite pass samples).
-                let iterations: usize = 3;
+                let iterations: usize = SSR_KAWASE_ITERATIONS;
                 let base_offset: f32 = 1.10;
                 let blur_radius: f32 = 1.0;
 
                 for level in 0..iterations {
-                    let (src_view, dst_view) = if level == 0 {
+                    let (_src_view, dst_view) = if level == 0 {
                         (ssr_src_view, ssr_blur_ping_view)
                     } else if level % 2 == 1 {
                         (ssr_blur_ping_view, ssr_blur_pong_view)
@@ -15056,29 +15326,6 @@ impl App {
                     let near = self.camera_controller.camera.near;
                     let far = self.camera_controller.camera.far;
                     let immediate_data = [texel_x, texel_y, offset, 0.0_f32, near, far, 0.0, 0.0];
-
-                    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some(&format!("SSR Kawase Temp BG L{}", level)),
-                        layout: ssr_kawase_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: wgpu::BindingResource::TextureView(src_view),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::Sampler(sampler),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: wgpu::BindingResource::TextureView(depth_view),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 3,
-                                resource: wgpu::BindingResource::TextureView(normal_view),
-                            },
-                        ],
-                    });
 
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some(&format!("SSR Kawase Blur L{}", level)),
@@ -15098,7 +15345,9 @@ impl App {
                     });
                     pass.set_pipeline(ssr_kawase_pipeline);
                     pass.set_immediates(0, bytemuck::cast_slice(&immediate_data));
-                    pass.set_bind_group(0, &bg, &[]);
+                    if let Some(bg) = self.ssr_kawase_bind_groups.get(level) {
+                        pass.set_bind_group(0, bg, &[]);
+                    }
                     pass.draw(0..3, 0..1);
                 }
             }
@@ -15129,6 +15378,8 @@ impl App {
                 self.ssr_history_valid = true;
             }
         }
+        #[cfg(feature = "gpu-profiling")]
+        self.gpu_write_timestamp(&mut encoder, 5);
 
         // Copy offscreen color to scene_copy_texture for water reflection sampling
         // Water pass writes to offscreen_color but needs to read scene color for reflections
@@ -15192,6 +15443,8 @@ impl App {
                 water_pass.draw(0..3, 0..1);
             }
         }
+        #[cfg(feature = "gpu-profiling")]
+        self.gpu_write_timestamp(&mut encoder, 6);
 
         if self.dof_bind_group.is_none() {
             self.update_dof_bind_group();
@@ -15430,6 +15683,8 @@ impl App {
                 }
             }
         }
+        #[cfg(feature = "gpu-profiling")]
+        self.gpu_write_timestamp(&mut encoder, 7);
 
         if self.bloom_enabled && self.bloom_settings.kawase_enabled {
             if let (
@@ -15572,6 +15827,8 @@ impl App {
                 }
             }
         }
+        #[cfg(feature = "gpu-profiling")]
+        self.gpu_write_timestamp(&mut encoder, 8);
 
         if let (Some(composite_pipeline), Some(composite_bind_group)) = (
             self.composite_pipeline.as_ref(),
@@ -15623,11 +15880,21 @@ impl App {
         } else {
             eprintln!("Composite resources unavailable; skipping final pass!");
         }
+        #[cfg(feature = "gpu-profiling")]
+        self.gpu_write_timestamp(&mut encoder, 9);
+
+        #[cfg(feature = "gpu-profiling")]
+        self.gpu_write_timestamp(&mut encoder, 10);
+
+        #[cfg(feature = "gpu-profiling")]
+        self.gpu_resolve_timestamps(&mut encoder);
 
         queue.submit(std::iter::once(encoder.finish()));
         log::debug!("submitted frame {} to GPU queue", self.frame_count);
         output.present();
         log::debug!("presented output for frame {}", self.frame_count);
+        #[cfg(feature = "gpu-profiling")]
+        self.gpu_collect_timestamps(&device);
 
         // Stats
         self.frame_count += 1;
