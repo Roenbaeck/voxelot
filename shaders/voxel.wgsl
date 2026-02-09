@@ -203,6 +203,101 @@ fn get_cheap_sky_color(rdir: vec3<f32>) -> vec3<f32> {
     return env * brightness;
 }
 
+// ── Shared helper: sample light probes for indirect emissive lighting ────────
+fn compute_light_probes(world_pos: vec3<f32>) -> vec3<f32> {
+    var indirect_light = vec3<f32>(0.0, 0.0, 0.0);
+    for (var i = 0u; i < uniforms.light_probe_count; i++) {
+        let probe = light_probes[i];
+        let to_light = probe.position - world_pos;
+        let dist_sq = dot(to_light, to_light);
+        let dist = sqrt(dist_sq);
+        let attenuation = (probe.color_power.a * 0.01) / max(dist_sq * dist, 128.0);
+        let probe_brightness = max(probe.color_power.r, max(probe.color_power.g, probe.color_power.b));
+        let normalized_color = probe.color_power.rgb / max(probe_brightness, 1.0);
+        indirect_light += normalized_color * attenuation;
+    }
+    return min(indirect_light, vec3<f32>(0.5, 0.5, 0.5));
+}
+
+// ── Shared helper: fog and inscatter ─────────────────────────────────────────
+struct FogResult {
+    fog_color: vec3<f32>,
+    fog_factor: f32,
+    inscatter: vec3<f32>,
+}
+
+fn compute_fog(distance: f32, ray_dir: vec3<f32>, sun_dir: vec3<f32>) -> FogResult {
+    let base_fog_color = vec3<f32>(0.7, 0.8, 0.9);
+    let skybox_brightness = uniforms.fog_time_pad.w;
+    let fog_base = mix(vec3<f32>(0.02, 0.02, 0.03), uniforms.ambient_color_pad.xyz, skybox_brightness);
+    let fog_color = min(base_fog_color * fog_base, vec3<f32>(0.12, 0.12, 0.16));
+    let transmittance = exp(-uniforms.fog_time_pad.x * distance);
+    let fog_factor = (1.0 - transmittance) * sqrt(skybox_brightness);
+    let sun_view_dot = max(dot(-ray_dir, -sun_dir), 0.0);
+    let inscatter = uniforms.sun_color_pad.xyz * 0.15 * fog_factor * sun_view_dot;
+    return FogResult(fog_color, fog_factor, inscatter);
+}
+
+// ── Shared helper: envelope GI blend ─────────────────────────────────────────
+fn compute_envelope_lit(
+    world_pos: vec3<f32>,
+    normal: vec3<f32>,
+    ray_dir: vec3<f32>,
+    reflectivity: f32,
+    sun_contribution: vec3<f32>,
+    moon_light: vec3<f32>,
+    fallback_color: vec3<f32>,
+    fallback_lighting: vec3<f32>,
+) -> vec3<f32> {
+    let chunk_coord = vec3<i32>(floor(world_pos / 16.0)) - camera.gi_grid_origin;
+    var env_lit: vec3<f32>;
+    if (all(chunk_coord >= vec3<i32>(0)) && all(chunk_coord < camera.gi_grid_dims)) {
+        let probe_color = textureLoad(gi_probe_color, chunk_coord, 0).rgb;
+        let relaxed_phi = textureLoad(gi_relaxed_phi, chunk_coord, 0).rgb;
+        let radiance = sample_radiance_int(chunk_coord, normal);
+        let total_lighting = sun_contribution + moon_light + (relaxed_phi + radiance * uniforms.gi_scale) + uniforms.ambient_color_pad.xyz * 0.1;
+        var reflection = vec3<f32>(0.0);
+        if (reflectivity > 0.001) {
+            let rdir = reflect(ray_dir, normal);
+            reflection = get_cheap_sky_color(rdir) * reflectivity;
+        }
+        env_lit = probe_color * total_lighting + reflection;
+    } else {
+        var reflection = vec3<f32>(0.0);
+        if (reflectivity > 0.001) {
+            let rdir = reflect(ray_dir, normal);
+            reflection = get_cheap_sky_color(rdir) * reflectivity;
+        }
+        env_lit = fallback_color * fallback_lighting + reflection;
+    }
+    return env_lit;
+}
+
+// ── Shared helper: underwater depth fading ───────────────────────────────────
+struct UnderwaterResult {
+    alpha: f32,
+    color_mod: f32,   // 1.0 = multiply brightened unchanged
+    deep_fade: f32,   // 0..1 blend towards deep water color
+}
+
+fn compute_underwater_fade(world_y: f32, ambient: vec3<f32>) -> UnderwaterResult {
+    let water_level = uniforms.water_level;
+    let water_vis = uniforms.water_visibility;
+    let underwater_depth = water_level - world_y;
+    var result = UnderwaterResult(1.0, 1.0, 0.0);
+    if (underwater_depth > 0.0 && water_vis > 0.0) {
+        let underwater_fade = smoothstep(0.0, water_vis, underwater_depth);
+        let absorption_coefficient = 12.0 / max(water_vis, 1.0);
+        result.alpha = exp(-absorption_coefficient * underwater_depth);
+        if (underwater_depth > water_vis * 0.5) {
+            result.alpha = result.alpha * 0.1;
+        }
+        result.color_mod = exp(-3.5 * underwater_depth / max(water_vis, 1.0));
+        result.deep_fade = pow(underwater_fade, 0.6);
+    }
+    return result;
+}
+
 @vertex
 fn vs_main(
     @location(0) instance_position: vec3<f32>,
@@ -278,7 +373,8 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     let mat_idx = min(input.voxel_type, 255u);
     let reflectivity = material_props[mat_idx].r;
     
-    let sun_dir = normalize(uniforms.sun_direction_shadow_bias.xyz);
+    // sun_direction is pre-normalized on CPU (glam::Vec3::normalize)
+    let sun_dir = uniforms.sun_direction_shadow_bias.xyz;
     let ndotl_raw = dot(input.normal, sun_dir);
     let sun_diffuse = max(ndotl_raw, 0.0);
     let base_shadow = compute_shadow(input.light_space_pos, input.normal, sun_dir);
@@ -299,28 +395,12 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     ambient = ambient * mix(vec3<f32>(1.0), vec3<f32>(back_scale), back_strength);
 
     // Moon light (no shadows yet) -------------------------------------------------
-    let moon_dir = normalize(uniforms.moon_direction_intensity.xyz);
+    // moon_direction is pre-normalized on CPU
+    let moon_dir = uniforms.moon_direction_intensity.xyz;
     let moon_diffuse = max(dot(input.normal, moon_dir), 0.0);
     let moon_light = moon_diffuse * uniforms.moon_color_pad.xyz * uniforms.moon_direction_intensity.w * dir_light_attenuation;
     
-    // Sample light probes for indirect emissive lighting
-    var indirect_light = vec3<f32>(0.0, 0.0, 0.0);
-    for (var i = 0u; i < uniforms.light_probe_count; i++) {
-        let probe = light_probes[i];
-        let to_light = probe.position - input.world_pos;
-        let dist_sq = dot(to_light, to_light);
-        // Very localized lighting: cubic falloff for rapid distance dropoff
-        let dist = sqrt(dist_sq);
-        let attenuation = (probe.color_power.a * 0.01) / max(dist_sq * dist, 128.0);
-        
-        // Normalize the probe color to prevent oversaturated color bleeding
-        let probe_brightness = max(probe.color_power.r, max(probe.color_power.g, probe.color_power.b));
-        let normalized_color = probe.color_power.rgb / max(probe_brightness, 1.0);
-        
-        indirect_light += normalized_color * attenuation;
-    }
-    // Keep it subtle but visible for testing (increased from 0.03)
-    indirect_light = min(indirect_light, vec3<f32>(0.5, 0.5, 0.5));
+    let indirect_light = compute_light_probes(input.world_pos);
     
     let lighting = ambient + sun_contribution + moon_light + indirect_light;
     
@@ -372,22 +452,10 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
         }
     }
 
-    // Fog color modulated by ambient and sky brightness (darker at night)
-    let base_fog_color = vec3<f32>(0.7, 0.8, 0.9);
-    let skybox_brightness = uniforms.fog_time_pad.w;
-    // Mix between a very dark night fog and the ambient color scaled by `skybox_brightness`.
-    // This prevents the fog from becoming brighter than the scene when the sky is bright
-    // near the horizon during dawn/dusk.
-    let fog_base = mix(vec3<f32>(0.02, 0.02, 0.03), uniforms.ambient_color_pad.xyz, skybox_brightness);
-    let fog_color = min(base_fog_color * fog_base, vec3<f32>(0.12, 0.12, 0.16));
-    let transmittance = exp(-uniforms.fog_time_pad.x * distance);
-    let fog_factor = (1.0 - transmittance) * sqrt(skybox_brightness);
-    // Add directional volumetric scattering from sun so the brightening only occurs
-    // when looking toward the sun, and not globally. This prevents distant objects on
-    // the horizon from being unnaturally lit when the sun is near the horizon.
-    let sun_dir_local = normalize(uniforms.sun_direction_shadow_bias.xyz);
-    let sun_view_dot = max(dot(-ray_dir, -sun_dir_local), 0.0);
-    let inscatter = uniforms.sun_color_pad.xyz * 0.15 * fog_factor * sun_view_dot;
+    let fog = compute_fog(distance, ray_dir, sun_dir);
+    let fog_color = fog.fog_color;
+    let fog_factor = fog.fog_factor;
+    let inscatter = fog.inscatter;
     let fogged_color = mix(color, fog_color + inscatter, fog_factor);
     
     // Add emissive after fog so it stays bright
@@ -420,70 +488,20 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     let env_fade_factor = smoothstep(env_fade_start, env_dist, distance);
     
     if (env_fade_factor > 0.0) {
-        let chunk_coord = vec3<i32>(floor(input.world_pos / 16.0)) - camera.gi_grid_origin;
-        var env_lit: vec3<f32>;
-        if (all(chunk_coord >= vec3<i32>(0)) && all(chunk_coord < camera.gi_grid_dims)) {
-            let probe_color = textureLoad(gi_probe_color, chunk_coord, 0).rgb;
-            let relaxed_phi = textureLoad(gi_relaxed_phi, chunk_coord, 0).rgb;
-            let radiance = sample_radiance_int(chunk_coord, input.normal);
-            // Re-integrate sun/moon for envelopes
-            let total_lighting = sun_contribution + moon_light + (relaxed_phi + radiance * uniforms.gi_scale) + uniforms.ambient_color_pad.xyz * 0.1;
-            
-            // Simplified distant reflection for envelopes
-            var reflection = vec3<f32>(0.0);
-            if (reflectivity > 0.001) {
-                let rdir = reflect(ray_dir, normalize(input.normal));
-                reflection = get_cheap_sky_color(rdir) * reflectivity;
-            }
-            
-            env_lit = probe_color * total_lighting + reflection;
-        } else {
-            // Fallback to average color + light
-            var reflection = vec3<f32>(0.0);
-            if (reflectivity > 0.001) {
-                let rdir = reflect(ray_dir, normalize(input.normal));
-                reflection = get_cheap_sky_color(rdir) * reflectivity;
-            }
-            env_lit = input.color.rgb * lighting + reflection;
-        }
+        let env_lit = compute_envelope_lit(
+            input.world_pos, input.normal, ray_dir, reflectivity,
+            sun_contribution, moon_light, input.color.rgb, lighting,
+        );
         let env_fogged = mix(env_lit, fog_color + inscatter, fog_factor);
-        
         brightened = mix(brightened, env_fogged, env_fade_factor);
     }
     
-    // Underwater depth fade: fade geometry based on depth below water surface
-    // Similar to distance fade, but based on y-coordinate depth from water_level (Y is up)
-    let water_level = uniforms.water_level;
-    let water_vis = uniforms.water_visibility;
-    let underwater_depth = water_level - input.world_pos.y;
-    var underwater_alpha = 1.0;
-    
-    // Only apply underwater fade if the geometry is actually underwater
-    if (underwater_depth > 0.0 && water_vis > 0.0) {
-        // Calculate fade factor: 0 at surface, 1 at max visibility depth
-        let underwater_fade = smoothstep(0.0, water_vis, underwater_depth);
-        
-        // Alpha fade using Beer-Lambert exponential decay (how light behaves in water)
-        // exp(-k*d) where k controls absorption rate, d is depth
-        // Very aggressive absorption to limit visibility depth
-        let absorption_coefficient = 12.0 / max(water_vis, 1.0);
-        underwater_alpha = exp(-absorption_coefficient * underwater_depth);
-        
-        // Force objects beyond half visibility to be nearly invisible
-        if (underwater_depth > water_vis * 0.5) {
-            underwater_alpha = underwater_alpha * 0.1;
-        }
-        
-        // Darken based on depth to simulate light absorption
-        let depth_darkness = exp(-3.5 * underwater_depth / max(water_vis, 1.0));
-        brightened = brightened * depth_darkness;
-        
-        // Fade to water color (deep water color) as objects get deeper
-        // This works even without alpha blending by making objects blend into water
+    let uw = compute_underwater_fade(input.world_pos.y, ambient);
+    var underwater_alpha = uw.alpha;
+    if (uw.deep_fade > 0.0) {
+        brightened = brightened * uw.color_mod;
         let deep_water_color = vec3<f32>(0.02, 0.12, 0.20) * ambient;
-        // More aggressive fade curve - objects become water color quickly
-        let color_fade = pow(underwater_fade, 0.6); // Power < 1 makes fade faster
-        brightened = mix(brightened, deep_water_color, color_fade);
+        brightened = mix(brightened, deep_water_color, uw.deep_fade);
     }
     
     // Add gradual alpha fading for smoother transitions
@@ -536,7 +554,7 @@ fn vs_mesh(
 @fragment
 fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     let reflectivity = input.material.r;
-    let sun_dir = normalize(uniforms.sun_direction_shadow_bias.xyz);
+    let sun_dir = uniforms.sun_direction_shadow_bias.xyz;
     let sun_diffuse = max(dot(input.normal, sun_dir), 0.0);
     let base_shadow = compute_shadow(input.light_space_pos, input.normal, sun_dir);
     let shadow_strength = uniforms.camera_shadow_strength.w;
@@ -555,28 +573,11 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     ambient = ambient * mix(vec3<f32>(1.0), vec3<f32>(back_scale), back_strength);
 
     // Moon light (no shadows yet)
-    let moon_dir = normalize(uniforms.moon_direction_intensity.xyz);
+    let moon_dir = uniforms.moon_direction_intensity.xyz;
     let moon_diffuse = max(dot(input.normal, moon_dir), 0.0);
     let moon_light = moon_diffuse * uniforms.moon_color_pad.xyz * uniforms.moon_direction_intensity.w * dir_light_attenuation;
     
-    // Sample light probes for indirect emissive lighting
-    var indirect_light = vec3<f32>(0.0, 0.0, 0.0);
-    for (var i = 0u; i < uniforms.light_probe_count; i++) {
-        let probe = light_probes[i];
-        let to_light = probe.position - input.world_pos;
-        let dist_sq = dot(to_light, to_light);
-        // Very localized lighting: cubic falloff for rapid distance dropoff
-        let dist = sqrt(dist_sq);
-        let attenuation = (probe.color_power.a * 0.01) / max(dist_sq * dist, 128.0);
-        
-        // Normalize the probe color to prevent oversaturated color bleeding
-        let probe_brightness = max(probe.color_power.r, max(probe.color_power.g, probe.color_power.b));
-        let normalized_color = probe.color_power.rgb / max(probe_brightness, 1.0);
-        
-        indirect_light += normalized_color * attenuation;
-    }
-    // Keep it subtle but visible for testing (increased from 0.03)
-    indirect_light = min(indirect_light, vec3<f32>(0.5, 0.5, 0.5));
+    let indirect_light = compute_light_probes(input.world_pos);
     
     var lighting = ambient + sun_contribution + moon_light + indirect_light;
     
@@ -604,17 +605,10 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
         color += reflection;
     }
     
-    // Fog color modulated by ambient and sky brightness (darker at night)
-    let base_fog_color = vec3<f32>(0.7, 0.8, 0.9);
-    let skybox_brightness = uniforms.fog_time_pad.w;
-    let fog_base = mix(vec3<f32>(0.02, 0.02, 0.03), uniforms.ambient_color_pad.xyz, skybox_brightness);
-    let fog_color = min(base_fog_color * fog_base, vec3<f32>(0.12, 0.12, 0.16));
-    let transmittance = exp(-uniforms.fog_time_pad.x * distance);
-    let fog_factor = (1.0 - transmittance) * sqrt(skybox_brightness);
-    // Add directional volumetric scattering from sun (towards sun only)
-    let sun_dir_local = normalize(uniforms.sun_direction_shadow_bias.xyz);
-    let sun_view_dot = max(dot(-ray_dir, -sun_dir_local), 0.0);
-    let inscatter = uniforms.sun_color_pad.xyz * 0.15 * fog_factor * sun_view_dot;
+    let fog = compute_fog(distance, ray_dir, sun_dir);
+    let fog_color = fog.fog_color;
+    let fog_factor = fog.fog_factor;
+    let inscatter = fog.inscatter;
     let fogged_color = mix(color, fog_color + inscatter, fog_factor);
     
     // Add emissive after fog so it stays bright
@@ -643,70 +637,20 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     let env_fade_factor = smoothstep(env_fade_start, env_dist, distance);
     
     if (env_fade_factor > 0.0) {
-        let chunk_coord = vec3<i32>(floor(input.world_pos / 16.0)) - camera.gi_grid_origin;
-        var env_lit: vec3<f32>;
-        if (all(chunk_coord >= vec3<i32>(0)) && all(chunk_coord < camera.gi_grid_dims)) {
-            let probe_color = textureLoad(gi_probe_color, chunk_coord, 0).rgb;
-            let relaxed_phi = textureLoad(gi_relaxed_phi, chunk_coord, 0).rgb;
-            let radiance = sample_radiance_int(chunk_coord, input.normal);
-            // Re-integrate sun/moon for envelopes
-            let total_lighting = sun_contribution + moon_light + (relaxed_phi + radiance * uniforms.gi_scale) + uniforms.ambient_color_pad.xyz * 0.1;
-
-            // Simplified distant reflection for envelopes
-            var reflection = vec3<f32>(0.0);
-            if (reflectivity > 0.001) {
-                let rdir = reflect(ray_dir, normalize(input.normal));
-                reflection = get_cheap_sky_color(rdir) * reflectivity;
-            }
-            
-            env_lit = probe_color * total_lighting + reflection;
-        } else {
-            // Fallback to average color + light
-            var reflection = vec3<f32>(0.0);
-            if (reflectivity > 0.001) {
-                let rdir = reflect(ray_dir, normalize(input.normal));
-                reflection = get_cheap_sky_color(rdir) * reflectivity;
-            }
-            env_lit = input.color.rgb * lighting + reflection;
-        }
+        let env_lit = compute_envelope_lit(
+            input.world_pos, input.normal, ray_dir, reflectivity,
+            sun_contribution, moon_light, input.color.rgb, lighting,
+        );
         let env_fogged = mix(env_lit, fog_color + inscatter, fog_factor);
-        
         brightened = mix(brightened, env_fogged, env_fade_factor);
     }
     
-    // Underwater depth fade: fade geometry based on depth below water surface
-    // Similar to distance fade, but based on y-coordinate depth from water_level (Y is up)
-    let water_level_mesh = uniforms.water_level;
-    let water_vis_mesh = uniforms.water_visibility;
-    let underwater_depth_mesh = water_level_mesh - input.world_pos.y;
-    var underwater_alpha_mesh = 1.0;
-    
-    // Only apply underwater fade if the geometry is actually underwater
-    if (underwater_depth_mesh > 0.0 && water_vis_mesh > 0.0) {
-        // Calculate fade factor: 0 at surface, 1 at max visibility depth
-        let underwater_fade_mesh = smoothstep(0.0, water_vis_mesh, underwater_depth_mesh);
-        
-        // Alpha fade using Beer-Lambert exponential decay (how light behaves in water)
-        // exp(-k*d) where k controls absorption rate, d is depth
-        // Very aggressive absorption to limit visibility depth
-        let absorption_coefficient_mesh = 12.0 / max(water_vis_mesh, 1.0);
-        underwater_alpha_mesh = exp(-absorption_coefficient_mesh * underwater_depth_mesh);
-        
-        // Force objects beyond half visibility to be nearly invisible
-        if (underwater_depth_mesh > water_vis_mesh * 0.5) {
-            underwater_alpha_mesh = underwater_alpha_mesh * 0.1;
-        }
-        
-        // Darken based on depth to simulate light absorption
-        let depth_darkness_mesh = exp(-3.5 * underwater_depth_mesh / max(water_vis_mesh, 1.0));
-        brightened = brightened * depth_darkness_mesh;
-        
-        // Fade to water color (deep water color) as objects get deeper
-        // This works even without alpha blending by making objects blend into water
+    let uw_mesh = compute_underwater_fade(input.world_pos.y, ambient);
+    var underwater_alpha_mesh = uw_mesh.alpha;
+    if (uw_mesh.deep_fade > 0.0) {
+        brightened = brightened * uw_mesh.color_mod;
         let deep_water_color_mesh = vec3<f32>(0.02, 0.12, 0.20) * ambient;
-        // More aggressive fade curve - objects become water color quickly
-        let color_fade_mesh = pow(underwater_fade_mesh, 0.6); // Power < 1 makes fade faster
-        brightened = mix(brightened, deep_water_color_mesh, color_fade_mesh);
+        brightened = mix(brightened, deep_water_color_mesh, uw_mesh.deep_fade);
     }
     
     // Add gradual alpha fading for smoother transitions

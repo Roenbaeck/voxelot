@@ -211,6 +211,14 @@ fn fbm(p: vec2<f32>, octaves: i32) -> f32 {
     return value;
 }
 
+// Unrolled 3-octave FBM — the compiler can statically schedule all instructions
+fn fbm3(p: vec2<f32>) -> f32 {
+    let v0 = 0.5  * noise2(p);
+    let v1 = 0.25 * noise2(p * 2.0);
+    let v2 = 0.125 * noise2(p * 4.0);
+    return v0 + v1 + v2;
+}
+
 // ============================================================================
 // WATER WAVE FUNCTIONS  
 // ============================================================================
@@ -285,8 +293,8 @@ fn get_shore_foam(depth_diff: f32, world_pos: vec3<f32>, time: f32) -> f32 {
     let foam_uv1 = pos * foam_scale + vec2<f32>(time * foam_speed, time * foam_speed * 0.7);
     let foam_uv2 = pos * foam_scale * 0.7 - vec2<f32>(time * foam_speed * 0.6, time * foam_speed * 0.4);
     
-    let foam_noise1 = fbm(foam_uv1, 3);
-    let foam_noise2 = fbm(foam_uv2, 3);
+    let foam_noise1 = fbm3(foam_uv1);
+    let foam_noise2 = fbm3(foam_uv2);
     let foam_pattern = (foam_noise1 + foam_noise2) * 0.5;
     
     // Lower cutoff threshold for more visible foam
@@ -297,12 +305,6 @@ fn get_shore_foam(depth_diff: f32, world_pos: vec3<f32>, time: f32) -> f32 {
     let edge_foam = smoothstep(0.5, 0.0, depth_diff) * 0.4;
     
     return max(foam * foam_mask, edge_foam);
-}
-
-// Surface foam for open water - disabled for smoother look
-fn get_surface_foam(world_pos: vec3<f32>, time: f32) -> f32 {
-    // Disabled - was creating too much noise on water surface
-    return 0.0;
 }
 
 // ============================================================================
@@ -789,12 +791,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // ========================================================================
     
     let shore_foam = get_shore_foam(depth_diff, hit_pos, time);
-    let surface_foam = get_surface_foam(hit_pos, time);
     var boat_wake = 0.0;
     if (water.boat_pos_wake.w > 0.0001) {
         boat_wake = get_boat_wake(hit_pos, time);
     }
-    let total_foam = clamp(shore_foam + surface_foam + boat_wake, 0.0, 1.0);
+    let total_foam = clamp(shore_foam + boat_wake, 0.0, 1.0);
     
     // Foam color darkens with scene brightness
     let foam_color = vec3<f32>(0.9, 0.92, 0.95) * brightness;
@@ -827,8 +828,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let fog_factor = min(1.0 - transmittance, 0.6);
     
     // Add directional volumetric scattering from sun (towards sun only)
-    let sun_dir_local = normalize(camera.sun_direction_shadow_bias.xyz);
-    let sun_view_dot = max(dot(-world_dir, -sun_dir_local), 0.0);
+    // Reuse the sun_dir already computed at line 776 (same vector)
+    let sun_view_dot = max(dot(-world_dir, -sun_dir), 0.0);
     let inscatter = camera.sun_color_pad.xyz * 0.15 * fog_factor * sun_view_dot;
     
     final_color = mix(final_color, fog_color + inscatter, fog_factor);

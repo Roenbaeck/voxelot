@@ -265,6 +265,13 @@ fn fs_main(@location(0) uv: vec2<f32>, @builtin(position) frag_pos: vec4<f32>) -
     let step_ratio = pow(screen_radius, 1.0 / sample_count);
     let hit_thickness_sq = ssao.hit_thickness * ssao.hit_thickness;
 
+    // Pre-compute the 4 inverse-projection elements needed for depth linearisation.
+    // When x,y are zero only column 2 and 3 matter: z_out = ip22*d + ip32, w_out = ip23*d + ip33.
+    let ip22 = ssao.inverse_projection[2][2];
+    let ip32 = ssao.inverse_projection[3][2];
+    let ip23 = ssao.inverse_projection[2][3];
+    let ip33 = ssao.inverse_projection[3][3];
+
     for (var slice = 0u; slice < ssao.slice_count; slice = slice + 1u) {
         let phi = (2.0 * PI / slice_count) * (f32(slice) + noise);
         let slice_dir = vec2<f32>(cos(phi), sin(phi));
@@ -313,8 +320,10 @@ fn fs_main(@location(0) uv: vec2<f32>, @builtin(position) frag_pos: vec4<f32>) -
                 // Reconstruct linear depth from depth buffer
                 let sample_raw_depth = load_depth_at_uv(sample_uv);
                 if (sample_raw_depth >= 1.0) { continue; }
-                let sample_view_z_reconst = ssao.inverse_projection * vec4<f32>(0.0, 0.0, sample_raw_depth, 1.0);
-                let sample_linear_depth = -(sample_view_z_reconst.z / sample_view_z_reconst.w);
+                // Linearise depth with 2 MAD ops instead of a full matrix multiply
+                let lin_z_num = ip22 * sample_raw_depth + ip32;
+                let lin_w     = ip23 * sample_raw_depth + ip33;
+                let sample_linear_depth = -(lin_z_num / lin_w);
 
                 if (sample_linear_depth <= 0.0) { continue; }
 

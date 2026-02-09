@@ -99,11 +99,12 @@ fn fs_main(in: VertexOutput) -> FragmentOutput {
     let dir = normalize(in.rotated_dir);
     
     // Convert direction to equirectangular UV
-    // atan2(z, x) gives angle in [-PI, PI]. We want [0, 1].
-    // acos(y) gives angle in [0, PI]. We want [0, 1].
+    // Pre-computed reciprocals avoid per-fragment divisions
+    let INV_TWO_PI = 0.15915494;  // 1.0 / (2.0 * PI)
+    let INV_PI     = 0.31830989;  // 1.0 / PI
     
-    let u = 0.5 + atan2(dir.z, dir.x) / (2.0 * 3.14159265);
-    let v = 0.5 - asin(dir.y) / 3.14159265; // y is up
+    let u = 0.5 + atan2(dir.z, dir.x) * INV_TWO_PI;
+    let v = 0.5 - asin(dir.y) * INV_PI; // y is up
     
     let color = textureSample(skybox_texture, skybox_sampler, vec2<f32>(u, v));
     

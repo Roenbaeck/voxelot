@@ -173,7 +173,8 @@ fn trace_local_ssr(start_pos: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
                     let mid_ndc = mid_clip.xyz / mid_clip.w;
                     let mid_uv = vec2<f32>(mid_ndc.x * 0.5 + 0.5, 0.5 - mid_ndc.y * 0.5);
                     let mid_d = textureLoad(scene_depth, vec2<i32>(mid_uv * fdim), 0);
-                    if (distance(camera.camera_pos, mid) > distance(camera.camera_pos, reconstruct_world_pos(mid_uv, mid_d)) + 0.05) {
+                    // Compare in NDC depth space to avoid an extra reconstruct_world_pos
+                    if (mid_ndc.z > mid_d + 0.0001) {
                         refine_pos = mid;
                     } else {
                         prev_pos = mid;
@@ -292,6 +293,9 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
     let world_grid_origin = vec3<f32>(camera.gi_grid_origin) * 16.0;
     let sun_dir = normalize(camera.sun_direction_intensity.xyz);
     let brightness = camera.skybox_brightness;
+    // Hoist textureDimensions once for the whole function
+    let depth_dim = textureDimensions(scene_depth);
+    let fdepth_dim = vec2<f32>(depth_dim);
 
     // Water plane intersection
     var t_water = -1.0;
@@ -413,8 +417,7 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                             let ndc = clip_pos.xyz / clip_pos.w;
                             if (abs(ndc.x) < 1.0 && abs(ndc.y) < 1.0) {
                                 let screen_uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-                                let dim = textureDimensions(scene_depth);
-                                let px = vec2<i32>(screen_uv * vec2<f32>(dim));
+                                let px = vec2<i32>(screen_uv * fdepth_dim);
                                 let d_buf = textureLoad(scene_depth, px, 0);
                                 // Skip background or invalid depth
                                 if (d_buf < 0.999999) {
@@ -445,7 +448,7 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                         }
 
                         // Decide whether to accept a coarse AABB/probe hit, or skip it and continue DDA.
-                        let dim_for_disprove = textureDimensions(scene_depth);
+                        let dim_for_disprove = depth_dim;
                         var screen_disproved = false;
                         var is_on_screen = false;
 
@@ -456,7 +459,7 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                                 if (abs(ndc.x) < 0.99 && abs(ndc.y) < 0.99) {
                                     is_on_screen = true;
                                     let screen_uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-                                    let px = vec2<i32>(screen_uv * vec2<f32>(dim_for_disprove));
+                                    let px = vec2<i32>(screen_uv * fdepth_dim);
                                     let d_raw = textureLoad(scene_depth, px, 0);
                                     
                                     // DISPROVE: If the depth buffer shows something clearly behind our hit,
