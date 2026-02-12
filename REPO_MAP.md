@@ -24,25 +24,45 @@ Path | Type | Description | Notes
 `KNOWN_BUGS.md` | doc | Tracked issues and regressions.
 `TODO.md` | doc | Roadmap and feature ideas for contributors.
 
-Top-level data & demo
+### Top-level data & demo
+
+Path | Type | Description | Notes
+---|---|---|---
 `demo/` | dir | Files packaged with the demo build (config, README). | `demo/config.toml` tuned for the distributed package.
 `demo/config.toml` | file | Tuned demo config (references `worlds/flat_city_test.vhc`, `worlds/palette.txt`, `worlds/skybox.hdr`). |
 `demo/README.md` | file | Instructions for running the demo package. |
+`demo/RELEASE_SIGNING.md` | doc | Release signing documentation and procedures. |
 `worlds/` | dir | Pre-generated demo and test worlds and metadata. | `.vhc` compressed chunk format, `.toml` world configs.
 `worlds/flat_city_test.vhc` | data | Demo world (leaf-equivalent voxel count: ~32,691,321). | Used by `demo/config.toml` and tests.
 `worlds/flat_city_test.toml` | file | World-specific config (camera, palette path) used in examples. |
+`worlds/flat_city_test_meta.json` | data | Metadata for flat_city_test world. |
+`worlds/large_world_test.vhc` | data | Large test world data file. |
+`worlds/large_world_test.toml` | file | Configuration for large world test. |
+`worlds/large_world_test_meta.json` | data | Metadata for large_world_test world. |
+`worlds/water_level_test.vhc` | data | Water level test world data file. |
+`worlds/water_level_test.toml` | file | Configuration for water level test. |
+`worlds/water_level_test_meta.json` | data | Metadata for water_level_test world. |
 `worlds/palette.txt` | data | Palette mapping voxel indices to color/emit properties (required by viewer). |
 `worlds/skybox.hdr` | data | HDR environment map used for the demo skybox (optional but packaged). |
 
-CI & Release
+### CI & Release
+
+Path | Type | Description | Notes
+---|---|---|---
 `.github/workflows/build-demo.yml` | CI | Builds `voxelot` across OS matrix, packages demo zips, uploads artifacts, and publishes releases. | Uses `actions/cache`, cross-platform zipping fallbacks and `softprops/action-gh-release@v2`.
 `.github/copilot-instructions.md` | doc | Short agent guidance — use `REPO_MAP.md` for the canonical path map. |
 
-Scripts & automation
+### Scripts & automation
+
+Path | Type | Description | Notes
+---|---|---|---
 `scripts/package-demo.sh` | script | Cross-platform packaging of demo binary and assets into a zip (zip / PowerShell / 7z / Python fallback). | Ensures `worlds/` and demo `config.toml` included; sets executable bit where appropriate.
 `scripts/delete_oct_files.sh` | script | Utility that deletes legacy `.oct` files (legacy compatibility helper). |
 
-Core library (src/)
+### Core library (src/)
+
+Path | Type | Description | Notes
+---|---|---|---
 `src/lib.rs` | file | Library entry point; re-exports major types and modules. |
 `src/lib_hierarchical.rs` | core | Hierarchical chunk world implementation — "chunks all the way" model. | Chunk size fixed at 16; uses Roaring bitmaps for presence and rank indexing.
 `src/file_format.rs` | core | `.vhc` load/save (zstd compressed). | Mirrors Chunk layout: positions, type/child encoding, recursion.
@@ -51,12 +71,16 @@ Core library (src/)
 `src/buffer_allocator.rs` | core | Slab allocator (SlabAllocator) for large GPU buffers (VB/IB pools). |
 `src/config.rs` | core | Serde-config structures and defaults for runtime settings. | Adds world.skybox and many effect toggles; used by viewer.
 `src/palette.rs` | core | Palette parsing and material properties (albedo & emissive). |
+`src/raycast.rs` | core | Raycasting and hit detection functionality. |
 `src/gi.rs` | core | Global illumination probe system (GiProbe, async updates). | Background probe calculation and caching.
 `src/input.rs` | core | Input mapping and debug/config setting helpers. |
 `src/pawn.rs` | core | Pawn types (BoatPawn) and player/vessel logic. |
 `src/profiling.rs` | core | Small profiling helpers and scope markers for overlays. |
 
-Binaries & tools (src/bin)
+### Binaries & tools (src/bin)
+
+Path | Type | Description | Notes
+---|---|---|---
 `src/bin/voxelot.rs` | binary | Main desktop viewer. | Loads config, world, shaders at runtime; runtime WGSL compilation via `wgpu`.
 `src/bin/generate_world.rs` | binary | High-performance world generator (writes `.vhc`). | Many flags to control terrain and tile size.
 `src/bin/generate_test_world.rs` | tool | Small generator used for tests/demos. |
@@ -73,7 +97,10 @@ Binaries & tools (src/bin)
 `src/bin/test_render_coords.rs` | tool | Debug helper for coordinate mapping in render code. |
 `src/bin/compress_worlds.rs` | tool | Utility to recompress or batch-compress `.vhc` files. |
 
-Shaders (shaders/)
+### Shaders (shaders/)
+
+Path | Type | Description | Notes
+---|---|---|---
 `shaders/` | dir | WGSL shaders embedded and compiled at runtime by `wgpu`. |
 `shaders/bloom_extract.wgsl` | file | Bloom extraction pass. |
 `shaders/dof_coc_copy.wgsl` | file | Depth-of-field circle-of-confusion copy pass. |
@@ -84,6 +111,7 @@ Shaders (shaders/)
 `shaders/gpu_cull.wgsl` | file | GPU culling and visibility. |
 `shaders/hzb_gen.wgsl` | file | Hierarchical Z-buffer generation. |
 `shaders/impostor.wgsl` | file | Impostor rendering. |
+`shaders/palette_ui.wgsl` | file | Palette UI rendering shader. |
 `shaders/post_composite.wgsl` | file | Post-processing composite pass. |
 `shaders/radiance_cascades.wgsl` | file | Radiance cascade lighting. |
 `shaders/skybox.wgsl` | file | Skybox shader implementing HDR sampling/compositing. |
@@ -96,11 +124,14 @@ Shaders (shaders/)
 `shaders/wts_inject.wgsl` | file | WTS sunlight injection. |
 `shaders/wts_relax.wgsl` | file | WTS relaxation/diffusion. |
 
-Other files of interest
-`demo/config.toml` | file | Tuned demo configuration (camera, rendering, world/palette paths). |
-`shaders/skybox.wgsl` | file | Skybox shader implementing HDR sampling and compositing. |
-`worlds/*.toml` | files | Per-world config templates (camera, palette, spawn mode). |
-`.github/*` | dir | CI and workflow rules; see `build-demo.yml` for demo packaging. |
+### Other files of interest
+
+Path | Type | Description | Notes
+---|---|---|---
+`config.toml` | file | Top-level runtime configuration file. |
+`voxelot.mp4` | media | Demo video showing the voxelot viewer in action. |
+`demo-with-skybox.zip` | archive | Pre-packaged demo with skybox included. |
+`AGENTS.md` | doc | Documentation for agent-based workflows and tooling. |
 
 Maintenance notes
 -----------------
