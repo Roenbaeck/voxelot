@@ -156,12 +156,24 @@ fn get_voxel_color(voxel_type: u32) -> vec3<f32> {
 // Optimized radiance sampling for fallback bounding boxes
 fn sample_radiance_int(pos: vec3<i32>, dir: vec3<f32>) -> vec3<f32> {
     let w = dir * dir;
-    let color_x = select(textureLoad(gi_probe_nx, pos, 0).rgb,
-                         textureLoad(gi_probe_px, pos, 0).rgb, dir.x > 0.0);
-    let color_y = select(textureLoad(gi_probe_ny, pos, 0).rgb,
-                         textureLoad(gi_probe_py, pos, 0).rgb, dir.y > 0.0);
-    let color_z = select(textureLoad(gi_probe_nz, pos, 0).rgb,
-                         textureLoad(gi_probe_pz, pos, 0).rgb, dir.z > 0.0);
+    var color_x: vec3<f32>;
+    var color_y: vec3<f32>;
+    var color_z: vec3<f32>;
+    if (dir.x > 0.0) {
+        color_x = textureLoad(gi_probe_px, pos, 0).rgb;
+    } else {
+        color_x = textureLoad(gi_probe_nx, pos, 0).rgb;
+    }
+    if (dir.y > 0.0) {
+        color_y = textureLoad(gi_probe_py, pos, 0).rgb;
+    } else {
+        color_y = textureLoad(gi_probe_ny, pos, 0).rgb;
+    }
+    if (dir.z > 0.0) {
+        color_z = textureLoad(gi_probe_pz, pos, 0).rgb;
+    } else {
+        color_z = textureLoad(gi_probe_nz, pos, 0).rgb;
+    }
     return (color_x * w.x + color_y * w.y + color_z * w.z) * uniforms.gi_scale;
 }
 

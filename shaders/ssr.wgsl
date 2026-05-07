@@ -196,28 +196,52 @@ fn trace_local_ssr(start_pos: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
     return vec4<f32>(0.0, 0.0, 0.0, 0.0);
 }
 
-// Optimized radiance: 3 samples with branchless selection (Integer/Discrete version)
+// Optimized radiance: one directional-probe sample per axis (integer/discrete version)
 fn sample_radiance_int(pos: vec3<i32>, dir: vec3<f32>) -> vec3<f32> {
     let w = dir * dir;
-    let color_x = select(textureLoad(gi_probe_nx, pos, 0).rgb,
-                         textureLoad(gi_probe_px, pos, 0).rgb, dir.x > 0.0);
-    let color_y = select(textureLoad(gi_probe_ny, pos, 0).rgb,
-                         textureLoad(gi_probe_py, pos, 0).rgb, dir.y > 0.0);
-    let color_z = select(textureLoad(gi_probe_nz, pos, 0).rgb,
-                         textureLoad(gi_probe_pz, pos, 0).rgb, dir.z > 0.0);
+    var color_x: vec3<f32>;
+    var color_y: vec3<f32>;
+    var color_z: vec3<f32>;
+    if (dir.x > 0.0) {
+        color_x = textureLoad(gi_probe_px, pos, 0).rgb;
+    } else {
+        color_x = textureLoad(gi_probe_nx, pos, 0).rgb;
+    }
+    if (dir.y > 0.0) {
+        color_y = textureLoad(gi_probe_py, pos, 0).rgb;
+    } else {
+        color_y = textureLoad(gi_probe_ny, pos, 0).rgb;
+    }
+    if (dir.z > 0.0) {
+        color_z = textureLoad(gi_probe_pz, pos, 0).rgb;
+    } else {
+        color_z = textureLoad(gi_probe_nz, pos, 0).rgb;
+    }
     let relaxed = textureLoad(gi_relaxed_phi, pos, 0).rgb;
     return (color_x * w.x + color_y * w.y + color_z * w.z) * params.gi_scale + relaxed * 0.5;
 }
 
-// Optimized radiance: 3 samples with branchless selection
+// Optimized radiance: one trilinear directional-probe sample per axis
 fn sample_radiance(uvw: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     let w = dir * dir;
-    let color_x = select(textureSampleLevel(gi_probe_nx, linear_sampler, uvw, 0.0).rgb,
-                         textureSampleLevel(gi_probe_px, linear_sampler, uvw, 0.0).rgb, dir.x > 0.0);
-    let color_y = select(textureSampleLevel(gi_probe_ny, linear_sampler, uvw, 0.0).rgb,
-                         textureSampleLevel(gi_probe_py, linear_sampler, uvw, 0.0).rgb, dir.y > 0.0);
-    let color_z = select(textureSampleLevel(gi_probe_nz, linear_sampler, uvw, 0.0).rgb,
-                         textureSampleLevel(gi_probe_pz, linear_sampler, uvw, 0.0).rgb, dir.z > 0.0);
+    var color_x: vec3<f32>;
+    var color_y: vec3<f32>;
+    var color_z: vec3<f32>;
+    if (dir.x > 0.0) {
+        color_x = textureSampleLevel(gi_probe_px, linear_sampler, uvw, 0.0).rgb;
+    } else {
+        color_x = textureSampleLevel(gi_probe_nx, linear_sampler, uvw, 0.0).rgb;
+    }
+    if (dir.y > 0.0) {
+        color_y = textureSampleLevel(gi_probe_py, linear_sampler, uvw, 0.0).rgb;
+    } else {
+        color_y = textureSampleLevel(gi_probe_ny, linear_sampler, uvw, 0.0).rgb;
+    }
+    if (dir.z > 0.0) {
+        color_z = textureSampleLevel(gi_probe_pz, linear_sampler, uvw, 0.0).rgb;
+    } else {
+        color_z = textureSampleLevel(gi_probe_nz, linear_sampler, uvw, 0.0).rgb;
+    }
     let relaxed = textureSampleLevel(gi_relaxed_phi, linear_sampler, uvw, 0.0).rgb;
     return (color_x * w.x + color_y * w.y + color_z * w.z) * params.gi_scale + relaxed * 0.5;
 }
@@ -674,4 +698,3 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
     return vec4<f32>(out_color, reflectivity_faded);
 }
-

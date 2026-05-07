@@ -5969,9 +5969,9 @@ impl App {
         if let Some(device) = self.device.as_ref() {
             let hzb_bytes: u64;
             let hzb_mips: u32;
-            let mut hzb_texture_opt: Option<wgpu::Texture> = None;
-            let mut hzb_view_opt: Option<wgpu::TextureView> = None;
-            let mut hzb_mip_views_local: Vec<wgpu::TextureView> = Vec::new();
+            let hzb_texture_opt: Option<wgpu::Texture>;
+            let hzb_view_opt: Option<wgpu::TextureView>;
+            let hzb_mip_views_local: Vec<wgpu::TextureView>;
 
             if self.hzb_enabled || self.hzb_debug {
                 let target_width = self.render_target_width.max(1);
@@ -6046,7 +6046,7 @@ impl App {
                     view_formats: &[],
                 });
                 let view_main = tex_main.create_view(&wgpu::TextureViewDescriptor::default());
-                hzb_mip_views_local.push(view_main.clone());
+                hzb_mip_views_local = vec![view_main.clone()];
                 hzb_texture_opt = Some(tex_main);
                 hzb_view_opt = Some(view_main);
                 hzb_mips = 1;
@@ -11737,13 +11737,11 @@ impl App {
 
             // Depth cull like in render loop: hide geometry fully below water
             let min_visible_y = self.water_level - self.water_visibility;
-            let visible: Vec<_> = all_visible
-                .into_iter()
-                .filter(|v| {
-                    let max_y = v.position[1] as f32 + v.scale[1];
-                    max_y >= min_visible_y
-                })
-                .collect();
+            let mut visible = all_visible;
+            visible.retain(|v| {
+                let max_y = v.position[1] as f32 + v.scale[1];
+                max_y >= min_visible_y
+            });
 
             // Seed the pending meshing queue with visible leaf chunks
             if self.mesh_worker_count > 0 {
@@ -11753,10 +11751,9 @@ impl App {
                         continue;
                     }
                     let key = (v.position[0], v.position[1], v.position[2]);
-                    if seen.contains(&key) {
+                    if !seen.insert(key) {
                         continue;
                     }
-                    seen.insert(key);
 
                     // Skip if we already have meshes; queue only missing ones
                     let has_standard = self.mesh_cache.contains_key(&key);
@@ -12593,14 +12590,12 @@ impl App {
         // Y is the up axis in this engine
         let min_visible_y = self.water_level - self.water_visibility;
         let pre_depth_cull_count = all_visible.len();
-        let visible: Vec<_> = all_visible
-            .into_iter()
-            .filter(|v| {
-                // The position is the min corner; scale[1] is the Y dimension size
-                let max_y = v.position[1] as f32 + v.scale[1];
-                max_y >= min_visible_y
-            })
-            .collect();
+        let mut visible = all_visible;
+        visible.retain(|v| {
+            // The position is the min corner; scale[1] is the Y dimension size
+            let max_y = v.position[1] as f32 + v.scale[1];
+            max_y >= min_visible_y
+        });
         let _depth_culled_count = pre_depth_cull_count - visible.len();
 
         let mut _voxel_expansion_count = 0;
@@ -13525,7 +13520,7 @@ impl App {
                     continue;
                 }
 
-                if !self.pending_chunk_set.contains(&key) {
+                if self.pending_chunk_set.insert(key) {
                     // Prioritize meshing for chunks that are within the LOD distance of the camera
                     // Use squared LOD distance for speed
                     let lod_sq = self.lod_distance * self.lod_distance;
@@ -13536,7 +13531,6 @@ impl App {
                         // push to back as normal for background meshing
                         self.pending_chunk_meshes.push_back(key);
                     }
-                    self.pending_chunk_set.insert(key);
                 }
             }
         }
@@ -13751,7 +13745,7 @@ impl App {
         }
         // Detailed timing for mesh upload parts: vertex buffer creation, index buffer creation and cache insertion.
         let mut mesh_upload_vbuf_time = std::time::Duration::ZERO;
-        let mut mesh_upload_ibuf_time = std::time::Duration::ZERO;
+        let mesh_upload_ibuf_time = std::time::Duration::ZERO;
         let mut mesh_upload_entry_time = std::time::Duration::ZERO;
         let mut mesh_build_vb_time = std::time::Duration::ZERO;
         let mut mesh_emitters_proc_time = std::time::Duration::ZERO;
@@ -13975,9 +13969,6 @@ impl App {
             let (vertex_offset, index_offset) =
                 alloc.expect("allocate_mesh_in_megabuffer should succeed after eviction loop");
             mesh_upload_vbuf_time += vbuf_start.elapsed();
-            let ibuf_start = std::time::Instant::now();
-            mesh_upload_ibuf_time += ibuf_start.elapsed();
-            mesh_upload_ibuf_time += ibuf_start.elapsed();
             let vertex_bytes = (vb_local.len() * std::mem::size_of::<MeshVertexRaw>()) as u64;
             let index_bytes = (mesh.indices.len() * std::mem::size_of::<u32>()) as u64;
             viewer_debug!(
@@ -14065,15 +14056,7 @@ impl App {
         // Convert remaining instances (exclude those belonging to meshed chunks)
         let instance_start = Instant::now();
 
-        let mut draw_mesh_keys = FxHashSet::default();
-        for v in &visible {
-            if v.is_leaf_chunk {
-                let key = (v.position[0], v.position[1], v.position[2]);
-                if cpu_mesh_keys.contains(&key) {
-                    draw_mesh_keys.insert(key);
-                }
-            }
-        }
+        let meshed_chunk_count = cpu_mesh_keys.len();
         // `instances` was previously a per-frame temporary; we intentionally
         // reuse `cpu_prepopulated_instances` instead (already cleared earlier)
         // so there's no need for a separate `instances` Vec here.
@@ -14082,7 +14065,7 @@ impl App {
 
         self.active_emitters.clear();
         let mut draw_calls: usize = 0;
-        for key in &draw_mesh_keys {
+        for key in &cpu_mesh_keys {
             if let Some(emitters) = self.chunk_emitters.get(key) {
                 self.active_emitters
                     .extend(emitters.iter().map(|emitter| ActiveLight {
@@ -14111,7 +14094,7 @@ impl App {
             viewer_debug!(
                 "GPU cull: candidates {} -> draw meshes {} -> instanced {}",
                 gpu_candidate_count,
-                draw_mesh_keys.len(),
+                meshed_chunk_count,
                 self.cpu_prepopulated_instances.len()
             );
         }
@@ -16127,7 +16110,7 @@ impl App {
                     avg_fps,
                     total_visible,
                     leaf_chunks.len(),
-                    draw_mesh_keys.len(),
+                    meshed_chunk_count,
                     self.pending_chunk_meshes.len(),
                     pending_set_count,
                     ready_count,
@@ -16190,7 +16173,7 @@ impl App {
             // Update UI overlay stats
             self.visible_count = total_visible;
             self.leaf_chunk_count = leaf_chunks.len();
-            self.meshed_chunk_count = draw_mesh_keys.len();
+            self.meshed_chunk_count = meshed_chunk_count;
             self.pending_mesh_count = self.pending_chunk_meshes.len();
             self.pending_mesh_set_count = pending_set_count;
             self.ready_mesh_count = ready_count;

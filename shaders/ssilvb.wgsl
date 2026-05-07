@@ -153,21 +153,24 @@ fn sample_grid_irradiance(world_pos: vec3<f32>, normal: vec3<f32>, camera_pos: v
     let w_y = normal.y * normal.y;
     let w_z = normal.z * normal.z;
 
-    let ir_x = select(
-        textureSample(gi_probe_nx, post_sampler, uvw).rgb,
-        textureSample(gi_probe_px, post_sampler, uvw).rgb,
-        normal.x > 0.0
-    );
-    let ir_y = select(
-        textureSample(gi_probe_ny, post_sampler, uvw).rgb,
-        textureSample(gi_probe_py, post_sampler, uvw).rgb,
-        normal.y > 0.0
-    );
-    let ir_z = select(
-        textureSample(gi_probe_nz, post_sampler, uvw).rgb,
-        textureSample(gi_probe_pz, post_sampler, uvw).rgb,
-        normal.z > 0.0
-    );
+    var ir_x: vec3<f32>;
+    var ir_y: vec3<f32>;
+    var ir_z: vec3<f32>;
+    if (normal.x > 0.0) {
+        ir_x = textureSample(gi_probe_px, post_sampler, uvw).rgb;
+    } else {
+        ir_x = textureSample(gi_probe_nx, post_sampler, uvw).rgb;
+    }
+    if (normal.y > 0.0) {
+        ir_y = textureSample(gi_probe_py, post_sampler, uvw).rgb;
+    } else {
+        ir_y = textureSample(gi_probe_ny, post_sampler, uvw).rgb;
+    }
+    if (normal.z > 0.0) {
+        ir_z = textureSample(gi_probe_pz, post_sampler, uvw).rgb;
+    } else {
+        ir_z = textureSample(gi_probe_nz, post_sampler, uvw).rgb;
+    }
 
     // Blend WTS with directional probes for local detail if available
     let directional_irradiance = ir_x * w_x + ir_y * w_y + ir_z * w_z;
