@@ -253,7 +253,7 @@ impl GiSystem {
         let mut probes_calculated = 0;
         let mut updates: Vec<GiProbeUpdate> = Vec::new();
         if !self.missing_probes.is_empty() {
-            // Process a batch of probes per update. 
+            // Process a batch of probes per update.
             // 256 probes at 16,384 probes per grid means the whole grid can be refreshed in 64 updates.
             // Since this runs on a background thread pool, it won't stall the main loop.
             let probes_to_process: Vec<IVec3> =

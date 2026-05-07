@@ -28,7 +28,11 @@ fn main() {
     println!("Expected X: {}", world_x as f32 + 15.0);
 
     if (x - (world_x as f32 + 15.0)).abs() > 0.001 {
-        println!("FAIL: Coordinate calculation is wrong! ({} vs {})", x, world_x as f32 + 15.0);
+        println!(
+            "FAIL: Coordinate calculation is wrong! ({} vs {})",
+            x,
+            world_x as f32 + 15.0
+        );
     } else {
         println!("PASS: Coordinate calculation is correct.");
     }

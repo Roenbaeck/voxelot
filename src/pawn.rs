@@ -1,7 +1,5 @@
 use crate::{Camera, World, WorldPos};
 
-
-
 /// Object-safe pawn trait for simple player-controlled entities
 use winit::keyboard::KeyCode;
 
@@ -37,7 +35,8 @@ pub trait Pawn {
     /// This exists so we can do visual-only effects (like wave bobbing) without
     /// changing collision/physics.
     fn debug_mesh_transform(&self) -> Option<([f32; 3], f32, f32, f32)> {
-        self.debug_mesh_pose().map(|(pos, yaw)| (pos, yaw, 0.0, 0.0))
+        self.debug_mesh_pose()
+            .map(|(pos, yaw)| (pos, yaw, 0.0, 0.0))
     }
 
     /// Optional: parameters for water interaction (wake/foam).
@@ -47,7 +46,7 @@ pub trait Pawn {
     }
 
     /// Optional: provide a simple debug visualization as a colored box: (pos, scale, color)
-    fn debug_viz(&self) -> Option<([f32;3],[f32;3],[f32;4])> {
+    fn debug_viz(&self) -> Option<([f32; 3], [f32; 3], [f32; 4])> {
         None
     }
 }
@@ -118,8 +117,16 @@ impl BoatPawn {
     }
 
     fn aabb_for_pos(&self, pos: [f32; 3]) -> ([f32; 3], [f32; 3]) {
-        let min = [pos[0] - self.hull_half[0], pos[1] - self.hull_half[1], pos[2] - self.hull_half[2]];
-        let max = [pos[0] + self.hull_half[0], pos[1] + self.hull_half[1], pos[2] + self.hull_half[2]];
+        let min = [
+            pos[0] - self.hull_half[0],
+            pos[1] - self.hull_half[1],
+            pos[2] - self.hull_half[2],
+        ];
+        let max = [
+            pos[0] + self.hull_half[0],
+            pos[1] + self.hull_half[1],
+            pos[2] + self.hull_half[2],
+        ];
         (min, max)
     }
 
@@ -157,18 +164,15 @@ impl BoatPawn {
         let p = [x, z];
 
         let w1_dir = [1.0, 0.3];
-        let w1 = (p[0] * w1_dir[0] + p[1] * w1_dir[1]) * (wave_scale)
-            + t * wave_speed;
+        let w1 = (p[0] * w1_dir[0] + p[1] * w1_dir[1]) * (wave_scale) + t * wave_speed;
         let w1_amp = wave_strength * 0.35;
 
         let w2_dir = [0.7, 0.7];
-        let w2 = (p[0] * w2_dir[0] + p[1] * w2_dir[1]) * (wave_scale * 1.8)
-            + t * wave_speed * 1.1;
+        let w2 = (p[0] * w2_dir[0] + p[1] * w2_dir[1]) * (wave_scale * 1.8) + t * wave_speed * 1.1;
         let w2_amp = wave_strength * 0.22;
 
         let w3_dir = [-0.4, 0.9];
-        let w3 = (p[0] * w3_dir[0] + p[1] * w3_dir[1]) * (wave_scale * 3.2)
-            + t * wave_speed * 0.9;
+        let w3 = (p[0] * w3_dir[0] + p[1] * w3_dir[1]) * (wave_scale * 3.2) + t * wave_speed * 0.9;
         let w3_amp = wave_strength * 0.12;
 
         // Height field = sum of sines.
@@ -253,7 +257,11 @@ impl Pawn for BoatPawn {
         self.vel[2] *= 0.995f32.powf(dt * 60.0);
 
         // Predict motion and sweep-check
-        let candidate = [self.pos[0] + self.vel[0] * dt, self.pos[1], self.pos[2] + self.vel[2] * dt];
+        let candidate = [
+            self.pos[0] + self.vel[0] * dt,
+            self.pos[1],
+            self.pos[2] + self.vel[2] * dt,
+        ];
 
         // Keep at water level (simple buoyancy)
         let mut candidate = candidate;
@@ -326,13 +334,19 @@ impl Pawn for BoatPawn {
         }
 
         // Look slightly above the boat origin
-        let look = [self.pos[0], (self.pos[1] + self.visual_bob) + 0.9, self.pos[2]];
+        let look = [
+            self.pos[0],
+            (self.pos[1] + self.visual_bob) + 0.9,
+            self.pos[2],
+        ];
         let mut fwd = [
             look[0] - self.cam_pos[0],
             look[1] - self.cam_pos[1],
             look[2] - self.cam_pos[2],
         ];
-        let len = (fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2]).sqrt().max(1e-6);
+        let len = (fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2])
+            .sqrt()
+            .max(1e-6);
         fwd[0] /= len;
         fwd[1] /= len;
         fwd[2] /= len;
@@ -369,10 +383,14 @@ impl Pawn for BoatPawn {
         Some((self.pos, forward, speed))
     }
 
-    fn debug_viz(&self) -> Option<([f32;3],[f32;3],[f32;4])> {
+    fn debug_viz(&self) -> Option<([f32; 3], [f32; 3], [f32; 4])> {
         Some((
             self.pos,
-            [self.hull_half[0] * 2.0, self.hull_half[1] * 2.0, self.hull_half[2] * 2.0],
+            [
+                self.hull_half[0] * 2.0,
+                self.hull_half[1] * 2.0,
+                self.hull_half[2] * 2.0,
+            ],
             [0.8, 0.25, 0.1, 1.0],
         ))
     }
@@ -402,6 +420,11 @@ pub struct WalkerPawn {
     cam_pos: [f32; 3],
     cam_initialized: bool,
     last_dt: f32,
+
+    // Animation state
+    anim_time: f32,
+    limb_swing: f32,
+    jump_factor: f32, // 0 = ground, 1 = peak jump / air
 }
 
 impl WalkerPawn {
@@ -436,6 +459,9 @@ impl WalkerPawn {
             cam_pos: p,
             cam_initialized: false,
             last_dt: 1.0 / 60.0,
+            anim_time: 0.0,
+            limb_swing: 0.0,
+            jump_factor: 0.0,
         }
     }
 
@@ -509,9 +535,10 @@ impl Pawn for WalkerPawn {
         let sensitivity = 0.002;
         self.yaw += delta_x as f32 * sensitivity;
         self.pitch -= delta_y as f32 * sensitivity;
-        self.pitch = self
-            .pitch
-            .clamp(-std::f32::consts::FRAC_PI_2 + 0.15, std::f32::consts::FRAC_PI_2 - 0.15);
+        self.pitch = self.pitch.clamp(
+            -std::f32::consts::FRAC_PI_2 + 0.15,
+            std::f32::consts::FRAC_PI_2 - 0.15,
+        );
     }
 
     fn update(&mut self, dt: f32, world: &World, _water_level: f32) {
@@ -591,6 +618,21 @@ impl Pawn for WalkerPawn {
 
         self.pos = pos;
         self.on_ground = on_ground;
+
+        // Update animation
+        let horizontal_speed = (self.vel[0] * self.vel[0] + self.vel[2] * self.vel[2]).sqrt();
+        if horizontal_speed > 0.1 && self.on_ground {
+            self.anim_time += dt * horizontal_speed * 2.0;
+            self.limb_swing = self.anim_time.sin() * 0.45; // Max 25 degree swing
+        } else {
+            // Smoothly return limbs to neutral if stopped or in air
+            self.limb_swing *= 0.85f32.powf(dt * 60.0);
+        }
+
+        // Jump factor for posing: 1.0 when rising, 0 when on ground
+        let target_jump = if self.on_ground { 0.0 } else { 1.0 };
+        let jump_relax = 1.0 - (-10.0 * dt).exp();
+        self.jump_factor += (target_jump - self.jump_factor) * jump_relax;
     }
 
     fn attach_camera(&mut self, camera: &mut Camera) {
@@ -619,7 +661,9 @@ impl Pawn for WalkerPawn {
             target[1] - self.cam_pos[1],
             target[2] - self.cam_pos[2],
         ];
-        let len = (fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2]).sqrt().max(1e-6);
+        let len = (fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2])
+            .sqrt()
+            .max(1e-6);
         fwd[0] /= len;
         fwd[1] /= len;
         fwd[2] /= len;
@@ -634,7 +678,18 @@ impl Pawn for WalkerPawn {
     fn position(&self) -> [f32; 3] {
         self.pos
     }
-    fn debug_viz(&self) -> Option<([f32;3],[f32;3],[f32;4])> {
+
+    fn debug_mesh_pose(&self) -> Option<([f32; 3], f32)> {
+        Some((self.pos, self.yaw))
+    }
+
+    fn debug_mesh_transform(&self) -> Option<([f32; 3], f32, f32, f32)> {
+        // Return (pos, yaw, limb_swing, jump_factor)
+        // We repurpose pitch and roll for animation signals to the renderer
+        Some((self.pos, self.yaw, self.limb_swing, self.jump_factor))
+    }
+
+    fn debug_viz(&self) -> Option<([f32; 3], [f32; 3], [f32; 4])> {
         Some((
             self.pos,
             [

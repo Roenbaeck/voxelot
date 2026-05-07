@@ -381,7 +381,6 @@ impl Chunk {
     pub fn update_lod_metadata_with_mask(&mut self, palette: &Palette, mask: u8) {
         self.update_lod_metadata_with_mask_internal(palette, mask, false);
     }
-    
 
     /// Update LOD metadata but preserve precomputed voxel_count/bounding_box if available.
     /// Useful when counts/bounds were computed during file load.
@@ -1739,7 +1738,13 @@ impl World {
 
     /// Second pass of LOD updates: Propagate visibility masks top-down to refine average colors.
     /// This ensures chunks on building facades don't have their average color diluted by buried faces.
-    pub fn update_metadata_at(&mut self, world_x: i64, world_y: i64, world_z: i64, palette: &Palette) {
+    pub fn update_metadata_at(
+        &mut self,
+        world_x: i64,
+        world_y: i64,
+        world_z: i64,
+        palette: &Palette,
+    ) {
         let mut path = Vec::new();
         let mut cur_x = world_x;
         let mut cur_y = world_y;

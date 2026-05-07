@@ -21,7 +21,11 @@ impl Profiler {
     }
 
     pub fn scope(self: &Arc<Self>, name: &'static str) -> CpuScopeGuard {
-        CpuScopeGuard { name, start: Instant::now(), profiler: Arc::clone(self) }
+        CpuScopeGuard {
+            name,
+            start: Instant::now(),
+            profiler: Arc::clone(self),
+        }
     }
 
     // `scope_cond` removed; profiling is gated by compile-time `cpu-profiling` feature
@@ -34,12 +38,19 @@ impl Profiler {
     /// Print a short summary (averages) via logging for each scope.
     pub fn print_summary(&self) {
         let lock = self.cpu_records.lock().unwrap();
-        if lock.is_empty() { return; }
+        if lock.is_empty() {
+            return;
+        }
         log::info!("--- CPU profiling summary (last values) ---");
         for (k, v) in lock.iter() {
             let sum: f32 = v.iter().copied().sum();
             let avg = sum / (v.len() as f32);
-            log::info!("{:<32} avg: {:>7.3} ms (samples {})", k, avg * 1000.0, v.len());
+            log::info!(
+                "{:<32} avg: {:>7.3} ms (samples {})",
+                k,
+                avg * 1000.0,
+                v.len()
+            );
         }
     }
 }
@@ -65,8 +76,12 @@ pub struct Profiler;
 
 #[cfg(not(feature = "cpu-profiling"))]
 impl Profiler {
-    pub fn new() -> Arc<Self> { Arc::new(Self) }
-    pub fn scope(self: &Arc<Self>, _name: &'static str) -> DummyGuard { DummyGuard }
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self)
+    }
+    pub fn scope(self: &Arc<Self>, _name: &'static str) -> DummyGuard {
+        DummyGuard
+    }
     // `scope_cond` removed; no-op profiler only exposes `scope` in this mode
     pub fn print_summary(&self) {}
 }
@@ -75,4 +90,6 @@ impl Profiler {
 pub struct DummyGuard;
 
 #[cfg(not(feature = "cpu-profiling"))]
-impl Drop for DummyGuard { fn drop(&mut self) {} }
+impl Drop for DummyGuard {
+    fn drop(&mut self) {}
+}

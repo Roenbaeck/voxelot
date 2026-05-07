@@ -1,6 +1,7 @@
 [world]
 file = "worlds/flat_city_test.vhc"
 palette = "worlds/palette.txt"
+skybox = "worlds/skybox.hdr"
 camera_position = [
     82.748825,
     65.60033,
@@ -15,6 +16,9 @@ chunk_lod_distance = 800.0
 fov_degrees = 70.0
 near_plane = 0.1
 far_plane = 5000.0
+visual_lod_enabled = true
+impostor_pixel_threshold = 1.5
+impostor_pixel_size = 1.0
 camera_speed_multiplier = 3.8146975
 window_width = 1280
 window_height = 720
@@ -26,7 +30,7 @@ macos_hdr_colorspace = "extended_linear_srgb"
 
 [atmosphere]
 fog_density = 0.003
-time_of_day = 0.6926211
+time_of_day = 0.8296474
 time_paused = false
 night_skybox_brightness = 0.02
 horizon_fade_up = 0.05
@@ -72,6 +76,7 @@ thickness = 0.5
 strength = 1.0
 blur_enabled = true
 blur_radius = 2.0
+max_ao_distance = 300.0
 
 [effects.radiance_cascades]
 enabled = true

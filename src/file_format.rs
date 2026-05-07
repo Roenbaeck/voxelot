@@ -44,7 +44,8 @@ pub fn save_world_file(
     save_world(world, &mut payload)?;
 
     let file = File::create(path)?;
-    let mut encoder = ZstdEncoder::new(file, 0).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let mut encoder =
+        ZstdEncoder::new(file, 0).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     encoder.write_all(&payload)?;
     encoder
         .finish()
@@ -105,7 +106,8 @@ pub fn load_world(reader: &mut impl Read) -> io::Result<crate::lib_hierarchical:
 pub fn load_world_file(path: &Path) -> io::Result<crate::lib_hierarchical::World> {
     // We only support zstd-compressed `.vhc` files; legacy raw `.oct` files have been removed.
     let file = File::open(path)?;
-    let mut decoder = ZstdDecoder::new(file).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let mut decoder =
+        ZstdDecoder::new(file).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     load_world(&mut decoder)
 }
 

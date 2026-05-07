@@ -21,7 +21,7 @@ use wgpu::util::DeviceExt;
 use winit::{
     application::ApplicationHandler,
     event::*,
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop, OwnedDisplayHandle},
     keyboard::{KeyCode, PhysicalKey},
     window::{Fullscreen, Window, WindowAttributes},
 };
@@ -440,12 +440,7 @@ fn boat_build_local_triangles(out: &mut Vec<MeshVertexRaw>) {
     boat_push_quad(out, seat1_a, seat1_b, seat1_c, seat1_d, seat);
 }
 
-fn pawn_push_box(
-    out: &mut Vec<MeshVertexRaw>,
-    min: [f32; 3],
-    max: [f32; 3],
-    color: [f32; 4],
-) {
+fn pawn_push_box(out: &mut Vec<MeshVertexRaw>, min: [f32; 3], max: [f32; 3], color: [f32; 4]) {
     let (x0, y0, z0) = (min[0], min[1], min[2]);
     let (x1, y1, z1) = (max[0], max[1], max[2]);
 
@@ -471,20 +466,125 @@ fn pawn_push_box(
     boat_push_quad(out, v001, v011, v111, v101, color);
 }
 
-fn walker_build_local_triangles(out: &mut Vec<MeshVertexRaw>) {
+fn push_rotated_box(
+    out: &mut Vec<MeshVertexRaw>,
+    pivot: [f32; 3],
+    size: [f32; 3],
+    angle: f32, // Rotation around local Z axis (swinging)
+    color: [f32; 4],
+) {
+    let s = angle.sin();
+    let c = angle.cos();
+
+    // Box extent from pivot (top-down limb)
+    // Pivot is at the top-center of the limb
+    let hx = size[0] * 0.5;
+    let hy = size[1];
+    let hz = size[2] * 0.5;
+
+    let corners = [
+        [-hx, 0.0, -hz],
+        [hx, 0.0, -hz],
+        [hx, 0.0, hz],
+        [-hx, 0.0, hz],
+        [-hx, -hy, -hz],
+        [hx, -hy, -hz],
+        [hx, -hy, hz],
+        [-hx, -hy, hz],
+    ];
+
+    let mut rotated = [[0.0f32; 3]; 8];
+    for (i, p) in corners.iter().enumerate() {
+        // Rotate around pivot Z (swinging forward/back)
+        // x' = x*c - y*s
+        // y' = x*s + y*c
+        let rx = p[0] * c - p[1] * s;
+        let ry = p[0] * s + p[1] * c;
+        rotated[i] = [rx + pivot[0], ry + pivot[1], p[2] + pivot[2]];
+    }
+
+    // Helper to push a quad from rotated corners
+    let mut quad = |i0, i1, i2, i3| {
+        boat_push_quad(
+            out,
+            rotated[i0],
+            rotated[i1],
+            rotated[i2],
+            rotated[i3],
+            color,
+        );
+    };
+
+    quad(0, 1, 5, 4); // -Z face
+    quad(2, 3, 7, 6); // +Z face
+    quad(0, 4, 7, 3); // -X face
+    quad(1, 2, 6, 5); // +X face
+    quad(0, 3, 2, 1); // +Y (top)
+    quad(4, 5, 6, 7); // -Y (bottom)
+}
+
+fn walker_build_animated_triangles(
+    out: &mut Vec<MeshVertexRaw>,
+    limb_angle: f32,
+    jump_factor: f32,
+) {
     out.clear();
 
-    let body_color = [0.2, 0.55, 0.85, 1.0];
-    let head_color = [0.85, 0.78, 0.62, 1.0];
+    let body_color = [0.22, 0.52, 0.82, 1.0];
+    let head_color = [0.88, 0.78, 0.65, 1.0];
+    let limb_color = [0.18, 0.45, 0.75, 1.0];
 
-    // Centered around origin; total height ~1.8 voxels.
-    let body_min = [-0.25, -0.9, -0.18];
-    let body_max = [0.25, 0.4, 0.18];
+    // 1. Torso (centered on XZ, bottom at -0.2)
+    let body_min = [-0.12, -0.2, -0.15];
+    let body_max = [0.12, 0.45, 0.15];
     pawn_push_box(out, body_min, body_max, body_color);
 
-    let head_min = [-0.18, 0.4, -0.18];
-    let head_max = [0.18, 0.9, 0.18];
+    // 2. Head
+    let head_min = [-0.14, 0.45, -0.14];
+    let head_max = [0.14, 0.75, 0.14];
     pawn_push_box(out, head_min, head_max, head_color);
+
+    // 3. Legs (swinging)
+    // Left Leg
+    let l_leg_angle = limb_angle + jump_factor * 0.4;
+    push_rotated_box(
+        out,
+        [0.0, -0.2, -0.08],
+        [0.12, 0.6, 0.12],
+        l_leg_angle,
+        limb_color,
+    );
+
+    // Right Leg
+    let r_leg_angle = -limb_angle + jump_factor * 0.4;
+    push_rotated_box(
+        out,
+        [0.0, -0.2, 0.08],
+        [0.12, 0.6, 0.12],
+        r_leg_angle,
+        limb_color,
+    );
+
+    // 4. Arms
+    // Left Arm (swings opposite to left leg)
+    let l_arm_angle = -limb_angle * 0.7 - jump_factor * 0.3;
+    push_rotated_box(
+        out,
+        [0.0, 0.38, -0.22],
+        [0.1, 0.5, 0.1],
+        l_arm_angle,
+        limb_color,
+    );
+
+    // Right Arm
+    let r_arm_angle = limb_angle * 0.7 - jump_factor * 0.3;
+    push_rotated_box(
+        out,
+        [0.0, 0.38, 0.22],
+        [0.1, 0.5, 0.1],
+        r_arm_angle,
+        limb_color,
+    );
 }
 
 fn boat_transform_into_world(
@@ -837,7 +937,7 @@ struct InjectParams {
     gi_grid_dims: [i32; 3],
     _pad0: u32,
     sun_dir_intensity: [f32; 4], // xyz: dir, w: intensity
-    sun_color_pad: [f32; 4],      // xyz: color, w: pad
+    sun_color_pad: [f32; 4],     // xyz: color, w: pad
     shadow_matrix: [[f32; 4]; 4],
 }
 
@@ -1882,13 +1982,11 @@ impl App {
             if timestamps.len() >= GPU_TIMESTAMP_QUERY_COUNT as usize {
                 for i in 0..(GPU_TIMESTAMP_QUERY_COUNT as usize - 1) {
                     let delta = timestamps[i + 1].saturating_sub(timestamps[i]) as f64;
-                    self.gpu_pass_ms[i] =
-                        delta * (self.gpu_timestamp_period as f64) / 1_000_000.0;
+                    self.gpu_pass_ms[i] = delta * (self.gpu_timestamp_period as f64) / 1_000_000.0;
                 }
                 let total = timestamps[GPU_TIMESTAMP_QUERY_COUNT as usize - 1]
                     .saturating_sub(timestamps[0]) as f64;
-                self.gpu_last_total_ms =
-                    total * (self.gpu_timestamp_period as f64) / 1_000_000.0;
+                self.gpu_last_total_ms = total * (self.gpu_timestamp_period as f64) / 1_000_000.0;
             }
             drop(data);
             readback_buffer.unmap();
@@ -1961,7 +2059,8 @@ impl App {
         true
     }
     fn create_editor_preview_pipeline(&mut self, device: &wgpu::Device) {
-        let shader = device.create_shader_module(wgpu::include_wgsl!("../../shaders/editor_preview.wgsl"));
+        let shader =
+            device.create_shader_module(wgpu::include_wgsl!("../../shaders/editor_preview.wgsl"));
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Editor Preview Bind Group Layout"),
@@ -1979,7 +2078,7 @@ impl App {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Editor Preview Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
+            bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
 
@@ -2025,8 +2124,8 @@ impl App {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::Always,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -2113,7 +2212,11 @@ impl App {
                 let nx = hit.normal[0] as i64;
                 let ny = hit.normal[1] as i64;
                 let nz = hit.normal[2] as i64;
-                WorldPos::new(hit.position.x + nx, hit.position.y + ny, hit.position.z + nz)
+                WorldPos::new(
+                    hit.position.x + nx,
+                    hit.position.y + ny,
+                    hit.position.z + nz,
+                )
             }
             EditMode::Remove => {
                 // For removing, we target the hit voxel itself
@@ -2556,7 +2659,7 @@ impl App {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("WTS Relax Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
+            bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
 
@@ -2640,7 +2743,7 @@ impl App {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("WTS Inject Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
+            bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
 
@@ -2709,15 +2812,17 @@ impl App {
                 | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        self.wts_injection_view = Some(injection_texture.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(wgpu::TextureViewDimension::D3),
-            ..Default::default()
-        }));
-        self.wts_injection_storage_view = Some(injection_texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("WTS Injection Storage View"),
-            dimension: Some(wgpu::TextureViewDimension::D3),
-            ..Default::default()
-        }));
+        self.wts_injection_view =
+            Some(injection_texture.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D3),
+                ..Default::default()
+            }));
+        self.wts_injection_storage_view =
+            Some(injection_texture.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("WTS Injection Storage View"),
+                dimension: Some(wgpu::TextureViewDimension::D3),
+                ..Default::default()
+            }));
         self.wts_injection_texture = Some(injection_texture);
 
         if self.wts_params_buffer.is_none() {
@@ -2893,65 +2998,63 @@ impl App {
             depth_or_array_layers: dims.z as u32,
         };
 
-        let mut copy_edge_slab = |delta_axis: i32,
-                                  axis: u32,
-                                  src_tex: &wgpu::Texture,
-                                  dst_tex: &wgpu::Texture| {
-            if delta_axis == 0 {
-                return;
-            }
-            let dim = match axis {
-                0 => dims_u32.width,
-                1 => dims_u32.height,
-                _ => dims_u32.depth_or_array_layers,
-            };
-            let abs_delta = delta_axis.abs() as u32;
-            if abs_delta == 0 || abs_delta > dim {
-                return;
-            }
-            let (src_offset, dst_offset) = if delta_axis > 0 {
-                (0, 0)
-            } else {
-                (dim - abs_delta, dim - abs_delta)
-            };
-            let (width, height, depth) = match axis {
-                0 => (abs_delta, dims_u32.height, dims_u32.depth_or_array_layers),
-                1 => (dims_u32.width, abs_delta, dims_u32.depth_or_array_layers),
-                _ => (dims_u32.width, dims_u32.height, abs_delta),
-            };
+        let mut copy_edge_slab =
+            |delta_axis: i32, axis: u32, src_tex: &wgpu::Texture, dst_tex: &wgpu::Texture| {
+                if delta_axis == 0 {
+                    return;
+                }
+                let dim = match axis {
+                    0 => dims_u32.width,
+                    1 => dims_u32.height,
+                    _ => dims_u32.depth_or_array_layers,
+                };
+                let abs_delta = delta_axis.abs() as u32;
+                if abs_delta == 0 || abs_delta > dim {
+                    return;
+                }
+                let (src_offset, dst_offset) = if delta_axis > 0 {
+                    (0, 0)
+                } else {
+                    (dim - abs_delta, dim - abs_delta)
+                };
+                let (width, height, depth) = match axis {
+                    0 => (abs_delta, dims_u32.height, dims_u32.depth_or_array_layers),
+                    1 => (dims_u32.width, abs_delta, dims_u32.depth_or_array_layers),
+                    _ => (dims_u32.width, dims_u32.height, abs_delta),
+                };
 
-            let src_origin = wgpu::Origin3d {
-                x: if axis == 0 { src_offset } else { 0 },
-                y: if axis == 1 { src_offset } else { 0 },
-                z: if axis == 2 { src_offset } else { 0 },
-            };
-            let dst_origin = wgpu::Origin3d {
-                x: if axis == 0 { dst_offset } else { 0 },
-                y: if axis == 1 { dst_offset } else { 0 },
-                z: if axis == 2 { dst_offset } else { 0 },
-            };
-            let extent = wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: depth,
-            };
+                let src_origin = wgpu::Origin3d {
+                    x: if axis == 0 { src_offset } else { 0 },
+                    y: if axis == 1 { src_offset } else { 0 },
+                    z: if axis == 2 { src_offset } else { 0 },
+                };
+                let dst_origin = wgpu::Origin3d {
+                    x: if axis == 0 { dst_offset } else { 0 },
+                    y: if axis == 1 { dst_offset } else { 0 },
+                    z: if axis == 2 { dst_offset } else { 0 },
+                };
+                let extent = wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: depth,
+                };
 
-            encoder.copy_texture_to_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: src_tex,
-                    mip_level: 0,
-                    origin: src_origin,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyTextureInfo {
-                    texture: dst_tex,
-                    mip_level: 0,
-                    origin: dst_origin,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                extent,
-            );
-        };
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: src_tex,
+                        mip_level: 0,
+                        origin: src_origin,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: dst_tex,
+                        mip_level: 0,
+                        origin: dst_origin,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    extent,
+                );
+            };
 
         copy_edge_slab(delta.x, 0, old_tex0, &new_tex0);
         copy_edge_slab(delta.y, 1, old_tex0, &new_tex0);
@@ -3543,7 +3646,7 @@ impl App {
         let mut boat_local_vertices = Vec::with_capacity(BOAT_VERTEX_CAPACITY);
         boat_build_local_triangles(&mut boat_local_vertices);
         let mut walker_local_vertices = Vec::with_capacity(WALKER_VERTEX_CAPACITY);
-        walker_build_local_triangles(&mut walker_local_vertices);
+        walker_build_animated_triangles(&mut walker_local_vertices, 0.0, 0.0);
 
         Self {
             window: None,
@@ -3581,7 +3684,9 @@ impl App {
             boat_vertex_capacity: BOAT_VERTEX_CAPACITY.max(WALKER_VERTEX_CAPACITY),
             boat_local_vertices,
             walker_local_vertices,
-            boat_world_vertices: Vec::with_capacity(BOAT_VERTEX_CAPACITY.max(WALKER_VERTEX_CAPACITY)),
+            boat_world_vertices: Vec::with_capacity(
+                BOAT_VERTEX_CAPACITY.max(WALKER_VERTEX_CAPACITY),
+            ),
             boat_vertex_count: 0,
 
             shadow_texture: None,
@@ -3804,10 +3909,9 @@ impl App {
                 None
             } else {
                 match cfg.world.start_mode.as_str() {
-                    "walker" | "walk" | "character" => Some(Box::new(voxelot::WalkerPawn::new(
-                        cam_pos,
-                        &world,
-                    ))),
+                    "walker" | "walk" | "character" => {
+                        Some(Box::new(voxelot::WalkerPawn::new(cam_pos, &world)))
+                    }
                     _ => Some(Box::new(voxelot::BoatPawn::new(
                         cam_pos,
                         cfg.world.water_level,
@@ -4480,10 +4584,7 @@ impl App {
                     }
                 } else {
                     let spawn = self.camera_controller.camera.position;
-                    self.active_pawn = Some(Box::new(voxelot::WalkerPawn::new(
-                        spawn,
-                        &self.world,
-                    )));
+                    self.active_pawn = Some(Box::new(voxelot::WalkerPawn::new(spawn, &self.world)));
                     log::info!(
                         "Spawned walker at ({:.1},{:.1},{:.1})",
                         spawn[0],
@@ -6285,7 +6386,9 @@ impl App {
             self.gi_probe_view_color.as_ref(),
         ) {
             // Select WTS view if available, otherwise fallback to raw probe color
-            let wts_view = self.wts_phi_views[self.wts_ping_pong].as_ref().unwrap_or(gi_color);
+            let wts_view = self.wts_phi_views[self.wts_ping_pong]
+                .as_ref()
+                .unwrap_or(gi_color);
 
             self.ssilvb_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("SSILVB Bind Group"),
@@ -6427,7 +6530,7 @@ impl App {
                             wts_view
                         } else {
                             gi_color
-                        }
+                        },
                     ),
                 },
             ] as &[wgpu::BindGroupEntry],
@@ -6513,7 +6616,8 @@ impl App {
             self.offscreen_color_view.as_ref(),
             self.post_sampler.as_ref(),
             self.dof_uniform_buffer.as_ref(),
-        ) else {
+        )
+        else {
             return;
         };
 
@@ -7272,7 +7376,7 @@ impl App {
                             wts_view
                         } else {
                             gi_color
-                        }
+                        },
                     ),
                 },
             ],
@@ -7875,7 +7979,7 @@ impl App {
         // Create pipeline layout
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Skybox Pipeline Layout"),
-            bind_group_layouts: &[main_bind_group_layout, &bind_group_layout],
+            bind_group_layouts: &[Some(main_bind_group_layout), Some(&bind_group_layout)],
             immediate_size: 0,
         });
 
@@ -7923,8 +8027,8 @@ impl App {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -8085,7 +8189,7 @@ impl App {
         // Create pipeline layout
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Water Pipeline Layout"),
-            bind_group_layouts: &[main_bind_group_layout, &bind_group_layout],
+            bind_group_layouts: &[Some(main_bind_group_layout), Some(&bind_group_layout)],
             immediate_size: 0,
         });
 
@@ -8442,7 +8546,7 @@ impl App {
             layout: Some(
                 &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: Some("SSR Pipeline Layout"),
-                    bind_group_layouts: &[&bind_group_layout],
+                    bind_group_layouts: &[Some(&bind_group_layout)],
                     immediate_size: 0,
                 }),
             ),
@@ -8942,15 +9046,18 @@ impl App {
         }
     }
 
-    async fn init_wgpu(&mut self, window: Arc<Window>) {
+    async fn init_wgpu(&mut self, window: Arc<Window>, display_handle: OwnedDisplayHandle) {
         let size = window.inner_size();
         let scale = window.scale_factor() as f32;
         // Compute logical window size (device-independent).
         // Use performance.render_scale to compute rendered offscreen resolution
         let render_scale = self.user_config.performance.render_scale;
 
-        // Create instance
-        let instance = wgpu::Instance::default();
+        // Create instance using winit's owned display handle, as required by wgpu 29 on platforms
+        // where the compositor/display connection is distinct from the window handle.
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
+            Box::new(display_handle),
+        ));
 
         // Create surface
         let surface = instance.create_surface(window.clone()).unwrap();
@@ -9364,14 +9471,17 @@ impl App {
         self.render_target_height = render_target_height.max(1);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
-            bind_group_layouts: &[&main_bind_group_layout, &voxel_gi_bind_group_layout],
+            bind_group_layouts: &[
+                Some(&main_bind_group_layout),
+                Some(&voxel_gi_bind_group_layout),
+            ],
             immediate_size: 0,
         });
 
         let shadow_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Shadow Pipeline Layout"),
-                bind_group_layouts: &[&shadow_bind_group_layout],
+                bind_group_layouts: &[Some(&shadow_bind_group_layout)],
                 immediate_size: 0,
             });
 
@@ -9445,8 +9555,8 @@ impl App {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -9634,8 +9744,8 @@ impl App {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -9689,8 +9799,8 @@ impl App {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState {
                     constant: 2,
@@ -9737,8 +9847,8 @@ impl App {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState {
                     constant: 2,
@@ -9901,7 +10011,7 @@ impl App {
         let dof_combine_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("DoF Combine Pipeline Layout"),
-                bind_group_layouts: &[&dof_combine_bind_group_layout],
+                bind_group_layouts: &[Some(&dof_combine_bind_group_layout)],
                 immediate_size: 0,
             });
 
@@ -10026,20 +10136,20 @@ impl App {
         let kawase_down_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Kawase Down Pipeline Layout"),
-                bind_group_layouts: &[&kawase_bind_group_layout],
+                bind_group_layouts: &[Some(&kawase_bind_group_layout)],
                 immediate_size: 16,
             });
         let kawase_up_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Kawase Up Pipeline Layout"),
-                bind_group_layouts: &[&kawase_bind_group_layout],
+                bind_group_layouts: &[Some(&kawase_bind_group_layout)],
                 immediate_size: 16,
             });
 
         let ssr_kawase_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("SSR Kawase Blur Pipeline Layout"),
-                bind_group_layouts: &[&ssr_kawase_bind_group_layout],
+                bind_group_layouts: &[Some(&ssr_kawase_bind_group_layout)],
                 immediate_size: 32,
             });
 
@@ -10278,7 +10388,7 @@ impl App {
 
         let rc_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Radiance Cascades Pipeline Layout"),
-            bind_group_layouts: &[&rc_bind_group_layout],
+            bind_group_layouts: &[Some(&rc_bind_group_layout)],
             immediate_size: 0,
         });
 
@@ -10589,21 +10699,21 @@ impl App {
         let bloom_extract_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Bloom Extract Pipeline Layout"),
-                bind_group_layouts: &[&bloom_extract_bind_group_layout],
+                bind_group_layouts: &[Some(&bloom_extract_bind_group_layout)],
                 immediate_size: 0,
             });
 
         let bloom_blur_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Bloom Blur Pipeline Layout"),
-                bind_group_layouts: &[&bloom_blur_bind_group_layout],
+                bind_group_layouts: &[Some(&bloom_blur_bind_group_layout)],
                 immediate_size: 0,
             });
 
         let composite_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Composite Pipeline Layout"),
-                bind_group_layouts: &[&composite_bind_group_layout],
+                bind_group_layouts: &[Some(&composite_bind_group_layout)],
                 immediate_size: 0,
             });
 
@@ -10879,7 +10989,7 @@ impl App {
         let gi_tex_ny = device.create_texture(&gi_tex_desc("GI Probe -Y 3D"));
         let gi_tex_pz = device.create_texture(&gi_tex_desc("GI Probe +Z 3D"));
         let gi_tex_nz = device.create_texture(&gi_tex_desc("GI Probe -Z 3D"));
-        
+
         let mut gi_color_desc = gi_tex_desc("GI Color 3D");
         gi_color_desc.usage |= wgpu::TextureUsages::STORAGE_BINDING;
         let gi_tex_color = device.create_texture(&gi_color_desc);
@@ -11078,7 +11188,7 @@ impl App {
 
         let cull_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("GPU Cull Pipeline Layout"),
-            bind_group_layouts: &[&cull_bind_group_layout],
+            bind_group_layouts: &[Some(&cull_bind_group_layout)],
             immediate_size: 0,
         });
 
@@ -11152,7 +11262,7 @@ impl App {
         let hzb_gen_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("HZB Gen Pipeline Layout"),
-                bind_group_layouts: &[&hzb_gen_bind_group_layout],
+                bind_group_layouts: &[Some(&hzb_gen_bind_group_layout)],
                 immediate_size: 0,
             });
 
@@ -11267,8 +11377,8 @@ impl App {
             label: Some("Impostor Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/impostor.wgsl").into()),
         });
-        let impostor_bind_group_layout = device.create_bind_group_layout(
-            &wgpu::BindGroupLayoutDescriptor {
+        let impostor_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Impostor Bind Group Layout"),
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -11280,42 +11390,40 @@ impl App {
                     },
                     count: None,
                 }],
-            },
-        );
-        let impostor_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Impostor Pipeline Layout"),
-            bind_group_layouts: &[&impostor_bind_group_layout],
-            immediate_size: 0,
-        });
+            });
+        let impostor_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Impostor Pipeline Layout"),
+                bind_group_layouts: &[Some(&impostor_bind_group_layout)],
+                immediate_size: 0,
+            });
         let impostor_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Impostor Pipeline"),
             layout: Some(&impostor_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &impostor_shader,
                 entry_point: Some("vs_main"),
-                buffers: &[
-                    wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<ImpostorInstanceRaw>() as wgpu::BufferAddress,
-                        step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &[
-                            wgpu::VertexAttribute {
-                                format: wgpu::VertexFormat::Float32x3,
-                                offset: 0,
-                                shader_location: 0,
-                            },
-                            wgpu::VertexAttribute {
-                                format: wgpu::VertexFormat::Float32x4,
-                                offset: 16,
-                                shader_location: 1,
-                            },
-                            wgpu::VertexAttribute {
-                                format: wgpu::VertexFormat::Float32x4,
-                                offset: 32,
-                                shader_location: 2,
-                            },
-                        ],
-                    },
-                ],
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<ImpostorInstanceRaw>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 16,
+                            shader_location: 1,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 32,
+                            shader_location: 2,
+                        },
+                    ],
+                }],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -11356,8 +11464,8 @@ impl App {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -11448,7 +11556,7 @@ impl App {
             layout: Some(
                 &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: Some("DoF CoC Pipeline Layout"),
-                    bind_group_layouts: &[&dof_bind_group_layout],
+                    bind_group_layouts: &[Some(&dof_bind_group_layout)],
                     immediate_size: 0,
                 }),
             ),
@@ -11523,7 +11631,7 @@ impl App {
         let ssilvb_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("SSILVB Pipeline Layout"),
-                bind_group_layouts: &[&ssilvb_bind_group_layout],
+                bind_group_layouts: &[Some(&ssilvb_bind_group_layout)],
                 immediate_size: 0,
             });
 
@@ -11709,8 +11817,14 @@ impl App {
         let mut lines = Vec::new();
         lines.extend([
             format!("FPS: {} ({:.2} ms)", self.last_fps, self.frame_ms),
-            format!("CULL: {:.2} ms  GROUP: {:.2} ms", self.cull_ms, self.grouping_ms),
-            format!("MESH: {:.2} ms  INST: {:.2} ms", self.mesh_ms, self.instance_ms),
+            format!(
+                "CULL: {:.2} ms  GROUP: {:.2} ms",
+                self.cull_ms, self.grouping_ms
+            ),
+            format!(
+                "MESH: {:.2} ms  INST: {:.2} ms",
+                self.mesh_ms, self.instance_ms
+            ),
             format!(
                 "VISIBLE: {}  LEAF: {}  MESHED: {}",
                 self.visible_count, self.leaf_chunk_count, self.meshed_chunk_count
@@ -11734,11 +11848,7 @@ impl App {
             ));
             lines.push(format!(
                 "GPU WTR:{:.2} DOF/RC:{:.2} BLM:{:.2} CMP:{:.2} TOT:{:.2}",
-                ms[5],
-                ms[6],
-                ms[7],
-                ms[8],
-                self.gpu_last_total_ms
+                ms[5], ms[6], ms[7], ms[8], self.gpu_last_total_ms
             ));
         }
 
@@ -11815,7 +11925,12 @@ impl App {
 
         let pixel_px = char_px / 8.0;
         let boost = self.ui_hdr_boost();
-        let boosted = [color[0] * boost, color[1] * boost, color[2] * boost, color[3]];
+        let boosted = [
+            color[0] * boost,
+            color[1] * boost,
+            color[2] * boost,
+            color[3],
+        ];
         let text_len = text.len() as f32;
         let text_w = text_len * (char_px + pixel_px);
         let text_h = char_px;
@@ -11921,17 +12036,13 @@ impl App {
             .floor()
             .max(1.0) as usize;
         let rows_needed = (total_colors + cols - 1) / cols;
-        let max_rows =
-            ((height * 0.22) / (cell_px + gap_px)).floor().max(1.0) as usize;
+        let max_rows = ((height * 0.22) / (cell_px + gap_px)).floor().max(1.0) as usize;
         let rows = rows_needed.min(max_rows);
         let count_shown = (cols * rows).min(total_colors);
 
         let _grid_w = cols as f32 * cell_px + (cols.saturating_sub(1)) as f32 * gap_px;
         let grid_h = rows as f32 * cell_px + (rows.saturating_sub(1)) as f32 * gap_px;
-        let origin_px = [
-            margin_px,
-            height - margin_px - grid_h,
-        ];
+        let origin_px = [margin_px, height - margin_px - grid_h];
 
         self.palette_ui_origin_px = origin_px;
         self.palette_ui_cell_px = cell_px;
@@ -11966,7 +12077,10 @@ impl App {
                 });
             }
 
-            let mut color = colors.get(palette_index).copied().unwrap_or([1.0, 1.0, 1.0, 1.0]);
+            let mut color = colors
+                .get(palette_index)
+                .copied()
+                .unwrap_or([1.0, 1.0, 1.0, 1.0]);
             color[0] *= boost;
             color[1] *= boost;
             color[2] *= boost;
@@ -12162,7 +12276,8 @@ impl App {
         while i < self.deferred_frees.len() {
             if self.deferred_frees[i].free_after_frame <= safe_before {
                 let df = self.deferred_frees.swap_remove(i);
-                self.vertex_allocator.free(df.vertex_offset, df.vertex_bytes);
+                self.vertex_allocator
+                    .free(df.vertex_offset, df.vertex_bytes);
                 self.index_allocator.free(df.index_offset, df.index_bytes);
                 if df.is_envelope {
                     self.envelope_mesh_cache_bytes = self
@@ -12265,7 +12380,11 @@ impl App {
                     let nx = hit.normal[0] as i64;
                     let ny = hit.normal[1] as i64;
                     let nz = hit.normal[2] as i64;
-                    WorldPos::new(hit.position.x + nx, hit.position.y + ny, hit.position.z + nz)
+                    WorldPos::new(
+                        hit.position.x + nx,
+                        hit.position.y + ny,
+                        hit.position.z + nz,
+                    )
                 }
                 EditMode::Remove => hit.position,
             };
@@ -12274,11 +12393,12 @@ impl App {
                 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5, 1.0,
             ]);
 
-            let (inner_color, outer_color, inner_scale, outer_scale) = if effective_mode == EditMode::Add {
-                ([0.0, 8.0, 8.0, 1.0], [0.0, 8.0, 8.0, 0.45], 1.0, 1.06)
-            } else {
-                ([8.0, 0.2, 0.2, 1.0], [8.0, 0.2, 0.2, 0.45], 1.0, 1.04)
-            };
+            let (inner_color, outer_color, inner_scale, outer_scale) =
+                if effective_mode == EditMode::Add {
+                    ([0.0, 8.0, 8.0, 1.0], [0.0, 8.0, 8.0, 0.45], 1.0, 1.06)
+                } else {
+                    ([8.0, 0.2, 0.2, 1.0], [8.0, 0.2, 0.2, 0.45], 1.0, 1.04)
+                };
 
             let inner_offset = (inner_scale - 1.0) * 0.5;
             let outer_offset = (outer_scale - 1.0) * 0.5;
@@ -12322,10 +12442,20 @@ impl App {
             pawn.attach_camera(&mut self.camera_controller.camera);
         }
 
-        // Update active pawn mesh (boat) vertices/buffer
+        // Update active pawn mesh (boat/walker) vertices/buffer
         self.boat_vertex_count = 0;
         if let (Some(pawn), Some(boat_buf)) = (&self.active_pawn, self.boat_vertex_buffer.as_ref())
         {
+            if pawn.kind() == voxelot::PawnKind::Walker {
+                if let Some((_, _, limb_angle, jump_factor)) = pawn.debug_mesh_transform() {
+                    walker_build_animated_triangles(
+                        &mut self.walker_local_vertices,
+                        limb_angle,
+                        jump_factor,
+                    );
+                }
+            }
+
             let local_vertices = match pawn.kind() {
                 voxelot::PawnKind::Boat => &self.boat_local_vertices,
                 voxelot::PawnKind::Walker => &self.walker_local_vertices,
@@ -12526,9 +12656,8 @@ impl App {
 
                     let fov_tan = (self.render_fov_radians() * 0.5).tan().max(1e-4);
                     let approx_radius = half_scale[0].max(half_scale[1]).max(half_scale[2]);
-                    let diameter_px =
-                        (approx_radius * self.render_target_height.max(1) as f32)
-                            / (z_cam * fov_tan).max(1e-4);
+                    let diameter_px = (approx_radius * self.render_target_height.max(1) as f32)
+                        / (z_cam * fov_tan).max(1e-4);
                     let use_impostor = diameter_px <= self.impostor_pixel_threshold
                         && !use_detail
                         && !use_envelope;
@@ -12557,19 +12686,31 @@ impl App {
                                 )
                             } else {
                                 (
-                                    [v.position[0] as f32, v.position[1] as f32, v.position[2] as f32],
+                                    [
+                                        v.position[0] as f32,
+                                        v.position[1] as f32,
+                                        v.position[2] as f32,
+                                    ],
                                     v.scale,
                                 )
                             }
                         } else {
                             (
-                                [v.position[0] as f32, v.position[1] as f32, v.position[2] as f32],
+                                [
+                                    v.position[0] as f32,
+                                    v.position[1] as f32,
+                                    v.position[2] as f32,
+                                ],
                                 v.scale,
                             )
                         }
                     } else {
                         (
-                            [v.position[0] as f32, v.position[1] as f32, v.position[2] as f32],
+                            [
+                                v.position[0] as f32,
+                                v.position[1] as f32,
+                                v.position[2] as f32,
+                            ],
                             v.scale,
                         )
                     };
@@ -13517,8 +13658,7 @@ impl App {
 
             // Check if we already have the desired mesh type (it might have been completed since queuing)
             if use_envelope {
-                if self.envelope_mesh_cache.contains_key(&key)
-                    && !self.dirty_meshes.contains(&key)
+                if self.envelope_mesh_cache.contains_key(&key) && !self.dirty_meshes.contains(&key)
                 {
                     self.pending_chunk_set.remove(&key);
                     continue;
@@ -13986,30 +14126,28 @@ impl App {
             surface.get_current_texture()
         };
         let output = match output_result {
-            Ok(texture) => texture,
-            Err(e) => {
-                eprintln!("Surface error: {:?}", e);
-                // Handle specific surface errors
-                match e {
-                    wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => {
-                        // Recreate surface
-                        if let Some(surface) = self.surface.as_ref() {
-                            surface.configure(&device, &config);
-                        }
-                        // Defer the heavy work to a safe point after rendering to avoid borrow conflicts
-                        self.pending_recreate_offscreen = true;
-                    }
-                    wgpu::SurfaceError::OutOfMemory => {
-                        eprintln!("Out of memory!");
-                        return;
-                    }
-                    wgpu::SurfaceError::Timeout => {
-                        eprintln!("Surface timeout!");
-                    }
-                    _ => {
-                        eprintln!("Other surface error");
-                    }
+            wgpu::CurrentSurfaceTexture::Success(texture) => texture,
+            wgpu::CurrentSurfaceTexture::Suboptimal(texture) => {
+                self.pending_recreate_offscreen = true;
+                texture
+            }
+            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
+                if let Some(surface) = self.surface.as_ref() {
+                    surface.configure(&device, &config);
                 }
+                // Defer the heavy work to a safe point after rendering to avoid borrow conflicts
+                self.pending_recreate_offscreen = true;
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                eprintln!("Surface timeout!");
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                eprintln!("Surface validation error");
                 return;
             }
         };
@@ -14678,7 +14816,8 @@ impl App {
                 for &dx in &[0.0, 16.0] {
                     for &dy in &[0.0, 16.0] {
                         for &dz in &[0.0, 16.0] {
-                            let world = Vec3::new(chunk_min.x + dx, chunk_min.y + dy, chunk_min.z + dz);
+                            let world =
+                                Vec3::new(chunk_min.x + dx, chunk_min.y + dy, chunk_min.z + dz);
                             let ls = (light_view * world.extend(1.0)).truncate();
                             ls_min = ls_min.min(ls);
                             ls_max = ls_max.max(ls);
@@ -14828,9 +14967,10 @@ impl App {
         // -----------------------------------------------------------------------------------------
         if self.wts_inject_pipeline.is_some() && self.wts_relax_pipeline.is_some() {
             // Re-bind to local name to avoid move issues
-            let mut wts_inject_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("WTS Inject Encoder"),
-            });
+            let mut wts_inject_encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("WTS Inject Encoder"),
+                });
 
             // Clear injection texture before each pass to prevent sunlight "staining" or accumulation
             if let Some(injection_texture) = self.wts_injection_texture.as_ref() {
@@ -14863,7 +15003,12 @@ impl App {
                 gi_grid_origin: self.gi_grid_origin.to_array(),
                 gi_grid_dims: self.gi_grid_dims.to_array(),
                 _pad0: 0,
-                sun_dir_intensity: [sun_direction[0], sun_direction[1], sun_direction[2], 1.5 * sun_fade],
+                sun_dir_intensity: [
+                    sun_direction[0],
+                    sun_direction[1],
+                    sun_direction[2],
+                    1.5 * sun_fade,
+                ],
                 sun_color_pad: [sun_color[0], sun_color[1], sun_color[2], 0.0],
                 shadow_matrix: sun_view_proj.to_cols_array_2d(),
             };
@@ -14871,10 +15016,11 @@ impl App {
 
             // 2. Run Inject Pass
             if let Some(inject_bg) = self.wts_inject_bind_group.as_ref() {
-                let mut cpass = wts_inject_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("WTS Inject Pass"),
-                    timestamp_writes: None,
-                });
+                let mut cpass =
+                    wts_inject_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("WTS Inject Pass"),
+                        timestamp_writes: None,
+                    });
                 cpass.set_pipeline(inject_pipeline);
                 cpass.set_bind_group(0, inject_bg, &[]);
                 let groups = (inject_params.candidate_count + 63) / 64;
@@ -14884,19 +15030,20 @@ impl App {
             }
             queue.submit(std::iter::once(wts_inject_encoder.finish()));
 
-            let mut wts_relax_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("WTS Relax Encoder"),
-            });
+            let mut wts_relax_encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("WTS Relax Encoder"),
+                });
 
             // 3. Update Relax Params
             let decay = 0.0001 + 0.003 * (1.0 - sun_fade).powf(2.0);
             let relax_params = WtsParamsRaw {
-                alpha: 0.05,          // Lower alpha for temporal stability
-                gamma: 0.1,           // Higher gamma to seed injection quickly
-                beta_diffuse: 0.01,   // Very low stiffness for solid surfaces
-                beta_air: 100.0,      // High stiffness for air
-                max_occupancy: 1.0,   // Alpha is 0..1
-                decay,                // Bleed off stale light over time (night-weighted)
+                alpha: 0.05,        // Lower alpha for temporal stability
+                gamma: 0.1,         // Higher gamma to seed injection quickly
+                beta_diffuse: 0.01, // Very low stiffness for solid surfaces
+                beta_air: 100.0,    // High stiffness for air
+                max_occupancy: 1.0, // Alpha is 0..1
+                decay,              // Bleed off stale light over time (night-weighted)
                 _pad1: 0.0,
                 _pad2: 0.0,
             };
@@ -14905,10 +15052,11 @@ impl App {
             // 4. Run Relax Pass
             if let Some(relax_bg) = self.wts_relax_bind_groups[self.wts_ping_pong].as_ref() {
                 {
-                    let mut cpass = wts_relax_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("WTS Relax Pass"),
-                        timestamp_writes: None,
-                    });
+                    let mut cpass =
+                        wts_relax_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("WTS Relax Pass"),
+                            timestamp_writes: None,
+                        });
                     cpass.set_pipeline(relax_pipeline);
                     cpass.set_bind_group(0, relax_bg, &[]);
 
@@ -14921,7 +15069,7 @@ impl App {
                 }
             }
             queue.submit(std::iter::once(wts_relax_encoder.finish()));
-            
+
             // Toggle ping-pong for next frame
             self.wts_ping_pong = 1 - self.wts_ping_pong;
 
@@ -15034,8 +15182,9 @@ impl App {
                     wgpu::IndexFormat::Uint32,
                 );
 
-                let multi_draw_supported =
-                    device.features().contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT);
+                let multi_draw_supported = device
+                    .features()
+                    .contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT);
 
                 if multi_draw_supported {
                     if cfg!(feature = "viewer-debug") {
@@ -15129,7 +15278,12 @@ impl App {
                 draw_calls += 1;
             }
 
-            if let (Some(impostor_pipeline), Some(impostor_indirect), Some(impostor_instances), Some(impostor_bg)) = (
+            if let (
+                Some(impostor_pipeline),
+                Some(impostor_indirect),
+                Some(impostor_instances),
+                Some(impostor_bg),
+            ) = (
                 self.impostor_pipeline.as_ref(),
                 self.impostor_indirect_buffer.as_ref(),
                 self.impostor_instance_buffer.as_ref(),
@@ -15146,7 +15300,7 @@ impl App {
             if let (Some(pipeline), Some(bg), Some(_hit)) = (
                 self.editor_preview_pipeline.as_ref(),
                 self.editor_preview_bind_group.as_ref(),
-                self.last_raycast_hit.as_ref()
+                self.last_raycast_hit.as_ref(),
             ) {
                 render_pass.set_pipeline(pipeline);
                 render_pass.set_bind_group(0, bg, &[]);
@@ -15169,19 +15323,19 @@ impl App {
                 self.ssilvb_bind_group.as_ref(),
                 self.ssao_ping_view.as_ref(),
             ) {
-                    let mut ssao_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("SSILVB Pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: ssao_ping_view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::DontCare(unsafe {
-                                    wgpu::LoadOpDontCare::enabled()
-                                }),
-                                store: wgpu::StoreOp::Store,
-                            },
-                            depth_slice: None,
-                        })],
+                let mut ssao_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("SSILVB Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: ssao_ping_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::DontCare(unsafe {
+                                wgpu::LoadOpDontCare::enabled()
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
                     occlusion_query_set: None,
@@ -16086,8 +16240,9 @@ impl ApplicationHandler for App {
                 .with_inner_size(winit::dpi::LogicalSize::new(window_width, window_height));
 
             let window = Arc::new(event_loop.create_window(window_attrs).unwrap());
+            let display_handle = event_loop.owned_display_handle();
 
-            pollster::block_on(self.init_wgpu(window));
+            pollster::block_on(self.init_wgpu(window, display_handle));
         }
     }
 
@@ -16146,11 +16301,7 @@ impl ApplicationHandler for App {
                     event_loop.exit();
                 }
             }
-            WindowEvent::MouseInput {
-                state,
-                button,
-                ..
-            } => {
+            WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
                 if button == MouseButton::Right {
                     self.mouse_pressed = pressed;
@@ -16159,7 +16310,10 @@ impl ApplicationHandler for App {
                     }
                 } else if button == MouseButton::Left && pressed {
                     if self.palette_ui_visible {
-                        if self.handle_palette_click(self.current_mouse_pos.0 as f32, self.current_mouse_pos.1 as f32) {
+                        if self.handle_palette_click(
+                            self.current_mouse_pos.0 as f32,
+                            self.current_mouse_pos.1 as f32,
+                        ) {
                             return;
                         }
                     }

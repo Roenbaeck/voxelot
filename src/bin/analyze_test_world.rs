@@ -22,7 +22,9 @@ fn main() {
     println!("Heights (first 120):");
     for i in 0..120.min(heights.len()) {
         print!("{:3}", heights[i]);
-        if (i + 1) % 20 == 0 { println!(""); }
+        if (i + 1) % 20 == 0 {
+            println!("");
+        }
     }
     println!("\nRun-length encoding of diffs (0 means equal):");
     // compute diffs and runs of equal increments
@@ -44,9 +46,13 @@ fn main() {
     // Summarize run lengths
     use std::collections::HashMap;
     let mut hist: HashMap<usize, usize> = HashMap::new();
-    for (_, count) in runs.iter() { *hist.entry(*count).or_default() += 1; }
+    for (_, count) in runs.iter() {
+        *hist.entry(*count).or_default() += 1;
+    }
     let mut keys: Vec<_> = hist.keys().cloned().collect();
     keys.sort();
     println!("Run length histogram:");
-    for k in keys { println!("{} -> {}", k, hist[&k]); }
+    for k in keys {
+        println!("{} -> {}", k, hist[&k]);
+    }
 }

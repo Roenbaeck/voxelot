@@ -24,7 +24,7 @@ rand = "0.8"
 clap = { version = "4.5.54", features = ["derive"] }
 noise = "0.9.0"
 # wgpu-based viewer (desktop)
-wgpu = "28.0"
+wgpu = "29.0.3"
 #windows = "0.62"
 winit = "0.30.12"
 

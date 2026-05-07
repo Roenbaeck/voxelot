@@ -361,8 +361,6 @@ pub struct PerformanceConfig {
     // Profiling is controlled at compile-time via Cargo features (`cpu-profiling` & `gpu-profiling`).
 }
 
-
-
 // Default values
 fn default_world_file() -> String {
     "world_1.vhc".to_string()

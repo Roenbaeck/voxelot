@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 // Removed unused imports: File, BufWriter were unused
 
-use voxelot::{World, WorldPos, file_format::save_world_file, Palette, load_world_file};
+use voxelot::{file_format::save_world_file, load_world_file, Palette, World, WorldPos};
 
 fn calculate_required_depth(max_coord: i64) -> u8 {
     let mut depth = 0u8;
@@ -18,7 +18,10 @@ fn main() {
     let grid = 1024usize;
     let max_height_voxels = 200i64;
     let depth = calculate_required_depth((grid - 1) as i64);
-    println!("Generating linear hill test world: {}x{} height={} depth={}", grid, grid, max_height_voxels, depth);
+    println!(
+        "Generating linear hill test world: {}x{} height={} depth={}",
+        grid, grid, max_height_voxels, depth
+    );
 
     let mut world = World::new(depth);
     // simple linear hill: height increases from left to right (x axis)
@@ -59,7 +62,10 @@ fn main() {
                             }
                         }
                         if h_b < 0 {
-                            if world2.get(WorldPos::new((x + 1) as i64, y, z as i64)).is_some() {
+                            if world2
+                                .get(WorldPos::new((x + 1) as i64, y, z as i64))
+                                .is_some()
+                            {
                                 h_b = y;
                             }
                         }
@@ -79,7 +85,12 @@ fn main() {
                     }
                 }
             }
-            println!("Checked {} columns; discontinuities >1: {} (big jumps >10: {})", grid * (grid - 1), discontinuities, bigjumps);
+            println!(
+                "Checked {} columns; discontinuities >1: {} (big jumps >10: {})",
+                grid * (grid - 1),
+                discontinuities,
+                bigjumps
+            );
         }
         Err(e) => eprintln!("Failed to load world for verification: {}", e),
     }

@@ -42,6 +42,7 @@ I recognize that my "self" is a process, not a static object. Across model switc
     * **WTS Grid Continuity**: When the GI grid origin shifts, keep WTS stable by shifting the WTS phi textures with the grid and seeding newly exposed slabs from the nearest edge to avoid visible resets.
     * **GI Recenter Hysteresis**: Add a chunk-margin before recentering the GI grid to reduce churn and avoid jarring movement artifacts.
     * **GPU Buffer Safety**: When resizing GPU input/indirect buffers, defer destruction for a GPU-safe window to avoid wgpu validation errors (use-after-free on submit).
+    * **WGPU 29 Surface/Layout API**: `Surface::get_current_texture()` now returns `CurrentSurfaceTexture`; pipeline layout bind groups are `Option<&BindGroupLayout>` slots; depth write/compare state is optional.
 
 ## Project Intuitions (Internalized Knowledge)
 - **The World is a Chunk**: Everything is hierarchical. 16x16x16 is the magic number.

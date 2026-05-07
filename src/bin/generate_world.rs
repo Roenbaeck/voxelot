@@ -205,20 +205,20 @@ const MAT_PALM_FROND_MID: usize = 39;
 // available for palette completeness.
 #[allow(dead_code)]
 const MAT_LIGHT_WARM: usize = 40; // Becomes 41 after +1 offset
-// Some palette constants are intentionally present but not always used by the
-// generator; mark them to suppress "dead_code" warnings while keeping them
-// available for palette completeness.
+                                  // Some palette constants are intentionally present but not always used by the
+                                  // generator; mark them to suppress "dead_code" warnings while keeping them
+                                  // available for palette completeness.
 #[allow(dead_code)]
 const MAT_LIGHT_COOL: usize = 41; // Becomes 42 after +1 offset
 const MAT_WINDOW_WARM: usize = 42; // Becomes 43 after +1 offset
 #[allow(dead_code)]
 const MAT_WINDOW_COOL: usize = 43; // Becomes 44 after +1 offset
-// Neon materials are present in palette but not always used by the generator.
+                                   // Neon materials are present in palette but not always used by the generator.
 #[allow(dead_code)]
 const MAT_NEON_RED: usize = 44; // Becomes 45 after +1 offset
 #[allow(dead_code)]
 const MAT_NEON_GREEN: usize = 45; // Becomes 46 after +1 offset
-// MAT_NEON_BLUE is currently defined for palette completeness but not used in generator
+                                  // MAT_NEON_BLUE is currently defined for palette completeness but not used in generator
 #[allow(dead_code)]
 const MAT_NEON_BLUE: usize = 46; // Becomes 47 after +1 offset
 const MAT_DUNE_GRASS: usize = 47; // Becomes 48 after +1 offset
@@ -3608,7 +3608,10 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     if matches!(args.format, OutputFormat::Vhc | OutputFormat::Both) {
         let vhc_path = PathBuf::from(format!("{}.vhc", args.output_name));
-        println!("Writing compressed VHC (hierarchical chunk) format to {}...", vhc_path.display());
+        println!(
+            "Writing compressed VHC (hierarchical chunk) format to {}...",
+            vhc_path.display()
+        );
         let max_coord = *[max_x, max_y, max_z].iter().max().unwrap_or(&0);
         let depth = calculate_required_depth(max_coord);
         println!(

@@ -129,14 +129,29 @@ impl SlabAllocator {
                 self.free_list.remove(i);
                 // prefix
                 if aligned_offset > region.offset {
-                    self.free_list.insert(i, FreeRegion { offset: region.offset, size: aligned_offset - region.offset });
+                    self.free_list.insert(
+                        i,
+                        FreeRegion {
+                            offset: region.offset,
+                            size: aligned_offset - region.offset,
+                        },
+                    );
                 }
                 // suffix
                 if aligned_offset + size < end {
                     let suffix_offset = aligned_offset + size;
                     let suffix_size = end - suffix_offset;
-                    let insert_idx = self.free_list.binary_search_by_key(&suffix_offset, |r| r.offset).unwrap_or_else(|p| p);
-                    self.free_list.insert(insert_idx, FreeRegion { offset: suffix_offset, size: suffix_size });
+                    let insert_idx = self
+                        .free_list
+                        .binary_search_by_key(&suffix_offset, |r| r.offset)
+                        .unwrap_or_else(|p| p);
+                    self.free_list.insert(
+                        insert_idx,
+                        FreeRegion {
+                            offset: suffix_offset,
+                            size: suffix_size,
+                        },
+                    );
                 }
 
                 self.allocated_count += 1;
