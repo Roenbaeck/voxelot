@@ -151,8 +151,7 @@ fn trace_local_ssr(start_pos: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
             continue;
         }
 
-        let px = vec2<i32>(uv * fdim);
-        let d_raw = textureLoad(scene_depth, px, 0);
+        let d_raw = load_depth_at_uv(uv);
 
         if (d_raw >= 0.999999 || d_raw <= 0.0) { continue; } 
 
@@ -172,7 +171,7 @@ fn trace_local_ssr(start_pos: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
                     let mid_clip = camera.view_proj * vec4<f32>(mid, 1.0);
                     let mid_ndc = mid_clip.xyz / mid_clip.w;
                     let mid_uv = vec2<f32>(mid_ndc.x * 0.5 + 0.5, 0.5 - mid_ndc.y * 0.5);
-                    let mid_d = textureLoad(scene_depth, vec2<i32>(mid_uv * fdim), 0);
+                    let mid_d = load_depth_at_uv(mid_uv);
                     // Compare in NDC depth space to avoid an extra reconstruct_world_pos
                     if (mid_ndc.z > mid_d + 0.0001) {
                         refine_pos = mid;
@@ -184,7 +183,7 @@ fn trace_local_ssr(start_pos: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
                 let final_clip = camera.view_proj * vec4<f32>(refine_pos, 1.0);
                 let final_ndc = final_clip.xyz / final_clip.w;
                 let final_uv = vec2<f32>(final_ndc.x * 0.5 + 0.5, 0.5 - final_ndc.y * 0.5);
-                let final_px = vec2<i32>(final_uv * fdim);
+                let final_px = clamp(vec2<i32>(final_uv * fdim), vec2<i32>(0), vec2<i32>(dim) - 1);
 
                 let color = textureLoad(scene_color, final_px, 0).rgb;
                 // Tight edge fade
@@ -253,7 +252,8 @@ struct RayHit {
 }
 
 fn ray_aabb_intersection(ro: vec3<f32>, rd: vec3<f32>, min_p: vec3<f32>, max_p: vec3<f32>) -> RayHit {
-    let inv_dir = 1.0 / rd;
+    let safe_rd = rd + select(vec3<f32>(0.0), vec3<f32>(1e-8), abs(rd) < vec3<f32>(1e-8));
+    let inv_dir = 1.0 / safe_rd;
     let t_bot = inv_dir * (min_p - ro);
     let t_top = inv_dir * (max_p - ro);
     let t_min = min(t_bot, t_top);
@@ -266,7 +266,7 @@ fn ray_aabb_intersection(ro: vec3<f32>, rd: vec3<f32>, min_p: vec3<f32>, max_p: 
         f32(t_near == t_min.y),
         f32(t_near == t_min.z)
     );
-    let normal = -sign(rd) * mask;
+    let normal = -sign(safe_rd) * mask;
     
     return RayHit(t_near, t_far, normal);
 }

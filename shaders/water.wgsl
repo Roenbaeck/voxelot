@@ -688,7 +688,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         
         // Reconstruct view-space distance (view_z) from depth buffer at the hit point
         let hit_raw_depth = load_depth_at_uv(ssr_hit.xy);
-        let hit_view_pos_reconst = camera.inverse_proj * vec4<f32>(ssr_hit.x * 2.0 - 1.0, 1.0 - ssr_hit.y * 2.0, hit_raw_depth, 1.0);
+        let hit_z_ndc = hit_raw_depth * 2.0 - 1.0;
+        let hit_view_pos_reconst = camera.inverse_proj * vec4<f32>(ssr_hit.x * 2.0 - 1.0, 1.0 - ssr_hit.y * 2.0, hit_z_ndc, 1.0);
         reflection_distance = max(-(hit_view_pos_reconst.z / hit_view_pos_reconst.w), 0.0);
         
         // Ray marches from water toward the scene along reflect_dir_raw.

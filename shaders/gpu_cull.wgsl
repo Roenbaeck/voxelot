@@ -194,7 +194,7 @@ fn cs_main(@builtin(global_invocation_id) global_id : vec3<u32>) {
                     select(-half_scale.y, half_scale.y, (i & 2) != 0),
                     select(-half_scale.z, half_scale.z, (i & 4) != 0)
                 );
-                let world_pos = instance.position + corner_offset;
+                let world_pos = instance_center + corner_offset;
                 
                 // Project to clip space
                 let clip_pos = params.view_proj * vec4<f32>(world_pos, 1.0);

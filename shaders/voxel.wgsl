@@ -174,7 +174,7 @@ fn sample_radiance_int(pos: vec3<i32>, dir: vec3<f32>) -> vec3<f32> {
     } else {
         color_z = textureLoad(gi_probe_nz, pos, 0).rgb;
     }
-    return (color_x * w.x + color_y * w.y + color_z * w.z) * uniforms.gi_scale;
+    return color_x * w.x + color_y * w.y + color_z * w.z;
 }
 
 // Cheap analytical sky for distant reflections without binding skybox texture

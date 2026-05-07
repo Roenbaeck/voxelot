@@ -32,7 +32,7 @@ struct SsaoUniforms {
 @group(0) @binding(8) var gi_probe_nz: texture_3d<f32>;
 @group(0) @binding(9) var normal_tex: texture_2d<f32>;
 @group(0) @binding(10) var screen_color_tex: texture_2d<f32>;
-@group(0) @binding(11) var gi_probe_color: texture_3d<f32>;
+@group(0) @binding(11) var gi_relaxed_phi: texture_3d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -102,9 +102,10 @@ fn ign(uv: vec2<f32>) -> f32 {
 }
 
 fn fast_acos(x: f32) -> f32 {
-    let out_val = -0.156583 * abs(x) + HALF_PI;
-    let res = out_val * sqrt(1.0 - abs(x));
-    return select(PI - res, res, x >= 0.0);
+    let x_clamped = clamp(x, -1.0, 1.0);
+    let out_val = -0.156583 * abs(x_clamped) + HALF_PI;
+    let res = out_val * sqrt(max(0.0, 1.0 - abs(x_clamped)));
+    return select(PI - res, res, x_clamped >= 0.0);
 }
 
 fn count_bits(value: u32) -> u32 {
@@ -147,7 +148,7 @@ fn sample_grid_irradiance(world_pos: vec3<f32>, normal: vec3<f32>, camera_pos: v
     let uvw = clamp((grid_coord + vec3<f32>(0.5)) / dims, vec3<f32>(0.0), vec3<f32>(1.0));
 
     // Sample the high-quality relaxed GI field (WTS)
-    let relaxed_irradiance = textureSample(gi_probe_color, post_sampler, uvw).rgb;
+    let relaxed_irradiance = textureSample(gi_relaxed_phi, post_sampler, uvw).rgb;
 
     let w_x = normal.x * normal.x;
     let w_y = normal.y * normal.y;
@@ -180,11 +181,12 @@ fn sample_grid_irradiance(world_pos: vec3<f32>, normal: vec3<f32>, camera_pos: v
     // Calculate distance to edge of grid for smooth fading
     // grid_coord is in chunk units (0..dims)
     // Fade width scales with gi_fade_range to reduce hard cutoffs.
-    let dist_to_edge = min(
-        min(grid_coord.x, f32(dims.x) - grid_coord.x),
-        min(min(grid_coord.y, f32(dims.y) - grid_coord.y),
-            min(grid_coord.z, f32(dims.z) - grid_coord.z))
-    );
+    let max_grid_coord = dims - vec3<f32>(1.0);
+    let dist_to_edge = max(0.0, min(
+        min(grid_coord.x, max_grid_coord.x - grid_coord.x),
+        min(min(grid_coord.y, max_grid_coord.y - grid_coord.y),
+            min(grid_coord.z, max_grid_coord.z - grid_coord.z))
+    ));
     
     let edge_fade_chunks = max(2.0, ssao.gi_fade_range / 16.0);
     let fade = smoothstep(0.0, edge_fade_chunks, dist_to_edge);
@@ -342,7 +344,10 @@ fn fs_main(@location(0) uv: vec2<f32>, @builtin(position) frag_pos: vec4<f32>) -
                 let horizon_angle_rel = fast_acos(horizon_cos) * direction;
                 
                 let back_horizon_num = d_dot_v - ssao.hit_thickness;
-                let back_horizon_den_sq = dist_sq - 2.0 * d_dot_v * ssao.hit_thickness + hit_thickness_sq;
+                let back_horizon_den_sq = max(
+                    dist_sq - 2.0 * d_dot_v * ssao.hit_thickness + hit_thickness_sq,
+                    1e-8
+                );
                 let back_horizon_cos = back_horizon_num * inverseSqrt(back_horizon_den_sq);
                 let back_horizon_angle = fast_acos(back_horizon_cos) * direction;
                 
