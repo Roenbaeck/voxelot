@@ -3,8 +3,8 @@ file = "worlds/flat_city_test.vhc"
 palette = "worlds/palette.txt"
 skybox = "worlds/skybox.hdr"
 camera_position = [
-    948.51685,
-    119.04659,
+    942.51685,
+    108.17258,
     322.40808,
 ]
 water_level = 20.0
@@ -56,10 +56,10 @@ kawase_enabled = true
 
 [effects.bloom]
 enabled = true
-threshold = 0.7
+threshold = 0.99999994
 knee = 0.6
 intensity = 1.8
-bloom_strength = 1.6
+bloom_strength = 1.0000017
 saturation_boost = 1.5
 exposure = 1.18
 blur_radius = 3.8

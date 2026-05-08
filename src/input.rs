@@ -48,6 +48,8 @@ impl DebugView {
 pub enum ConfigurableSetting {
     FogDensity,
     BloomEnabled,
+    BloomStrength,
+    BloomThreshold,
     SsaoEnabled,
     SsrEnabled,
     SdrTonemap,
@@ -62,6 +64,7 @@ pub enum ConfigurableSetting {
     DofBlurStrength,
     KawaseIterations,
     KawaseOffset,
+    RenderScale,
     WaterLevel,
 }
 
@@ -70,7 +73,9 @@ impl ConfigurableSetting {
         use ConfigurableSetting::*;
         match self {
             FogDensity => BloomEnabled,
-            BloomEnabled => SsaoEnabled,
+            BloomEnabled => BloomStrength,
+            BloomStrength => BloomThreshold,
+            BloomThreshold => SsaoEnabled,
             SsaoEnabled => SsrEnabled,
             SsrEnabled => SdrTonemap,
             SdrTonemap => DofEnabled,
@@ -84,7 +89,8 @@ impl ConfigurableSetting {
             DofFocalRange => DofBlurStrength,
             DofBlurStrength => KawaseIterations,
             KawaseIterations => KawaseOffset,
-            KawaseOffset => WaterLevel,
+            KawaseOffset => RenderScale,
+            RenderScale => WaterLevel,
             WaterLevel => FogDensity,
         }
     }
@@ -93,6 +99,8 @@ impl ConfigurableSetting {
         match self {
             ConfigurableSetting::FogDensity => "Fog Density",
             ConfigurableSetting::BloomEnabled => "Bloom",
+            ConfigurableSetting::BloomStrength => "Bloom Strength",
+            ConfigurableSetting::BloomThreshold => "Bloom Threshold",
             ConfigurableSetting::SsaoEnabled => "SSAO",
             ConfigurableSetting::SsrEnabled => "SSR",
             ConfigurableSetting::SdrTonemap => "SDR Tonemap",
@@ -107,6 +115,7 @@ impl ConfigurableSetting {
             ConfigurableSetting::DofBlurStrength => "DoF Strength",
             ConfigurableSetting::KawaseIterations => "Kawase Iters",
             ConfigurableSetting::KawaseOffset => "Kawase Offset",
+            ConfigurableSetting::RenderScale => "Render Scale",
             ConfigurableSetting::WaterLevel => "Water Level",
         }
     }

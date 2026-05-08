@@ -3283,6 +3283,38 @@ impl App {
         1.0 + self.user_config.rendering.render_overscan.max(0.0)
     }
 
+    fn update_render_target_dimensions(&mut self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let size = window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
+
+        let scale = window.scale_factor() as f32;
+        let logical_width = ((size.width as f32) / scale).round() as u32;
+        let logical_height = ((size.height as f32) / scale).round() as u32;
+        let render_scale = self.user_config.performance.render_scale;
+        let overscan_factor = self.render_overscan_factor();
+        self.present_target_width = ((logical_width as f32) * render_scale).round().max(1.0) as u32;
+        self.present_target_height =
+            ((logical_height as f32) * render_scale).round().max(1.0) as u32;
+        self.render_target_width = ((self.present_target_width as f32) * overscan_factor)
+            .round()
+            .max(1.0) as u32;
+        self.render_target_height = ((self.present_target_height as f32) * overscan_factor)
+            .round()
+            .max(1.0) as u32;
+
+        self.camera_controller.camera.aspect =
+            self.render_target_width as f32 / self.render_target_height.max(1) as f32;
+        let position = self.camera_controller.camera.position;
+        let forward = self.camera_controller.camera.forward;
+        let up = self.camera_controller.camera.up;
+        self.camera_controller.camera.update(position, forward, up);
+    }
+
     /// Wider internal render FOV used when `rendering.render_overscan > 0`.
     /// Final presentation crops centrally to match the configured camera FOV.
     fn render_fov_radians(&self) -> f32 {
@@ -4761,6 +4793,19 @@ impl App {
                 self.bloom_enabled = direction > 0;
                 log::info!("Bloom {}", if self.bloom_enabled { "ON" } else { "OFF" });
             }
+            ConfigurableSetting::BloomStrength => {
+                let delta = 0.1 * direction as f32;
+                self.bloom_settings.bloom_strength =
+                    (self.bloom_settings.bloom_strength + delta).clamp(0.0, 4.0);
+                log::info!("Bloom strength: {:.2}", self.bloom_settings.bloom_strength);
+            }
+            ConfigurableSetting::BloomThreshold => {
+                let delta = 0.05 * direction as f32;
+                self.bloom_settings.threshold =
+                    (self.bloom_settings.threshold + delta).clamp(0.0, 5.0);
+                self.update_bloom_uniforms();
+                log::info!("Bloom threshold: {:.2}", self.bloom_settings.threshold);
+            }
             ConfigurableSetting::SsaoEnabled => {
                 self.ssao_enabled = direction > 0;
                 log::info!("SSAO {}", if self.ssao_enabled { "ON" } else { "OFF" });
@@ -4876,6 +4921,19 @@ impl App {
                 log::info!("Kawase offset: {:.2}", self.dof_settings.kawase_offset);
                 self.update_kawase_bind_groups();
             }
+            ConfigurableSetting::RenderScale => {
+                let delta = 0.05 * direction as f32;
+                self.user_config.performance.render_scale =
+                    (self.user_config.performance.render_scale + delta).clamp(0.50, 2.00);
+                self.update_render_target_dimensions();
+                self.pending_recreate_offscreen = true;
+                log::info!(
+                    "Render scale: {:.2} ({}x{})",
+                    self.user_config.performance.render_scale,
+                    self.present_target_width,
+                    self.present_target_height
+                );
+            }
             ConfigurableSetting::WaterLevel => {
                 let delta = 5.0 * direction as f32;
                 self.water_level = (self.water_level + delta).clamp(0.0, 1000.0);
@@ -4894,6 +4952,12 @@ impl App {
                 } else {
                     "OFF".into()
                 }
+            }
+            ConfigurableSetting::BloomStrength => {
+                format!("{:.2}", self.bloom_settings.bloom_strength)
+            }
+            ConfigurableSetting::BloomThreshold => {
+                format!("{:.2}", self.bloom_settings.threshold)
             }
             ConfigurableSetting::SsaoEnabled => {
                 if self.ssao_enabled {
@@ -4950,6 +5014,9 @@ impl App {
                 format!("{}", self.dof_settings.kawase_iterations)
             }
             ConfigurableSetting::KawaseOffset => format!("{:.2}", self.dof_settings.kawase_offset),
+            ConfigurableSetting::RenderScale => {
+                format!("{:.2}", self.user_config.performance.render_scale)
+            }
             ConfigurableSetting::WaterLevel => format!("{:.1}", self.water_level),
         }
     }
@@ -16406,24 +16473,7 @@ impl ApplicationHandler for App {
                         config.height = new_size.height;
                     }
 
-                    // Update internal render target dims based on logical window size and configured render_scale
-                    if let Some(window) = self.window.as_ref() {
-                        let scale = window.scale_factor() as f32;
-                        let logical_width = ((new_size.width as f32) / scale).round() as u32;
-                        let logical_height = ((new_size.height as f32) / scale).round() as u32;
-                        let render_scale = self.user_config.performance.render_scale;
-                        let overscan_factor = self.render_overscan_factor();
-                        let present_target_width =
-                            ((logical_width as f32) * render_scale).round() as u32;
-                        let present_target_height =
-                            ((logical_height as f32) * render_scale).round() as u32;
-                        self.present_target_width = present_target_width.max(1);
-                        self.present_target_height = present_target_height.max(1);
-                        self.render_target_width =
-                            ((self.present_target_width as f32) * overscan_factor).round() as u32;
-                        self.render_target_height =
-                            ((self.present_target_height as f32) * overscan_factor).round() as u32;
-                    }
+                    self.update_render_target_dimensions();
 
                     if let (Some(surface), Some(device), Some(config)) = (
                         self.surface.as_ref(),
@@ -16434,17 +16484,6 @@ impl ApplicationHandler for App {
                     }
 
                     self.recreate_offscreen_targets();
-
-                    // Use internal render target dims to set camera aspect ratio, not swapchain physical pixels
-                    if self.render_target_width > 0 && self.render_target_height > 0 {
-                        self.camera_controller.camera.aspect =
-                            self.render_target_width as f32 / self.render_target_height as f32;
-                    }
-
-                    let cam = &self.camera_controller.camera;
-                    self.camera_controller
-                        .camera
-                        .update(cam.position, cam.forward, cam.up);
                 }
             }
             WindowEvent::RedrawRequested => {
