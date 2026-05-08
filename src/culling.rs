@@ -904,7 +904,7 @@ fn process_voxels<I>(
 
                     result.push(VoxelInstance {
                         position: pos,
-                        voxel_type: VoxelType::from(1), // Use default type for LOD
+                        voxel_type: sub_chunk.dominant_type,
                         distance,
                         custom_color: Some(sub_chunk.average_color),
                         scale: size,
@@ -1138,7 +1138,7 @@ pub fn cull_visible_voxels_parallel(
 
                                 cell_instances.push(VoxelInstance {
                                     position: pos,
-                                    voxel_type: 0,
+                                    voxel_type: chunk.dominant_type,
                                     distance,
                                     custom_color: Some(chunk.average_color),
                                     scale: size,
@@ -1152,7 +1152,7 @@ pub fn cull_visible_voxels_parallel(
                             if chunk.voxel_count > 0 {
                                 cell_instances.push(VoxelInstance {
                                     position: [world_x, world_y, world_z],
-                                    voxel_type: 0,
+                                    voxel_type: chunk.dominant_type,
                                     distance,
                                     custom_color: Some(chunk.average_color),
                                     scale: [scale as f32, scale as f32, scale as f32],
@@ -1295,7 +1295,11 @@ fn mul_scalar(v: &[f32; 3], s: f32) -> [f32; 3] {
 
 #[cfg(test)]
 mod tests_culling {
-    use crate::lib_hierarchical::bbox_local_to_world;
+    use crate::lib_hierarchical::{bbox_local_to_world, World, WorldPos};
+    use crate::palette::Palette;
+
+    use super::{cull_visible_voxels_parallel, Camera, RenderConfig};
+
     #[test]
     fn test_bbox_local_to_world() {
         // scale = 16 -> unit = 1
@@ -1313,5 +1317,69 @@ mod tests_culling {
         let (pos3, size3) = bbox_local_to_world([0, 0, 0], 4096, [0, 0, 0, 15, 15, 15]);
         assert_eq!(pos3, [0, 0, 0]);
         assert_eq!(size3, [4096.0, 4096.0, 4096.0]);
+    }
+
+    #[test]
+    fn test_parallel_cull_preserves_chunk_dominant_type_for_lod() {
+        let palette = Palette::from_string(
+            "\
+0 255 255 255 255 0 0 0 0 0
+2 100 120 140 255 0 0 0 0 220
+",
+        )
+        .unwrap();
+        let mut world = World::new(2);
+        world.set(WorldPos::new(0, 0, 0), 2);
+        world.update_all_lod_metadata(&palette);
+        world.generate_all_hierarchy_shells();
+
+        let camera = Camera::with_config(
+            [-32.0, 8.0, 8.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            RenderConfig {
+                lod_render_distance: 0.0,
+                far_plane: 256.0,
+                fov_degrees: 90.0,
+                near_plane: 0.1,
+                culling_overscan: 0.0,
+            },
+        );
+
+        let (instances, _, _) = cull_visible_voxels_parallel(&world, &camera);
+
+        assert!(instances.iter().any(|instance| instance.voxel_type == 2));
+    }
+
+    #[test]
+    fn test_recursive_cull_preserves_subchunk_dominant_type_for_lod() {
+        let palette = Palette::from_string(
+            "\
+0 255 255 255 255 0 0 0 0 0
+2 100 120 140 255 0 0 0 0 220
+",
+        )
+        .unwrap();
+        let mut world = World::new(3);
+        world.set(WorldPos::new(0, 0, 0), 2);
+        world.update_all_lod_metadata(&palette);
+        world.generate_all_hierarchy_shells();
+
+        let camera = Camera::with_config(
+            [-32.0, 8.0, 8.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            RenderConfig {
+                lod_render_distance: 0.0,
+                far_plane: 4096.0,
+                fov_degrees: 90.0,
+                near_plane: 0.1,
+                culling_overscan: 0.0,
+            },
+        );
+
+        let (instances, _, _) = cull_visible_voxels_parallel(&world, &camera);
+
+        assert!(instances.iter().any(|instance| instance.voxel_type == 2));
     }
 }

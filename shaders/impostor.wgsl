@@ -32,6 +32,7 @@ struct ImpostorInstance {
     _pad0 : f32,
     color : vec4<f32>,
     emissive : vec4<f32>,
+    material : vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -41,6 +42,8 @@ struct VertexOut {
     @builtin(position) position : vec4<f32>,
     @location(0) color : vec4<f32>,
     @location(1) emissive : vec4<f32>,
+    @location(2) world_pos : vec3<f32>,
+    @location(3) @interpolate(flat) material : vec4<f32>,
 };
 
 const QUAD: array<vec2<f32>, 6> = array<vec2<f32>, 6>(
@@ -58,6 +61,7 @@ fn vs_main(
     @location(0) inst_pos : vec3<f32>,
     @location(1) inst_color : vec4<f32>,
     @location(2) inst_emissive : vec4<f32>,
+    @location(3) inst_material : vec4<f32>,
 ) -> VertexOut {
     var out : VertexOut;
     let clip = params.view_proj * vec4<f32>(inst_pos, 1.0);
@@ -72,6 +76,8 @@ fn vs_main(
     out.position = clip + vec4<f32>(ndc_offset * clip.w, 0.0, 0.0);
     out.color = inst_color;
     out.emissive = inst_emissive;
+    out.world_pos = inst_pos;
+    out.material = inst_material;
     return out;
 }
 
@@ -86,9 +92,11 @@ struct FragmentOut {
 fn fs_main(input : VertexOut) -> FragmentOut {
     var out : FragmentOut;
     let alpha = select(1.0, input.color.a, input.color.a > 0.0);
-    let base_color = input.color.rgb * params.skybox_brightness;
+    let reflectivity = clamp(input.material.r, 0.0, 1.0);
+    let sky_reflection = mix(vec3<f32>(0.035, 0.04, 0.06), vec3<f32>(0.78, 0.86, 0.95), params.skybox_brightness);
+    let base_color = input.color.rgb * params.skybox_brightness + sky_reflection * reflectivity;
     let fog_density = max(params.fog_density, 0.0);
-    let dist = length(params.camera_position - input.position.xyz);
+    let dist = length(params.camera_position - input.world_pos);
     let transmittance = exp(-fog_density * dist);
     let fog_base = mix(vec3<f32>(0.02, 0.02, 0.03), vec3<f32>(0.7, 0.8, 0.9), params.skybox_brightness);
     let fog_color = fog_base * vec3<f32>(1.0, 1.0, 1.0);
@@ -96,6 +104,6 @@ fn fs_main(input : VertexOut) -> FragmentOut {
     out.color = vec4<f32>(fogged, alpha);
     out.emissive = vec4<f32>(input.emissive.rgb * input.emissive.a, 1.0);
     out.normal = vec2<f32>(0.0, 0.0);
-    out.material = 0.0;
+    out.material = reflectivity;
     return out;
 }

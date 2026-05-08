@@ -122,6 +122,29 @@ impl GiSystem {
         Some(x + y * dx + z * dx * dy)
     }
 
+    fn queue_missing_probe(
+        &mut self,
+        chunk_coord: IVec3,
+        grid_origin: IVec3,
+        missing_set: &mut HashSet<IVec3>,
+    ) -> bool {
+        let relative = chunk_coord - grid_origin;
+        if relative.x < 0
+            || relative.x >= self.grid_dims.x
+            || relative.y < 0
+            || relative.y >= self.grid_dims.y
+            || relative.z < 0
+            || relative.z >= self.grid_dims.z
+            || self.probe_cache.contains_key(&chunk_coord)
+            || !missing_set.insert(chunk_coord)
+        {
+            return false;
+        }
+
+        self.missing_probes.push(chunk_coord);
+        true
+    }
+
     pub fn build_flat_probes(&self) -> Vec<GiProbe> {
         let dims = self.grid_dims;
         let origin = self.grid_origin;
@@ -209,31 +232,50 @@ impl GiSystem {
         // Check for missing probes whenever grid moves OR when we have new visible chunks
         let grid_moved = new_origin != self.last_grid_origin;
 
+        let mut missing_set: HashSet<IVec3> = self.missing_probes.iter().copied().collect();
+        let mut added_missing_probes = false;
+
         if grid_moved {
             self.missing_probes.clear();
+            missing_set.clear();
         }
 
-        // Always check visible chunks for missing probes (handles rotation case)
-        for &chunk_coord in visible_chunks {
-            // Check if chunk is within our grid bounds
-            let relative = chunk_coord - new_origin;
-            if relative.x >= 0
-                && relative.x < self.grid_dims.x
-                && relative.y >= 0
-                && relative.y < self.grid_dims.y
-                && relative.z >= 0
-                && relative.z < self.grid_dims.z
-            {
-                if !self.probe_cache.contains_key(&chunk_coord) {
-                    // Only add if not already in the list
-                    if !self.missing_probes.contains(&chunk_coord) {
-                        self.missing_probes.push(chunk_coord);
+        // On grid moves, seed the whole world-space GI volume, sorted below by
+        // distance. This keeps WTS sunlight from depending on the current view
+        // frustum while still processing nearest probes first.
+        if grid_moved {
+            for z in 0..self.grid_dims.z {
+                for y in 0..self.grid_dims.y {
+                    for x in 0..self.grid_dims.x {
+                        let coord = new_origin + IVec3::new(x, y, z);
+                        added_missing_probes |=
+                            self.queue_missing_probe(coord, new_origin, &mut missing_set);
                     }
                 }
             }
         }
 
-        if grid_moved {
+        // Always check visible chunks for missing probes (handles rotation case).
+        for &chunk_coord in visible_chunks {
+            added_missing_probes |=
+                self.queue_missing_probe(chunk_coord, new_origin, &mut missing_set);
+        }
+
+        // Also keep a small camera-local cube filled even for chunks behind or
+        // beside the camera. WTS lighting and reflections sample nearby surfaces
+        // that may not be in the current frustum.
+        const GI_NEAR_PROBE_RADIUS_CHUNKS: i32 = 6;
+        for z in -GI_NEAR_PROBE_RADIUS_CHUNKS..=GI_NEAR_PROBE_RADIUS_CHUNKS {
+            for y in -GI_NEAR_PROBE_RADIUS_CHUNKS..=GI_NEAR_PROBE_RADIUS_CHUNKS {
+                for x in -GI_NEAR_PROBE_RADIUS_CHUNKS..=GI_NEAR_PROBE_RADIUS_CHUNKS {
+                    let coord = cam_chunk + IVec3::new(x, y, z);
+                    added_missing_probes |=
+                        self.queue_missing_probe(coord, new_origin, &mut missing_set);
+                }
+            }
+        }
+
+        if grid_moved || added_missing_probes {
             // Sort missing probes by distance to camera (prioritize nearest)
             // This matches the mesh worker priority system
             self.missing_probes.sort_by(|a, b| {
@@ -254,7 +296,7 @@ impl GiSystem {
         let mut updates: Vec<GiProbeUpdate> = Vec::new();
         if !self.missing_probes.is_empty() {
             // Process a batch of probes per update.
-            // 256 probes at 16,384 probes per grid means the whole grid can be refreshed in 64 updates.
+            // The whole grid refreshes incrementally over multiple updates.
             // Since this runs on a background thread pool, it won't stall the main loop.
             let probes_to_process: Vec<IVec3> =
                 self.missing_probes.iter().take(256).cloned().collect();

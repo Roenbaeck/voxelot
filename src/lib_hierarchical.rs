@@ -486,7 +486,10 @@ impl Chunk {
                     Voxel::Chunk(c) => (c.dominant_type, Palette::normalize_rgba(c.average_color)),
                 };
 
-                type_scores[v_type as usize] += 1.0;
+                let reflectivity = palette.reflectivity(v_type as u32);
+                let brightness = (v_color[0] + v_color[1] + v_color[2]) / 3.0;
+                let reflective_weight = 1.0 + reflectivity * (2.0 + brightness);
+                type_scores[v_type as usize] += reflective_weight;
 
                 color_sum[0] += v_color[0];
                 color_sum[1] += v_color[1];
@@ -1079,6 +1082,73 @@ impl World {
             root: Arc::new(Chunk::new()),
             hierarchy_depth,
             chunk_size: 16,
+        }
+    }
+
+    /// Return the occupied world-space bounds as `[min, max)`, or `None` for an empty world.
+    pub fn occupied_bounds(&self) -> Option<([i64; 3], [i64; 3])> {
+        let mut bounds = None;
+        Self::accumulate_occupied_bounds(
+            self.root(),
+            [0, 0, 0],
+            self.world_size() as i64,
+            &mut bounds,
+        );
+        bounds
+    }
+
+    fn include_occupied_bounds(
+        bounds: &mut Option<([i64; 3], [i64; 3])>,
+        min: [i64; 3],
+        max: [i64; 3],
+    ) {
+        match bounds {
+            Some((bounds_min, bounds_max)) => {
+                for axis in 0..3 {
+                    bounds_min[axis] = bounds_min[axis].min(min[axis]);
+                    bounds_max[axis] = bounds_max[axis].max(max[axis]);
+                }
+            }
+            None => {
+                *bounds = Some((min, max));
+            }
+        }
+    }
+
+    fn accumulate_occupied_bounds(
+        chunk: &Chunk,
+        origin: [i64; 3],
+        scale: i64,
+        bounds: &mut Option<([i64; 3], [i64; 3])>,
+    ) {
+        if chunk.is_empty() {
+            return;
+        }
+
+        let unit = (scale / 16).max(1);
+        for (x, y, z) in chunk.positions() {
+            let child_min = [
+                origin[0] + x as i64 * unit,
+                origin[1] + y as i64 * unit,
+                origin[2] + z as i64 * unit,
+            ];
+            match chunk.get(x, y, z) {
+                Some(Voxel::Solid(_)) => {
+                    Self::include_occupied_bounds(
+                        bounds,
+                        child_min,
+                        [
+                            child_min[0] + unit,
+                            child_min[1] + unit,
+                            child_min[2] + unit,
+                        ],
+                    );
+                }
+                Some(Voxel::Chunk(sub_chunk)) => {
+                    Self::accumulate_occupied_bounds(sub_chunk, child_min, unit, bounds);
+                }
+                None => {}
+            }
         }
     }
 
@@ -1834,6 +1904,8 @@ impl Default for World {
 
 #[cfg(test)]
 mod tests {
+    use crate::palette::Palette;
+
     use super::*;
 
     #[test]
@@ -1915,6 +1987,40 @@ mod tests {
         world.set(WorldPos::new(-1, 0, 0), 4);
         assert_eq!(world.get(WorldPos::new(256, 0, 0)), None);
         assert_eq!(world.get(WorldPos::new(-1, 0, 0)), None);
+    }
+
+    #[test]
+    fn test_occupied_bounds() {
+        let mut world = World::new(2);
+        assert_eq!(world.occupied_bounds(), None);
+
+        world.set(WorldPos::new(10, 20, 30), 1);
+        world.set(WorldPos::new(200, 5, 40), 2);
+
+        assert_eq!(world.occupied_bounds(), Some(([10, 5, 30], [201, 21, 41])));
+    }
+
+    #[test]
+    fn test_lod_metadata_prefers_reflective_surface_type() {
+        let palette = Palette::from_string(
+            "\
+0 255 255 255 255 0 0 0 0 0
+1 50 50 50 255 0 0 0 0 0
+2 100 120 140 255 0 0 0 0 220
+",
+        )
+        .unwrap();
+        let mut chunk = Chunk::new();
+
+        chunk.set(0, 0, 0, 1);
+        chunk.set(1, 0, 0, 1);
+        chunk.set(2, 0, 0, 1);
+        chunk.set(3, 0, 0, 2);
+        chunk.set(4, 0, 0, 2);
+
+        chunk.update_lod_metadata(&palette);
+
+        assert_eq!(chunk.dominant_type, 2);
     }
 
     #[test]

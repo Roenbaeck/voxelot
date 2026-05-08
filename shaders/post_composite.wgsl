@@ -186,20 +186,27 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     // Sample Radiance Cascades (RC) high-frequency GI
     let rc_light = textureSample(rc_texture, post_sampler, sample_uv).rgb;
 
-    // Sum everything before saturation and tonemapping to match old "punchy" look
-    // Note: direct emissive is already included in 'base' (added in DoF CoC pass)
-    var color = base + bloom * composite.bloom_strength + (indirect_light + rc_light) * composite.indirect_light_scale;
-    
-    // Apply AO to the radiance sum
-    color = color * ao;
+    // Sum everything before saturation and tonemapping to match old "punchy" look.
+    // Note: direct emissive is already included in 'base' (added in DoF CoC pass).
+    let indirect_sum = (indirect_light + rc_light) * composite.indirect_light_scale;
+
+    // SSILVB AO is a near-field screen-space effect. Applying it to the entire
+    // HDR radiance sum turns its finite radius into a camera-centered shadow
+    // volume, especially once WTS has added stable sunlight at distance. Keep
+    // real contact occlusion, but suppress broad low-grade haze.
+    let occlusion = clamp(1.0 - ao, 0.0, 1.0);
+    let contact_occlusion = smoothstep(0.02, 0.18, occlusion) * min(occlusion * 1.15, 0.9);
+    let contact_ao = 1.0 - contact_occlusion;
+    var color = (base + indirect_sum) * contact_ao + bloom * composite.bloom_strength;
 
     // Sample Radiance Cascades (RC) high-frequency GI for debug overlays (redundant but kept for structure)
     // let rc_light is already sampled above
 
     // GI Combined Debug overlay
     if (composite.gi_combined_debug > 0.5) {
-        // Show raw indirect light (probes + ssgi) in debug mode to ensure visibility
-        return vec4<f32>(indirect_light, 1.0);
+        // Show the combined indirect light with the same AO used by the final
+        // composite so the debug view preserves visible shadowing.
+        return vec4<f32>(indirect_light * contact_ao, 1.0);
     }
 
     // GI Probes Debug overlay

@@ -183,20 +183,20 @@ fn get_cheap_sky_color(rdir: vec3<f32>) -> vec3<f32> {
     let brightness = uniforms.fog_time_pad.w;
     
     // Simple procedural sky (varies with elevation + azimuth + horizon glow).
-    let t = clamp(rdir.y * 0.5 + 0.5, 0.0, 1.0);
+    let t = clamp(max(rdir.y, -0.15) * 0.5 + 0.5, 0.0, 1.0);
     let PI = 3.14159265359;
     let TWO_PI = 6.28318530718;
     let u = fract(0.5 + atan2(rdir.z, rdir.x) / TWO_PI);
     
-    let night_a = vec3<f32>(0.02, 0.02, 0.03);
-    let night_b = vec3<f32>(0.04, 0.05, 0.08);
-    let day_a = vec3<f32>(0.90, 0.92, 0.95);
-    let day_b = vec3<f32>(0.95, 0.96, 0.98);
+    let night_horizon = vec3<f32>(0.035, 0.04, 0.06);
+    let night_zenith = vec3<f32>(0.015, 0.018, 0.03);
+    let day_horizon = vec3<f32>(0.72, 0.80, 0.90);
+    let day_zenith = vec3<f32>(0.92, 0.95, 1.0);
     
     let az_blend = 0.5 + 0.5 * sin(u * TWO_PI);
-    let night = mix(night_a, night_b, az_blend);
-    let day = mix(day_a, day_b, az_blend);
-    var env = mix(night, day, t);
+    let night = mix(night_horizon, night_zenith, t) * mix(0.9, 1.1, az_blend);
+    let day = mix(day_horizon, day_zenith, t) * mix(0.96, 1.04, az_blend);
+    var env = mix(night, day, brightness);
     
     // Horizon glow makes vertical-face reflections less uniform.
     let horizon = pow(1.0 - abs(rdir.y), 3.0);
@@ -212,7 +212,7 @@ fn get_cheap_sky_color(rdir: vec3<f32>) -> vec3<f32> {
     let effect_strength = (1.0 - brightness) * tint_strength;
     env = mix(env, env * tint, effect_strength);
     
-    return env * brightness;
+    return env;
 }
 
 // ── Shared helper: sample light probes for indirect emissive lighting ────────
@@ -241,8 +241,10 @@ struct FogResult {
 fn compute_fog(distance: f32, ray_dir: vec3<f32>, sun_dir: vec3<f32>) -> FogResult {
     let base_fog_color = vec3<f32>(0.7, 0.8, 0.9);
     let skybox_brightness = uniforms.fog_time_pad.w;
-    let fog_base = mix(vec3<f32>(0.02, 0.02, 0.03), uniforms.ambient_color_pad.xyz, skybox_brightness);
-    let fog_color = min(base_fog_color * fog_base, vec3<f32>(0.12, 0.12, 0.16));
+    let night_fog = vec3<f32>(0.02, 0.02, 0.03);
+    let daylight_air = mix(uniforms.ambient_color_pad.xyz, vec3<f32>(0.75), 0.35 * skybox_brightness);
+    let day_fog = base_fog_color * daylight_air;
+    let fog_color = mix(night_fog, day_fog, skybox_brightness);
     let transmittance = exp(-uniforms.fog_time_pad.x * distance);
     let fog_factor = (1.0 - transmittance) * sqrt(skybox_brightness);
     let sun_view_dot = max(dot(-ray_dir, -sun_dir), 0.0);
@@ -256,24 +258,21 @@ fn compute_envelope_lit(
     normal: vec3<f32>,
     ray_dir: vec3<f32>,
     reflectivity: f32,
-    sun_contribution: vec3<f32>,
-    moon_light: vec3<f32>,
     fallback_color: vec3<f32>,
     fallback_lighting: vec3<f32>,
 ) -> vec3<f32> {
     let chunk_coord = vec3<i32>(floor(world_pos / 16.0)) - camera.gi_grid_origin;
     var env_lit: vec3<f32>;
     if (all(chunk_coord >= vec3<i32>(0)) && all(chunk_coord < camera.gi_grid_dims)) {
-        let probe_color = textureLoad(gi_probe_color, chunk_coord, 0).rgb;
         let relaxed_phi = textureLoad(gi_relaxed_phi, chunk_coord, 0).rgb;
         let radiance = sample_radiance_int(chunk_coord, normal);
-        let total_lighting = sun_contribution + moon_light + (relaxed_phi + radiance * uniforms.gi_scale) + uniforms.ambient_color_pad.xyz * 0.1;
+        let total_lighting = fallback_lighting + (relaxed_phi * 0.4 + radiance * uniforms.gi_scale);
         var reflection = vec3<f32>(0.0);
         if (reflectivity > 0.001) {
             let rdir = reflect(ray_dir, normal);
             reflection = get_cheap_sky_color(rdir) * reflectivity;
         }
-        env_lit = probe_color * total_lighting + reflection;
+        env_lit = fallback_color * total_lighting + reflection;
     } else {
         var reflection = vec3<f32>(0.0);
         if (reflectivity > 0.001) {
@@ -428,15 +427,12 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
 
     // Check if we are a fallback bounding box (scale is 16)
     if (input.scale > 15.0) {
-        let world_grid_origin = vec3<f32>(camera.gi_grid_origin) * 16.0;
         let chunk_coord = vec3<i32>(floor(input.world_pos / 16.0)) - camera.gi_grid_origin;
         
         if (all(chunk_coord >= vec3<i32>(0)) && all(chunk_coord < camera.gi_grid_dims)) {
-            let probe_color = textureLoad(gi_probe_color, chunk_coord, 0).rgb;
             let relaxed_phi = textureLoad(gi_relaxed_phi, chunk_coord, 0).rgb;
             let radiance = sample_radiance_int(chunk_coord, input.normal);
-            // Re-integrate sun/moon for fallbacks to avoid "flat" look
-            let total_lighting = sun_contribution + moon_light + (relaxed_phi + radiance * uniforms.gi_scale) + uniforms.ambient_color_pad.xyz * 0.1;
+            let total_lighting = lighting + (relaxed_phi * 0.4 + radiance * uniforms.gi_scale);
             
             // Simplified distant reflection
             var reflection = vec3<f32>(0.0);
@@ -445,15 +441,15 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
                 reflection = get_cheap_sky_color(reflect_dir) * reflectivity;
             }
             
-            color = vec4<f32>(probe_color * total_lighting + reflection, 1.0).rgb;
+            color = input.color.rgb * total_lighting + reflection;
         } else {
-            // Outside GI grid, use the passed color (chunk average) + direct light
+            // Outside GI grid, keep the same baseline lighting as nearby detail geometry.
             var reflection = vec3<f32>(0.0);
             if (reflectivity > 0.001) {
                 let reflect_dir = reflect(ray_dir, input.normal);
                 reflection = get_cheap_sky_color(reflect_dir) * reflectivity;
             }
-            color = input.color.rgb * (sun_contribution + moon_light + uniforms.ambient_color_pad.xyz * 0.1) + reflection;
+            color = input.color.rgb * lighting + reflection;
         }
     } else {
         // Standard voxel path: add reflections before fog
@@ -502,7 +498,7 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     if (env_fade_factor > 0.0) {
         let env_lit = compute_envelope_lit(
             input.world_pos, input.normal, ray_dir, reflectivity,
-            sun_contribution, moon_light, input.color.rgb, lighting,
+            input.color.rgb, lighting,
         );
         let env_fogged = mix(env_lit, fog_color + inscatter, fog_factor);
         brightened = mix(brightened, env_fogged, env_fade_factor);
@@ -591,7 +587,8 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     
     let indirect_light = compute_light_probes(input.world_pos);
     
-    var lighting = ambient + sun_contribution + moon_light + indirect_light;
+    let base_lighting = ambient + sun_contribution + moon_light + indirect_light;
+    var lighting = base_lighting;
     
     let chunk_coord = vec3<i32>(floor(input.world_pos / 16.0)) - camera.gi_grid_origin;
     if (all(chunk_coord >= vec3<i32>(0)) && all(chunk_coord < camera.gi_grid_dims)) {
@@ -651,7 +648,7 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     if (env_fade_factor > 0.0) {
         let env_lit = compute_envelope_lit(
             input.world_pos, input.normal, ray_dir, reflectivity,
-            sun_contribution, moon_light, input.color.rgb, lighting,
+            input.color.rgb, base_lighting,
         );
         let env_fogged = mix(env_lit, fog_color + inscatter, fog_factor);
         brightened = mix(brightened, env_fogged, env_fade_factor);

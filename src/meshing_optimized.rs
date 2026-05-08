@@ -103,6 +103,55 @@ fn greedy_mesh_binary_plane(mut data: [u16; 16]) -> Vec<GreedyQuad> {
     quads
 }
 
+fn is_surface_voxel(chunk: &Chunk, x: u8, y: u8, z: u8) -> bool {
+    x == 0
+        || x == 15
+        || y == 0
+        || y == 15
+        || z == 0
+        || z == 15
+        || !chunk.contains(x + 1, y, z)
+        || !chunk.contains(x - 1, y, z)
+        || !chunk.contains(x, y + 1, z)
+        || !chunk.contains(x, y - 1, z)
+        || !chunk.contains(x, y, z + 1)
+        || !chunk.contains(x, y, z - 1)
+}
+
+fn representative_surface_reflectivity(chunk: &Chunk, palette: &Palette) -> f32 {
+    let mut visible_total = 0u32;
+    let mut reflective_total = 0u32;
+    let mut reflectivity_sum = 0.0f32;
+    let mut reflectivity_max = 0.0f32;
+
+    for ((x, y, z), voxel) in chunk.iter() {
+        if !is_surface_voxel(chunk, x, y, z) {
+            continue;
+        }
+
+        let Voxel::Solid(voxel_type) = voxel else {
+            continue;
+        };
+
+        let reflectivity = palette.reflectivity(*voxel_type as u32);
+        visible_total = visible_total.saturating_add(1);
+        reflectivity_sum += reflectivity;
+        reflectivity_max = reflectivity_max.max(reflectivity);
+        if reflectivity > 0.01 {
+            reflective_total = reflective_total.saturating_add(1);
+        }
+    }
+
+    if visible_total == 0 {
+        return palette.reflectivity(chunk.dominant_type as u32);
+    }
+
+    let coverage = reflective_total as f32 / visible_total as f32;
+    let average = reflectivity_sum / visible_total as f32;
+    let coverage_boost = ((coverage - 0.03) / 0.22).clamp(0.0, 1.0);
+    average.max(reflectivity_max * coverage_boost * 0.85)
+}
+
 /// Generate mesh for a chunk using optimized bitwise operations
 pub fn generate_chunk_mesh_optimized(
     chunk: &Chunk,
@@ -329,7 +378,12 @@ pub fn generate_chunk_mesh_optimized(
                     material.emissive_intensity,
                 ]
             };
-            let material_props = [material.reflectivity, 0.0, 0.0, 0.0];
+            let reflectivity = if envelope {
+                representative_surface_reflectivity(chunk, palette)
+            } else {
+                material.reflectivity
+            };
+            let material_props = [reflectivity, 0.0, 0.0, 0.0];
 
             for (depth, plane) in depth_map {
                 let quads = greedy_mesh_binary_plane(*plane);
@@ -531,6 +585,29 @@ mod tests {
         assert!(mesh.indices.len() > 0);
         // Should have 6 faces * 4 vertices = 24 vertices
         assert_eq!(mesh.vertices.len(), 24);
+    }
+
+    #[test]
+    fn test_envelope_mesh_preserves_surface_reflectivity() {
+        let palette = Palette::from_string(
+            "\
+0 255 255 255 255 0 0 0 0 0
+1 50 50 50 255 0 0 0 0 0
+2 100 120 140 255 0 0 0 0 200
+",
+        )
+        .unwrap();
+        let mut chunk = Chunk::new();
+        for x in 0..8 {
+            chunk.set(x, 0, 0, 1);
+        }
+        for x in 8..12 {
+            chunk.set(x, 0, 0, 2);
+        }
+
+        let mesh = generate_chunk_mesh_optimized(&chunk, &palette, None, true);
+
+        assert!(mesh.vertices.iter().any(|v| v.material[0] > 0.2));
     }
 
     #[test]

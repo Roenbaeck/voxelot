@@ -205,6 +205,7 @@ struct ImpostorInstanceRaw {
     _pad0: f32,
     color: [f32; 4],
     emissive: [f32; 4],
+    material: [f32; 4],
 }
 
 /// Input layout for GPU culling compute pass (std430-friendly)
@@ -932,7 +933,7 @@ struct WtsParamsRaw {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct InjectParams {
-    candidate_count: u32,
+    _unused0: u32,
     gi_grid_origin: [i32; 3],
     gi_grid_dims: [i32; 3],
     _pad0: u32,
@@ -2685,14 +2686,14 @@ impl App {
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("WTS Inject Bind Group Layout"),
             entries: &[
-                // 0: Candidates Buffer (Storage Read)
+                // 0: GI probe color/occupancy volume
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
                     },
                     count: None,
                 },
@@ -2709,7 +2710,7 @@ impl App {
                     },
                     count: None,
                 },
-                // 2: Seed Texture (Storage Write)
+                // 2: WTS sunlight injection texture (Storage Write)
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -2824,6 +2825,7 @@ impl App {
                 ..Default::default()
             }));
         self.wts_injection_texture = Some(injection_texture);
+        self.wts_inject_bind_group = None;
 
         if self.wts_params_buffer.is_none() {
             self.wts_params_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
@@ -3099,14 +3101,14 @@ impl App {
 
         let (
             Some(layout),
-            Some(input_buf),
+            Some(seed_view),
             Some(params_buf),
             Some(injection_view),
             Some(shadow_view),
             Some(shadow_sampler),
         ) = (
             self.wts_inject_bind_group_layout.as_ref(),
-            self.gpu_input_buffer.as_ref(), // Matches current field name
+            self.gi_probe_view_color.as_ref(),
             self.wts_inject_params_buffer.as_ref(),
             self.wts_injection_storage_view.as_ref(),
             self.shadow_view.as_ref(),
@@ -3116,7 +3118,7 @@ impl App {
             return;
         };
 
-        let r0 = input_buf.as_entire_binding();
+        let r0 = wgpu::BindingResource::TextureView(seed_view);
         let r1 = params_buf.as_entire_binding();
         let r2 = wgpu::BindingResource::TextureView(injection_view);
         let r3 = wgpu::BindingResource::TextureView(shadow_view);
@@ -3321,6 +3323,58 @@ impl App {
         }
         total
     }
+
+    fn recenter_start_camera_if_outside_map(world: &World, camera: &mut [f32; 3]) {
+        let world_size = world.world_size() as f32;
+        let outside_world = !camera.iter().all(|v| v.is_finite())
+            || camera[0] < 0.0
+            || camera[1] < 0.0
+            || camera[2] < 0.0
+            || camera[0] >= world_size
+            || camera[1] >= world_size
+            || camera[2] >= world_size;
+
+        if let Some((min_i, max_i)) = world.occupied_bounds() {
+            let min = [min_i[0] as f32, min_i[1] as f32, min_i[2] as f32];
+            let max = [max_i[0] as f32, max_i[1] as f32, max_i[2] as f32];
+            let outside_content_xz = camera[0] < min[0]
+                || camera[0] >= max[0]
+                || camera[2] < min[2]
+                || camera[2] >= max[2];
+
+            if outside_world || outside_content_xz {
+                let old = *camera;
+                camera[0] = (min[0] + max[0]) * 0.5;
+                camera[2] = (min[2] + max[2]) * 0.5;
+                if !camera[1].is_finite() || camera[1] < 0.0 || camera[1] >= world_size {
+                    camera[1] = (max[1] + 10.0).min(world_size - 1.0).max(min[1] + 1.0);
+                }
+                log::info!(
+                    "Start camera was outside map/content bounds ({:.1}, {:.1}, {:.1}); moved to map center ({:.1}, {:.1}, {:.1})",
+                    old[0],
+                    old[1],
+                    old[2],
+                    camera[0],
+                    camera[1],
+                    camera[2],
+                );
+            }
+        } else if outside_world {
+            let old = *camera;
+            let center = world_size * 0.5;
+            *camera = [center, center, center];
+            log::info!(
+                "Start camera was outside empty world bounds ({:.1}, {:.1}, {:.1}); moved to world center ({:.1}, {:.1}, {:.1})",
+                old[0],
+                old[1],
+                old[2],
+                camera[0],
+                camera[1],
+                camera[2],
+            );
+        }
+    }
+
     fn new(config_path: &str) -> Self {
         let mut system_info = System::new();
         let process_pid = Pid::from(std::process::id() as usize);
@@ -3484,6 +3538,9 @@ impl App {
 
             world = Arc::new(temp_world);
         }
+
+        // Failsafe: Ensure camera starts over the loaded map before the first cull/GI pass.
+        Self::recenter_start_camera_if_outside_map(&world, &mut initial_camera);
 
         // Failsafe: Ensure camera spawns above terrain
         let mut cam_pos = initial_camera;
@@ -7551,6 +7608,7 @@ impl App {
             Some(impostor_indirect),
             Some(impostor_instances),
             Some(hzb_view),
+            Some(material_props_buffer),
         ) = (
             self.cull_bind_group_layout.as_ref(),
             self.gpu_input_buffer.as_ref(),
@@ -7562,6 +7620,7 @@ impl App {
             self.impostor_indirect_buffer.as_ref(),
             self.impostor_instance_buffer.as_ref(),
             self.hzb_view.as_ref(),
+            self.material_props_buffer.as_ref(),
         )
         else {
             return;
@@ -7634,6 +7693,10 @@ impl App {
                 wgpu::BindGroupEntry {
                     binding: 8,
                     resource: wgpu::BindingResource::TextureView(hzb_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: material_props_buffer.as_entire_binding(),
                 },
             ],
         }));
@@ -11183,6 +11246,16 @@ impl App {
                         },
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 9,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -11421,6 +11494,11 @@ impl App {
                             format: wgpu::VertexFormat::Float32x4,
                             offset: 32,
                             shader_location: 2,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 48,
+                            shader_location: 3,
                         },
                     ],
                 }],
@@ -14982,14 +15060,14 @@ impl App {
 
             // 1. Update Inject Params
             let inject_params = InjectParams {
-                candidate_count: self.gpu_inputs.len() as u32,
+                _unused0: 0,
                 gi_grid_origin: self.gi_grid_origin.to_array(),
                 gi_grid_dims: self.gi_grid_dims.to_array(),
                 _pad0: 0,
                 sun_dir_intensity: [
-                    sun_direction[0],
-                    sun_direction[1],
-                    sun_direction[2],
+                    sun_direction_vec.x,
+                    sun_direction_vec.y,
+                    sun_direction_vec.z,
                     1.5 * sun_fade,
                 ],
                 sun_color_pad: [sun_color[0], sun_color[1], sun_color[2], 0.0],
@@ -15006,9 +15084,12 @@ impl App {
                     });
                 cpass.set_pipeline(inject_pipeline);
                 cpass.set_bind_group(0, inject_bg, &[]);
-                let groups = (inject_params.candidate_count + 63) / 64;
-                if groups > 0 {
-                    cpass.dispatch_workgroups(groups, 1, 1);
+                let wg_size = [8, 8, 4];
+                let dispatch_x = (self.gi_grid_dims.x.max(0) as u32 + wg_size[0] - 1) / wg_size[0];
+                let dispatch_y = (self.gi_grid_dims.y.max(0) as u32 + wg_size[1] - 1) / wg_size[1];
+                let dispatch_z = (self.gi_grid_dims.z.max(0) as u32 + wg_size[2] - 1) / wg_size[2];
+                if dispatch_x > 0 && dispatch_y > 0 && dispatch_z > 0 {
+                    cpass.dispatch_workgroups(dispatch_x, dispatch_y, dispatch_z);
                 }
             }
             queue.submit(std::iter::once(wts_inject_encoder.finish()));

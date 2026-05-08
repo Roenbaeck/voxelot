@@ -86,6 +86,7 @@ struct ImpostorInstance {
     _pad0 : f32,
     color : vec4<f32>,
     emissive : vec4<f32>,
+    material : vec4<f32>,
 };
 
 @group(0) @binding(6)
@@ -96,6 +97,9 @@ var<storage, read_write> impostor_instances : array<ImpostorInstance>;
 
 @group(0) @binding(8)
 var hzb_tex : texture_2d<f32>;
+
+@group(0) @binding(9)
+var<storage, read> material_props : array<vec4<f32>>;
 
 @compute @workgroup_size(64)
 fn cs_main(@builtin(global_invocation_id) global_id : vec3<u32>) {
@@ -276,6 +280,7 @@ fn cs_main(@builtin(global_invocation_id) global_id : vec3<u32>) {
                 imp._pad0 = 0.0;
                 imp.color = select(vec4<f32>(0.4, 0.4, 0.45, 0.8), instance.custom_color, has_color);
                 imp.emissive = instance.emissive;
+                imp.material = material_props[min(instance.voxel_type, 255u)];
                 impostor_instances[idx] = imp;
             }
         } else {

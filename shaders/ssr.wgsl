@@ -653,15 +653,10 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
     let world_pos = reconstruct_world_pos(input.uv, depth);
 
-    // Distance-based reflection fade: keeps far reflections from looking overly punchy/noisy.
-    // This scales the returned alpha (reflectivity), so downstream passes (DoF/composite)
-    // automatically blend less SSR with distance.
     let dist_to_cam = distance(camera.camera_pos, world_pos);
-    let dist_fade = 1.0 - smoothstep(400.0, 2000.0, dist_to_cam);
-    let reflectivity_faded = reflectivity * clamp(dist_fade, 0.0, 1.0);
-    if (reflectivity_faded < 0.005) {
-        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
-    }
+    // Distance-based detail fade: fade expensive/noisy screen and GI hits into
+    // the sky fallback, but keep the material's reflectivity alive at distance.
+    let reflection_detail_fade = clamp(1.0 - smoothstep(400.0, 2000.0, dist_to_cam), 0.0, 1.0);
 
     // Skip submerged surfaces
     if (camera.water_vis_fog_density.x > 0.0 && world_pos.y < camera.sun_color_water_level.w) {
@@ -676,6 +671,10 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
     // Sample sky once
     let sky_color = sample_sky_equirect(reflect_dir);
+
+    if (reflection_detail_fade <= 0.001) {
+        return vec4<f32>(sky_color, reflectivity);
+    }
     
     // Hybrid: Local Screen-Space Raymarch + Distant GI Grid Trace
     let ssr_res = trace_local_ssr(world_pos, reflect_dir);
@@ -694,7 +693,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         max(ssr_res.a, gi_res_raw.a)
     );
     
-    let out_color = mix(sky_color, gi_res.rgb, gi_res.a);
+    let detailed_color = mix(sky_color, gi_res.rgb, gi_res.a);
+    let out_color = mix(sky_color, detailed_color, reflection_detail_fade);
 
-    return vec4<f32>(out_color, reflectivity_faded);
+    return vec4<f32>(out_color, reflectivity);
 }

@@ -1,5 +1,5 @@
 // WTS-RT: Symplectic Ray Relaxation Compute Shader
-// Solves: Phi_{t+1} = Phi_t + alpha * (Grad^2 Phi - Phi/Beta) + gamma * (Seed - Phi)
+// Solves: Phi_{t+1} = Phi_t + alpha * (Grad^2 Phi - Phi/Beta) + gamma * Flux
 // Inspired by: Aaron M. Schutza, "Symplectic Ray Relaxation: An O(1) Global Illumination Method
 // via Geometric Stress Minimization on Tensor Architecture" (Jan 7, 2026).
 
@@ -69,9 +69,9 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
     // Injection: Sunlight/Emissive flux from injection_texture
     let flux = textureLoad(injection_texture, coord, 0).rgb;
     
-    // Update
-    // alpha * flux treats injected light as a source term for the diffusion equation.
-    var new_phi_rgb = phi_t.rgb + relaxation + params.alpha * flux;
+    // Update. Gamma controls how strongly the injected sunlight/emissive flux
+    // seeds the relaxed field; alpha is kept for relaxation speed.
+    var new_phi_rgb = phi_t.rgb + relaxation + params.gamma * flux;
     new_phi_rgb *= (1.0 - params.decay);
     
     // Clamp to prevent runaway/NaNs (limited for LDR/balanced HDR)

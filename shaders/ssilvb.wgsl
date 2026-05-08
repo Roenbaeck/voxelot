@@ -224,14 +224,6 @@ fn fs_main(@location(0) uv: vec2<f32>, @builtin(position) frag_pos: vec4<f32>) -
     let normal_data = textureLoad(normal_tex, clamp(vec2<i32>(uv * vec2<f32>(normal_dims)), vec2<i32>(0), normal_dims - 1), 0).xy;
     let world_normal = oct_decode(normal_data);
 
-    // Cheap "Sky AO" fallback for distant pixels to avoid flat/washed out look
-    let cheap_sky_ao = 0.75 + 0.25 * world_normal.y;
-
-    // Early-out for very distant pixels - AO is not visible at distance anyway
-    if (linear_depth > ssao.max_ao_distance) {
-        return vec4<f32>(0.0, 0.0, 0.0, cheap_sky_ao);
-    }
-
     let inv_proj_00 = ssao.inverse_projection[0][0];
     let inv_proj_11 = ssao.inverse_projection[1][1];
     let ndc_xy_pixel = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
@@ -250,7 +242,14 @@ fn fs_main(@location(0) uv: vec2<f32>, @builtin(position) frag_pos: vec4<f32>) -
     // Reconstruct world position
     let world_pos_4 = ssao.inverse_view * vec4<f32>(view_pos, 1.0);
     let world_pos = world_pos_4.xyz / world_pos_4.w;
-    
+
+    // Extract camera position from inverse view matrix (translation component)
+    let camera_pos = ssao.inverse_view[3].xyz;
+
+    // WTS/probe GI is world-space and should not disappear just because
+    // screen-space AO has reached its camera-distance cutoff.
+    let grid_gi = sample_grid_irradiance(world_pos, world_normal, camera_pos);
+
     let screen_size = vec2<f32>(ssao.screen_width, ssao.screen_height);
     let inv_screen_size = 1.0 / screen_size;
     let frag_coord = frag_pos.xy;
@@ -258,8 +257,16 @@ fn fs_main(@location(0) uv: vec2<f32>, @builtin(position) frag_pos: vec4<f32>) -
     // Random rotation using absolute pixel coordinates
     let noise = ign(frag_coord);
     
-    let sample_count = f32(ssao.sample_count);
-    let slice_count = f32(ssao.slice_count);
+    // Treat max_ao_distance as a quality boundary, not an AO cutoff. Past it,
+    // keep a cheaper far-field pass alive so distant lighting does not pop
+    // from shadowed to fully lit inside a camera-centered radius.
+    let far_field_ao = linear_depth > ssao.max_ao_distance;
+    let far_sample_count_u = min(ssao.sample_count, max(4u, ssao.sample_count / 2u));
+    let far_slice_count_u = min(ssao.slice_count, max(2u, ssao.slice_count / 2u));
+    let effective_sample_count_u = select(ssao.sample_count, far_sample_count_u, far_field_ao);
+    let effective_slice_count_u = select(ssao.slice_count, far_slice_count_u, far_field_ao);
+    let sample_count = f32(effective_sample_count_u);
+    let slice_count = f32(effective_slice_count_u);
     let radius = ssao.sample_radius;
     
     var visibility = 0.0;
@@ -277,7 +284,7 @@ fn fs_main(@location(0) uv: vec2<f32>, @builtin(position) frag_pos: vec4<f32>) -
     let ip23 = ssao.inverse_projection[2][3];
     let ip33 = ssao.inverse_projection[3][3];
 
-    for (var slice = 0u; slice < ssao.slice_count; slice = slice + 1u) {
+    for (var slice = 0u; slice < effective_slice_count_u; slice = slice + 1u) {
         let phi = (2.0 * PI / slice_count) * (f32(slice) + noise);
         let slice_dir = vec2<f32>(cos(phi), sin(phi));
         
@@ -309,7 +316,7 @@ fn fs_main(@location(0) uv: vec2<f32>, @builtin(position) frag_pos: vec4<f32>) -
             var current_step = pow(step_ratio, select(noise, 1.0 - noise, side == 1u));
             
             for (var s = 0u; s < 64u; s = s + 1u) {
-                if (s >= ssao.sample_count) { break; }
+                if (s >= effective_sample_count_u) { break; }
 
                 // Compute sample UV directly (avoids integer coord path that triggers naga bounds checks)
                 let sample_uv = uv + (ray_dir * current_step) * inv_screen_size;
@@ -387,22 +394,11 @@ fn fs_main(@location(0) uv: vec2<f32>, @builtin(position) frag_pos: vec4<f32>) -
         ssgi_irradiance += slice_irradiance / 32.0;
     }
     
-    visibility /= f32(ssao.slice_count);
-    ssgi_irradiance /= f32(ssao.slice_count);
+    visibility /= f32(effective_slice_count_u);
+    ssgi_irradiance /= f32(effective_slice_count_u);
 
     // Softer AO exponent (was 2.0)
     visibility = pow(visibility, 1.3);
-    
-    // Smoothly fade calculated AO to Cheap Sky AO over the fade range
-    let fade_start = ssao.max_ao_distance * 0.75;
-    let fade_factor = smoothstep(fade_start, ssao.max_ao_distance, linear_depth);
-    visibility = mix(visibility, cheap_sky_ao, fade_factor);
-
-    // Extract camera position from inverse view matrix (translation component)
-    let camera_pos = ssao.inverse_view[3].xyz;
-    
-    // Sample GI from probes
-    let grid_gi = sample_grid_irradiance(world_pos, world_normal, camera_pos);
     
     var indirect_light = vec3<f32>(0.0);
     if (ssao.debug_mode == 1u) {
