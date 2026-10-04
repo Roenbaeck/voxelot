@@ -18,7 +18,9 @@ struct CompositeUniforms {
     radiance_cascades_debug: f32,
     gi_probes_debug: f32,
     gi_ssgi_debug: f32,
-    _pad: vec2<f32>,
+    rc_active: f32,  // 1 when the radiance-cascade texture can be non-zero
+    indirect_albedo: f32,  // 1 = screen-space indirect light is multiplied by albedo * haze transmittance
+    ambient_only_ao: f32,  // 1 = contact AO only darkens the occludable share of the surface light
     uv_scale: vec2<f32>,
     uv_offset: vec2<f32>,
 };
@@ -81,6 +83,65 @@ struct VertexOutput {
 @group(0) @binding(6) var rc_texture: texture_2d<f32>;
 @group(0) @binding(7) var hzb_texture: texture_2d<f32>;
 @group(0) @binding(3) var post_sampler: sampler;
+// Full-resolution scene depth (render-target size) for joint-bilateral upsampling.
+@group(0) @binding(8) var scene_depth: texture_depth_2d;
+// Surface G-buffer (render-target size): rgb = albedo * haze transmittance, a = share of the
+// pixel's radiance that is occludable surface light (sky ambient, moon, probe GI).
+@group(0) @binding(9) var surface_gbuffer: texture_2d<f32>;
+
+// Relative view-depth difference at which an upsample tap's weight falls to 1/e is
+// 1/UPSAMPLE_DEPTH_SHARPNESS.
+const UPSAMPLE_DEPTH_SHARPNESS: f32 = 32.0;
+const SKY_LINEAR_DEPTH: f32 = 1.0e30;
+
+fn linear_depth_at_pixel(pixel: vec2<i32>) -> f32 {
+    let d = textureLoad(scene_depth, pixel, 0);
+    if (d >= 1.0) {
+        return SKY_LINEAR_DEPTH;
+    }
+    let n = composite.near;
+    let f = composite.far;
+    return (n * f) / max(f - d * (f - n), 1e-6);
+}
+
+// Joint-bilateral upsample of a lighting buffer rendered at 1/scale of the scene depth size,
+// whose texel t was shaded at full-resolution pixel t*scale + scale/2 (see ssilvb.wgsl).
+// Bilinear weights keep surfaces smooth; the relative-depth term rejects texels from another
+// surface, so AO/GI does not smear across silhouettes or into the sky.
+fn upsample_bilateral(tex: texture_2d<f32>, scale: i32, uv: vec2<f32>, center_depth: f32) -> vec4<f32> {
+    let full_size = vec2<i32>(textureDimensions(scene_depth));
+    let low_size = vec2<i32>(textureDimensions(tex));
+    let pixel = uv * vec2<f32>(full_size) - vec2<f32>(0.5);
+    let position = (pixel - vec2<f32>(f32(scale / 2))) / f32(scale);
+    let base = vec2<i32>(floor(position));
+    let fraction = position - floor(position);
+    var sum = vec4<f32>(0.0);
+    var weight_sum = 0.0;
+    var nearest = vec4<f32>(0.0);
+    var nearest_difference = 1.0e38;
+    for (var y = 0; y < 2; y++) {
+        for (var x = 0; x < 2; x++) {
+            let texel = clamp(base + vec2<i32>(x, y), vec2<i32>(0), low_size - vec2<i32>(1));
+            let source = clamp(
+                texel * scale + vec2<i32>(scale / 2),
+                vec2<i32>(0),
+                full_size - vec2<i32>(1)
+            );
+            let difference = abs(linear_depth_at_pixel(source) - center_depth) / center_depth;
+            let bilinear = select(fraction.x, 1.0 - fraction.x, x == 0)
+                * select(fraction.y, 1.0 - fraction.y, y == 0);
+            let weight = (bilinear + 1.0e-3) * exp(-difference * UPSAMPLE_DEPTH_SHARPNESS);
+            let value = textureLoad(tex, texel, 0);
+            sum += value * weight;
+            weight_sum += weight;
+            if (difference < nearest_difference) {
+                nearest_difference = difference;
+                nearest = value;
+            }
+        }
+    }
+    return select(nearest, sum / weight_sum, weight_sum > 1.0e-4);
+}
 
 @vertex
 fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
@@ -104,8 +165,21 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let base = textureSample(post_color, post_sampler, sample_uv).rgb;
     let bloom = textureSample(bloom_texture, post_sampler, sample_uv).rgb;
 
-    // Sample SSILVB: RGB = accumulated emissive light, A = ambient occlusion
-    let ssilvb_sample = textureSample(ssao_texture, post_sampler, sample_uv);
+    // Depth of the scene pixel this output pixel shows (sky: no AO/GI).
+    let depth_size = vec2<i32>(textureDimensions(scene_depth));
+    let center_pixel = clamp(
+        vec2<i32>(sample_uv * vec2<f32>(depth_size)),
+        vec2<i32>(0),
+        depth_size - vec2<i32>(1)
+    );
+    let center_depth = linear_depth_at_pixel(center_pixel);
+    let is_sky = center_depth >= SKY_LINEAR_DEPTH;
+
+    // Sample SSILVB (half resolution): RGB = accumulated emissive light, A = ambient occlusion
+    var ssilvb_sample = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    if (!is_sky) {
+        ssilvb_sample = upsample_bilateral(ssao_texture, 2, sample_uv, center_depth);
+    }
     let indirect_light = ssilvb_sample.rgb;
     let raw_ao = ssilvb_sample.a;
 
@@ -183,12 +257,23 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
 
     let luma_weights = vec3<f32>(0.2126, 0.7152, 0.0722);
 
-    // Sample Radiance Cascades (RC) high-frequency GI
-    let rc_light = textureSample(rc_texture, post_sampler, sample_uv).rgb;
+    // Sample Radiance Cascades (RC) GI (render-target resolution), depth-aware as well since
+    // the presented image is rescaled from the render target.
+    var rc_light = vec3<f32>(0.0);
+    if (!is_sky && composite.rc_active > 0.5) {
+        rc_light = upsample_bilateral(rc_texture, 1, sample_uv, center_depth).rgb;
+    }
 
     // Sum everything before saturation and tonemapping to match old "punchy" look.
     // Note: direct emissive is already included in 'base' (added in DoF CoC pass).
-    let indirect_sum = (indirect_light + rc_light) * composite.indirect_light_scale;
+    // The screen-space indirect light is irradiance: it reaches the eye after reflecting off
+    // the surface (albedo) and through the same haze as direct light. Sky pixels have none.
+    let surface = textureLoad(surface_gbuffer, center_pixel, 0);
+    var indirect_albedo = vec3<f32>(1.0);
+    if (composite.indirect_albedo > 0.5) {
+        indirect_albedo = surface.rgb;
+    }
+    let indirect_sum = (indirect_light + rc_light) * composite.indirect_light_scale * indirect_albedo;
 
     // SSILVB AO is a near-field screen-space effect. Applying it to the entire
     // HDR radiance sum turns its finite radius into a camera-centered shadow
@@ -198,6 +283,15 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let contact_occlusion = smoothstep(0.02, 0.18, occlusion) * min(occlusion * 1.15, 0.9);
     let contact_ao = 1.0 - contact_occlusion;
     var color = (base + indirect_sum) * contact_ao + bloom * composite.bloom_strength;
+    if (composite.ambient_only_ao > 0.5) {
+        // Contact AO only occludes the sky/ambient (non-sunlight) share of the surface light:
+        // shadow-mapped sun is already shadowed, and emission and haze are not light that a
+        // nearby surface can block. The share (a channel) is the fraction of this pixel's
+        // radiance that is occludable surface light, written by the scene shaders. The
+        // screen-space indirect light is ambient-like and stays fully occludable.
+        color = base - base * (surface.a * contact_occlusion) + indirect_sum * contact_ao
+            + bloom * composite.bloom_strength;
+    }
 
     // Sample Radiance Cascades (RC) high-frequency GI for debug overlays (redundant but kept for structure)
     // let rc_light is already sampled above

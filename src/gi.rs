@@ -518,7 +518,8 @@ impl GiSystem {
                         let face_normal = normals[f];
                         let face_center = center_pos + face_offsets[f];
 
-                        // Check if face center is buried
+                        // Check if face center is buried (World::get also answers for voxels
+                        // inside coarse uniform solids)
                         let face_wp = WorldPos::new(
                             face_center.x.floor() as i64,
                             face_center.y.floor() as i64,
@@ -544,7 +545,10 @@ impl GiSystem {
                             let dir = delta / dist;
                             let cos_theta = dir.dot(face_normal);
 
-                            // Use hierarchical line_of_sight instead of DDA
+                            // Use hierarchical line_of_sight instead of DDA. The segment runs
+                            // between the centres of the face-centre voxel and the emitter voxel;
+                            // `end_pos` is the emitter's own voxel, which line_of_sight does not
+                            // count as a blocker, so it never shadows its own light.
                             let start_pos = WorldPos::new(
                                 face_center.x.floor() as i64,
                                 face_center.y.floor() as i64,
@@ -655,4 +659,82 @@ pub fn spawn_gi_worker(
         .expect("failed to spawn GI worker");
 
     (request_tx, result_rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lib_hierarchical::Chunk;
+
+    fn palette() -> Palette {
+        Palette::from_string(
+            "\
+0 255 255 255 255
+1 120 120 120 255
+2 255 200 100 255 255 200 100 255
+",
+        )
+        .unwrap()
+    }
+
+    /// Compute the probe of `chunk` with the camera standing in it (one `update` fills the grid).
+    fn probe_at(world: &mut World, chunk: IVec3) -> GiProbe {
+        world.update_all_lod_metadata(&palette());
+        let mut gi = GiSystem::new(IVec3::new(9, 3, 9));
+        let camera = (chunk * 16).as_vec3() + Vec3::splat(8.0);
+        gi.update(world, &palette(), camera, &[], &[]);
+        gi.probe_cache[&chunk]
+    }
+
+    /// Emitter in chunk (7,0,5), probe in chunk (5,0,5): the +X bin looks along the world's +X.
+    fn world_with_emitter() -> World {
+        let mut world = World::new(3);
+        world.set(WorldPos::new(7 * 16 + 8, 8, 5 * 16 + 8), 2);
+        world
+    }
+
+    const PROBE: IVec3 = IVec3::new(5, 0, 5);
+
+    #[test]
+    fn open_probe_receives_light_from_a_clear_emitter() {
+        let mut world = world_with_emitter();
+        let probe = probe_at(&mut world, PROBE);
+        assert!(probe.light_data[0][0] > 0.0, "{:?}", probe.light_data[0]);
+    }
+
+    #[test]
+    fn wall_in_a_neighbouring_chunk_shadows_the_probe() {
+        // The wall is ~19 voxels from the sample point, in another chunk than the probe: the old
+        // ray walker only noticed blockers within a few voxels of its start.
+        let mut world = world_with_emitter();
+        for y in 6..11 {
+            for z in 86..91 {
+                world.set(WorldPos::new(6 * 16 + 4, y, z), 1);
+            }
+        }
+        let probe = probe_at(&mut world, PROBE);
+        assert_eq!(probe.light_data[0], [0.0; 4]);
+    }
+
+    #[test]
+    fn emitter_does_not_shadow_itself() {
+        // Neighbouring emissive voxels (a lit sign) behind the front one must not hide it.
+        let mut world = world_with_emitter();
+        world.set(WorldPos::new(7 * 16 + 9, 8, 5 * 16 + 8), 2);
+        let probe = probe_at(&mut world, PROBE);
+        assert!(probe.light_data[0][0] > 0.0);
+    }
+
+    #[test]
+    fn buried_probe_inside_a_coarse_solid_gets_no_light() {
+        // The probe's own chunk is a uniform solid stored as one voxel at the middle level.
+        let mut world = world_with_emitter();
+        let mut mid = Chunk::new();
+        mid.set(5, 0, 5, 1);
+        world.root_mut().set_chunk(0, 0, 0, mid);
+        let probe = probe_at(&mut world, PROBE);
+        for (face, light) in probe.light_data.iter().enumerate() {
+            assert_eq!(*light, [0.0; 4], "face {face}");
+        }
+    }
 }

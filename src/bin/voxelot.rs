@@ -67,6 +67,92 @@ struct ViewerArgs {
     /// as the config file unless `--config` is explicitly supplied.
     #[arg(value_name = "CONFIG", index = 1)]
     config_arg: Option<String>,
+
+    // --- Deterministic screenshot harness (rendering verification) ---------------------------
+    /// Render a deterministic frame, save it as PNG to PATH and exit. Animation clocks
+    /// (water time, day/night, skybox rotation) are frozen and the config file is not saved.
+    /// The capture waits until streaming, meshing and GI are idle, then renders
+    /// `--screenshot-frames` more frames so WTS/temporal effects settle.
+    #[arg(long, value_name = "PATH")]
+    screenshot: Option<std::path::PathBuf>,
+    /// Frames rendered after everything is idle before capturing (also the FPS sample window).
+    #[arg(long, value_name = "N", default_value_t = 240)]
+    screenshot_frames: u32,
+    /// Capture the first frame rendered after teleporting to this pose `x,y,z,yaw,pitch`
+    /// (degrees) once the start pose has settled. Exercises stale-HZB/temporal paths.
+    #[arg(long, value_name = "X,Y,Z,YAW,PITCH", allow_hyphen_values = true)]
+    screenshot_jump: Option<String>,
+    /// Override the start camera position `x,y,z` (forces free-camera mode).
+    #[arg(long, value_name = "X,Y,Z", allow_hyphen_values = true)]
+    camera: Option<String>,
+    /// Override the start camera yaw in degrees (0 = +X, 90 = +Z, -90 = -Z).
+    #[arg(long, allow_hyphen_values = true)]
+    yaw: Option<f32>,
+    /// Override the start camera pitch in degrees (positive looks up).
+    #[arg(long, allow_hyphen_values = true)]
+    pitch: Option<f32>,
+    /// Start in a debug view (as cycled with F3), e.g. `ssao`, `ssr`, `hzb`, `gi-combined`.
+    #[arg(long, value_name = "NAME")]
+    debug_view: Option<String>,
+}
+
+/// Camera pose used by the screenshot harness (`--camera/--yaw/--pitch`, `--screenshot-jump`).
+#[derive(Clone, Copy, Debug)]
+struct CameraPose {
+    position: Option<[f32; 3]>,
+    yaw_deg: Option<f32>,
+    pitch_deg: Option<f32>,
+}
+
+fn parse_f32_list(text: &str, expected: usize, what: &str) -> Vec<f32> {
+    let values: Vec<f32> = text
+        .split(',')
+        .map(|s| {
+            s.trim()
+                .parse::<f32>()
+                .unwrap_or_else(|_| panic!("invalid number '{}' in {}", s, what))
+        })
+        .collect();
+    assert!(
+        values.len() == expected,
+        "{} expects {} comma-separated values, got {}",
+        what,
+        expected,
+        values.len()
+    );
+    values
+}
+
+/// Fixed water-animation time used while the screenshot harness is active.
+const SCREENSHOT_ELAPSED_TIME: f32 = 10.0;
+/// Give up waiting for idle streaming after this long and capture anyway (with a warning).
+const SCREENSHOT_IDLE_TIMEOUT_SECS: f64 = 150.0;
+/// GI counts as settled after this many frames without probe work.
+const SCREENSHOT_GI_QUIET_FRAMES: u64 = 30;
+
+/// State of the `--screenshot` verification harness.
+struct ScreenshotHarness {
+    path: std::path::PathBuf,
+    settle_frames: u32,
+    jump: Option<CameraPose>,
+    started: Instant,
+    /// Consecutive idle frames rendered so far (also the FPS sample).
+    idle_frames: u32,
+    idle_since: Option<Instant>,
+    /// Last frame index on which the GI worker reported probe work.
+    gi_last_busy_frame: u64,
+    /// FPS measured over the idle window, frozen when the capture is decided.
+    measured_fps: f64,
+    capture_this_frame: bool,
+}
+
+/// Pending GPU->CPU copy of the presented frame.
+struct ScreenshotReadback {
+    buffer: wgpu::Buffer,
+    padded_bytes_per_row: u32,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
 }
 const GPU_CULL_WORKGROUP_SIZE: u32 = 64;
 const SHADOW_FRUSTUM_EXTENT_MIN: f32 = 150.0;
@@ -253,10 +339,34 @@ struct GpuCullParams {
     envelope_fade_range: f32,
     hzb_enabled: u32,
     max_hzb_mip: u32,
-    _pad3: f32,
-    _pad_align2: [u32; 3],    // Align view_proj to 16 bytes
+    /// 1 when the HZB holds last frame's depth rendered with `hzb_view_proj`.
+    hzb_valid: u32,
+    // Pads view_proj to offset 144, matching WGSL's 16-byte mat4x4 alignment (an extra
+    // 8-byte pad here used to shift the matrix the cull/impostor shaders read).
+    _pad3: u32,
     view_proj: [[f32; 4]; 4], // 4x4 matrix (column-major)
+    /// View-projection the HZB depth was rendered with (previous frame), for reprojection.
+    hzb_view_proj: [[f32; 4]; 4],
+    /// Camera position the HZB depth was rendered from (parallax bound for camera motion).
+    hzb_camera_position: [f32; 3],
+    /// Base dilation of every occlusion footprint, in HZB mip-0 pixels.
+    hzb_margin_px: f32,
+    /// Shared horizon haze colour for impostor fog (same as `Uniforms::haze_color`).
+    haze_color: [f32; 4],
+    /// x = haze base height (water level).
+    haze_params: [f32; 4],
 }
+
+/// Gain applied to the screen-space indirect light when it is albedo-modulated
+/// (`effects.gi.albedo_modulated`); see `build_composite_uniforms`.
+const INDIRECT_ALBEDO_GAIN: f32 = 2.0;
+
+/// Base screen-space dilation (pixels) of HZB occlusion footprints.
+const HZB_MARGIN_PX: f32 = 2.0;
+/// Impostor indirect args (16 bytes) followed by the GPU cull's HZB counters
+/// [tested, occluded, pad, pad] (16 bytes). Sharing the buffer keeps the cull shader within
+/// WebGPU's default limit of 8 storage buffers per stage.
+const IMPOSTOR_INDIRECT_BYTES: u64 = 32;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -775,7 +885,10 @@ struct Uniforms {
     inverse_view: [[f32; 4]; 4],
     inverse_proj: [[f32; 4]; 4],
     gi_scale: f32,
-    _pad_gi: [f32; 7],
+    _pad_gi: [f32; 3],
+    /// rgb = shared horizon haze colour (see `App::haze_color`), w = `atmosphere.horizon_haze_strength`
+    /// (density scale of the shared sky/haze model; 0 = legacy per-shader fog colours).
+    haze_color: [f32; 4],
 }
 
 // SSR camera uniform buffer (matches shaders/ssr.wgsl CameraUniforms)
@@ -854,7 +967,8 @@ struct BloomBlurUniforms {
     radius: f32,
     _padding0: f32,
     texel_size: [f32; 2],
-    _padding1: [f32; 2],
+    /// Camera near/far planes (depth-aware SSAO blur linearises depth).
+    near_far: [f32; 2],
 }
 
 #[repr(C)]
@@ -879,7 +993,14 @@ struct CompositeUniforms {
     radiance_cascades_debug: f32,
     gi_probes_debug: f32,
     gi_ssgi_debug: f32,
-    _pad: [f32; 3],
+    /// 1 when the radiance-cascade texture can be non-zero (RC on and dynamic lights present).
+    rc_active: f32,
+    /// 1 = screen-space indirect light is multiplied by the surface albedo and haze transmittance
+    /// (`effects.gi.albedo_modulated`).
+    indirect_albedo: f32,
+    /// 1 = contact AO only darkens the occludable share of the surface light
+    /// (`effects.ssao.ambient_only`).
+    ambient_only_ao: f32,
     uv_scale: [f32; 2],
     uv_offset: [f32; 2],
 }
@@ -1717,6 +1838,14 @@ struct App {
     _hzb_gen_downsample_bind_groups: Vec<Option<wgpu::BindGroup>>,
     hzb_enabled: bool,
     hzb_debug: bool,
+    /// View-projection and camera position the current HZB contents were rendered with;
+    /// None until the pyramid has been built for the current render-target size.
+    hzb_source: Option<([[f32; 4]; 4], [f32; 3])>,
+    /// Mappable copy of the HZB occlusion counters written by gpu_cull.wgsl.
+    cull_stats_readback: Option<wgpu::Buffer>,
+    cull_stats_pending: Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    /// Last read-back (candidates HZB-tested, candidates HZB-occluded).
+    hzb_cull_stats: (u32, u32),
     // Frame timing
     _frame_times: VecDeque<f32>,
 
@@ -1893,6 +2022,11 @@ struct App {
     material_texture: Option<wgpu::Texture>,
     material_view: Option<wgpu::TextureView>,
     material_texture_bytes: u64,
+    // G-Buffer surface texture (Rgba8Unorm): rgb = albedo * haze transmittance (multiplies
+    // screen-space indirect light), a = share of the final radiance that contact AO may occlude.
+    surface_texture: Option<wgpu::Texture>,
+    surface_view: Option<wgpu::TextureView>,
+    surface_texture_bytes: u64,
     // Path to loaded config file (user provided or default)
     config_path: String,
     // Profiling helper (CPU scopes). No-op if compiled without `cpu-profiling` feature.
@@ -1915,6 +2049,22 @@ struct App {
     gpu_readback_pending: bool,
     #[cfg(feature = "gpu-profiling")]
     gpu_readback_rx: Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    /// atmosphere.horizon_haze_strength: shared sky/haze model (0 = off).
+    horizon_haze_strength: f32,
+    /// Mean linear colour of the skybox image just above the horizon (0.5-4 deg elevation).
+    skybox_horizon_color: [f32; 3],
+    // FXAA (rendering.fxaa_enabled): the composite renders into `fxaa_source_*` (surface
+    // size/format), then the FXAA pass writes the surface and UI overlays draw on top.
+    fxaa_enabled: bool,
+    fxaa_pipeline: Option<wgpu::RenderPipeline>,
+    fxaa_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    fxaa_bind_group: Option<wgpu::BindGroup>,
+    fxaa_source_texture: Option<wgpu::Texture>,
+    fxaa_source_view: Option<wgpu::TextureView>,
+    /// `--screenshot` verification harness (None during normal interactive use).
+    screenshot: Option<ScreenshotHarness>,
+    /// Set by the harness once the PNG is written; the event loop exits on the next wait.
+    exit_requested: bool,
 }
 
 impl App {
@@ -2113,6 +2263,12 @@ impl App {
                     }),
                     Some(wgpu::ColorTargetState {
                         format: wgpu::TextureFormat::R8Unorm,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::empty(),
+                    }),
+                    // Surface G-buffer (albedo * haze transmittance, occludable share)
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
                         blend: None,
                         write_mask: wgpu::ColorWrites::empty(),
                     }),
@@ -3334,7 +3490,7 @@ impl App {
     ) -> u64 {
         let bpp: u64 = match format {
             wgpu::TextureFormat::Rgba32Float => 16,
-            wgpu::TextureFormat::Rgba16Float => 8,
+            wgpu::TextureFormat::Rgba16Float | wgpu::TextureFormat::Rg32Float => 8,
             wgpu::TextureFormat::Rgba8Unorm
             | wgpu::TextureFormat::Rgba8UnormSrgb
             | wgpu::TextureFormat::Bgra8Unorm
@@ -4017,6 +4173,9 @@ impl App {
             material_texture: None,
             material_view: None,
             material_texture_bytes: 0,
+            surface_texture: None,
+            surface_view: None,
+            surface_texture_bytes: 0,
             config_path: config_path.to_string(),
             profiler: voxelot::profiling::Profiler::new(),
             #[cfg(feature = "gpu-profiling")]
@@ -4103,6 +4262,10 @@ impl App {
             hzb_params_buffer: None,
             hzb_enabled: cfg.performance.hzb_enabled,
             hzb_debug: false,
+            hzb_source: None,
+            cull_stats_readback: None,
+            cull_stats_pending: None,
+            hzb_cull_stats: (0, 0),
             _frame_times: VecDeque::with_capacity(60),
             dof_combine_pipeline: None,
             dof_combine_bind_group_layout: None,
@@ -4287,6 +4450,341 @@ impl App {
             reflection_probe_normal_bytes: 0,
             reflection_probe_material_bytes: 0,
             reflection_probe_depth_bytes: 0,
+            horizon_haze_strength: cfg.atmosphere.horizon_haze_strength.max(0.0),
+            // Legacy fog base colour until the skybox is loaded.
+            skybox_horizon_color: [0.7, 0.8, 0.9],
+            fxaa_enabled: cfg.rendering.fxaa_enabled,
+            fxaa_pipeline: None,
+            fxaa_bind_group_layout: None,
+            fxaa_bind_group: None,
+            fxaa_source_texture: None,
+            fxaa_source_view: None,
+            screenshot: None,
+            exit_requested: false,
+        }
+    }
+
+    /// Shared horizon haze colour for the sky/haze model: the skybox's own horizon colour put
+    /// through exactly the transform skybox.wgsl applies (night desaturation, night tint,
+    /// brightness), so fogged land/water reaches the colour the sky shows at the horizon and
+    /// stays dark at night. w = haze strength (> 0 enables the model in the shaders).
+    fn haze_color(&self, skybox_brightness: f32) -> [f32; 4] {
+        if self.horizon_haze_strength <= 0.0 {
+            return [0.0; 4];
+        }
+        let c = self.skybox_horizon_color;
+        let b = skybox_brightness.clamp(0.0, 1.0);
+        let min_sat = self.skybox_min_saturation;
+        let sat = min_sat + (1.0 - min_sat) * b;
+        let lum = c[0] * 0.299 + c[1] * 0.587 + c[2] * 0.114;
+        let tint_amount = (1.0 - b) * self.skybox_tint_strength;
+        let mut out = [0.0f32; 4];
+        for i in 0..3 {
+            let desaturated = lum + (c[i] - lum) * sat;
+            let tinted =
+                desaturated + (desaturated * self.skybox_night_tint[i] - desaturated) * tint_amount;
+            out[i] = tinted * skybox_brightness;
+        }
+        out[3] = self.horizon_haze_strength;
+        out
+    }
+
+    /// (Re)creates the FXAA input texture at the swapchain size/format when needed.
+    fn ensure_fxaa_target(&mut self) {
+        let (Some(device), Some(config), Some(layout), Some(sampler)) = (
+            self.device.as_ref(),
+            self.config.as_ref(),
+            self.fxaa_bind_group_layout.as_ref(),
+            self.linear_sampler.as_ref(),
+        ) else {
+            return;
+        };
+        if let Some(tex) = self.fxaa_source_texture.as_ref() {
+            if tex.width() == config.width
+                && tex.height() == config.height
+                && tex.format() == config.format
+                && self.fxaa_bind_group.is_some()
+            {
+                return;
+            }
+        }
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("FXAA Source Texture"),
+            size: wgpu::Extent3d {
+                width: config.width.max(1),
+                height: config.height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.fxaa_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("FXAA Bind Group"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        }));
+        let bytes = App::compute_texture_bytes(config.format, config.width, config.height, 1, 1);
+        if let Some(old) = self.fxaa_source_texture.replace(texture) {
+            let old_bytes =
+                App::compute_texture_bytes(old.format(), old.width(), old.height(), 1, 1);
+            self.gpu_texture_bytes = self.gpu_texture_bytes.saturating_sub(old_bytes);
+        }
+        self.gpu_texture_bytes = self.gpu_texture_bytes.saturating_add(bytes);
+        self.fxaa_source_view = Some(view);
+    }
+
+    /// 2D overlays (palette picker, metrics HUD), drawn after FXAA so text stays crisp.
+    fn draw_ui_overlays(&self, pass: &mut wgpu::RenderPass<'_>) {
+        if self.palette_ui_visible && self.palette_ui_count > 0 {
+            if let (Some(pipeline), Some(buf)) = (
+                self.palette_ui_pipeline.as_ref(),
+                self.palette_ui_buffer.as_ref(),
+            ) {
+                pass.set_pipeline(pipeline);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..6, 0..self.palette_ui_count);
+            }
+        }
+        if self.gui_visible && self.ui_quad_count > 0 {
+            if let (Some(pipeline), Some(buf)) = (
+                self.palette_ui_pipeline.as_ref(),
+                self.ui_quad_buffer.as_ref(),
+            ) {
+                pass.set_pipeline(pipeline);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..6, 0..self.ui_quad_count);
+            }
+        }
+    }
+
+    /// Moves the free camera to `pose` (fields left as None keep their current value) and
+    /// leaves any pawn so the pose is not overridden by a boat/walker.
+    fn apply_camera_pose(&mut self, pose: &CameraPose) {
+        self.active_pawn = None;
+        let controller = &mut self.camera_controller;
+        if let Some(position) = pose.position {
+            controller.camera.position = position;
+        }
+        if let Some(yaw) = pose.yaw_deg {
+            controller.yaw = yaw.to_radians();
+        }
+        if let Some(pitch) = pose.pitch_deg {
+            let limit = std::f32::consts::FRAC_PI_2 - 0.1;
+            controller.pitch = pitch.to_radians().clamp(-limit, limit);
+        }
+        controller.update_camera_vectors();
+    }
+
+    /// Enables the `--screenshot` harness: freezes the day/night and skybox clocks (water time is
+    /// pinned each frame in `render`) so repeated runs of the same scene produce the same image.
+    fn enable_screenshot_harness(
+        &mut self,
+        path: std::path::PathBuf,
+        settle_frames: u32,
+        jump: Option<CameraPose>,
+    ) {
+        self.time_paused = true;
+        self.skybox_angle = 0.0;
+        self.elapsed_time = SCREENSHOT_ELAPSED_TIME;
+        self.screenshot = Some(ScreenshotHarness {
+            path,
+            settle_frames: settle_frames.max(1),
+            jump,
+            started: Instant::now(),
+            idle_frames: 0,
+            idle_since: None,
+            gi_last_busy_frame: 0,
+            measured_fps: 0.0,
+            capture_this_frame: false,
+        });
+    }
+
+    /// Per-frame harness step, run before any camera-dependent work. Decides whether this frame
+    /// is the one to capture (and performs the optional `--screenshot-jump` teleport first).
+    fn screenshot_pre_frame(&mut self) {
+        let mesh_idle = self.pending_chunk_meshes.is_empty()
+            && self.ready_chunk_meshes.is_empty()
+            && self.mesh_jobs_in_flight == 0;
+        let gi_queue = self.gi_request_tx.len();
+        let frame_index = self.frame_index;
+        let Some(h) = self.screenshot.as_mut() else {
+            return;
+        };
+        if h.capture_this_frame {
+            return;
+        }
+        let gi_quiet_frames = frame_index.saturating_sub(h.gi_last_busy_frame);
+        let gi_idle = gi_quiet_frames >= SCREENSHOT_GI_QUIET_FRAMES && gi_queue <= 2;
+        if frame_index % 120 == 0 {
+            log::info!(
+                "screenshot: waiting (mesh_idle={}, gi_queue={}, gi_quiet_frames={}, idle_frames={})",
+                mesh_idle,
+                gi_queue,
+                gi_quiet_frames,
+                h.idle_frames
+            );
+        }
+        // Never count the very first frames: nothing has been scheduled yet.
+        let idle = mesh_idle && gi_idle && frame_index > 2;
+        if idle {
+            if h.idle_since.is_none() {
+                h.idle_since = Some(Instant::now());
+            }
+            h.idle_frames += 1;
+        } else {
+            h.idle_frames = 0;
+            h.idle_since = None;
+        }
+        let timed_out = h.started.elapsed().as_secs_f64() > SCREENSHOT_IDLE_TIMEOUT_SECS;
+        if h.idle_frames >= h.settle_frames || timed_out {
+            if timed_out && h.idle_frames < h.settle_frames {
+                log::warn!(
+                    "screenshot: streaming not idle after {:.0}s (mesh_idle={}, gi_idle={}); capturing anyway",
+                    SCREENSHOT_IDLE_TIMEOUT_SECS,
+                    mesh_idle,
+                    gi_idle
+                );
+            }
+            h.measured_fps = match h.idle_since {
+                Some(t) if h.idle_frames > 1 => {
+                    (h.idle_frames - 1) as f64 / t.elapsed().as_secs_f64().max(1e-6)
+                }
+                _ => 0.0,
+            };
+            h.capture_this_frame = true;
+            if let Some(jump) = h.jump {
+                self.apply_camera_pose(&jump);
+            }
+        }
+    }
+
+    /// Records the presented surface texture into a mappable buffer (before submit).
+    fn encode_screenshot_copy(
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        texture: &wgpu::Texture,
+    ) -> ScreenshotReadback {
+        let width = texture.width();
+        let height = texture.height();
+        let format = texture.format();
+        let bytes_per_pixel = format.block_copy_size(None).unwrap_or(4);
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bytes_per_row = (width * bytes_per_pixel).div_ceil(align) * align;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Screenshot Readback Buffer"),
+            size: padded_bytes_per_row as u64 * height as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        ScreenshotReadback {
+            buffer,
+            padded_bytes_per_row,
+            width,
+            height,
+            format,
+        }
+    }
+
+    /// Maps the readback buffer, converts it to 8-bit sRGB and writes the PNG.
+    /// HDR (Rgba16Float, extended linear) output is shown as an SDR display would show it,
+    /// except that values above 0.6 roll off with a Reinhard shoulder (1.0 -> 0.8, 4.0 -> 0.96)
+    /// so EDR highlights keep their gradation in the 8-bit image instead of clipping.
+    fn save_screenshot(
+        device: &wgpu::Device,
+        readback: &ScreenshotReadback,
+        path: &std::path::Path,
+    ) {
+        let slice = readback.buffer.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let data = slice.get_mapped_range();
+        let (w, h) = (readback.width as usize, readback.height as usize);
+        let mut rgba = vec![0u8; w * h * 4];
+        let encode = |linear: f32| -> u8 {
+            const KNEE: f32 = 0.6;
+            let x = if linear.is_finite() {
+                linear.max(0.0)
+            } else {
+                0.0
+            };
+            let c = if x > KNEE {
+                let over = x - KNEE;
+                KNEE + (1.0 - KNEE) * over / (over + (1.0 - KNEE))
+            } else {
+                x
+            };
+            let s = if c <= 0.003_130_8 {
+                c * 12.92
+            } else {
+                1.055 * c.powf(1.0 / 2.4) - 0.055
+            };
+            (s * 255.0 + 0.5) as u8
+        };
+        for y in 0..h {
+            let row = &data[y * readback.padded_bytes_per_row as usize..];
+            for x in 0..w {
+                let out = &mut rgba[(y * w + x) * 4..(y * w + x) * 4 + 4];
+                match readback.format {
+                    wgpu::TextureFormat::Rgba16Float => {
+                        let px = &row[x * 8..x * 8 + 8];
+                        for c in 0..3 {
+                            let v = f16::from_le_bytes([px[c * 2], px[c * 2 + 1]]).to_f32();
+                            out[c] = encode(v);
+                        }
+                        out[3] = 255;
+                    }
+                    wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => {
+                        let px = &row[x * 4..x * 4 + 4];
+                        out.copy_from_slice(&[px[2], px[1], px[0], 255]);
+                    }
+                    _ => {
+                        let px = &row[x * 4..x * 4 + 4];
+                        out.copy_from_slice(&[px[0], px[1], px[2], 255]);
+                    }
+                }
+            }
+        }
+        drop(data);
+        readback.buffer.unmap();
+        match image::RgbaImage::from_raw(w as u32, h as u32, rgba).map(|img| img.save(path)) {
+            Some(Ok(())) => {}
+            Some(Err(e)) => log::error!("screenshot: failed to write {}: {}", path.display(), e),
+            None => log::error!("screenshot: invalid image dimensions {}x{}", w, h),
         }
     }
 
@@ -4435,7 +4933,10 @@ impl App {
                 1.0 / target_width.max(1) as f32,
                 1.0 / target_height.max(1) as f32,
             ],
-            _padding1: [0.0; 2],
+            near_far: [
+                self.camera_controller.camera.near,
+                self.camera_controller.camera.far,
+            ],
         }
     }
 
@@ -4447,12 +4948,8 @@ impl App {
             self.camera_controller.camera.near,
             self.camera_controller.camera.far,
         );
-        // Match main renderer's projection transform (even if redundant for glam, it's what's in the depth buffer)
-        const OPENGL_TO_WGPU_MATRIX: Mat4 = Mat4::from_cols_array(&[
-            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5, 1.0,
-        ]);
-        let corrected_projection = OPENGL_TO_WGPU_MATRIX * projection;
-        let inv_proj = corrected_projection.inverse();
+        // glam's perspective_rh already targets wgpu's [0,1] depth, matching the depth buffer.
+        let inv_proj = projection.inverse();
         let view = Mat4::look_to_rh(
             Vec3::from(self.camera_controller.camera.position),
             Vec3::from(self.camera_controller.camera.forward),
@@ -4513,6 +5010,14 @@ impl App {
             0.5 + 0.5 * smoothstep(0.80, 1.0, t)
         };
         indirect_light_scale *= self.gi_settings.indirect_scale;
+        if self.user_config.effects.gi.albedo_modulated {
+            // The screen-space indirect light is now multiplied by the surface albedo (about 0.4-0.5
+            // for the city palette) and the haze transmittance in post_composite.wgsl, so the same
+            // intensities read about half as strong as when it was added unmodulated. Compensate
+            // so the night/dusk bounce keeps its energy (this also lifts the near-invisible
+            // daytime floor from 0.05 to 0.1).
+            indirect_light_scale *= INDIRECT_ALBEDO_GAIN;
+        }
 
         let hdr_exposure_boost = if self.hdr_active {
             self.user_config.rendering.macos_hdr_exposure_boost
@@ -4562,7 +5067,21 @@ impl App {
             },
             gi_probes_debug: if self.gi_probes_debug { 1.0 } else { 0.0 },
             gi_ssgi_debug: if self.gi_ssgi_debug { 1.0 } else { 0.0 },
-            _pad: [0.0; 3],
+            rc_active: if self.rc_enabled && !self.light_probes.is_empty() {
+                1.0
+            } else {
+                0.0
+            },
+            indirect_albedo: if self.user_config.effects.gi.albedo_modulated {
+                1.0
+            } else {
+                0.0
+            },
+            ambient_only_ao: if self.user_config.effects.ssao.ambient_only {
+                1.0
+            } else {
+                0.0
+            },
             uv_scale: [crop_scale, crop_scale],
             uv_offset: [crop_offset, crop_offset],
         }
@@ -4594,14 +5113,8 @@ impl App {
             self.camera_controller.camera.far,
         );
 
-        // Match wgpu's NDC depth range (0..1). glam's perspective matrices are OpenGL-style
-        // (depth -1..1), so apply the same correction used elsewhere (e.g. SSAO unprojection).
-        const OPENGL_TO_WGPU_MATRIX: glam::Mat4 = glam::Mat4::from_cols_array(&[
-            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5, 1.0,
-        ]);
-        let corrected_proj = OPENGL_TO_WGPU_MATRIX * proj;
-
-        let view_proj = corrected_proj * view;
+        // glam's perspective_rh already produces wgpu's [0,1] NDC depth (no GL remap needed).
+        let view_proj = proj * view;
         let inverse_view_proj = view_proj.inverse();
 
         RadianceCascadesCamera {
@@ -6007,6 +6520,41 @@ impl App {
             material_bytes,
             &mut self.gpu_texture_bytes,
         );
+        // Surface G-buffer (albedo + occludable share), same size as the other G-buffer targets.
+        if let Some(device) = self.device.as_ref() {
+            let surface_width = self.render_target_width.max(1);
+            let surface_height = self.render_target_height.max(1);
+            let surface_texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Surface G-Buffer Texture"),
+                size: wgpu::Extent3d {
+                    width: surface_width,
+                    height: surface_height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            self.surface_view =
+                Some(surface_texture.create_view(&wgpu::TextureViewDescriptor::default()));
+            self.surface_texture = Some(surface_texture);
+            let surface_bytes = App::compute_texture_bytes(
+                wgpu::TextureFormat::Rgba8Unorm,
+                surface_width,
+                surface_height,
+                1,
+                1,
+            );
+            App::replace_texture_bytes_static(
+                &mut self.surface_texture_bytes,
+                surface_bytes,
+                &mut self.gpu_texture_bytes,
+            );
+        }
         // Assign and track other created textures
         App::replace_texture_bytes_static(
             &mut self.depth_texture_bytes,
@@ -6097,7 +6645,9 @@ impl App {
             let hzb_view_opt: Option<wgpu::TextureView>;
             let hzb_mip_views_local: Vec<wgpu::TextureView>;
 
-            if self.hzb_enabled || self.hzb_debug {
+            // Always built: water reflections ray-march its MIN channel even when HZB occlusion
+            // culling (`performance.hzb_enabled`) is off.
+            {
                 let target_width = self.render_target_width.max(1);
                 let target_height = self.render_target_height.max(1);
                 let max_dim = target_width.max(target_height);
@@ -6113,7 +6663,8 @@ impl App {
                     mip_level_count: mip_levels,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::R32Float,
+                    // R = min (nearest) depth, G = max (farthest) depth; see hzb_gen.wgsl.
+                    format: wgpu::TextureFormat::Rg32Float,
                     usage: wgpu::TextureUsages::TEXTURE_BINDING
                         | wgpu::TextureUsages::STORAGE_BINDING
                         | wgpu::TextureUsages::COPY_SRC
@@ -6127,7 +6678,7 @@ impl App {
                 for mip in 0..mip_levels {
                     let mip_view = tex.create_view(&wgpu::TextureViewDescriptor {
                         label: Some(&format!("HZB Mip {} View", mip)),
-                        format: Some(wgpu::TextureFormat::R32Float),
+                        format: Some(wgpu::TextureFormat::Rg32Float),
                         dimension: Some(wgpu::TextureViewDimension::D2),
                         aspect: wgpu::TextureAspect::All,
                         base_mip_level: mip,
@@ -6145,37 +6696,15 @@ impl App {
 
                 hzb_mips = mip_levels;
                 hzb_bytes = App::compute_texture_bytes(
-                    wgpu::TextureFormat::R32Float,
+                    wgpu::TextureFormat::Rg32Float,
                     target_width,
                     target_height,
                     mip_levels,
                     1,
                 ); // ONLY ONE texture now!
-            } else {
-                // Create dummy 1x1 R32 texture
-                let tex_main = device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("HZB Dummy Texture"),
-                    size: wgpu::Extent3d {
-                        width: 1,
-                        height: 1,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::R32Float,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING
-                        | wgpu::TextureUsages::STORAGE_BINDING
-                        | wgpu::TextureUsages::COPY_DST,
-                    view_formats: &[],
-                });
-                let view_main = tex_main.create_view(&wgpu::TextureViewDescriptor::default());
-                hzb_mip_views_local = vec![view_main.clone()];
-                hzb_texture_opt = Some(tex_main);
-                hzb_view_opt = Some(view_main);
-                hzb_mips = 1;
-                hzb_bytes = App::compute_texture_bytes(wgpu::TextureFormat::R32Float, 1, 1, 1, 1);
             }
+            // New (empty) pyramid: no previous-frame depth to cull against yet.
+            self.hzb_source = None;
             App::replace_texture_bytes_static(
                 &mut self.hzb_texture_bytes,
                 hzb_bytes,
@@ -6919,10 +7448,11 @@ impl App {
 
             // SSAO blur horizontal bind group (use bloom blur pipeline)
             if self.ssao_settings.blur_enabled {
-                if let (Some(ssao_h_ubo), Some(ssao_ping_view), Some(psampler)) = (
+                if let (Some(ssao_h_ubo), Some(ssao_ping_view), Some(psampler), Some(depth_view)) = (
                     self.ssao_blur_horizontal_uniform_buffer.as_ref(),
                     self.ssao_ping_view.as_ref(),
                     self.post_sampler.as_ref(),
+                    self.offscreen_depth_view.as_ref(),
                 ) {
                     self.ssao_blur_horizontal_bind_group =
                         Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -6940,6 +7470,10 @@ impl App {
                                 wgpu::BindGroupEntry {
                                     binding: 2,
                                     resource: wgpu::BindingResource::Sampler(psampler),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 3,
+                                    resource: wgpu::BindingResource::TextureView(depth_view),
                                 },
                             ],
                         }));
@@ -6990,10 +7524,11 @@ impl App {
 
             // SSAO blur vertical bind group (reads from SSAO Pong after horizontal)
             if self.ssao_settings.blur_enabled {
-                if let (Some(ssao_v_ubo), Some(ssao_pong_view), Some(psampler)) = (
+                if let (Some(ssao_v_ubo), Some(ssao_pong_view), Some(psampler), Some(depth_view)) = (
                     self.ssao_blur_vertical_uniform_buffer.as_ref(),
                     self.ssao_pong_view.as_ref(),
                     self.post_sampler.as_ref(),
+                    self.offscreen_depth_view.as_ref(),
                 ) {
                     self.ssao_blur_vertical_bind_group =
                         Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -7012,6 +7547,10 @@ impl App {
                                     binding: 2,
                                     resource: wgpu::BindingResource::Sampler(psampler),
                                 },
+                                wgpu::BindGroupEntry {
+                                    binding: 3,
+                                    resource: wgpu::BindingResource::TextureView(depth_view),
+                                },
                             ],
                         }));
                 }
@@ -7025,6 +7564,8 @@ impl App {
             Some(post_view_ref),
             Some(rc_view),
             Some(hzb_view),
+            Some(scene_depth_view),
+            Some(surface_view),
         ) = (
             self.composite_uniform_buffer.as_ref(),
             self.post_sampler.as_ref(),
@@ -7032,6 +7573,8 @@ impl App {
             self.post_color_view.as_ref(), // This is the designated POST texture view
             self.rc_texture_view.as_ref(),
             self.hzb_view.as_ref(),
+            self.offscreen_depth_view.as_ref(),
+            self.surface_view.as_ref(),
         ) {
             // If DoF is fully disabled or negligible, bind the offscreen color DIRECTLY
             // to the composite pass to avoid a full-resolution texture copy every frame.
@@ -7087,6 +7630,14 @@ impl App {
                         wgpu::BindGroupEntry {
                             binding: 3,
                             resource: wgpu::BindingResource::Sampler(sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 8,
+                            resource: wgpu::BindingResource::TextureView(scene_depth_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 9,
+                            resource: wgpu::BindingResource::TextureView(surface_view),
                         },
                     ],
                 }));
@@ -7645,15 +8196,16 @@ impl App {
         if self.impostor_indirect_buffer.is_none() {
             self.impostor_indirect_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Impostor Indirect Args Buffer"),
-                size: std::mem::size_of::<wgpu::util::DrawIndirectArgs>() as u64,
+                size: IMPOSTOR_INDIRECT_BYTES,
                 usage: wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::INDIRECT
-                    | wgpu::BufferUsages::COPY_DST,
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             }));
             App::replace_buffer_bytes_static(
                 &mut self.impostor_indirect_bytes,
-                std::mem::size_of::<wgpu::util::DrawIndirectArgs>() as u64,
+                IMPOSTOR_INDIRECT_BYTES,
                 &mut self.gpu_buffer_bytes,
             );
         }
@@ -8006,6 +8558,40 @@ impl App {
         let height = hdr_image.height();
         let rgb_image = hdr_image.to_rgb32f();
 
+        // Horizon colour for the shared sky/haze model: mean of the equirect rows between
+        // 0.5 and 4 degrees above the horizon (v = 0.5 - elevation / PI).
+        {
+            let row_of = |elev_deg: f32| -> u32 {
+                let v = 0.5 - elev_deg.to_radians() / std::f32::consts::PI;
+                ((v * height as f32) as u32).min(height.saturating_sub(1))
+            };
+            let (row_top, row_bottom) = (row_of(4.0), row_of(0.5));
+            let mut sum = [0.0f64; 3];
+            let mut count = 0u64;
+            for y in row_top..=row_bottom {
+                for x in 0..width {
+                    let p = rgb_image.get_pixel(x, y).0;
+                    if p.iter().all(|v| v.is_finite()) {
+                        for i in 0..3 {
+                            sum[i] += p[i] as f64;
+                        }
+                        count += 1;
+                    }
+                }
+            }
+            if count > 0 {
+                self.skybox_horizon_color = [
+                    (sum[0] / count as f64) as f32,
+                    (sum[1] / count as f64) as f32,
+                    (sum[2] / count as f64) as f32,
+                ];
+            }
+            log::info!(
+                "Skybox horizon colour (haze): {:?}",
+                self.skybox_horizon_color
+            );
+        }
+
         // Convert RGB F32 to RGBA F32
         let mut rgba_data = Vec::with_capacity((width * height * 4) as usize);
         for pixel in rgb_image.pixels() {
@@ -8145,6 +8731,12 @@ impl App {
                     // Material G-buffer (reflectivity in R channel)
                     Some(wgpu::ColorTargetState {
                         format: wgpu::TextureFormat::R8Unorm,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    // Surface G-buffer (albedo * haze transmittance, occludable share)
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
                         blend: None,
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
@@ -8820,11 +9412,10 @@ impl App {
         Ok((vertex_offset, index_offset))
     }
 
+    /// Builds the min/max depth pyramid from this frame's depth buffer. Always runs: water
+    /// reflections ray-march the MIN channel, and next frame's occlusion culling (when
+    /// enabled) tests against the MAX channel.
     fn generate_hzb(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        if !(self.hzb_enabled || self.hzb_debug) {
-            return;
-        }
-
         let target_width = self.render_target_width.max(1);
         let target_height = self.render_target_height.max(1);
 
@@ -8898,10 +9489,21 @@ impl App {
             let reset_data = [36u32, initial_fallback_instances, 0, 0];
             queue.write_buffer(buffer, 0, bytemuck::cast_slice(&reset_data));
         }
+        // Impostor draw args + zeroed HZB counters (see IMPOSTOR_INDIRECT_BYTES).
         if let Some(buffer) = &self.impostor_indirect_buffer {
-            let reset_data = [6u32, 0u32, 0u32, 0u32];
+            let reset_data = [6u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32];
             queue.write_buffer(buffer, 0, bytemuck::cast_slice(&reset_data));
         }
+
+        // A screenshot capture reports the stats of exactly this frame.
+        let capture = self
+            .screenshot
+            .as_ref()
+            .is_some_and(|h| h.capture_this_frame);
+        if capture && self.cull_stats_pending.is_some() {
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        }
+        self.collect_cull_stats(device);
 
         let (Some(cull_pipeline), Some(cull_bind_group)) =
             (self.cull_pipeline.as_ref(), self.cull_bind_group.as_ref())
@@ -8924,8 +9526,56 @@ impl App {
         compute_pass.dispatch_workgroups(dispatch_x, 1, 1);
         drop(compute_pass);
 
+        // Sample the occlusion counters every 30 frames (non-blocking readback).
+        let read_stats =
+            self.cull_stats_pending.is_none() && (capture || self.frame_index % 30 == 0);
+        if read_stats {
+            if let (Some(stats), Some(readback)) = (
+                self.impostor_indirect_buffer.as_ref(),
+                self.cull_stats_readback.as_ref(),
+            ) {
+                encoder.copy_buffer_to_buffer(stats, 16, readback, 0, 16);
+            }
+        }
+
         // resolve + copy moved to the end of render() to capture all passes correctly.
         queue.submit(std::iter::once(encoder.finish()));
+
+        if read_stats {
+            if let Some(readback) = self.cull_stats_readback.as_ref() {
+                let (tx, rx) = std::sync::mpsc::channel();
+                readback.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                    let _ = tx.send(r);
+                });
+                self.cull_stats_pending = Some(rx);
+                if capture {
+                    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                    self.collect_cull_stats(device);
+                }
+            }
+        }
+    }
+
+    /// Picks up a finished HZB-statistics readback, if any (never blocks).
+    fn collect_cull_stats(&mut self, device: &wgpu::Device) {
+        let Some(rx) = self.cull_stats_pending.as_ref() else {
+            return;
+        };
+        let _ = device.poll(wgpu::PollType::Poll);
+        let Ok(result) = rx.try_recv() else {
+            return;
+        };
+        self.cull_stats_pending = None;
+        let Some(readback) = self.cull_stats_readback.as_ref() else {
+            return;
+        };
+        if result.is_ok() {
+            let data = readback.slice(..).get_mapped_range();
+            let counters: &[u32] = bytemuck::cast_slice(&data);
+            self.hzb_cull_stats = (counters[0], counters[1]);
+            drop(data);
+            readback.unmap();
+        }
     }
 
     fn populate_multi_draw_indirects(&mut self, queue: &wgpu::Queue, visible: &Vec<VoxelInstance>) {
@@ -9365,8 +10015,18 @@ impl App {
             wgpu::PresentMode::Fifo
         };
 
+        // The screenshot harness copies the presented frame back to the CPU.
+        let mut surface_usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
+        if self.screenshot.is_some() {
+            if surface_caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
+                surface_usage |= wgpu::TextureUsages::COPY_SRC;
+            } else {
+                log::error!("screenshot: surface does not support COPY_SRC; capture disabled");
+                self.screenshot = None;
+            }
+        }
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: surface_usage,
             format: surface_format,
             width: size.width,
             height: size.height,
@@ -9671,6 +10331,12 @@ impl App {
                         blend: Some(wgpu::BlendState::REPLACE),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
+                    // Surface G-buffer (albedo * haze transmittance, occludable share)
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
                 ],
                 compilation_options: Default::default(),
             }),
@@ -9857,6 +10523,12 @@ impl App {
                     // Material G-buffer (reflectivity in R channel)
                     Some(wgpu::ColorTargetState {
                         format: wgpu::TextureFormat::R8Unorm,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    // Surface G-buffer (albedo * haze transmittance, occludable share)
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
                         blend: Some(wgpu::BlendState::REPLACE),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
@@ -10740,6 +11412,17 @@ impl App {
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
+                    // Scene depth for the depth-aware SSAO blur
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -10821,6 +11504,28 @@ impl App {
                         binding: 3,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    // Scene depth for joint-bilateral upsampling of SSILVB / RC lighting
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 8,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // Surface G-buffer: albedo * haze transmittance, occludable share
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 9,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
                         count: None,
                     },
                 ],
@@ -11006,7 +11711,8 @@ impl App {
             inverse_view: [[0.0; 4]; 4],
             inverse_proj: [[0.0; 4]; 4],
             gi_scale: 1.0,
-            _pad_gi: [0.0; 7],
+            _pad_gi: [0.0; 3],
+            haze_color: [0.0; 4],
         };
 
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -11369,7 +12075,7 @@ impl App {
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::StorageTexture {
                             access: wgpu::StorageTextureAccess::WriteOnly,
-                            format: wgpu::TextureFormat::R32Float,
+                            format: wgpu::TextureFormat::Rg32Float,
                             view_dimension: wgpu::TextureViewDimension::D2,
                         },
                         count: None,
@@ -11457,15 +12163,24 @@ impl App {
             envelope_fade_range: 32.0,
             hzb_enabled: 0,
             max_hzb_mip: 0,
-            _pad3: 0.0,
-            _pad_align2: [0; 3],
-            view_proj: [
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
-            ],
+            hzb_valid: 0,
+            _pad3: 0,
+            view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+            hzb_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+            hzb_camera_position: [0.0; 3],
+            hzb_margin_px: HZB_MARGIN_PX,
+            haze_color: [0.0; 4],
+            haze_params: [0.0; 4],
         };
+
+        // Mappable copy of the HZB occlusion counters that gpu_cull.wgsl keeps after the
+        // impostor indirect args (see IMPOSTOR_INDIRECT_BYTES).
+        self.cull_stats_readback = Some(device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("GPU Cull Stats Readback"),
+            size: 16,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
 
         let cull_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("GPU Cull Params Buffer"),
@@ -11592,6 +12307,12 @@ impl App {
                     }),
                     Some(wgpu::ColorTargetState {
                         format: wgpu::TextureFormat::R8Unorm,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    // Surface G-buffer (albedo * haze transmittance, occludable share)
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
                         blend: Some(wgpu::BlendState::REPLACE),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
@@ -11742,6 +12463,68 @@ impl App {
         // Old separable bloom blur pipeline removed; Kawase blur is used for bloom instead.
         self.ssao_blur_pipeline = Some(ssao_blur_pipeline);
         self.composite_pipeline = Some(composite_pipeline);
+
+        // FXAA: composited image (swapchain format) -> swapchain, before the UI overlays.
+        let fxaa_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("FXAA Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/fxaa.wgsl").into()),
+        });
+        let fxaa_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("FXAA Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let fxaa_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("FXAA Pipeline Layout"),
+            bind_group_layouts: &[Some(&fxaa_bind_group_layout)],
+            immediate_size: 0,
+        });
+        self.fxaa_pipeline = Some(
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("FXAA Pipeline"),
+                layout: Some(&fxaa_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &fxaa_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &fxaa_shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            }),
+        );
+        self.fxaa_bind_group_layout = Some(fxaa_bind_group_layout);
+
         self.bloom_extract_bind_group_layout = Some(bloom_extract_bind_group_layout);
         self.bloom_blur_bind_group_layout = Some(bloom_blur_bind_group_layout);
         self.composite_bind_group_layout = Some(composite_bind_group_layout);
@@ -12409,8 +13192,14 @@ impl App {
         self.last_frame = now;
         self.frame_ms = (dt as f64) * 1000.0;
         log::debug!("render: camera updated dt={}", dt);
-        self.elapsed_time += dt;
+        if self.screenshot.is_some() {
+            // Deterministic capture: pin the water animation clock.
+            self.elapsed_time = SCREENSHOT_ELAPSED_TIME;
+        } else {
+            self.elapsed_time += dt;
+        }
         self.frame_index = self.frame_index.wrapping_add(1);
+        self.screenshot_pre_frame();
 
         // Free deferred mesh allocations after the GPU-safe window to avoid reuse flashes.
         let safe_before = self.frame_index.saturating_sub(GPU_EVICTION_SAFE_FRAMES);
@@ -12493,11 +13282,8 @@ impl App {
             let ndc_x = (2.0 * self.current_mouse_pos.0 as f32 / width) - 1.0;
             let ndc_y = 1.0 - (2.0 * self.current_mouse_pos.1 as f32 / height);
 
-            const OPENGL_TO_WGPU_MATRIX: glam::Mat4 = glam::Mat4::from_cols_array(&[
-                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5, 1.0,
-            ]);
-
-            let inv_vp = (OPENGL_TO_WGPU_MATRIX * projection * view).inverse();
+            // perspective_rh maps depth to [0,1]: z=0 is the near plane, z=1 the far plane.
+            let inv_vp = (projection * view).inverse();
             let near_clip = inv_vp.project_point3(glam::vec3(ndc_x, ndc_y, 0.0));
             let far_clip = inv_vp.project_point3(glam::vec3(ndc_x, ndc_y, 1.0));
             let dir = (far_clip - near_clip).normalize();
@@ -12531,10 +13317,6 @@ impl App {
                 EditMode::Remove => hit.position,
             };
 
-            const OPENGL_TO_WGPU_MATRIX: glam::Mat4 = glam::Mat4::from_cols_array(&[
-                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5, 1.0,
-            ]);
-
             let (inner_color, outer_color, inner_scale, outer_scale) =
                 if effective_mode == EditMode::Add {
                     ([0.0, 8.0, 8.0, 1.0], [0.0, 8.0, 8.0, 0.45], 1.0, 1.06)
@@ -12559,7 +13341,7 @@ impl App {
             let render_view = glam::Mat4::look_at_rh(eye, center, up);
 
             let uniforms = EditorPreviewUniforms {
-                view_proj: (OPENGL_TO_WGPU_MATRIX * render_proj * render_view).to_cols_array_2d(),
+                view_proj: (render_proj * render_view).to_cols_array_2d(),
                 pos0: [
                     target_pos.x as f32 - inner_offset,
                     target_pos.y as f32 - inner_offset,
@@ -12655,6 +13437,19 @@ impl App {
         // Check for GI results (non-blocking, like mesh result polling)
         while let Ok(result) = self.gi_result_rx.try_recv() {
             let old_origin = self.gi_grid_origin;
+            if let Some(h) = self.screenshot.as_mut() {
+                let busy = match &result {
+                    voxelot::gi::GiUpdateResult::Full { .. } => true,
+                    voxelot::gi::GiUpdateResult::Partial {
+                        updates,
+                        probes_calculated,
+                        ..
+                    } => *probes_calculated > 0 || !updates.is_empty(),
+                };
+                if busy {
+                    h.gi_last_busy_frame = self.frame_index;
+                }
+            }
             match result {
                 voxelot::gi::GiUpdateResult::Full {
                     probes,
@@ -12716,19 +13511,25 @@ impl App {
 
         // Send async GI update request with visible chunks (non-blocking, after culling)
         let camera_pos = glam::Vec3::from(self.camera_controller.camera.position);
-        let world_to_send = if self.world_changed || self.frame_index == 0 {
-            Some(self.world.clone())
-        } else {
-            None
-        };
-        let dirty_chunks: Vec<glam::IVec3> = self.gi_dirty_chunks.drain().collect();
-        let _ = self.gi_request_tx.send(voxelot::gi::GiUpdateRequest {
-            camera_pos,
-            visible_chunks,
-            dirty_chunks,
-            world: world_to_send,
-        });
-        self.world_changed = false;
+        // The screenshot harness renders a static pose, so it coalesces GI requests (one in
+        // flight at a time) instead of queueing one per frame; the worker otherwise falls
+        // behind and its backlog never drains.
+        let coalesce_gi = self.screenshot.is_some() && !self.gi_request_tx.is_empty();
+        if !coalesce_gi {
+            let world_to_send = if self.world_changed || self.frame_index == 0 {
+                Some(self.world.clone())
+            } else {
+                None
+            };
+            let dirty_chunks: Vec<glam::IVec3> = self.gi_dirty_chunks.drain().collect();
+            let _ = self.gi_request_tx.send(voxelot::gi::GiUpdateRequest {
+                camera_pos,
+                visible_chunks,
+                dirty_chunks,
+                world: world_to_send,
+            });
+            self.world_changed = false;
+        }
 
         // CPU cull: filter out chunks that are completely below water visibility threshold
         // Any chunk whose max y-value is below (water_level - water_visibility) is invisible
@@ -13514,8 +14315,13 @@ impl App {
                 envelope_fade_range: self.envelope_fade_range,
                 hzb_enabled: if self.hzb_enabled { 1 } else { 0 },
                 max_hzb_mip: self.hzb_mip_levels.saturating_sub(1),
-                _pad3: 0.0,
-                _pad_align2: [0; 3],
+                hzb_valid: if self.hzb_source.is_some() { 1 } else { 0 },
+                _pad3: 0,
+                hzb_view_proj: self.hzb_source.map(|(vp, _)| vp).unwrap_or([[0.0; 4]; 4]),
+                hzb_camera_position: self.hzb_source.map(|(_, pos)| pos).unwrap_or([0.0; 3]),
+                hzb_margin_px: HZB_MARGIN_PX,
+                haze_color: self.haze_color(skybox_brightness),
+                haze_params: [self.water_level, 0.0, 0.0, 0.0],
                 view_proj: {
                     // Build view matrix
                     let cam_pos = glam::Vec3::from_array(self.camera_controller.camera.position);
@@ -13811,37 +14617,18 @@ impl App {
 
             match self
                 .world
-                .get_leaf_chunk_arc_at_origin(WorldPos::new(key.0, key.1, key.2))
+                .leaf_chunk_arc_ref_at_origin(WorldPos::new(key.0, key.1, key.2))
+                .cloned()
             {
                 Some(chunk) => {
-                    // Snapshot neighbor chunks so AO can be computed across chunk bounds.
+                    // Snapshot the 6 face neighbours the mesher reads for boundary-face culling
+                    // (AO is a placeholder, so the diagonal neighbours are never consulted).
                     let neighbor_start = std::time::Instant::now();
-                    let mut neighbors: FxHashMap<(i8, i8, i8), Arc<Chunk>> = FxHashMap::default();
-                    for dx in -1i64..=1 {
-                        for dy in -1i64..=1 {
-                            for dz in -1i64..=1 {
-                                let nx = key.0 + (dx << 4);
-                                let ny = key.1 + (dy << 4);
-                                let nz = key.2 + (dz << 4);
-                                if let Some(nc) = self
-                                    .world
-                                    .get_leaf_chunk_arc_at_origin(WorldPos::new(nx, ny, nz))
-                                {
-                                    let nk = (nx, ny, nz);
-                                    // Reuse cached Arc or cache the new one
-                                    let arc_neigh = if let Some(existing) =
-                                        self.mesh_chunk_arc_cache.get(&nk)
-                                    {
-                                        existing.clone()
-                                    } else {
-                                        self.mesh_chunk_arc_cache.insert(nk, nc.clone());
-                                        nc
-                                    };
-                                    neighbors.insert((dx as i8, dy as i8, dz as i8), arc_neigh);
-                                }
-                            }
-                        }
-                    }
+                    let neighbors = voxelot::meshing_optimized::snapshot_mesh_neighbors(
+                        &self.world,
+                        key,
+                        &mut self.mesh_chunk_arc_cache,
+                    );
 
                     mesh_job_neighbors_time += neighbor_start.elapsed();
                     // Use cached Arc for the chunk as well
@@ -14295,11 +15082,11 @@ impl App {
         let center = eye + Vec3::from(self.camera_controller.camera.forward) * 100.0; // look far ahead
         let up = Vec3::from(self.camera_controller.camera.up);
         let view_mat = Mat4::look_at_rh(eye, center, up);
-        // Convert from OpenGL-style NDC (glam) to wgpu's 0..1 depth range
-        const OPENGL_TO_WGPU_MATRIX: Mat4 = Mat4::from_cols_array(&[
-            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5, 1.0,
-        ]);
-        let mvp = OPENGL_TO_WGPU_MATRIX * projection * view_mat;
+        // glam's perspective_rh already yields wgpu/Metal [0,1] depth. (An extra GL->wgpu remap
+        // z' = 0.5z + 0.5w used to squeeze stored depth into [0.5,1], halving its precision.)
+        // Every depth consumer (shaders reading the depth buffer/HZB, SSAO/RC/SSR inverse
+        // matrices) uses this same convention.
+        let mvp = projection * view_mat;
         let mvp_cols: [[f32; 4]; 4] = mvp.to_cols_array_2d();
 
         // Calculate inverse matrices for skybox rendering
@@ -14560,15 +15347,21 @@ impl App {
         let shadow_cull_min = bounds_min - Vec3::splat(shadow_cull_padding);
         let shadow_cull_max = bounds_max + Vec3::splat(shadow_cull_padding);
 
+        // orthographic_rh already targets [0,1] depth. The old GL->wgpu remap on top of it
+        // implicitly extended the light-space near plane by (far - near) toward the sun, so
+        // casters slightly in front of `near_plane` (the caster cull above admits them) were not
+        // clipped. Keep that coverage explicitly; this is the exact same depth mapping, so all
+        // shadow-depth biases (voxel.wgsl, water.wgsl, wts_inject.wgsl) keep their meaning.
+        let shadow_depth_near = 2.0 * near_plane - far_plane;
         let light_proj = Mat4::orthographic_rh(
             bounds_min.x,
             bounds_max.x,
             bounds_min.y,
             bounds_max.y,
-            near_plane,
+            shadow_depth_near,
             far_plane,
         );
-        let sun_view_proj = OPENGL_TO_WGPU_MATRIX * light_proj * light_view;
+        let sun_view_proj = light_proj * light_view;
         let sun_view_proj_cols: [[f32; 4]; 4] = sun_view_proj.to_cols_array_2d();
 
         let shadow_calc_direction = [
@@ -14784,7 +15577,8 @@ impl App {
             inverse_view: inverse_view_cols,
             inverse_proj: inverse_proj_cols,
             gi_scale: self.ssr_settings.gi_scale, // Use gi_scale from SSR settings
-            _pad_gi: [0.0; 7],
+            _pad_gi: [0.0; 3],
+            haze_color: self.haze_color(skybox_brightness),
         };
 
         queue.write_buffer(
@@ -14795,7 +15589,7 @@ impl App {
 
         // Update SSR camera UBO with inverse/view/proj matrices for SSR pass
         if let Some(ssr_cam_buf) = self.ssr_camera_uniform_buffer.as_ref() {
-            let view_proj = (OPENGL_TO_WGPU_MATRIX * projection * view_mat).to_cols_array_2d();
+            let view_proj = mvp_cols;
             let ssr_cam = SsrCameraUniforms {
                 inverse_view: inverse_view_cols,
                 inverse_proj: inverse_proj_cols,
@@ -15273,6 +16067,16 @@ impl App {
                         },
                         depth_slice: None,
                     }),
+                    // G-Buffer surface texture (albedo * haze transmittance, occludable share)
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: self.surface_view.as_ref().unwrap(),
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    }),
                 ],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: offscreen_depth_view,
@@ -15444,6 +16248,8 @@ impl App {
 
         // Generate HZB mip chain from the depth buffer we just populated
         self.generate_hzb(&mut encoder);
+        // Next frame's GPU cull reprojects against this pyramid with this frame's camera.
+        self.hzb_source = Some((mvp_cols, camera_pos));
         #[cfg(feature = "gpu-profiling")]
         self.gpu_write_timestamp(&mut encoder, 3);
 
@@ -16131,14 +16937,27 @@ impl App {
         #[cfg(feature = "gpu-profiling")]
         self.gpu_write_timestamp(&mut encoder, 8);
 
+        // With FXAA the composite goes to an intermediate swapchain-format texture; the FXAA
+        // pass then writes the swapchain and the UI overlays are drawn after it (crisp text).
+        let use_fxaa = self.fxaa_enabled && self.fxaa_pipeline.is_some();
+        if use_fxaa {
+            self.ensure_fxaa_target();
+        }
+        let use_fxaa =
+            use_fxaa && self.fxaa_source_view.is_some() && self.fxaa_bind_group.is_some();
         if let (Some(composite_pipeline), Some(composite_bind_group)) = (
             self.composite_pipeline.as_ref(),
             self.composite_bind_group.as_ref(),
         ) {
+            let composite_target = if use_fxaa {
+                self.fxaa_source_view.as_ref().unwrap()
+            } else {
+                &view
+            };
             let mut composite_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Composite Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: composite_target,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -16154,29 +16973,8 @@ impl App {
             composite_pass.set_pipeline(composite_pipeline);
             composite_pass.set_bind_group(0, composite_bind_group, &[]);
             composite_pass.draw(0..3, 0..1);
-
-            // Palette UI (2D overlay)
-            if self.palette_ui_visible && self.palette_ui_count > 0 {
-                if let (Some(pipeline), Some(buf)) = (
-                    self.palette_ui_pipeline.as_ref(),
-                    self.palette_ui_buffer.as_ref(),
-                ) {
-                    composite_pass.set_pipeline(pipeline);
-                    composite_pass.set_vertex_buffer(0, buf.slice(..));
-                    composite_pass.draw(0..6, 0..self.palette_ui_count);
-                }
-            }
-
-            // Metrics UI (2D overlay)
-            if self.gui_visible && self.ui_quad_count > 0 {
-                if let (Some(pipeline), Some(buf)) = (
-                    self.palette_ui_pipeline.as_ref(),
-                    self.ui_quad_buffer.as_ref(),
-                ) {
-                    composite_pass.set_pipeline(pipeline);
-                    composite_pass.set_vertex_buffer(0, buf.slice(..));
-                    composite_pass.draw(0..6, 0..self.ui_quad_count);
-                }
+            if !use_fxaa {
+                self.draw_ui_overlays(&mut composite_pass);
             }
         } else {
             eprintln!("Composite resources unavailable; skipping final pass!");
@@ -16184,16 +16982,84 @@ impl App {
         #[cfg(feature = "gpu-profiling")]
         self.gpu_write_timestamp(&mut encoder, 9);
 
+        if use_fxaa {
+            if let (Some(fxaa_pipeline), Some(fxaa_bind_group)) =
+                (self.fxaa_pipeline.as_ref(), self.fxaa_bind_group.as_ref())
+            {
+                let mut fxaa_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("FXAA Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::DontCare(unsafe {
+                                wgpu::LoadOpDontCare::enabled()
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                fxaa_pass.set_pipeline(fxaa_pipeline);
+                fxaa_pass.set_bind_group(0, fxaa_bind_group, &[]);
+                fxaa_pass.draw(0..3, 0..1);
+                self.draw_ui_overlays(&mut fxaa_pass);
+            }
+        }
+
         #[cfg(feature = "gpu-profiling")]
         self.gpu_write_timestamp(&mut encoder, 10);
 
         #[cfg(feature = "gpu-profiling")]
         self.gpu_resolve_timestamps(&mut encoder);
 
+        let screenshot_readback = if self
+            .screenshot
+            .as_ref()
+            .is_some_and(|h| h.capture_this_frame)
+        {
+            Some(Self::encode_screenshot_copy(
+                &device,
+                &mut encoder,
+                &output.texture,
+            ))
+        } else {
+            None
+        };
+
         queue.submit(std::iter::once(encoder.finish()));
         log::debug!("submitted frame {} to GPU queue", self.frame_count);
         output.present();
         log::debug!("presented output for frame {}", self.frame_count);
+
+        if let (Some(readback), Some(h)) = (screenshot_readback, self.screenshot.as_ref()) {
+            Self::save_screenshot(&device, &readback, &h.path);
+            let cam = &self.camera_controller;
+            println!(
+                "SCREENSHOT path={} size={}x{} fps={:.1} idle_frames={} visible={} meshed={} fallback={} hzb={} hzb_culled={}/{} camera=({:.1},{:.1},{:.1}) yaw={:.1} pitch={:.1}",
+                h.path.display(),
+                readback.width,
+                readback.height,
+                h.measured_fps,
+                h.idle_frames,
+                visible.len(),
+                meshed_chunk_count,
+                missing_chunks.len(),
+                if self.hzb_enabled { "on" } else { "off" },
+                self.hzb_cull_stats.1,
+                self.hzb_cull_stats.0,
+                cam.camera.position[0],
+                cam.camera.position[1],
+                cam.camera.position[2],
+                cam.yaw.to_degrees(),
+                cam.pitch.to_degrees(),
+            );
+            self.exit_requested = true;
+        }
         #[cfg(feature = "gpu-profiling")]
         self.gpu_collect_timestamps(&device);
 
@@ -16302,6 +17168,12 @@ impl App {
                     frame_mesh_upload_limit
                 );
             }
+            log::info!(
+                "HZB occlusion: {} ({} of {} tested candidates culled)",
+                if self.hzb_enabled { "on" } else { "off" },
+                self.hzb_cull_stats.1,
+                self.hzb_cull_stats.0
+            );
             // Print culling statistics grouped by reason
             #[cfg(feature = "cpu-profiling")]
             {
@@ -16377,7 +17249,11 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.exit_requested {
+            event_loop.exit();
+            return;
+        }
         // Continuously update and render
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -16390,7 +17266,21 @@ impl ApplicationHandler for App {
         _window_id: winit::window::WindowId,
         event: WindowEvent,
     ) {
+        // The screenshot harness renders a fixed pose: ignore keyboard/mouse input.
+        if self.screenshot.is_some()
+            && matches!(
+                event,
+                WindowEvent::KeyboardInput { .. }
+                    | WindowEvent::MouseInput { .. }
+                    | WindowEvent::CursorMoved { .. }
+            )
+        {
+            return;
+        }
         match event {
+            WindowEvent::CloseRequested if self.screenshot.is_some() => {
+                event_loop.exit();
+            }
             WindowEvent::CloseRequested => {
                 log::info!("Close requested");
                 self.save_config();
@@ -16510,10 +17400,294 @@ fn main() {
     log::info!("  ESC - Quit\n");
 
     let args = ViewerArgs::parse();
-    let config_path = args.config_arg.unwrap_or(args.config);
+    let config_path = args.config_arg.clone().unwrap_or(args.config.clone());
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let mut app = App::new(&config_path);
+
+    let start_pose = CameraPose {
+        position: args.camera.as_deref().map(|s| {
+            let v = parse_f32_list(s, 3, "--camera");
+            [v[0], v[1], v[2]]
+        }),
+        yaw_deg: args.yaw,
+        pitch_deg: args.pitch,
+    };
+    if start_pose.position.is_some()
+        || start_pose.yaw_deg.is_some()
+        || start_pose.pitch_deg.is_some()
+    {
+        app.apply_camera_pose(&start_pose);
+    }
+    if let Some(name) = args.debug_view.as_deref() {
+        let wanted = name.to_ascii_lowercase().replace(['-', '_', ' '], "");
+        // Cycle exactly as F3 does until the requested view is active.
+        for _ in 0..16 {
+            let current = app.input_manager.active_debug_view.name();
+            if current.to_ascii_lowercase().replace(' ', "") == wanted {
+                break;
+            }
+            app.process_lighting_key(KeyCode::F3);
+        }
+    }
+    if let Some(path) = args.screenshot.clone() {
+        let jump = args.screenshot_jump.as_deref().map(|s| {
+            let v = parse_f32_list(s, 5, "--screenshot-jump");
+            CameraPose {
+                position: Some([v[0], v[1], v[2]]),
+                yaw_deg: Some(v[3]),
+                pitch_deg: Some(v[4]),
+            }
+        });
+        app.enable_screenshot_harness(path, args.screenshot_frames, jump);
+    }
     event_loop.run_app(&mut app).unwrap();
+}
+
+#[cfg(test)]
+mod shader_tests {
+    //! Validates every WGSL shader with naga and checks that host uniform structs match the
+    //! layout the shaders read (a mismatch silently feeds the GPU garbage, e.g. GpuCullParams
+    //! once had view_proj 8 bytes off).
+    use super::*;
+    use std::mem::{offset_of, size_of};
+
+    fn shader_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders")
+    }
+
+    fn parse(name: &str) -> naga::Module {
+        let path = shader_dir().join(name);
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
+        naga::front::wgsl::parse_str(&src)
+            .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(&src)))
+    }
+
+    #[test]
+    fn all_shaders_validate() {
+        let mut count = 0;
+        for entry in std::fs::read_dir(shader_dir()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("wgsl") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_str().unwrap().to_string();
+            let module = parse(&name);
+            let src = std::fs::read_to_string(&path).unwrap();
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(&src)));
+            count += 1;
+        }
+        assert!(count > 0, "no shaders found");
+    }
+
+    /// Asserts that WGSL struct `wgsl_struct` in `shader` fits the host struct (`host_size`
+    /// bytes; the shader may declare only a prefix) and that the listed members sit at the
+    /// given host offsets.
+    fn assert_layout(shader: &str, wgsl_struct: &str, host_size: usize, members: &[(&str, usize)]) {
+        let module = parse(shader);
+        let mut layouter = naga::proc::Layouter::default();
+        layouter.update(module.to_ctx()).unwrap();
+        let (handle, ty) = module
+            .types
+            .iter()
+            .find(|(_, ty)| ty.name.as_deref() == Some(wgsl_struct))
+            .unwrap_or_else(|| panic!("{shader}: struct {wgsl_struct} not found"));
+        let naga::TypeInner::Struct {
+            members: wgsl_members,
+            ..
+        } = &ty.inner
+        else {
+            panic!("{shader}: {wgsl_struct} is not a struct");
+        };
+        let wgsl_size = layouter[handle].size as usize;
+        assert!(
+            wgsl_size <= host_size,
+            "{shader}::{wgsl_struct} is {wgsl_size} bytes but the host writes only {host_size}"
+        );
+        for (name, host_offset) in members {
+            let member = wgsl_members
+                .iter()
+                .find(|m| m.name.as_deref() == Some(*name))
+                .unwrap_or_else(|| panic!("{shader}::{wgsl_struct}: no member {name}"));
+            assert_eq!(
+                member.offset as usize, *host_offset,
+                "{shader}::{wgsl_struct}.{name}: shader offset vs host offset"
+            );
+        }
+    }
+
+    #[test]
+    fn host_uniform_layouts_match_shaders() {
+        let cull = size_of::<GpuCullParams>();
+        let cull_members = [
+            ("hzb_enabled", offset_of!(GpuCullParams, hzb_enabled)),
+            ("view_proj", offset_of!(GpuCullParams, view_proj)),
+        ];
+        assert_layout("gpu_cull.wgsl", "CullParams", cull, &cull_members);
+        assert_layout(
+            "gpu_cull.wgsl",
+            "CullParams",
+            cull,
+            &[
+                ("hzb_view_proj", offset_of!(GpuCullParams, hzb_view_proj)),
+                (
+                    "hzb_camera_position",
+                    offset_of!(GpuCullParams, hzb_camera_position),
+                ),
+                ("hzb_margin_px", offset_of!(GpuCullParams, hzb_margin_px)),
+                ("haze_color", offset_of!(GpuCullParams, haze_color)),
+                ("haze_params", offset_of!(GpuCullParams, haze_params)),
+            ],
+        );
+        assert_layout("impostor.wgsl", "CullParams", cull, &cull_members);
+        assert_layout(
+            "impostor.wgsl",
+            "CullParams",
+            cull,
+            &[
+                ("haze_color", offset_of!(GpuCullParams, haze_color)),
+                ("haze_params", offset_of!(GpuCullParams, haze_params)),
+            ],
+        );
+
+        let uniforms = [
+            ("inverse_view", offset_of!(Uniforms, inverse_view)),
+            ("inverse_proj", offset_of!(Uniforms, inverse_proj)),
+            ("gi_scale", offset_of!(Uniforms, gi_scale)),
+            ("haze_color", offset_of!(Uniforms, haze_color)),
+        ];
+        assert_layout("voxel.wgsl", "Uniforms", size_of::<Uniforms>(), &uniforms);
+        for shader in ["water.wgsl", "skybox.wgsl"] {
+            assert_layout(shader, "CameraUniforms", size_of::<Uniforms>(), &uniforms);
+        }
+        assert_layout(
+            "ssr.wgsl",
+            "CameraUniforms",
+            size_of::<SsrCameraUniforms>(),
+            &[
+                ("camera_pos", offset_of!(SsrCameraUniforms, camera_pos)),
+                ("gi_grid_dims", offset_of!(SsrCameraUniforms, gi_grid_dims)),
+                (
+                    "ambient_color",
+                    offset_of!(SsrCameraUniforms, ambient_color),
+                ),
+            ],
+        );
+        assert_layout(
+            "voxel.wgsl",
+            "CameraUniforms",
+            size_of::<SsrCameraUniforms>(),
+            &[
+                (
+                    "gi_grid_origin",
+                    offset_of!(SsrCameraUniforms, gi_grid_origin),
+                ),
+                ("gi_grid_dims", offset_of!(SsrCameraUniforms, gi_grid_dims)),
+            ],
+        );
+        assert_layout(
+            "post_composite.wgsl",
+            "CompositeUniforms",
+            size_of::<CompositeUniforms>(),
+            &[
+                ("rc_active", offset_of!(CompositeUniforms, rc_active)),
+                (
+                    "indirect_albedo",
+                    offset_of!(CompositeUniforms, indirect_albedo),
+                ),
+                (
+                    "ambient_only_ao",
+                    offset_of!(CompositeUniforms, ambient_only_ao),
+                ),
+                ("uv_scale", offset_of!(CompositeUniforms, uv_scale)),
+                ("uv_offset", offset_of!(CompositeUniforms, uv_offset)),
+            ],
+        );
+        assert_layout(
+            "ssilvb.wgsl",
+            "SsaoUniforms",
+            size_of::<SsaoUniformsRaw>(),
+            &[
+                (
+                    "inverse_projection",
+                    offset_of!(SsaoUniformsRaw, inverse_projection),
+                ),
+                ("grid_dims", offset_of!(SsaoUniformsRaw, grid_dims)),
+                ("debug_mode", offset_of!(SsaoUniformsRaw, debug_mode)),
+            ],
+        );
+        assert_layout(
+            "water.wgsl",
+            "WaterUniforms",
+            size_of::<WaterUniforms>(),
+            &[(
+                "dof_focal_distance",
+                offset_of!(WaterUniforms, dof_focal_distance),
+            )],
+        );
+        assert_layout(
+            "radiance_cascades.wgsl",
+            "CameraUniforms",
+            size_of::<RadianceCascadesCamera>(),
+            &[("camera_pos", offset_of!(RadianceCascadesCamera, camera_pos))],
+        );
+        assert_layout(
+            "radiance_cascades.wgsl",
+            "RCParams",
+            size_of::<RadianceCascadesParams>(),
+            &[(
+                "frame_count",
+                offset_of!(RadianceCascadesParams, frame_count),
+            )],
+        );
+        assert_layout(
+            "wts_inject.wgsl",
+            "InjectParams",
+            size_of::<InjectParams>(),
+            &[("shadow_matrix", offset_of!(InjectParams, shadow_matrix))],
+        );
+        assert_layout(
+            "wts_relax.wgsl",
+            "WtsParams",
+            size_of::<WtsParamsRaw>(),
+            &[],
+        );
+        assert_layout(
+            "bloom_extract.wgsl",
+            "BloomExtractUniforms",
+            size_of::<BloomExtractUniforms>(),
+            &[],
+        );
+        assert_layout(
+            "ssao_blur.wgsl",
+            "BloomBlurUniforms",
+            size_of::<BloomBlurUniforms>(),
+            &[("texel_size", offset_of!(BloomBlurUniforms, texel_size))],
+        );
+        assert_layout(
+            "editor_preview.wgsl",
+            "Uniforms",
+            size_of::<EditorPreviewUniforms>(),
+            &[],
+        );
+        assert_layout(
+            "dof_coc_copy.wgsl",
+            "DoFUniforms",
+            DOF_UNIFORM_FLOATS * 4,
+            &[],
+        );
+        assert_layout("hzb_gen.wgsl", "HzbParams", size_of::<HzbParams>(), &[]);
+        assert_layout(
+            "ssao_blur.wgsl",
+            "BloomBlurUniforms",
+            size_of::<BloomBlurUniforms>(),
+            &[("near_far", offset_of!(BloomBlurUniforms, near_far))],
+        );
+    }
 }

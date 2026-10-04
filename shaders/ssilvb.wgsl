@@ -79,21 +79,23 @@ fn fetch_depth(coord: vec2<i32>) -> f32 {
     return textureLoad(depth_tex, coord, 0);
 }
 
-// Fetch depth with manual bilinear filtering to reduce banding/aliasing on flat surfaces
-fn load_depth_at_uv(uv: vec2<f32>) -> f32 {
-    let dims = vec2<f32>(textureDimensions(depth_tex));
-    let pixel_pos = uv * dims - 0.5;
-    let base_coord = vec2<i32>(floor(pixel_pos));
-    let fract_pos = pixel_pos - vec2<f32>(base_coord);
+// Full-resolution pixel shaded by half-resolution texel `texel`. The depth-aware blur and the
+// composite's joint-bilateral upsample compare against this same pixel, so AO/GI stay on the
+// surface that produced them. (A bilinear depth average invented phantom depths between a
+// silhouette and the background, bleeding AO/GI across edges and into the sky.)
+fn source_pixel(texel: vec2<i32>, full_size: vec2<i32>) -> vec2<i32> {
+    return clamp(texel * 2 + vec2<i32>(1), vec2<i32>(0), full_size - vec2<i32>(1));
+}
 
-    let d00 = textureLoad(depth_tex, clamp(base_coord + vec2<i32>(0, 0), vec2<i32>(0), vec2<i32>(dims) - 1), 0);
-    let d10 = textureLoad(depth_tex, clamp(base_coord + vec2<i32>(1, 0), vec2<i32>(0), vec2<i32>(dims) - 1), 0);
-    let d01 = textureLoad(depth_tex, clamp(base_coord + vec2<i32>(0, 1), vec2<i32>(0), vec2<i32>(dims) - 1), 0);
-    let d11 = textureLoad(depth_tex, clamp(base_coord + vec2<i32>(1, 1), vec2<i32>(0), vec2<i32>(dims) - 1), 0);
+// Full-resolution pixel containing `uv`, and the UV of that pixel's centre. Positions are
+// reconstructed at the centre of the pixel whose depth was read, so flat surfaces stay exact
+// (no stair-stepping from mixing one pixel's depth with another pixel's ray).
+fn pixel_at_uv(uv: vec2<f32>, full_size: vec2<i32>) -> vec2<i32> {
+    return clamp(vec2<i32>(uv * vec2<f32>(full_size)), vec2<i32>(0), full_size - vec2<i32>(1));
+}
 
-    let d0 = mix(d00, d10, fract_pos.x);
-    let d1 = mix(d01, d11, fract_pos.x);
-    return mix(d0, d1, fract_pos.y);
+fn pixel_center_uv(pixel: vec2<i32>, full_size: vec2<i32>) -> vec2<f32> {
+    return (vec2<f32>(pixel) + vec2<f32>(0.5)) / vec2<f32>(full_size);
 }
 
 // Interleaved Gradient Noise
@@ -204,9 +206,12 @@ fn sample_grid_irradiance(world_pos: vec3<f32>, normal: vec3<f32>, camera_pos: v
 }
 
 @fragment
-fn fs_main(@location(0) uv: vec2<f32>, @builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
-    // Reconstruct linear depth from depth texture
-    let raw_depth = load_depth_at_uv(uv);
+fn fs_main(@location(0) half_uv: vec2<f32>, @builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
+    // Shade the exact full-resolution source pixel of this half-resolution texel.
+    let full_size = vec2<i32>(textureDimensions(depth_tex));
+    let center_pixel = source_pixel(vec2<i32>(frag_pos.xy), full_size);
+    let uv = pixel_center_uv(center_pixel, full_size);
+    let raw_depth = textureLoad(depth_tex, center_pixel, 0);
     if (raw_depth >= 1.0) {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
@@ -221,7 +226,7 @@ fn fs_main(@location(0) uv: vec2<f32>, @builtin(position) frag_pos: vec4<f32>) -
 
     // Use textureLoad for normal G-buffer to avoid linear filtering artifacts on Oct-encoded data
     let normal_dims = vec2<i32>(textureDimensions(normal_tex));
-    let normal_data = textureLoad(normal_tex, clamp(vec2<i32>(uv * vec2<f32>(normal_dims)), vec2<i32>(0), normal_dims - 1), 0).xy;
+    let normal_data = textureLoad(normal_tex, pixel_at_uv(uv, normal_dims), 0).xy;
     let world_normal = oct_decode(normal_data);
 
     let inv_proj_00 = ssao.inverse_projection[0][0];
@@ -327,10 +332,10 @@ fn fs_main(@location(0) uv: vec2<f32>, @builtin(position) frag_pos: vec4<f32>) -
                 if (sample_uv.x < 0.0 || sample_uv.x > 1.0 ||
                     sample_uv.y < 0.0 || sample_uv.y > 1.0) { break; }
 
-                // Use sampler-based access - hardware handles clamping natively without
-                // naga inserting min(coord, get_width()-1) bounds checks per read
-                // Reconstruct linear depth from depth buffer
-                let sample_raw_depth = load_depth_at_uv(sample_uv);
+                // Point-sample the tap's pixel and reconstruct at that pixel's centre.
+                let tap_pixel = pixel_at_uv(sample_uv, full_size);
+                let tap_uv = pixel_center_uv(tap_pixel, full_size);
+                let sample_raw_depth = textureLoad(depth_tex, tap_pixel, 0);
                 if (sample_raw_depth >= 1.0) { continue; }
                 // Linearise depth with 2 MAD ops instead of a full matrix multiply
                 let lin_z_num = ip22 * sample_raw_depth + ip32;
@@ -339,7 +344,7 @@ fn fs_main(@location(0) uv: vec2<f32>, @builtin(position) frag_pos: vec4<f32>) -
 
                 if (sample_linear_depth <= 0.0) { continue; }
 
-                let sample_ndc_xy = vec2<f32>(sample_uv.x * 2.0 - 1.0, 1.0 - sample_uv.y * 2.0);
+                let sample_ndc_xy = vec2<f32>(tap_uv.x * 2.0 - 1.0, 1.0 - tap_uv.y * 2.0);
                 let sample_pos = vec3<f32>(sample_ndc_xy.x * sample_linear_depth * inv_proj_00, sample_ndc_xy.y * sample_linear_depth * inv_proj_11, -sample_linear_depth);
                 
                 let delta = sample_pos - view_pos;
@@ -376,7 +381,7 @@ fn fs_main(@location(0) uv: vec2<f32>, @builtin(position) frag_pos: vec4<f32>) -
                         let mask = (0xFFFFFFFFu >> (32u - count)) << start_bit;
                         let new_bits = mask & (~occlusion_bits);
                         if (new_bits != 0u) {
-                            let sample_color = textureSampleLevel(screen_color_tex, post_sampler, sample_uv, 0.0).rgb;
+                            let sample_color = textureLoad(screen_color_tex, tap_pixel, 0).rgb;
                             slice_irradiance += sample_color * f32(count_bits(new_bits));
                         }
                         occlusion_bits = occlusion_bits | mask;

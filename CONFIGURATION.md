@@ -130,6 +130,12 @@ Each entry shows the default value (as found in `src/config.rs`), a short descri
   - Used: `src/bin/voxelot.rs` (CAMetalLayer colorspace)
   - Effect of change: Use `"extended_linear_srgb"` to keep hues consistent with a linear-sRGB renderer. Use `"extended_linear_display_p3"` only if you also convert your output to Display P3.
 
+- `rendering.fxaa_enabled` (bool)
+  - Default: `true`
+  - Description: Final FXAA (edge anti-aliasing) pass over the composited image. The composite renders into an intermediate swapchain-format texture, FXAA writes the swapchain, and the UI overlays (HUD, palette) are drawn afterwards so text stays crisp. Edges are detected on a compressed luma, so it works on both the SDR and the macOS HDR (Rgba16Float, extended linear) swapchain.
+  - Used: `src/bin/voxelot.rs` (`ensure_fxaa_target`, FXAA pass after the composite), `shaders/fxaa.wgsl`
+  - Effect of change: `false` skips the extra full-screen pass and its intermediate texture (slightly faster, aliased voxel silhouettes).
+
 ---
 
 ## Atmosphere
@@ -181,6 +187,12 @@ Each entry shows the default value (as found in `src/config.rs`), a short descri
   - Description: Strength of the night tint applied to the skybox.
   - Used: `src/bin/voxelot.rs` and `shaders/skybox.wgsl`
   - Effect of change: Higher values make the night color more pronounced.
+
+- `atmosphere.horizon_haze_strength` (float)
+  - Default: `0.35` (`0` = legacy look)
+  - Description: Shared sky/haze model. The haze colour is the skybox image's own colour just above the horizon (measured once at load), put through the same night desaturation/tint/brightness as the skybox, so it stays dark at night. Distant land, water and impostors fade to that colour with distance (`1 - exp(-fog_density * strength * d * height_factor)`, where the height factor thins the haze with altitude above the water level, plus a small sun-facing glow), and the sky blends to it in a band (~4 degrees) above the horizon whose opacity is the haze a far sea point would have. Land, water and sky therefore meet at one horizon colour instead of a seam. The value multiplies `fog_density` for this model only.
+  - Used: `src/bin/voxelot.rs` (`App::haze_color`, `init_skybox`), `shaders/voxel.wgsl` (`compute_fog`), `shaders/water.wgsl`, `shaders/skybox.wgsl`, `shaders/impostor.wgsl`
+  - Effect of change: Higher = thicker, paler distance; lower = more contrast at range (but a visible sea/sky seam returns). `0` restores the legacy per-shader fog colours (land: ambient-tinted blue-grey, water: capped at 60% fog, sky: no haze).
 
 ---
 
@@ -245,6 +257,16 @@ Each entry shows the default value (as found in `src/config.rs`), a short descri
   - Effect of change: Set to `false` to skip the RC pass entirely (useful for performance A/B tests).
 
 ---
+
+### Global Illumination (`effects.gi`)
+
+- `albedo_modulated` (bool)
+  - Default: `true`
+  - Description: The screen-space indirect light (SSILVB probe/bounce light and Radiance Cascades dynamic lights) is irradiance, so the composite multiplies it by the surface albedo and by the haze transmittance of that pixel, both read from the surface G-buffer (`Rgba8Unorm`, rgb = albedo x (1 - haze), a = occludable share, written by `voxel.wgsl`, `impostor.wgsl`; the sky writes zero). Lit window glow no longer smears orange over dark glass, walls and the sky at night, and far surfaces receive proportionally less bounce. The daytime/night intensity ramp is compensated by x2 (`INDIRECT_ALBEDO_GAIN`) because albedo roughly halves the light.
+  - Used: `src/bin/voxelot.rs` (`build_composite_uniforms`, surface G-buffer target), `shaders/post_composite.wgsl`, `shaders/voxel.wgsl`, `shaders/impostor.wgsl`, `shaders/skybox.wgsl`
+  - Effect of change: `false` restores the old behaviour: indirect light is added unmodulated (and without the x2 compensation).
+
+---
 ### Screen-Space Reflections (`effects.ssr`)
 
 - `enabled` (bool)
@@ -285,10 +307,16 @@ Each entry shows the default value (as found in `src/config.rs`), a short descri
   - Used: `src/bin/voxelot.rs` and SSILVB/SSAO shaders
   - Effect of change: Disabling removes ambient occlusion calculations for surfaces.
 
+- `ambient_only` (bool)
+  - Default: `true`
+  - Description: Contact AO only darkens the occludable share of a pixel's radiance: sky ambient, moon and probe/GI light, as packed by the scene shaders into the surface G-buffer alpha. Shadow-mapped sunlight (already shadowed), emission and distance haze are never multiplied by AO, so sunlit facades no longer get dark blotches under balconies and fogged distance keeps its colour. Screen-space indirect light is ambient-like and is still fully darkened.
+  - Used: `shaders/post_composite.wgsl`, `shaders/voxel.wgsl`, `shaders/impostor.wgsl`
+  - Effect of change: `false` restores the old composite: AO multiplies the whole composited radiance (sun, emission, haze and indirect light included).
+
 - `sample_count`, `slice_count`, `radius`, `thickness`, `strength`, `blur_enabled`, `blur_radius`
   - Defaults: `8`, `4`, `4.0`, `0.5`, `1.0`, `true`, `2.0`
-  - Description: Parameters used for SSAO sampling, occlusion strength and blur pass settings.
-  - Used: `src/bin/voxelot.rs` and SSAO shaders
+  - Description: Parameters used for SSAO sampling, occlusion strength and blur pass settings. The half-resolution SSILVB pass shades the exact full-resolution source pixel of each texel; the blur (`blur_radius` = tap spacing in half-res texels) and the composite's joint-bilateral upsample weight samples by relative view depth, so AO/GI do not bleed across silhouettes or into the sky.
+  - Used: `src/bin/voxelot.rs`, `shaders/ssilvb.wgsl`, `shaders/ssao_blur.wgsl`, `shaders/post_composite.wgsl`
   - Effect of change: Increasing `sample_count` and `radius` yields more accurate occlusion at performance cost.
 
 ---
@@ -346,6 +374,12 @@ Each entry shows the default value (as found in `src/config.rs`), a short descri
   - Description: Envelope mesh distances for fallback meshes and their fade ranges.
   - Used: `src/bin/voxelot.rs` (envelopes & LOD)
   - Effect of change: Larger values increase how far distance envelope meshes are used.
+
+- `performance.hzb_enabled` (bool)
+  - Default: `true`
+  - Description: GPU occlusion culling against a hierarchical depth buffer (HZB) built from the previous frame's depth. Each candidate chunk's box is reprojected with the previous frame's view-projection, dilated by a small margin plus the worst-case parallax of the camera's movement since then, and only skipped (no mesh/envelope/impostor/fallback draw) if the farthest depth over its footprint is still in front of it. Chunks whose voxels the CPU expanded into fallback instances are never culled. Statistics (`HZB occlusion: N of M tested candidates culled`) are logged with the FPS line. Also toggleable at runtime from the settings cycle.
+  - Used: `src/bin/voxelot.rs` (`run_gpu_culling`, `generate_hzb`), `shaders/gpu_cull.wgsl`, `shaders/hzb_gen.wgsl`
+  - Effect of change: `false` draws every frustum-visible chunk. The HZB pyramid (R = nearest depth for water/SSR ray marching, G = farthest depth for culling) is built either way because water reflections use it.
 
 - `performance.mesh_priority_sort_interval_frames` (int)
   - Default: `30`

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 // Removed unused imports: File, BufWriter were unused
 
-use voxelot::{file_format::save_world_file, load_world_file, Palette, World, WorldPos};
+use voxelot::{file_format::save_world_file, load_world_file, World, WorldPos};
 
 fn calculate_required_depth(max_coord: i64) -> u8 {
     let mut depth = 0u8;
@@ -35,10 +35,8 @@ fn main() {
         }
     }
 
-    // Save palette (optional) and world
-    let palette = Palette::load("worlds/palette.txt");
+    // Save the world (the .vhc writer stores only voxels; the viewer computes LOD metadata on load)
     let oct_path = PathBuf::from("test_linear_hill.vhc");
-    world.update_all_lod_metadata(&palette);
     println!("Saving world to {}...", oct_path.display());
     match save_world_file(&world, &oct_path, true) {
         Ok(_) => println!("Saved {}", oct_path.display()),

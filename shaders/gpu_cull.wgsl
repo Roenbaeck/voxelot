@@ -49,9 +49,33 @@ struct CullParams {
     envelope_fade_range : f32,
     hzb_enabled : u32,
     max_hzb_mip : u32,
-    _pad3 : f32,
-    // View-projection matrix (column-major)
+    // 1 when hzb_tex holds a depth pyramid rendered with hzb_view_proj (last frame).
+    hzb_valid : u32,
+    _pad3 : u32,
+    // View-projection matrix (column-major) of the current frame.
     view_proj : mat4x4<f32>,
+    // View-projection and camera position the HZB depth was rendered with (previous frame).
+    hzb_view_proj : mat4x4<f32>,
+    hzb_camera_position : vec3<f32>,
+    // Base screen-space dilation (HZB mip-0 pixels) applied to every occlusion test.
+    hzb_margin_px : f32,
+    // Shared horizon haze colour and x = haze base height (water level); used by
+    // impostor.wgsl, which reads this same buffer.
+    haze_color : vec4<f32>,
+    haze_params : vec4<f32>,
+};
+
+// Impostor draw args followed by occlusion-cull statistics (one buffer, so the shader stays
+// within the default limit of 8 storage buffers). Cleared by the CPU before each dispatch.
+struct ImpostorIndirectAndStats {
+    vertex_count : u32,
+    instance_count : atomic<u32>,
+    first_vertex : u32,
+    first_instance : u32,
+    hzb_tested : atomic<u32>,
+    hzb_occluded : atomic<u32>,
+    _pad0 : u32,
+    _pad1 : u32,
 };
 
 @group(0) @binding(0)
@@ -90,7 +114,7 @@ struct ImpostorInstance {
 };
 
 @group(0) @binding(6)
-var<storage, read_write> impostor_indirect : DrawIndirectArgs;
+var<storage, read_write> impostor_indirect : ImpostorIndirectAndStats;
 
 @group(0) @binding(7)
 var<storage, read_write> impostor_instances : array<ImpostorInstance>;
@@ -100,6 +124,107 @@ var hzb_tex : texture_2d<f32>;
 
 @group(0) @binding(9)
 var<storage, read> material_props : array<vec4<f32>>;
+
+// View distance from a [0,1] perspective depth (glam perspective_rh).
+fn hzb_linear_distance(depth : f32) -> f32 {
+    let n = params.near_plane;
+    let f = params.far_plane;
+    return (n * f) / max(f - depth * (f - n), 1e-6);
+}
+
+struct HzbFootprint {
+    farthest : f32, // max depth over the footprint (G channel)
+    nearest : f32,  // min depth over the footprint (R channel)
+    valid : bool,
+};
+
+// Reads the (at most) 2x2 HZB texels at the mip whose texels cover `rect` (mip-0 pixels).
+fn hzb_footprint(rect_min : vec2<f32>, rect_max : vec2<f32>) -> HzbFootprint {
+    var fp : HzbFootprint;
+    fp.valid = false;
+    let size = max(rect_max - rect_min, vec2<f32>(1.0));
+    let level = u32(clamp(ceil(log2(max(size.x, size.y))), 0.0, f32(params.max_hzb_mip)));
+    let mip_dims = vec2<i32>(textureDimensions(hzb_tex, level));
+    let scale = 1.0 / f32(1u << level);
+    let t0 = clamp(vec2<i32>(floor(rect_min * scale)), vec2<i32>(0), mip_dims - 1);
+    let t1 = clamp(vec2<i32>(floor(rect_max * scale)), vec2<i32>(0), mip_dims - 1);
+    // At the top mips the rect may still span more than 2 texels; give up (keep visible).
+    if (any((t1 - t0) > vec2<i32>(1))) {
+        return fp;
+    }
+    var farthest = 0.0;
+    var nearest = 1.0;
+    for (var y = t0.y; y <= t1.y; y++) {
+        for (var x = t0.x; x <= t1.x; x++) {
+            let t = textureLoad(hzb_tex, vec2<i32>(x, y), i32(level)).rg;
+            nearest = min(nearest, t.r);
+            farthest = max(farthest, t.g);
+        }
+    }
+    fp.farthest = farthest;
+    fp.nearest = nearest;
+    fp.valid = true;
+    return fp;
+}
+
+// Conservative occlusion test of a world AABB against the previous frame's HZB.
+// The box is projected with the matrix the HZB was rendered with (reprojection), so camera
+// rotation is exact. Camera translation causes parallax: occluders at distance >= D move
+// by at most |dt| * focal_px / D pixels relative to the box, so the screen rect is dilated
+// by that bound (D = nearest depth in the footprint) before requiring full coverage.
+fn hzb_occluded(box_min : vec3<f32>, box_max : vec3<f32>) -> bool {
+    var rect_min = vec2<f32>(1e30);
+    var rect_max = vec2<f32>(-1e30);
+    var box_nearest = 1.0;
+    let screen = vec2<f32>(params.screen_width, params.screen_height);
+    for (var i = 0u; i < 8u; i++) {
+        let corner = select(box_min, box_max, vec3<bool>((i & 1u) != 0u, (i & 2u) != 0u, (i & 4u) != 0u));
+        let clip = params.hzb_view_proj * vec4<f32>(corner, 1.0);
+        // Box reaches the camera plane: no reliable footprint.
+        if (clip.w <= params.near_plane) {
+            return false;
+        }
+        let ndc = clip.xyz / clip.w;
+        let px = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * screen;
+        rect_min = min(rect_min, px);
+        rect_max = max(rect_max, px);
+        box_nearest = min(box_nearest, ndc.z);
+    }
+    if (box_nearest <= 0.0) {
+        return false;
+    }
+
+    let margin = params.hzb_margin_px;
+    var lo = rect_min - vec2<f32>(margin);
+    var hi = rect_max + vec2<f32>(margin);
+    // Off-screen parts of the box were never rasterized into the HZB.
+    if (any(lo < vec2<f32>(0.0)) || any(hi > screen - vec2<f32>(1.0))) {
+        return false;
+    }
+    var fp = hzb_footprint(lo, hi);
+    if (!fp.valid) {
+        return false;
+    }
+
+    let moved = length(params.camera_position - params.hzb_camera_position);
+    if (moved > 0.0) {
+        let focal_px = params.screen_height / (2.0 * max(params.fov_tan, 1e-4));
+        let parallax_px = moved * focal_px / max(hzb_linear_distance(fp.nearest), params.near_plane);
+        lo = lo - vec2<f32>(parallax_px);
+        hi = hi + vec2<f32>(parallax_px);
+        if (any(lo < vec2<f32>(0.0)) || any(hi > screen - vec2<f32>(1.0))) {
+            return false;
+        }
+        fp = hzb_footprint(lo, hi);
+        if (!fp.valid) {
+            return false;
+        }
+    }
+
+    // Hidden only if the box's nearest point is behind the farthest occluder depth everywhere
+    // in the footprint.
+    return box_nearest > fp.farthest;
+}
 
 @compute @workgroup_size(64)
 fn cs_main(@builtin(global_invocation_id) global_id : vec3<u32>) {
@@ -125,11 +250,9 @@ fn cs_main(@builtin(global_invocation_id) global_id : vec3<u32>) {
     let radius = dot(abs(params.camera_forward), half_scale);
     let in_front = dot(params.camera_forward, to_instance) > -radius;
 
-    var visible = within_depth && in_front;
+    let visible = within_depth && in_front;
 
     if (visible) {
-        candidates[index].flags = candidates[index].flags | 4u; // Mark visible for debug
-        
         let detail_sq = params.detail_cull_distance * params.detail_cull_distance;
         // Use envelope_fade_range to bias the threshold so detail remains active through the fade band
         let env = params.envelope_distance;
@@ -178,86 +301,26 @@ fn cs_main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         let diameter_px = (approx_radius * params.screen_height) / denom;
         let use_impostor = (diameter_px <= params.impostor_pixel_threshold) && !use_detail && !use_envelope && !cpu_prepopulated;
 
-        // Always cull chunks behind the camera (regardless of HZB)
-        if (z_cam <= 0.0) {
-            visible = false;
+        // HZB occlusion against last frame's depth pyramid, reprojected (see hzb_occluded).
+        // Chunks whose voxels the CPU already expanded into fallback instances are drawn
+        // regardless (those instances are not owned by this shader).
+        var occluded = false;
+        if (params.hzb_enabled != 0u && params.hzb_valid != 0u && !cpu_prepopulated) {
+            atomicAdd(&impostor_indirect.hzb_tested, 1u);
+            occluded = hzb_occluded(instance.position, instance.position + instance.scale);
         }
-
-        // HZB occlusion test (conditional on hzb_enabled && visible)
-        if (params.hzb_enabled != 0u && visible) {
-            // Calculate screen-space AABB by projecting 8 corners of chunk
-            let half_scale = instance.scale * 0.5;
-            var min_screen = vec2<f32>(1e10);
-            var max_screen = vec2<f32>(-1e10);
-            var min_depth = 1e10;
-            
-            // Project all 8 corners
-            for (var i = 0; i < 8; i++) {
-                let corner_offset = vec3<f32>(
-                    select(-half_scale.x, half_scale.x, (i & 1) != 0),
-                    select(-half_scale.y, half_scale.y, (i & 2) != 0),
-                    select(-half_scale.z, half_scale.z, (i & 4) != 0)
-                );
-                let world_pos = instance_center + corner_offset;
-                
-                // Project to clip space
-                let clip_pos = params.view_proj * vec4<f32>(world_pos, 1.0);
-                
-                // Perspective divide to NDC
-                if (clip_pos.w > 0.0) {
-                    let ndc = clip_pos.xyz / clip_pos.w;
-                    
-                    // Convert to screen coords (0 to width/height)
-                    let screen_x = (ndc.x * 0.5 + 0.5) * params.screen_width;
-                    let screen_y = (ndc.y * 0.5 + 0.5) * params.screen_height;
-                    
-                    min_screen = min(min_screen, vec2<f32>(screen_x, screen_y));
-                    max_screen = max(max_screen, vec2<f32>(screen_x, screen_y));
-                    
-                    // Track minimum (nearest) depth
-                    min_depth = min(min_depth, ndc.z);
-                }
+        if (occluded) {
+            atomicAdd(&impostor_indirect.hzb_occluded, 1u);
+            candidates[index].flags = instance.flags | 16u; // debug: HZB occluded
+            if (has_mesh) {
+                mesh_indirect[instance.mesh_index].instance_count = 0u;
             }
-
-            // If the projected bounds extend outside the screen, HZB cannot conservatively
-            // determine occlusion for the missing region. In that case, skip HZB culling.
-            let offscreen = (min_screen.x < 0.0) || (min_screen.y < 0.0) ||
-                (max_screen.x > (params.screen_width - 1.0)) || (max_screen.y > (params.screen_height - 1.0));
-            if (offscreen) {
-                // Keep visible without HZB test
-            } else {
-            
-            // Clamp AABB to screen bounds
-            min_screen = clamp(min_screen, vec2<f32>(0.0), vec2<f32>(params.screen_width - 1.0, params.screen_height - 1.0));
-            max_screen = clamp(max_screen, vec2<f32>(0.0), vec2<f32>(params.screen_width - 1.0, params.screen_height - 1.0));
-            
-            // Calculate AABB size
-            let aabb_size = max_screen - min_screen;
-            let max_size = max(aabb_size.x, aabb_size.y);
-            
-            // Select mip level where AABB covers ~2-4 pixels
-            let mip_level = clamp(
-                i32(log2(max_size / 2.0)),
-                0,
-                i32(params.max_hzb_mip)
-            );
-            
-            // Sample HZB at selected mip level (center of AABB)
-            let sample_pos = (min_screen + max_screen) * 0.5;
-            let mip_width = max(1.0, params.screen_width / f32(1 << u32(mip_level)));
-            let mip_height = max(1.0, params.screen_height / f32(1 << u32(mip_level)));
-            let mip_u = i32(clamp(sample_pos.x / f32(1 << u32(mip_level)), 0.0, mip_width - 1.0));
-            let mip_v = i32(clamp(sample_pos.y / f32(1 << u32(mip_level)), 0.0, mip_height - 1.0));
-            
-            let hzb_depth = textureLoad(hzb_tex, vec2<i32>(mip_u, mip_v), mip_level).x;
-            
-            // Conservative test: cull if chunk's NEAREST point is farther than HZB's FURTHEST point
-            if (min_depth > hzb_depth) {
-                // Fully occluded
-                visible = false;
+            if (has_envelope) {
+                envelope_indirect[instance.envelope_index].instance_count = 0u;
             }
-            }
+            return;
         }
+        candidates[index].flags = instance.flags | 8u; // debug: drawn
 
         if (use_detail) {
             // Enable mesh draw

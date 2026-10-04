@@ -25,8 +25,27 @@ struct CameraUniforms {
     _pad_gi0: f32,
     _pad_gi1: f32,
     _pad_gi2: f32,
-    _pad_gi3: vec4<f32>,
+    // rgb = shared horizon haze colour, w = atmosphere.horizon_haze_strength (density scale; 0 = legacy fog).
+    haze_color: vec4<f32>,
 };
+
+// Shared sky/haze model constants (identical in voxel.wgsl, skybox.wgsl, impostor.wgsl).
+const HAZE_SUN_GLOW: f32 = 0.15;
+const HAZE_SCALE_HEIGHT: f32 = 140.0;
+
+// Fraction of light replaced by haze between `camera` and `point` (see voxel.wgsl).
+fn haze_amount(point: vec3<f32>, camera_pos: vec3<f32>, dist: f32, density: f32, base_height: f32) -> f32 {
+    let camera_height = max(camera_pos.y - base_height, 0.0);
+    let point_height = max(point.y - base_height, 0.0);
+    let camera_density = exp(-camera_height / HAZE_SCALE_HEIGHT);
+    let height_delta = point_height - camera_height;
+    var height_factor = camera_density;
+    if (abs(height_delta) > 1.0) {
+        height_factor = HAZE_SCALE_HEIGHT
+            * (camera_density - exp(-point_height / HAZE_SCALE_HEIGHT)) / height_delta;
+    }
+    return 1.0 - exp(-dist * density * height_factor);
+}
 
 struct WaterUniforms {
     water_level: f32,
@@ -172,6 +191,10 @@ struct VertexOutput {
 // Constants
 const PI: f32 = 3.14159265359;
 const TWO_PI: f32 = 6.28318530718;
+// Raw [0,1] perspective depth beyond which scene pixels are treated as "far/sky" by the water
+// effects. 1 - depth ~= near / distance, so this is ~500 units with near = 0.1 (unchanged from
+// when the depth buffer was remapped into [0.5,1] and the threshold read 0.9999).
+const FAR_DEPTH: f32 = 0.9998;
 
 // ============================================================================
 // NOISE FUNCTIONS
@@ -403,11 +426,13 @@ fn get_max_mip_level() -> f32 {
 }
 
 // Screen-space reflection ray marching with HZB acceleration
+const SSR_MAX_RAY_DIST: f32 = 400.0;
+
 fn trace_water_reflection(start_pos: vec3<f32>, ray_dir: vec3<f32>, cam_pos: vec3<f32>, pixel_uv: vec2<f32>) -> vec3<f32> {
     let max_steps = 40u;
     let thickness_base = 5.0;
-    
-    let max_dist = 400.0;
+
+    let max_dist = SSR_MAX_RAY_DIST;
     let end_pos = start_pos + ray_dir * max_dist;
     
     let start_screen = world_to_screen_uv(start_pos);
@@ -428,8 +453,9 @@ fn trace_water_reflection(start_pos: vec3<f32>, ray_dir: vec3<f32>, cam_pos: vec
     let max_mip = get_max_mip_level();
     var current_mip = min(3.0, max_mip);
 
-    let thickness_scale = 0.00005 * screen_factor; 
-    let thickness_offset = (thickness_base * 0.001) * screen_factor;
+    // Hit thickness in raw [0,1] depth units.
+    let thickness_scale = 0.0001 * screen_factor;
+    let thickness_offset = (thickness_base * 0.002) * screen_factor;
     let start_cam_dist = distance(cam_pos, start_pos);
     let world_step = max_dist / f32(max_steps);
     
@@ -566,7 +592,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // DEPTH CALCULATION (World-space vertical depth)
     // ========================================================================
     
-    let z_ndc = scene_depth_raw * 2.0 - 1.0;
+    // The depth buffer already holds wgpu [0,1] NDC depth.
+    let z_ndc = scene_depth_raw;
     let scene_ndc = vec4<f32>(
         screen_uv.x * 2.0 - 1.0,
         1.0 - 2.0 * screen_uv.y,
@@ -627,7 +654,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // CAUSTICS (on underwater surfaces)
     // ========================================================================
     
-    if (scene_depth_raw < 0.9999 && depth_diff > 0.0 && depth_diff < max_depth) {
+    if (scene_depth_raw < FAR_DEPTH && depth_diff > 0.0 && depth_diff < max_depth) {
         let caustic_strength = get_caustics(scene_world_pos, time);
         let caustic_fade = (1.0 - depth_factor) * 0.3 * brightness;
         water_color += vec3<f32>(caustic_strength * caustic_fade);
@@ -688,7 +715,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         
         // Reconstruct view-space distance (view_z) from depth buffer at the hit point
         let hit_raw_depth = load_depth_at_uv(ssr_hit.xy);
-        let hit_z_ndc = hit_raw_depth * 2.0 - 1.0;
+        let hit_z_ndc = hit_raw_depth;
         let hit_view_pos_reconst = camera.inverse_proj * vec4<f32>(ssr_hit.x * 2.0 - 1.0, 1.0 - ssr_hit.y * 2.0, hit_z_ndc, 1.0);
         reflection_distance = max(-(hit_view_pos_reconst.z / hit_view_pos_reconst.w), 0.0);
         
@@ -697,9 +724,27 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let facing = dot(hit_normal, -reflect_dir_raw);
         let facing_factor = smoothstep(0.0, 0.2, facing);
 
+        // World-space validation of the screen-space crossing. A small depth gap can be a large
+        // world gap at distance, so at foreground silhouettes the projected ray appears to cross
+        // geometry that is far from the reflected ray: require the hit to lie within a
+        // distance-scaled tolerance of the ray. The depth buffer also holds the submerged bed,
+        // which is never a valid reflection source: require the hit to be above the water.
+        let hit_view = hit_view_pos_reconst.xyz / hit_view_pos_reconst.w;
+        let hit_world = (camera.inverse_view * vec4<f32>(hit_view, 1.0)).xyz;
+        let ray_along = dot(hit_world - hit_pos, reflect_dir_raw);
+        let ray_closest = hit_pos + reflect_dir_raw * max(ray_along, 0.0);
+        let ray_miss = distance(hit_world, ray_closest);
+        let ray_tolerance = min(8.0, 2.0 + max(ray_along, 0.0) * 0.015);
+        let plausible = select(
+            0.0,
+            1.0,
+            ray_along > 0.0 && ray_along <= SSR_MAX_RAY_DIST * 1.05 && ray_miss <= ray_tolerance
+        );
+        let above_water = smoothstep(0.0, 0.45, hit_world.y - water_level);
+
         let ssr_max_dist = 1000.0;
         let ssr_dist_fade = clamp((ssr_max_dist - dist) / ssr_max_dist, 0.0, 1.0);
-        ssr_effect = ssr_hit_valid * ssr_dist_fade * facing_factor;
+        ssr_effect = ssr_hit_valid * ssr_dist_fade * facing_factor * plausible * above_water;
     } else {
         // Cheap fallback for missing SSR hits: project a far point along the reflection ray,
         // sample the scene color there and use it as an approximate fill for distant reflections.
@@ -710,15 +755,24 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let fallback_coords = vec2<i32>(vec2<f32>(dim) * fallback_scr.xy);
             if (fallback_coords.x >= 0 && fallback_coords.x < i32(dim.x) && fallback_coords.y >= 0 && fallback_coords.y < i32(dim.y)) {
                 let fallback_depth = textureLoad(depth_texture, fallback_coords, 0);
-                if (fallback_depth < 0.9999) {
+                if (fallback_depth < FAR_DEPTH) {
                     let fallback_sample = textureSample(scene_color_texture, scene_sampler, fallback_scr.xy);
                     let fallback_ssr = textureSample(ssr_texture, scene_sampler, fallback_scr.xy).rgb;
                     ssr_color = fallback_sample.rgb + fallback_ssr;
                     sample_center = fallback_scr.xy;
                     // Approximate distance to the reflected point using the fallback projection
                     reflection_distance = distance(cam_pos, fallback_point);
+                    // As for real hits, the submerged bed is not a reflection source.
+                    let fb_view = camera.inverse_proj * vec4<f32>(
+                        fallback_scr.x * 2.0 - 1.0,
+                        1.0 - fallback_scr.y * 2.0,
+                        fallback_depth,
+                        1.0
+                    );
+                    let fb_world = (camera.inverse_view * vec4<f32>(fb_view.xyz / fb_view.w, 1.0)).xyz;
+                    let fb_above_water = smoothstep(0.0, 0.45, fb_world.y - water_level);
                     // Give it a stronger but still modest effect so it doesn't overpower skybox when inaccurate
-                    ssr_effect = 0.8 * clamp((fallback_dist - dist) / fallback_dist, 0.0, 1.0);
+                    ssr_effect = 0.8 * clamp((fallback_dist - dist) / fallback_dist, 0.0, 1.0) * fb_above_water;
                 }
             }
         }
@@ -749,7 +803,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                         continue;
                     }
                     let s_depth = textureLoad(depth_texture, s_coords, 0);
-                    if (s_depth >= 0.9999) { continue; }
+                    if (s_depth >= FAR_DEPTH) { continue; }
                     let s_sample = textureSample(scene_color_texture, scene_sampler, offset_uv);
                     let s_ssr = textureSample(ssr_texture, scene_sampler, offset_uv).rgb;
                     accum += s_sample.rgb + s_ssr;
@@ -818,33 +872,36 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // FOG
     // ========================================================================
     
-    // Fog color modulated by ambient and sky brightness (darker at night)
-    let base_fog_color = vec3<f32>(0.7, 0.8, 0.9);
-    // Mix between a very dark night fog and the ambient color scaled by `brightness`.
-    let fog_base = mix(vec3<f32>(0.02, 0.02, 0.03), camera.ambient_color_pad.xyz, brightness);
-    let fog_color = base_fog_color * fog_base * sqrt(brightness);
-
     let distance = t; // 't' is the world-space distance to water surface
     let transmittance = exp(-camera.fog_time_pad.x * distance);
-    let fog_factor = min(1.0 - transmittance, 0.6);
-    
-    // Add directional volumetric scattering from sun (towards sun only)
-    // Reuse the sun_dir already computed at line 776 (same vector)
     let sun_view_dot = max(dot(-world_dir, -sun_dir), 0.0);
-    let inscatter = camera.sun_color_pad.xyz * 0.15 * fog_factor * sun_view_dot;
-    
-    final_color = mix(final_color, fog_color + inscatter, fog_factor);
+    if (camera.haze_color.w > 0.0) {
+        // Shared sky/haze model (see voxel.wgsl compute_fog): far water reaches the same
+        // horizon colour as land and sky instead of stopping at 60% fog.
+        let haze = camera.haze_color.rgb + camera.sun_color_pad.xyz * HAZE_SUN_GLOW * sun_view_dot;
+        let haze_factor = haze_amount(hit_pos, cam_pos, distance, camera.fog_time_pad.x * camera.haze_color.w, water_level);
+        final_color = mix(final_color, haze, haze_factor);
+    } else {
+        // Legacy: fog color modulated by ambient and sky brightness (darker at night)
+        let base_fog_color = vec3<f32>(0.7, 0.8, 0.9);
+        // Mix between a very dark night fog and the ambient color scaled by `brightness`.
+        let fog_base = mix(vec3<f32>(0.02, 0.02, 0.03), camera.ambient_color_pad.xyz, brightness);
+        let fog_color = base_fog_color * fog_base * sqrt(brightness);
+        let fog_factor = min(1.0 - transmittance, 0.6);
+        // Add directional volumetric scattering from sun (towards sun only)
+        let inscatter = camera.sun_color_pad.xyz * 0.15 * fog_factor * sun_view_dot;
+        final_color = mix(final_color, fog_color + inscatter, fog_factor);
+    }
     
     // ========================================================================
     // ALPHA / TRANSPARENCY
     // ========================================================================
     
-    // Base alpha from water color
+    // Base alpha from water color.
+    // Fresnel already sets the reflected share of final_color (reflection_strength above);
+    // applying it to alpha too made shallow beds pop in and out with the view angle.
     var alpha = water.water_color.a;
-    
-    // More opaque at grazing angles
-    alpha = mix(alpha, 1.0, fresnel * 0.6);
-    
+
     // Increase opacity with depth
     let absorption_coeff = 3.0 / max_depth;
     let depth_opacity = 1.0 - exp(-absorption_coeff * max(depth_diff, 0.0));
@@ -855,7 +912,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     
     // Shore fade
     var shore_fade = smoothstep(0.0, 0.8, depth_diff);
-    if (scene_depth_raw >= 0.9999) {
+    if (scene_depth_raw >= FAR_DEPTH) {
         shore_fade = 1.0;
     }
     

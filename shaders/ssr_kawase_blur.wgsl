@@ -82,8 +82,8 @@ fn edge_weight(depth0: f32, normal0: vec3<f32>, uv: vec2<f32>) -> f32 {
     let ndot = clamp(dot(normal0, normal1), 0.0, 1.0);
     let normal_diff = 1.0 - ndot;
 
-    // Tune: raw depth is non-linear; this is still a good edge-stop for silhouettes.
-    let w_depth = exp(-depth_diff * 200.0);
+    // Tune: raw [0,1] depth is non-linear; this is still a good edge-stop for silhouettes.
+    let w_depth = exp(-depth_diff * 100.0);
     let w_normal = exp(-normal_diff * 12.0);
     return w_depth * w_normal;
 }
@@ -105,7 +105,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let normal0 = load_normal_at_uv(uv);
 
     // Linearize depth for more natural distance-based falloff.
-    // Reversed-Z: d=0 is far, d=1 is near.
+    // Standard [0,1] depth (glam perspective_rh): d=0 is near, d=1 is far.
     // Linear distance: z = (f*n) / max(f - depth0 * (f - n), 1e-5);
     let n = kawase.near;
     let f = kawase.far;

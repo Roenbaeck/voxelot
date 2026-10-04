@@ -50,12 +50,13 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return output;
 }
 
+// View distance from a wgpu [0,1] perspective depth (glam perspective_rh):
+// depth = f (z - n) / ((f - n) z)  =>  z = n f / (f - depth (f - n)).
+// (The previous OpenGL [-1,1] formula fed with [0,1] depth returned ~2x the true distance.)
 fn linearize_depth(depth: f32) -> f32 {
     let near_plane = dof_uniforms.near_plane;
     let far_plane = dof_uniforms.far_plane;
-    let z_ndc = depth * 2.0 - 1.0;
-    return (2.0 * near_plane * far_plane) /
-        (far_plane + near_plane - z_ndc * (far_plane - near_plane));
+    return (near_plane * far_plane) / max(far_plane - depth * (far_plane - near_plane), 1e-6);
 }
 
 @fragment

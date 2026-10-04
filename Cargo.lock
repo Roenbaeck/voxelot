@@ -2833,6 +2833,7 @@ dependencies = [
  "image",
  "libc",
  "log",
+ "naga",
  "noise",
  "objc",
  "pollster",

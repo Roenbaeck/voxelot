@@ -43,6 +43,10 @@ struct SSRParams {
     _pad8: f32,
 }
 
+// Raw [0,1] depth treated as sky/background (1 - depth ~= near / distance: ~100k units at
+// near = 0.1, i.e. only cleared pixels).
+const SKY_DEPTH: f32 = 0.999998;
+
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
 @group(0) @binding(1) var<uniform> params: SSRParams;
 @group(0) @binding(2) var scene_depth: texture_depth_2d;
@@ -102,7 +106,7 @@ fn load_depth_at_uv(uv: vec2<f32>) -> f32 {
 }
 
 fn reconstruct_world_pos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
-    let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - 2.0 * uv.y, depth * 2.0 - 1.0, 1.0);
+    let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - 2.0 * uv.y, depth, 1.0);
     let view_pos = camera.inverse_proj * ndc;
     let world_pos = camera.inverse_view * vec4<f32>(view_pos.xyz / view_pos.w, 1.0);
     return world_pos.xyz;
@@ -153,7 +157,7 @@ fn trace_local_ssr(start_pos: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
 
         let d_raw = load_depth_at_uv(uv);
 
-        if (d_raw >= 0.999999 || d_raw <= 0.0) { continue; } 
+        if (d_raw >= SKY_DEPTH || d_raw <= 0.0) { continue; } 
 
         let sample_pos = reconstruct_world_pos(uv, d_raw);
         let dist_sample = distance(camera.camera_pos, sample_pos);
@@ -173,7 +177,7 @@ fn trace_local_ssr(start_pos: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
                     let mid_uv = vec2<f32>(mid_ndc.x * 0.5 + 0.5, 0.5 - mid_ndc.y * 0.5);
                     let mid_d = load_depth_at_uv(mid_uv);
                     // Compare in NDC depth space to avoid an extra reconstruct_world_pos
-                    if (mid_ndc.z > mid_d + 0.0001) {
+                    if (mid_ndc.z > mid_d + 0.0002) {
                         refine_pos = mid;
                     } else {
                         prev_pos = mid;
@@ -444,7 +448,7 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                                 let px = vec2<i32>(screen_uv * fdepth_dim);
                                 let d_buf = textureLoad(scene_depth, px, 0);
                                 // Skip background or invalid depth
-                                if (d_buf < 0.999999) {
+                                if (d_buf < SKY_DEPTH) {
                                     let mesh_pos = reconstruct_world_pos(screen_uv, d_buf);
                                     let dist = distance(mesh_pos, hit_point);
                                     // Require closer match and roughly similar surface normal to avoid snapping to unrelated geometry
@@ -493,9 +497,9 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
                                     let hit_dist_to_cam = distance(camera.camera_pos, hit_point);
                                     
                                     // Disprove only if the screen depth is significantly behind the hit point.
-                                    // we no longer disprove with sky (d_raw >= 0.999999) because windows or gaps 
+                                    // we no longer disprove with sky (d_raw >= SKY_DEPTH) because windows or gaps 
                                     // on screen shouldn't block distant coarse reflections.
-                                    if (d_raw < 0.999999 && mesh_dist_to_cam > hit_dist_to_cam + 2.0) {
+                                    if (d_raw < SKY_DEPTH && mesh_dist_to_cam > hit_dist_to_cam + 2.0) {
                                         screen_disproved = true;
                                     }
                                 }
@@ -641,7 +645,7 @@ fn sample_gi_grid(world_pos: vec3<f32>, reflect_dir: vec3<f32>, sky_color: vec3<
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let depth = load_depth_at_uv(input.uv);
-    if (depth >= 0.999999) {
+    if (depth >= SKY_DEPTH) {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
 

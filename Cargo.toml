@@ -48,6 +48,8 @@ windows = "0.62.2"
 
 [dev-dependencies]
 anyhow = "1"
+# WGSL validation + host/shader uniform layout tests (same naga that wgpu 29 uses).
+naga = { version = "29.0.3", features = ["wgsl-in"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"

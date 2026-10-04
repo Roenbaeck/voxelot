@@ -10,7 +10,7 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::Serialize;
 
 use noise::{NoiseFn, Perlin};
-use voxelot::{file_format::save_world_file, Palette, World, WorldPos};
+use voxelot::{file_format::save_world_file, World, WorldPos};
 
 const EARTH_RADIUS_METERS: f64 = 6_378_137.0;
 // Total amplitude of noise layers (350 + 100 + 20)
@@ -3621,7 +3621,6 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         );
 
         let mut world = World::new(depth);
-        let palette = Palette::load("worlds/palette.txt");
 
         for result in &results {
             let tile_offset_x =
@@ -3638,7 +3637,8 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        world.update_all_lod_metadata(&palette);
+        // No LOD metadata pass here: the .vhc writer only stores voxels and the viewer
+        // recomputes LOD metadata after loading.
         save_world_file(&world, &vhc_path, true)?;
         println!(
             "VHC file size: {:.1} MB",

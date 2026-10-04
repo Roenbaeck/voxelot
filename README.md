@@ -66,6 +66,24 @@ cargo run --release --bin voxelot -- worlds/flat_city_test.toml
 cargo run --bin generate_world -- --help
 ```
 
+### Deterministic screenshots (rendering verification)
+
+The viewer can render one deterministic frame to a PNG and exit, which makes before/after
+comparisons of rendering changes possible without looking at the window:
+
+```bash
+# Camera pose: x,y,z position, yaw/pitch in degrees (yaw 0 = +X, 90 = +Z; positive pitch looks up)
+cargo run --release --bin voxelot -- worlds/flat_city_test.toml \
+    --screenshot /tmp/street.png --camera 450,32,300 --yaw -60 --pitch 5
+```
+
+Water time, the day/night clock and the skybox rotation are frozen, input is ignored and the config
+is not saved. The capture waits until streaming, meshing and GI are idle, then renders
+`--screenshot-frames` (default 240) more frames so temporal effects settle; the log line starting with
+`SCREENSHOT` reports the FPS over that window. `--screenshot-jump x,y,z,yaw,pitch` captures the first
+frame after teleporting, which exercises the temporal paths (e.g. HZB occlusion with a stale pyramid).
+Always run it under a time limit when scripting (`perl -e 'alarm 120; exec @ARGV' ...`).
+
 ## Interactive Viewer Controls
 
 **Window mode:**

@@ -108,6 +108,7 @@ Path | Type | Description | Notes
 `shaders/dual_kawase_down.wgsl` | file | Dual Kawase downsample blur. |
 `shaders/dual_kawase_up.wgsl` | file | Dual Kawase upsample blur. |
 `shaders/editor_preview.wgsl` | file | Editor preview/wireframe rendering. |
+`shaders/fxaa.wgsl` | file | Final FXAA pass (runs before the HUD/palette overlays; `rendering.fxaa_enabled`). |
 `shaders/gpu_cull.wgsl` | file | GPU culling and visibility. |
 `shaders/hzb_gen.wgsl` | file | Hierarchical Z-buffer generation. |
 `shaders/impostor.wgsl` | file | Impostor rendering. |

@@ -119,6 +119,16 @@ pub struct RenderingConfig {
     /// If your renderer outputs linear sRGB values, prefer `extended_linear_srgb` to avoid hue shifts.
     #[serde(default = "default_macos_hdr_colorspace")]
     pub macos_hdr_colorspace: MacosHdrColorspace,
+
+    /// Final FXAA (edge anti-aliasing) pass over the composited image. UI overlays are drawn
+    /// after it so text stays crisp. Works on both the SDR and the macOS HDR (Rgba16Float)
+    /// swapchain: edges are detected on a compressed luma.
+    #[serde(default = "default_fxaa_enabled")]
+    pub fxaa_enabled: bool,
+}
+
+fn default_fxaa_enabled() -> bool {
+    true
 }
 
 fn default_window_width() -> u32 {
@@ -173,6 +183,17 @@ pub struct AtmosphereConfig {
     pub skybox_night_tint: [f32; 3],
     #[serde(default = "default_skybox_tint_strength")]
     pub skybox_tint_strength: f32,
+    /// Shared sky/haze model: distant land, water and impostors fade to the colour the
+    /// skybox shows at the horizon, and the sky blends toward that colour in a band above
+    /// the horizon. The value scales `fog_density` for this model (1.0 = `fog_density` as
+    /// is); 0 = legacy per-shader fog colours (land: ambient-tinted blue-grey, water: capped
+    /// at 60% fog, sky: no haze).
+    #[serde(default = "default_horizon_haze_strength")]
+    pub horizon_haze_strength: f32,
+}
+
+fn default_horizon_haze_strength() -> f32 {
+    0.35
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,6 +272,15 @@ pub struct SsaoConfig {
     pub blur_radius: f32,
     #[serde(default = "default_ssao_max_ao_distance")]
     pub max_ao_distance: f32,
+    /// Contact AO darkens only the occludable (sky/ambient/probe) share of a surface's light.
+    /// Shadow-mapped sunlight, emission and haze are left alone. false = legacy: AO multiplies
+    /// the whole composited radiance.
+    #[serde(default = "default_ssao_ambient_only")]
+    pub ambient_only: bool,
+}
+
+fn default_ssao_ambient_only() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -265,6 +295,14 @@ pub struct GiConfig {
     pub fade_range: f32,
     #[serde(default = "default_gi_grid_dims")]
     pub grid_dims: [i32; 3],
+    /// Screen-space indirect light (SSILVB/RC) is irradiance: multiply it by the surface albedo
+    /// and attenuate it by the same haze as direct light. false = legacy (added unmodulated).
+    #[serde(default = "default_gi_albedo_modulated")]
+    pub albedo_modulated: bool,
+}
+
+fn default_gi_albedo_modulated() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -709,6 +747,7 @@ impl Default for RenderingConfig {
             macos_hdr: default_macos_hdr(),
             macos_hdr_exposure_boost: default_macos_hdr_exposure_boost(),
             macos_hdr_colorspace: default_macos_hdr_colorspace(),
+            fxaa_enabled: default_fxaa_enabled(),
         }
     }
 }
@@ -727,6 +766,7 @@ impl Default for AtmosphereConfig {
             skybox_min_saturation: default_skybox_min_saturation(),
             skybox_night_tint: default_skybox_tint(),
             skybox_tint_strength: default_skybox_tint_strength(),
+            horizon_haze_strength: default_horizon_haze_strength(),
         }
     }
 }
@@ -808,6 +848,7 @@ impl Default for SsaoConfig {
             blur_enabled: default_ssao_blur_enabled(),
             blur_radius: default_ssao_blur_radius(),
             max_ao_distance: default_ssao_max_ao_distance(),
+            ambient_only: default_ssao_ambient_only(),
         }
     }
 }
@@ -820,6 +861,7 @@ impl Default for GiConfig {
             fade_distance: default_gi_fade_distance(),
             fade_range: default_gi_fade_range(),
             grid_dims: default_gi_grid_dims(),
+            albedo_modulated: default_gi_albedo_modulated(),
         }
     }
 }
@@ -921,5 +963,23 @@ mod tests {
             cfg.shadows.backface_ambient_scale,
             default_backface_ambient_scale()
         );
+    }
+
+    #[test]
+    fn lighting_pipeline_keys_default_and_override() {
+        // Old config files (without the keys) get the new look; each key can switch it off.
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!((cfg.atmosphere.horizon_haze_strength - 0.35).abs() < 1e-6);
+        assert!(cfg.effects.gi.albedo_modulated);
+        assert!(cfg.effects.ssao.ambient_only);
+        assert!(cfg.rendering.fxaa_enabled);
+        let cfg: Config = toml::from_str(
+            "[atmosphere]\nhorizon_haze_strength = 0.0\n[effects.gi]\nalbedo_modulated = false\n\
+             [effects.ssao]\nambient_only = false\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.atmosphere.horizon_haze_strength, 0.0);
+        assert!(!cfg.effects.gi.albedo_modulated);
+        assert!(!cfg.effects.ssao.ambient_only);
     }
 }

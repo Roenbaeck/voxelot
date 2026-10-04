@@ -26,8 +26,19 @@ struct CameraUniforms {
     _pad_gi0: f32,
     _pad_gi1: f32,
     _pad_gi2: f32,
-    _pad_gi3: vec4<f32>,
+    // rgb = shared horizon haze colour, w = atmosphere.horizon_haze_strength (density scale; 0 = legacy fog).
+    haze_color: vec4<f32>,
 };
+
+// Shared sky/haze model constants (identical in voxel.wgsl, water.wgsl, impostor.wgsl).
+const HAZE_SUN_GLOW: f32 = 0.15;
+const HAZE_SCALE_HEIGHT: f32 = 140.0;
+// Elevation (sine, ~4 degrees) over which the sky fades from the haze colour at the horizon
+// to the skybox image.
+const HAZE_HORIZON_BAND: f32 = 0.07;
+// Distance at which the horizon band's opacity is evaluated: the haze the far sea reaches
+// (water level, seen from the camera height), so sea and sky meet at the same value.
+const HAZE_HORIZON_DISTANCE: f32 = 8000.0;
 
 @group(0) @binding(0)
 var<uniform> camera: CameraUniforms;
@@ -41,6 +52,8 @@ struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) rotated_dir: vec3<f32>,
+    // Unrotated world-space view direction (for the haze sun glow).
+    @location(2) world_dir: vec3<f32>,
 };
 
 @vertex
@@ -70,6 +83,8 @@ fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
     // We want direction, so set w=0 for view matrix transform (ignore translation)
     let world_dir = (camera.inverse_view * vec4<f32>(view_space_dir, 0.0)).xyz;
     
+    out.world_dir = world_dir;
+
     // Apply skybox rotation (around Y axis)
     let angle = camera.fog_time_pad.z;
     let c = cos(angle);
@@ -92,6 +107,7 @@ struct FragmentOutput {
     @location(1) emissive: vec4<f32>,
     @location(2) normal: vec2<f32>,
     @location(3) material: f32,
+    @location(4) surface: vec4<f32>,
 }
 
 @fragment
@@ -122,10 +138,33 @@ fn fs_main(in: VertexOutput) -> FragmentOutput {
     let effect_strength = (1.0 - brightness) * tint_strength; // stronger at night
     let tinted = mix(desaturated, desaturated * tint, effect_strength);
     
+    var sky = tinted * brightness;
+    if (camera.haze_color.w > 0.0) {
+        // Shared sky/haze model: near the horizon the sky fades to the same haze colour that
+        // distant land and water fade to (voxel.wgsl compute_fog, water.wgsl), so there is
+        // no seam where fully fogged geometry meets the sky. The haze colour comes from this
+        // skybox's own horizon after the same day/night transform, so night stays dark.
+        let view_dir = normalize(in.world_dir);
+        let sun_dir = camera.sun_direction_shadow_bias.xyz;
+        let haze = camera.haze_color.rgb
+            + camera.sun_color_pad.xyz * HAZE_SUN_GLOW * max(dot(view_dir, sun_dir), 0.0);
+        let band = 1.0 - smoothstep(0.0, HAZE_HORIZON_BAND, max(dir.y, 0.0));
+        // Haze of a sea-level point HAZE_HORIZON_DISTANCE away (haze_amount in voxel.wgsl).
+        let camera_height = max(camera.camera_shadow_strength.y - camera.water_level, 0.0);
+        let camera_density = exp(-camera_height / HAZE_SCALE_HEIGHT);
+        var height_factor = camera_density;
+        if (camera_height > 1.0) {
+            height_factor = HAZE_SCALE_HEIGHT * (1.0 - camera_density) / camera_height;
+        }
+        let opacity = 1.0 - exp(-camera.fog_time_pad.x * camera.haze_color.w * HAZE_HORIZON_DISTANCE * height_factor);
+        sky = mix(sky, haze, band * opacity);
+    }
+
     var out: FragmentOutput;
-    out.color = vec4<f32>(tinted * brightness, color.a);
+    out.color = vec4<f32>(sky, color.a);
     out.emissive = vec4<f32>(0.0, 0.0, 0.0, 1.0); // Skybox is not emissive in the G-Buffer sense
     out.normal = vec2<f32>(0.0, 0.0); // Sky has no valid normal (detected by depth >= 1.0)
     out.material = 0.0; // Sky has no reflectivity
+    out.surface = vec4<f32>(0.0); // Sky: no albedo, nothing for contact AO to occlude
     return out;
 }

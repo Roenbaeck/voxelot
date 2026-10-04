@@ -23,9 +23,34 @@ struct CullParams {
     envelope_fade_range : f32,
     hzb_enabled : u32,
     max_hzb_mip : u32,
-    _pad3 : f32,
+    hzb_valid : u32,
+    _pad3 : u32,
     view_proj : mat4x4<f32>,
+    hzb_view_proj : mat4x4<f32>,
+    hzb_camera_position : vec3<f32>,
+    hzb_margin_px : f32,
+    // rgb = shared horizon haze colour, w = atmosphere.horizon_haze_strength (density scale; 0 = legacy fog).
+    haze_color : vec4<f32>,
+    // x = haze base height (water level)
+    haze_params : vec4<f32>,
 };
+
+// Shared sky/haze model constant (identical in voxel.wgsl, water.wgsl, skybox.wgsl).
+const HAZE_SCALE_HEIGHT: f32 = 140.0;
+
+// Fraction of light replaced by haze between `camera` and `point` (see voxel.wgsl).
+fn haze_amount(point: vec3<f32>, camera_pos: vec3<f32>, dist: f32, density: f32, base_height: f32) -> f32 {
+    let camera_height = max(camera_pos.y - base_height, 0.0);
+    let point_height = max(point.y - base_height, 0.0);
+    let camera_density = exp(-camera_height / HAZE_SCALE_HEIGHT);
+    let height_delta = point_height - camera_height;
+    var height_factor = camera_density;
+    if (abs(height_delta) > 1.0) {
+        height_factor = HAZE_SCALE_HEIGHT
+            * (camera_density - exp(-point_height / HAZE_SCALE_HEIGHT)) / height_delta;
+    }
+    return 1.0 - exp(-dist * density * height_factor);
+}
 
 struct ImpostorInstance {
     position : vec3<f32>,
@@ -86,6 +111,7 @@ struct FragmentOut {
     @location(1) emissive : vec4<f32>,
     @location(2) normal : vec2<f32>,
     @location(3) material : f32,
+    @location(4) surface : vec4<f32>,
 };
 
 @fragment
@@ -98,11 +124,32 @@ fn fs_main(input : VertexOut) -> FragmentOut {
     let fog_density = max(params.fog_density, 0.0);
     let dist = length(params.camera_position - input.world_pos);
     let transmittance = exp(-fog_density * dist);
-    let fog_base = mix(vec3<f32>(0.02, 0.02, 0.03), vec3<f32>(0.7, 0.8, 0.9), params.skybox_brightness);
-    let fog_color = fog_base * vec3<f32>(1.0, 1.0, 1.0);
-    let fogged = mix(base_color, fog_color, 1.0 - transmittance);
+    var fog_color = mix(vec3<f32>(0.02, 0.02, 0.03), vec3<f32>(0.7, 0.8, 0.9), params.skybox_brightness);
+    var fog_amount = 1.0 - transmittance;
+    if (params.haze_color.w > 0.0) {
+        // Shared sky/haze model (voxel.wgsl compute_fog), without the sun glow term.
+        fog_color = params.haze_color.rgb;
+        fog_amount = haze_amount(
+            input.world_pos,
+            params.camera_position,
+            dist,
+            fog_density * params.haze_color.w,
+            params.haze_params.x,
+        );
+    }
+    let fogged = mix(base_color, fog_color, fog_amount);
     out.color = vec4<f32>(fogged, alpha);
-    out.emissive = vec4<f32>(input.emissive.rgb * input.emissive.a, 1.0);
+    let emitted = input.emissive.rgb * input.emissive.a;
+    out.emissive = vec4<f32>(emitted, 1.0);
+    // Surface G-buffer (see voxel.wgsl pack_surface): the impostor's whole diffuse term is
+    // ambient-like, so its share is the diffuse luminance over the final luminance.
+    let impostor_luma = vec3<f32>(0.2126, 0.7152, 0.0722);
+    let diffuse_luma = dot(input.color.rgb * params.skybox_brightness, impostor_luma) * (1.0 - fog_amount);
+    let total_luma = dot(fogged + emitted, impostor_luma);
+    out.surface = vec4<f32>(
+        input.color.rgb * (1.0 - fog_amount),
+        clamp(diffuse_luma / max(total_luma, 1.0e-4), 0.0, 1.0),
+    );
     out.normal = vec2<f32>(0.0, 0.0);
     out.material = reflectivity;
     return out;

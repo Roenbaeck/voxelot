@@ -10,13 +10,32 @@
 
 use croaring::Bitmap;
 use std::cell::RefCell;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use crate::palette::Palette;
 
 // Thread-local bitmap for ray marching to avoid allocations
 thread_local! {
     static RAY_BITMAP: RefCell<Bitmap> = RefCell::new(Bitmap::new());
+}
+
+/// Full 16^3 chunk of a single voxel type, shared by every lookup that has to answer for a coarse
+/// uniform `Voxel::Solid` as if it were a subdivided leaf chunk. Built lazily per type.
+fn uniform_leaf_chunk(voxel_type: VoxelType) -> &'static Arc<Chunk> {
+    static CACHE: LazyLock<Vec<OnceLock<Arc<Chunk>>>> = LazyLock::new(|| {
+        (0..=VoxelType::MAX as usize)
+            .map(|_| OnceLock::new())
+            .collect()
+    });
+    CACHE[voxel_type as usize].get_or_init(|| Arc::new(Chunk::full(voxel_type)))
+}
+
+/// What occupies the 16^3 cell of a leaf chunk (see `World::leaf_cell_at_origin`).
+enum LeafCell<'a> {
+    /// A subdivided leaf chunk.
+    Chunk(&'a Arc<Chunk>),
+    /// A uniform `Voxel::Solid` stored at this level or above, covering the whole cell.
+    Uniform(VoxelType),
 }
 
 /// Convert a local chunk bounding box (bbox in 0..15 coordinates) to world-space position and
@@ -331,6 +350,43 @@ impl Chunk {
         self.pz |= sub_pz;
     }
 
+    /// Mutable access to the sub-chunk at (x, y, z), creating an empty one if the slot is free or
+    /// splitting a `Voxel::Solid` into a full chunk of the same type.
+    ///
+    /// The slot is classified without cloning the voxel: a cloned `Arc` would still be alive when
+    /// `Arc::make_mut` runs, which then always deep-copies the sub-chunk even if it is not shared.
+    fn child_chunk_mut(&mut self, x: u8, y: u8, z: u8) -> &mut Chunk {
+        let idx = Self::flat_index(x, y, z);
+
+        // `Some(rank)` if the slot already holds a chunk, otherwise what to create.
+        let mut existing_rank = None;
+        let mut split_type = None;
+        if self.presence.contains(idx) {
+            let rank = self.presence.rank(idx) as usize;
+            match &self.voxels[rank - 1] {
+                Voxel::Chunk(_) => existing_rank = Some(rank),
+                Voxel::Solid(t) => split_type = Some(*t),
+            }
+        }
+
+        let rank = match existing_rank {
+            Some(rank) => rank,
+            None => {
+                let new_chunk = match split_type {
+                    Some(t) => Chunk::full(t),
+                    None => Chunk::new(),
+                };
+                self.set_chunk(x, y, z, new_chunk);
+                self.presence.rank(idx) as usize
+            }
+        };
+
+        match &mut self.voxels[rank - 1] {
+            Voxel::Chunk(chunk_arc) => Arc::make_mut(chunk_arc),
+            Voxel::Solid(_) => unreachable!("slot was just made a chunk"),
+        }
+    }
+
     /// Remove a voxel at (x, y, z)
     pub fn remove(&mut self, x: u8, y: u8, z: u8) {
         let idx = Self::flat_index(x, y, z);
@@ -343,14 +399,20 @@ impl Chunk {
         self.presence.remove(idx);
         self.voxels.remove(rank - 1);
 
-        // Update marginals if needed - check if this was the last voxel on this axis
-        if (0..16).all(|i| i == x || !self.contains(i, y, z)) {
+        // Update marginals: a bit may only be cleared when its whole slice is now empty. (Checking
+        // just the row through the removed voxel hid other voxels in the same slice.)
+        if (0..256u32).all(|yz| !self.presence.contains(x as u32 | (yz << 4))) {
             self.px &= !(1 << x);
         }
-        if (0..16).all(|i| i == y || !self.contains(x, i, z)) {
+        let y_empty = (0..16u32).all(|zi| {
+            let start = (zi << 8) | ((y as u32) << 4);
+            self.presence.range_cardinality(start..start + 16) == 0
+        });
+        if y_empty {
             self.py &= !(1 << y);
         }
-        if (0..16).all(|i| i == z || !self.contains(x, y, i)) {
+        let z_start = (z as u32) << 8;
+        if self.presence.range_cardinality(z_start..z_start + 256) == 0 {
             self.pz &= !(1 << z);
         }
     }
@@ -1152,9 +1214,10 @@ impl World {
         }
     }
 
-    /// Get a reference to the 16x16x16 leaf chunk located at the given world origin (must be aligned to 16).
-    /// Returns None if that position isn't a subdivided chunk.
-    pub fn get_leaf_chunk_at_origin(&self, origin: WorldPos) -> Option<&Chunk> {
+    /// Find what occupies the 16^3 leaf-chunk cell at `origin` (aligned to 16): a subdivided chunk,
+    /// or a uniform `Voxel::Solid` stored at the leaf-chunk level or at any level above it.
+    /// `None` for an empty or out-of-bounds cell and for unaligned origins.
+    fn leaf_cell_at_origin(&self, origin: WorldPos) -> Option<LeafCell<'_>> {
         // Ensure alignment (optional safety)
         if (origin.x & 15) != 0 || (origin.y & 15) != 0 || (origin.z & 15) != 0 {
             return None;
@@ -1162,40 +1225,40 @@ impl World {
 
         if self.hierarchy_depth == 1 {
             // Special case: root is the leaf chunk
-            return Some(&self.root);
+            return Some(LeafCell::Chunk(&self.root));
         }
 
         let path = self.position_to_path(origin).ok()?;
-        // Navigate to the parent of the leaf chunk level (depth-2)
-        let parent = self.navigate_to(&path, self.hierarchy_depth as usize - 2)?;
-        // The leaf chunk is at position path[depth-2] in that parent
-        let &(x, y, z) = &path[self.hierarchy_depth as usize - 2];
-        match parent.get(x, y, z)? {
-            Voxel::Chunk(c) => Some(c),
-            _ => None,
+        // Walk to the leaf chunk's cell, which sits at path[depth-2] in a chunk one level up
+        let last_level = self.hierarchy_depth as usize - 2;
+        let mut current: &Chunk = &self.root;
+        for (level, &(x, y, z)) in path[..=last_level].iter().enumerate() {
+            match current.get(x, y, z)? {
+                Voxel::Solid(t) => return Some(LeafCell::Uniform(*t)),
+                Voxel::Chunk(c) if level == last_level => return Some(LeafCell::Chunk(c)),
+                Voxel::Chunk(c) => current = c,
+            }
+        }
+        None
+    }
+
+    /// Get a reference to the 16x16x16 leaf chunk located at the given world origin (must be aligned to 16).
+    /// Returns None if that position is empty. A uniform `Voxel::Solid` covering the cell (stored at
+    /// the leaf-chunk level or above) is returned as a full chunk of its type; that chunk is shared
+    /// and only carries the type and counts, not LOD metadata such as `average_color`.
+    pub fn get_leaf_chunk_at_origin(&self, origin: WorldPos) -> Option<&Chunk> {
+        match self.leaf_cell_at_origin(origin)? {
+            LeafCell::Chunk(c) => Some(c),
+            LeafCell::Uniform(t) => Some(uniform_leaf_chunk(t)),
         }
     }
 
-    /// Get the Arc<Chunk> at the given origin position (avoids cloning the chunk)
+    /// Get the Arc<Chunk> at the given origin position (avoids cloning the chunk).
+    /// Coarse uniform solids are expanded as in `get_leaf_chunk_at_origin`.
     pub fn get_leaf_chunk_arc_at_origin(&self, origin: WorldPos) -> Option<Arc<Chunk>> {
-        // Ensure alignment (optional safety)
-        if (origin.x & 15) != 0 || (origin.y & 15) != 0 || (origin.z & 15) != 0 {
-            return None;
-        }
-
-        if self.hierarchy_depth == 1 {
-            // Special case: root is the leaf chunk - clone the Arc
-            return Some(self.root.clone());
-        }
-
-        let path = self.position_to_path(origin).ok()?;
-        // Navigate to the parent of the leaf chunk level (depth-2)
-        let parent = self.navigate_to(&path, self.hierarchy_depth as usize - 2)?;
-        // The leaf chunk is at position path[depth-2] in that parent
-        let &(x, y, z) = &path[self.hierarchy_depth as usize - 2];
-        match parent.get(x, y, z)? {
-            Voxel::Chunk(c) => Some(c.clone()), // Clone the Arc, not the Chunk!
-            _ => None,
+        match self.leaf_cell_at_origin(origin)? {
+            LeafCell::Chunk(c) => Some(c.clone()), // Clone the Arc, not the Chunk!
+            LeafCell::Uniform(t) => Some(uniform_leaf_chunk(t).clone()),
         }
     }
 
@@ -1305,6 +1368,51 @@ impl World {
         Ok(path)
     }
 
+    /// Borrow the leaf chunk (`Arc`) whose 16-aligned origin is `origin`, without allocating.
+    ///
+    /// Same lookup as `get_leaf_chunk_arc_at_origin`, but it walks the hierarchy directly with
+    /// shifts instead of materialising a `Vec` path via `position_to_path`, and it hands out a
+    /// borrow so the caller only pays for an `Arc` clone if it keeps the chunk. Returns `None`
+    /// for misaligned or out-of-world origins and for empty cells. A uniform `Voxel::Solid` covering
+    /// the cell is answered with the shared full chunk of its type, exactly as
+    /// `get_leaf_chunk_arc_at_origin` does.
+    ///
+    /// Unlike `get_leaf_chunk_arc_at_origin`, a depth-1 world only resolves origin (0, 0, 0)
+    /// (the old code returned the root chunk for *any* origin, including positions outside it).
+    pub fn leaf_chunk_arc_ref_at_origin(&self, origin: WorldPos) -> Option<&Arc<Chunk>> {
+        if (origin.x | origin.y | origin.z) & 15 != 0 {
+            return None;
+        }
+        let world_size = self.world_size() as i64;
+        if origin.x < 0
+            || origin.y < 0
+            || origin.z < 0
+            || origin.x >= world_size
+            || origin.y >= world_size
+            || origin.z >= world_size
+        {
+            return None;
+        }
+        if self.hierarchy_depth == 1 {
+            return Some(&self.root);
+        }
+
+        // Levels `depth-1 ..= 1` each select one child; the child picked at level 1 is the leaf.
+        let mut current: &Chunk = &self.root;
+        for level in (1..self.hierarchy_depth as u32).rev() {
+            let shift = 4 * level;
+            let lx = ((origin.x >> shift) & 15) as u8;
+            let ly = ((origin.y >> shift) & 15) as u8;
+            let lz = ((origin.z >> shift) & 15) as u8;
+            match current.get(lx, ly, lz)? {
+                Voxel::Chunk(child) if level == 1 => return Some(child),
+                Voxel::Chunk(child) => current = child,
+                Voxel::Solid(t) => return Some(uniform_leaf_chunk(*t)),
+            }
+        }
+        None
+    }
+
     /// Navigate to a chunk at the given path depth (0 = root, depth-1 = leaf parent)
     fn navigate_to<'a>(&'a self, path: &[(u8, u8, u8)], depth: usize) -> Option<&'a Chunk> {
         let mut current = &self.root;
@@ -1324,57 +1432,40 @@ impl World {
         let mut current = Arc::make_mut(&mut self.root);
 
         for &(x, y, z) in &path[..depth] {
-            let idx = Chunk::flat_index(x, y, z);
-
-            // Check if voxel exists and what type it is
-            let existing_voxel = if current.presence.contains(idx) {
-                let rank = current.presence.rank(idx) as usize;
-                Some(current.voxels[rank - 1].clone())
-            } else {
-                None
-            };
-
-            let needs_chunk = match &existing_voxel {
-                Some(Voxel::Chunk(_)) => false,
-                _ => true,
-            };
-
-            // Create or ensure it's a chunk
-            if needs_chunk {
-                let new_chunk = match existing_voxel {
-                    Some(Voxel::Solid(t)) => Chunk::full(t),
-                    _ => Chunk::new(),
-                };
-                current.set_chunk(x, y, z, new_chunk);
-            }
-
-            // Navigate into the chunk - need to use Arc::make_mut
-            let rank = current.presence.rank(idx) as usize;
-            match &mut current.voxels[rank - 1] {
-                Voxel::Chunk(chunk_arc) => {
-                    current = Arc::make_mut(chunk_arc);
-                }
-                _ => unreachable!(),
-            }
+            current = current.child_chunk_mut(x, y, z);
         }
 
         current
     }
 
-    /// Get voxel type at world position (only works for Solid voxels)
+    /// Get voxel type at world position (only works for Solid voxels).
+    ///
+    /// A uniform `Voxel::Solid` stored above the leaf level (covering a whole sub-chunk) answers
+    /// with its type for every voxel inside it, as if it were subdivided.
     pub fn get(&self, pos: WorldPos) -> Option<VoxelType> {
         let path = self.position_to_path(pos).ok()?;
+        let last_level = path.len() - 1;
 
-        // Navigate to the parent chunk
-        let parent = self.navigate_to(&path, self.hierarchy_depth as usize - 1)?;
-
-        // Get the leaf position
-        let &(x, y, z) = path.last()?;
-        parent.get_type(x, y, z)
+        let mut current: &Chunk = &self.root;
+        for (level, &(x, y, z)) in path.iter().enumerate() {
+            match current.get(x, y, z)? {
+                Voxel::Solid(t) => return Some(*t),
+                Voxel::Chunk(c) if level < last_level => current = c,
+                Voxel::Chunk(_) => return None, // a chunk where a voxel should be
+            }
+        }
+        None
     }
 
     /// Check line of sight between two world positions using hierarchical bitmap intersection
-    /// Returns true if there's a clear line of sight (no voxels blocking)
+    /// Returns true if there's a clear line of sight (no voxels blocking).
+    ///
+    /// The segment runs between the centres of the `start` and `end` voxels. The `end` voxel
+    /// itself is not tested (it is the target, typically an emissive voxel); every other voxel
+    /// the segment passes through, including `start`, can block. A voxel only counts if the
+    /// segment has positive length inside it, so rays grazing an edge or corner are not blocked.
+    /// Coarse uniform solids block like any other solid (even one containing `end`), either
+    /// endpoint may lie outside the world, and `start == end` is always clear.
     pub fn line_of_sight(&self, start: WorldPos, end: WorldPos) -> bool {
         // Early check: if start == end, we have line of sight
         if start == end {
@@ -1414,6 +1505,20 @@ impl World {
         // Compute which voxels in this chunk the ray passes through
         bitmap.clear();
         self.rasterize_ray_in_chunk(start, end, chunk_origin, voxel_size, bitmap);
+
+        // The voxel containing `end` is the target (e.g. the emissive voxel being lit from) and
+        // must not occlude its own ray. Only a leaf-level voxel can be excluded; a coarse
+        // uniform solid that happens to contain `end` still blocks.
+        if depth == 1 {
+            let (lx, ly, lz) = (
+                end.x - chunk_origin.x,
+                end.y - chunk_origin.y,
+                end.z - chunk_origin.z,
+            );
+            if (0..16).contains(&lx) && (0..16).contains(&ly) && (0..16).contains(&lz) {
+                bitmap.remove(Chunk::flat_index(lx as u8, ly as u8, lz as u8));
+            }
+        }
 
         // Fast check: if ray doesn't pass through any voxels in chunk's presence bitmap
         if !bitmap.intersect(&chunk.presence) {
@@ -1464,8 +1569,15 @@ impl World {
         true
     }
 
-    /// Rasterize a ray into a bitmap of which voxels (0-15 in each axis) it passes through
-    /// Uses a 3D DDA algorithm
+    /// Rasterize the segment between the *centres* of the `start` and `end` voxels into a
+    /// bitmap of the cells (0-15 per axis, each `voxel_size` wide) of the chunk at `chunk_origin`
+    /// that it passes through.
+    ///
+    /// The segment is first clipped to the chunk's box, so the traversal starts where the ray
+    /// enters the chunk no matter how far away `start` is, and stops where it leaves the chunk
+    /// or reaches `end`. When several axes cross a cell boundary at the same parameter (an
+    /// edge/corner crossing) all of them advance together, so cells the ray only touches along an
+    /// edge are not visited and the result is the same for a ray and its reverse.
     fn rasterize_ray_in_chunk(
         &self,
         start: WorldPos,
@@ -1474,134 +1586,83 @@ impl World {
         voxel_size: i64,
         bitmap: &mut Bitmap,
     ) {
-        // Convert world positions to chunk-local coordinates (in voxel units 0-15)
-        let start_local = [
-            ((start.x - chunk_origin.x) as f64 / voxel_size as f64),
-            ((start.y - chunk_origin.y) as f64 / voxel_size as f64),
-            ((start.z - chunk_origin.z) as f64 / voxel_size as f64),
-        ];
+        const EPS: f64 = 1e-10;
+        let scale = 1.0 / voxel_size as f64;
 
-        let end_local = [
-            ((end.x - chunk_origin.x) as f64 / voxel_size as f64),
-            ((end.y - chunk_origin.y) as f64 / voxel_size as f64),
-            ((end.z - chunk_origin.z) as f64 / voxel_size as f64),
+        // Voxel-centre coordinates in this chunk's cell units; the chunk spans [0, 16)^3.
+        let s = [
+            ((start.x - chunk_origin.x) as f64 + 0.5) * scale,
+            ((start.y - chunk_origin.y) as f64 + 0.5) * scale,
+            ((start.z - chunk_origin.z) as f64 + 0.5) * scale,
         ];
-
-        // DDA ray traversal
-        let delta = [
-            end_local[0] - start_local[0],
-            end_local[1] - start_local[1],
-            end_local[2] - start_local[2],
+        let e = [
+            ((end.x - chunk_origin.x) as f64 + 0.5) * scale,
+            ((end.y - chunk_origin.y) as f64 + 0.5) * scale,
+            ((end.z - chunk_origin.z) as f64 + 0.5) * scale,
         ];
+        let d = [e[0] - s[0], e[1] - s[1], e[2] - s[2]];
 
-        let length = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
-        if length < 0.001 {
-            // Ray is too short, just add start voxel if in bounds
-            let x = start_local[0].floor() as i32;
-            let y = start_local[1].floor() as i32;
-            let z = start_local[2].floor() as i32;
-            if x >= 0 && x < 16 && y >= 0 && y < 16 && z >= 0 && z < 16 {
-                bitmap.add(Chunk::flat_index(x as u8, y as u8, z as u8));
+        // Clip the segment (t in [0, 1]) to the chunk box with the slab method.
+        let (mut t0, mut t1) = (0.0f64, 1.0f64);
+        for a in 0..3 {
+            if d[a].abs() < 1e-12 {
+                if s[a] < 0.0 || s[a] >= 16.0 {
+                    return;
+                }
+                continue;
             }
-            return;
+            let inv = 1.0 / d[a];
+            let mut ta = (0.0 - s[a]) * inv;
+            let mut tb = (16.0 - s[a]) * inv;
+            if ta > tb {
+                std::mem::swap(&mut ta, &mut tb);
+            }
+            t0 = t0.max(ta);
+            t1 = t1.min(tb);
+            if t0 > t1 {
+                return;
+            }
+        }
+        if t1 - t0 <= EPS {
+            return; // only touches the chunk at an edge or corner: no cell is entered
         }
 
-        // Normalized direction
-        let dir = [delta[0] / length, delta[1] / length, delta[2] / length];
+        // Cell at the entry point (nudged into the interval to pick the cell being entered).
+        let t_sample = t1.min(t0 + 1e-9);
+        let mut cell = [0i32; 3];
+        let mut step = [1i32; 3];
+        let mut next = [f64::INFINITY; 3];
+        let mut delta = [f64::INFINITY; 3];
+        for a in 0..3 {
+            cell[a] = ((s[a] + d[a] * t_sample).floor() as i32).clamp(0, 15);
+            if d[a].abs() >= 1e-12 {
+                step[a] = if d[a] < 0.0 { -1 } else { 1 };
+                delta[a] = 1.0 / d[a].abs();
+                let boundary = if step[a] > 0 { cell[a] + 1 } else { cell[a] } as f64;
+                next[a] = (boundary - s[a]) / d[a];
+            }
+        }
 
-        // Step sizes for each axis
-        let step_x = if dir[0].abs() > 0.0001 {
-            1.0 / dir[0].abs()
-        } else {
-            f64::MAX
-        };
-        let step_y = if dir[1].abs() > 0.0001 {
-            1.0 / dir[1].abs()
-        } else {
-            f64::MAX
-        };
-        let step_z = if dir[2].abs() > 0.0001 {
-            1.0 / dir[2].abs()
-        } else {
-            f64::MAX
-        };
+        loop {
+            bitmap.add(Chunk::flat_index(
+                cell[0] as u8,
+                cell[1] as u8,
+                cell[2] as u8,
+            ));
 
-        // Current voxel
-        let mut vx = start_local[0].floor() as i32;
-        let mut vy = start_local[1].floor() as i32;
-        let mut vz = start_local[2].floor() as i32;
-
-        // Initial t-values to next voxel boundaries
-        let mut t_max_x = if dir[0] > 0.0 {
-            ((vx + 1) as f64 - start_local[0]) / dir[0]
-        } else if dir[0] < 0.0 {
-            (vx as f64 - start_local[0]) / dir[0]
-        } else {
-            f64::MAX
-        };
-
-        let mut t_max_y = if dir[1] > 0.0 {
-            ((vy + 1) as f64 - start_local[1]) / dir[1]
-        } else if dir[1] < 0.0 {
-            (vy as f64 - start_local[1]) / dir[1]
-        } else {
-            f64::MAX
-        };
-
-        let mut t_max_z = if dir[2] > 0.0 {
-            ((vz + 1) as f64 - start_local[2]) / dir[2]
-        } else if dir[2] < 0.0 {
-            (vz as f64 - start_local[2]) / dir[2]
-        } else {
-            f64::MAX
-        };
-
-        // Step directions
-        let step_dir_x = if dir[0] > 0.0 { 1 } else { -1 };
-        let step_dir_y = if dir[1] > 0.0 { 1 } else { -1 };
-        let step_dir_z = if dir[2] > 0.0 { 1 } else { -1 };
-
-        // Traverse the ray
-        let max_steps = 48; // Max voxels to check (covers diagonal + some margin)
-        for _ in 0..max_steps {
-            // Add current voxel if in bounds
-            if vx >= 0 && vx < 16 && vy >= 0 && vy < 16 && vz >= 0 && vz < 16 {
-                bitmap.add(Chunk::flat_index(vx as u8, vy as u8, vz as u8));
+            let exit_t = t1.min(next[0].min(next[1]).min(next[2]));
+            if exit_t >= t1 - EPS {
+                break; // segment ends (or leaves the chunk) inside this cell
             }
 
-            // Check if we've passed the end point
-            let current = [vx as f64 + 0.5, vy as f64 + 0.5, vz as f64 + 0.5];
-            let to_end = [
-                end_local[0] - current[0],
-                end_local[1] - current[1],
-                end_local[2] - current[2],
-            ];
-            let dist_sq = to_end[0] * to_end[0] + to_end[1] * to_end[1] + to_end[2] * to_end[2];
-            if dist_sq < 0.5 {
-                break; // Reached end
-            }
-
-            // Step to next voxel boundary
-            if t_max_x < t_max_y {
-                if t_max_x < t_max_z {
-                    vx += step_dir_x;
-                    t_max_x += step_x;
-                } else {
-                    vz += step_dir_z;
-                    t_max_z += step_z;
-                }
-            } else {
-                if t_max_y < t_max_z {
-                    vy += step_dir_y;
-                    t_max_y += step_y;
-                } else {
-                    vz += step_dir_z;
-                    t_max_z += step_z;
+            // Cross every axis tied at this boundary together.
+            for a in 0..3 {
+                if next[a] <= exit_t + EPS {
+                    cell[a] += step[a];
+                    next[a] += delta[a];
                 }
             }
-
-            // Safety: exit if we've gone too far outside the chunk
-            if vx < -2 || vx > 17 || vy < -2 || vy > 17 || vz < -2 || vz > 17 {
+            if cell.iter().any(|&c| !(0..16).contains(&c)) {
                 break;
             }
         }
@@ -1614,50 +1675,11 @@ impl World {
             Err(_) => return, // Out of bounds, silently ignore
         };
 
-        let depth = self.hierarchy_depth as usize;
-
-        if depth == 1 {
-            // Special case: single-level world, root IS the leaf chunk
-            let &(x, y, z) = path.last().unwrap();
-            Arc::make_mut(&mut self.root).set(x, y, z, voxel_type);
-            return;
-        }
-
-        // Navigate to the "grandparent" level (one above the leaf chunk level)
-        let grandparent = self.navigate_to_mut(&path, depth - 2);
-
-        // Ensure the leaf chunk exists at path[depth-2]
-        let &(lx, ly, lz) = &path[depth - 2];
-        let idx = Chunk::flat_index(lx, ly, lz);
-
-        // Check if we need to create or replace with a chunk
-        let existing_voxel = if grandparent.presence.contains(idx) {
-            let rank = grandparent.presence.rank(idx) as usize;
-            Some(grandparent.voxels[rank - 1].clone())
-        } else {
-            None
-        };
-
-        let needs_chunk = match &existing_voxel {
-            Some(Voxel::Chunk(_)) => false,
-            _ => true,
-        };
-
-        if needs_chunk {
-            // Create the leaf chunk (splitting a Solid voxel if it exists)
-            let new_chunk = match existing_voxel {
-                Some(Voxel::Solid(t)) => Chunk::full(t),
-                _ => Chunk::new(),
-            };
-            grandparent.set_chunk(lx, ly, lz, new_chunk);
-        }
-
-        // Now get the leaf chunk and set the voxel in it
-        let rank = grandparent.presence.rank(idx) as usize;
-        if let Voxel::Chunk(leaf_chunk_arc) = &mut grandparent.voxels[rank - 1] {
-            let &(x, y, z) = path.last().unwrap();
-            Arc::make_mut(leaf_chunk_arc).set(x, y, z, voxel_type);
-        }
+        // Navigate to the leaf chunk (the root itself for a single-level world), creating it or
+        // splitting a coarse Solid voxel on the way, then set the voxel in it.
+        let &(x, y, z) = path.last().unwrap();
+        self.navigate_to_mut(&path, self.hierarchy_depth as usize - 1)
+            .set(x, y, z, voxel_type);
     }
 
     /// Remove a voxel at world position
@@ -1903,6 +1925,59 @@ impl Default for World {
 }
 
 #[cfg(test)]
+pub(crate) mod test_util {
+    //! Helpers shared by the tests of this crate.
+    use super::*;
+
+    /// Panic unless the two chunks are structurally identical (recursively): marginals,
+    /// presence, voxels in rank order and the cached counts/bounds.
+    pub(crate) fn assert_same_chunk(a: &Chunk, b: &Chunk, at: &str) {
+        assert_eq!((a.px, a.py, a.pz), (b.px, b.py, b.pz), "marginals at {at}");
+        assert!(a.presence == b.presence, "presence at {at}");
+        assert_eq!(a.voxel_count, b.voxel_count, "voxel_count at {at}");
+        assert_eq!(
+            a.solid_ratio.to_bits(),
+            b.solid_ratio.to_bits(),
+            "solid_ratio at {at}"
+        );
+        assert_eq!(a.bounding_box, b.bounding_box, "bounding_box at {at}");
+        assert_eq!(a.dominant_type, b.dominant_type, "dominant_type at {at}");
+        assert_eq!(a.average_color, b.average_color, "average_color at {at}");
+        assert_eq!(a.voxels.len(), b.voxels.len(), "voxel count at {at}");
+        for (i, (va, vb)) in a.voxels.iter().zip(&b.voxels).enumerate() {
+            let at = format!("{at}/{i}");
+            match (va, vb) {
+                (Voxel::Solid(ta), Voxel::Solid(tb)) => assert_eq!(ta, tb, "solid at {at}"),
+                (Voxel::Chunk(ca), Voxel::Chunk(cb)) => assert_same_chunk(ca, cb, &at),
+                _ => panic!("voxel kind differs at {at}"),
+            }
+        }
+    }
+
+    pub(crate) fn assert_same_world(a: &World, b: &World, what: &str) {
+        assert_eq!(a.hierarchy_depth(), b.hierarchy_depth(), "{what}");
+        assert_same_chunk(a.root(), b.root(), what);
+    }
+}
+
+#[cfg(test)]
+impl World {
+    /// Test helper: store a uniform solid covering the `size`^3 cell at `origin` (`size` = 16^k
+    /// with k >= 1, `origin` aligned to it) as a single coarse `Voxel::Solid` at the matching
+    /// hierarchy level, the way a generator or a loaded .vhc file can.
+    pub(crate) fn set_uniform_solid(&mut self, origin: [i64; 3], size: i64, t: VoxelType) {
+        let k = size.trailing_zeros() as usize / 4;
+        assert!(k >= 1 && size == 16i64.pow(k as u32) && k < self.hierarchy_depth as usize);
+        let path = self
+            .position_to_path(WorldPos::new(origin[0], origin[1], origin[2]))
+            .unwrap();
+        let level = self.hierarchy_depth as usize - 1 - k;
+        let (x, y, z) = path[level];
+        self.navigate_to_mut(&path, level).set(x, y, z, t);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use crate::palette::Palette;
 
@@ -1990,6 +2065,47 @@ mod tests {
     }
 
     #[test]
+    fn test_chunk_remove_keeps_marginals_of_other_voxels() {
+        let mut chunk = Chunk::new();
+        chunk.set(1, 1, 1, 1);
+        chunk.set(2, 1, 1, 3); // shares the y and z slices with (1,1,1)
+        chunk.set(1, 5, 5, 2); // shares the x slice with (1,1,1)
+        chunk.remove(1, 1, 1);
+        assert_eq!(chunk.get_type(2, 1, 1), Some(3));
+        assert_eq!(chunk.get_type(1, 5, 5), Some(2));
+
+        chunk.remove(2, 1, 1);
+        assert_eq!(chunk.get_type(1, 5, 5), Some(2));
+        assert_eq!((chunk.px, chunk.py, chunk.pz), (1 << 1, 1 << 5, 1 << 5));
+    }
+
+    #[test]
+    fn test_chunk_remove_marginals_stay_exact() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(99);
+        let mut chunk = Chunk::new();
+        for step in 0..3000 {
+            let (x, y, z) = (
+                rng.gen_range(0..16),
+                rng.gen_range(0..16),
+                rng.gen_range(0..16),
+            );
+            if rng.gen_bool(0.6) {
+                chunk.set(x, y, z, 1);
+            } else {
+                chunk.remove(x, y, z);
+            }
+            let (mut px, mut py, mut pz) = (0u16, 0u16, 0u16);
+            for (vx, vy, vz) in chunk.positions() {
+                px |= 1 << vx;
+                py |= 1 << vy;
+                pz |= 1 << vz;
+            }
+            assert_eq!((chunk.px, chunk.py, chunk.pz), (px, py, pz), "step {step}");
+        }
+    }
+
+    #[test]
     fn test_occupied_bounds() {
         let mut world = World::new(2);
         assert_eq!(world.occupied_bounds(), None);
@@ -2030,5 +2146,1206 @@ mod tests {
         let (pos, size) = crate::lib_hierarchical::bbox_local_to_world([0, 0, 0], 16, bbox);
         assert_eq!(pos, [7, 7, 7]);
         assert_eq!(size, [1.0, 1.0, 1.0]);
+    }
+}
+
+#[cfg(test)]
+mod line_of_sight_tests {
+    //! Regression tests for `World::line_of_sight`, ported from the Swift
+    //! `VHCHierarchicalLineOfSightTests` in the eyetheisles project. The API takes integer voxel
+    //! coordinates and the segment runs between the voxel centres.
+    use super::*;
+
+    fn p(x: i64, y: i64, z: i64) -> WorldPos {
+        WorldPos::new(x, y, z)
+    }
+
+    fn world_with(depth: u8, solids: &[(i64, i64, i64)]) -> World {
+        let mut w = World::new(depth);
+        for &(x, y, z) in solids {
+            w.set(p(x, y, z), 1);
+        }
+        w
+    }
+
+    #[test]
+    fn readme_repro_blocker_in_second_child() {
+        // depth 2: root cell (1,0,0) is the child beginning at (16,0,0).
+        let w = world_with(2, &[(21, 5, 5)]);
+        assert_eq!(w.get(p(21, 5, 5)), Some(1));
+        assert!(
+            !w.line_of_sight(p(0, 5, 5), p(40, 5, 5)),
+            "blocker at (21,5,5) ignored"
+        );
+    }
+
+    #[test]
+    fn empty_segment_visible() {
+        let w = world_with(1, &[]);
+        assert!(w.line_of_sight(p(0, 5, 5), p(12, 5, 5)));
+    }
+
+    #[test]
+    fn intervening_voxel_blocks_depth1() {
+        let w = world_with(1, &[(5, 5, 5)]);
+        assert!(!w.line_of_sight(p(0, 5, 5), p(12, 5, 5)));
+    }
+
+    #[test]
+    fn occupied_endpoint_is_excluded() {
+        // The emitter voxel at `end` must not occlude its own ray (swift: excludingEndVoxel).
+        let w = world_with(1, &[(5, 5, 5)]);
+        assert!(w.line_of_sight(p(0, 5, 5), p(5, 5, 5)));
+    }
+
+    #[test]
+    fn occupied_endpoint_in_other_child_is_excluded() {
+        let w = world_with(2, &[(40, 5, 5)]);
+        assert!(w.line_of_sight(p(0, 5, 5), p(40, 5, 5)));
+        // ...but a wall in between still blocks.
+        let w = world_with(2, &[(40, 5, 5), (30, 5, 5)]);
+        assert!(!w.line_of_sight(p(0, 5, 5), p(40, 5, 5)));
+    }
+
+    /// Exact reference: segment between voxel centres vs. every solid box `(lo, size)`, excluding
+    /// a unit box equal to the end voxel. A box blocks if the segment spends positive length
+    /// inside it.
+    fn reference_visible_boxes(boxes: &[([i64; 3], i64)], a: WorldPos, b: WorldPos) -> bool {
+        let s = [a.x as f64 + 0.5, a.y as f64 + 0.5, a.z as f64 + 0.5];
+        let d = [(b.x - a.x) as f64, (b.y - a.y) as f64, (b.z - a.z) as f64];
+        for &(lo, size) in boxes {
+            if size == 1 && lo == [b.x, b.y, b.z] {
+                continue;
+            }
+            let (mut t0, mut t1) = (0.0f64, 1.0f64);
+            let mut hit = true;
+            for ax in 0..3 {
+                let lo_a = lo[ax] as f64;
+                let hi_a = (lo[ax] + size) as f64;
+                if d[ax] == 0.0 {
+                    if s[ax] <= lo_a || s[ax] >= hi_a {
+                        hit = false;
+                        break;
+                    }
+                    continue;
+                }
+                let mut ta = (lo_a - s[ax]) / d[ax];
+                let mut tb = (hi_a - s[ax]) / d[ax];
+                if ta > tb {
+                    std::mem::swap(&mut ta, &mut tb);
+                }
+                t0 = t0.max(ta);
+                t1 = t1.min(tb);
+            }
+            if hit && t1 - t0 > 1e-7 {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn reference_visible(solids: &[(i64, i64, i64)], a: WorldPos, b: WorldPos) -> bool {
+        let boxes: Vec<([i64; 3], i64)> = solids.iter().map(|&(x, y, z)| ([x, y, z], 1)).collect();
+        reference_visible_boxes(&boxes, a, b)
+    }
+
+    #[test]
+    fn randomized_matches_exact_reference() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(0xC0FFEE);
+        let mut mismatches = 0;
+        let mut missed_blockers = 0; // reported visible, reference says blocked
+        let mut false_blocks = 0; // reported blocked, reference says visible
+        let mut blocked = 0;
+        let mut total = 0;
+        for trial in 0..30 {
+            let depth = if trial % 2 == 0 { 2 } else { 3 };
+            // solids scattered over a 70^3 region that straddles several 16^3 children
+            let n = 800 + (trial % 5) * 800;
+            let solids: Vec<(i64, i64, i64)> = (0..n)
+                .map(|_| {
+                    (
+                        rng.gen_range(0..70),
+                        rng.gen_range(0..70),
+                        rng.gen_range(0..70),
+                    )
+                })
+                .collect();
+            let w = world_with(depth, &solids);
+            for _ in 0..300 {
+                let a = p(
+                    rng.gen_range(0..70),
+                    rng.gen_range(0..70),
+                    rng.gen_range(0..70),
+                );
+                let b = p(
+                    rng.gen_range(0..70),
+                    rng.gen_range(0..70),
+                    rng.gen_range(0..70),
+                );
+                if a == b {
+                    continue;
+                }
+                let got = w.line_of_sight(a, b);
+                let want = reference_visible(&solids, a, b);
+                total += 1;
+                if !want {
+                    blocked += 1;
+                }
+                if got != want {
+                    mismatches += 1;
+                    if got {
+                        missed_blockers += 1;
+                    } else {
+                        false_blocks += 1;
+                    }
+                    if mismatches <= 10 {
+                        println!("mismatch depth {depth} {a:?}->{b:?}: got {got}, want {want}");
+                    }
+                }
+            }
+        }
+        println!(
+            "rays {total}, reference-blocked {blocked}, mismatches {mismatches} \
+             (missed blockers {missed_blockers}, false blocks {false_blocks})"
+        );
+        assert_eq!(mismatches, 0);
+    }
+
+    #[test]
+    fn wall_before_emitter_still_blocks() {
+        let w = world_with(1, &[(4, 5, 5), (5, 5, 5)]);
+        assert!(!w.line_of_sight(p(0, 5, 5), p(5, 5, 5)));
+    }
+
+    #[test]
+    fn neighbouring_child_start_distance_sweep() {
+        // blocker in child (1,0,0) at x=21; vary how far the start is from the child.
+        let w = world_with(2, &[(21, 5, 5)]);
+        for sx in [0i64, 8, 12, 13, 14, 15, 16, 17, 20] {
+            let vis = w.line_of_sight(p(sx, 5, 5), p(40, 5, 5));
+            println!("start x={sx:>2} -> end x=40, blocker x=21 : visible={vis}");
+        }
+        // All of these must be blocked.
+        for sx in [0i64, 8, 12, 13, 14, 15, 16, 17, 20] {
+            assert!(!w.line_of_sight(p(sx, 5, 5), p(40, 5, 5)), "start x={sx}");
+        }
+    }
+
+    #[test]
+    fn blocker_in_far_child_negative_direction() {
+        let w = world_with(2, &[(21, 5, 5)]);
+        assert!(!w.line_of_sight(p(40, 5, 5), p(0, 5, 5)));
+    }
+
+    #[test]
+    fn blocker_in_middle_child() {
+        let w = world_with(2, &[(40, 5, 5)]);
+        assert!(!w.line_of_sight(p(0, 5, 5), p(60, 5, 5)));
+    }
+
+    #[test]
+    fn blocker_in_end_child() {
+        let w = world_with(2, &[(50, 5, 5)]);
+        assert!(!w.line_of_sight(p(0, 5, 5), p(60, 5, 5)));
+    }
+
+    #[test]
+    fn blocker_in_start_child_works() {
+        // control: blocker in the same leaf chunk as the start
+        let w = world_with(2, &[(5, 5, 5)]);
+        assert!(!w.line_of_sight(p(0, 5, 5), p(40, 5, 5)));
+    }
+
+    #[test]
+    fn depth3_long_ray() {
+        let w = world_with(3, &[(1000, 7, 7)]);
+        assert!(!w.line_of_sight(p(4, 7, 7), p(2000, 7, 7)));
+    }
+
+    #[test]
+    fn enter_from_outside_world_positive() {
+        let w = world_with(1, &[(5, 5, 5)]);
+        assert!(!w.line_of_sight(p(-32, 5, 5), p(12, 5, 5)));
+    }
+
+    #[test]
+    fn enter_from_outside_world_negative() {
+        let w = world_with(1, &[(5, 5, 5)]);
+        assert!(!w.line_of_sight(p(32, 5, 5), p(0, 5, 5)));
+    }
+
+    #[test]
+    fn diagonal_blocker_on_ray_forward() {
+        let w = world_with(1, &[(5, 5, 5)]);
+        assert!(!w.line_of_sight(p(0, 0, 0), p(12, 12, 12)));
+    }
+
+    #[test]
+    fn diagonal_blocker_on_ray_reverse() {
+        let w = world_with(1, &[(5, 5, 5)]);
+        assert!(!w.line_of_sight(p(12, 12, 12), p(0, 0, 0)));
+    }
+
+    #[test]
+    fn diagonal_beside_ray_forward() {
+        let w = world_with(1, &[(5, 4, 4)]);
+        assert!(w.line_of_sight(p(0, 0, 0), p(12, 12, 12)));
+    }
+
+    #[test]
+    fn diagonal_beside_ray_reverse() {
+        let w = world_with(1, &[(5, 4, 4)]);
+        assert!(w.line_of_sight(p(12, 12, 12), p(0, 0, 0)));
+    }
+
+    #[test]
+    fn uniform_coarse_solid_blocks() {
+        let mut w = World::new(2);
+        Arc::make_mut(&mut w.root).set(1, 0, 0, 1); // 16^3 uniform solid at coarse level
+        assert!(!w.line_of_sight(p(0, 5, 5), p(40, 5, 5)));
+    }
+
+    #[test]
+    fn wall_behind_endpoint_does_not_block() {
+        // Overshoot check: wall lies BEYOND the end point along the ray.
+        let w = world_with(1, &[(14, 5, 5)]);
+        assert!(
+            w.line_of_sight(p(0, 5, 5), p(10, 5, 5)),
+            "wall behind the end point blocked the ray"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn los_perf_probe_like_rays() {
+        // gi.rs-like workload: rays up to 64 voxels long in a sparse 256^3 region.
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut w = World::new(3);
+        for _ in 0..60_000 {
+            // clustered "city": dense columns on a plane + scattered blocks
+            let x = rng.gen_range(0..256);
+            let z = rng.gen_range(0..256);
+            let h = rng.gen_range(1..20);
+            for y in 0..h {
+                w.set(p(x, y, z), 1);
+            }
+        }
+        let n = 200_000;
+        let rays: Vec<(WorldPos, WorldPos)> = (0..n)
+            .map(|_| {
+                let a = p(
+                    rng.gen_range(32..224),
+                    rng.gen_range(2..24),
+                    rng.gen_range(32..224),
+                );
+                let b = p(
+                    a.x + rng.gen_range(-40..40),
+                    (a.y + rng.gen_range(-12..12)).max(0),
+                    a.z + rng.gen_range(-40..40),
+                );
+                (a, b)
+            })
+            .collect();
+        let t = std::time::Instant::now();
+        let mut vis = 0usize;
+        for (a, b) in &rays {
+            if w.line_of_sight(*a, *b) {
+                vis += 1;
+            }
+        }
+        let el = t.elapsed();
+        println!(
+            "PERF {n} rays: {:?} ({:.0} ns/ray), visible {:.1}%",
+            el,
+            el.as_nanos() as f64 / n as f64,
+            100.0 * vis as f64 / n as f64
+        );
+    }
+
+    #[test]
+    fn solid_emitter_self_block_survey() {
+        // gi.rs passes end = emitter voxel index (floor(light centre)); how often is an
+        // otherwise-clear ray to a lone solid emitter reported visible?
+        let w = world_with(1, &[(10, 8, 8)]);
+        let mut vis = 0;
+        let mut tot = 0;
+        for dz in -8i64..=0 {
+            for dy in -8i64..=0 {
+                for dx in -8i64..=-1 {
+                    let s = p(10 + dx, 8 + dy, 8 + dz);
+                    tot += 1;
+                    if w.line_of_sight(s, p(10, 8, 8)) {
+                        vis += 1;
+                    }
+                }
+            }
+        }
+        println!("lone emitter, clear rays: visible {vis}/{tot}");
+        assert_eq!(vis, tot, "a lone emitter must not block its own rays");
+    }
+    #[test]
+    fn start_voxel_blocks() {
+        // gi.rs rejects solid start voxels itself, but the function must not silently ignore one.
+        let w = world_with(1, &[(0, 5, 5)]);
+        assert!(!w.line_of_sight(p(0, 5, 5), p(8, 5, 5)));
+    }
+
+    #[test]
+    fn adjacent_voxels_across_a_chunk_boundary() {
+        let w = world_with(2, &[(15, 5, 5), (16, 5, 5)]);
+        // start itself is solid -> blocked
+        assert!(!w.line_of_sight(p(15, 5, 5), p(16, 5, 5)));
+        // end voxel (solid) is excluded, nothing else in between
+        assert!(w.line_of_sight(p(14, 5, 5), p(15, 5, 5)));
+        assert!(w.line_of_sight(p(17, 5, 5), p(16, 5, 5)));
+        // but the solid at x=15 is crossed on the way to x=16
+        assert!(!w.line_of_sight(p(14, 5, 5), p(16, 5, 5)));
+    }
+
+    #[test]
+    fn rays_outside_the_world() {
+        let w = world_with(1, &[(5, 5, 5)]);
+        // entirely outside, never touching the world
+        assert!(w.line_of_sight(p(-40, 5, 5), p(-10, 5, 5)));
+        assert!(w.line_of_sight(p(-40, 40, 5), p(40, -40, 5)));
+        // passes through the blocker from one side of the world to the other
+        assert!(!w.line_of_sight(p(-20, 5, 5), p(30, 5, 5)));
+        // far-away endpoints must not hang or overflow
+        assert!(w.line_of_sight(p(-1_000_000, 5, 5), p(-999_000, 5, 5)));
+        assert!(!w.line_of_sight(p(-1_000_000, 5, 5), p(1_000_000, 5, 5)));
+    }
+
+    #[test]
+    fn edge_touching_cells_do_not_block() {
+        // z=5 plane, ray (0,0)->(4,4) passes exactly through the cell corners (1,1), (2,2), (3,3).
+        let beside: [&[(i64, i64, i64)]; 2] = [
+            &[
+                (1, 0, 5),
+                (0, 1, 5),
+                (2, 1, 5),
+                (1, 2, 5),
+                (3, 2, 5),
+                (2, 3, 5),
+            ],
+            &[(1, 0, 5), (2, 0, 5), (3, 0, 5), (0, 3, 5), (0, 2, 5)],
+        ];
+        for blockers in beside {
+            let w = world_with(1, blockers);
+            assert!(w.line_of_sight(p(0, 0, 5), p(4, 4, 5)), "{blockers:?} fwd");
+            assert!(w.line_of_sight(p(4, 4, 5), p(0, 0, 5)), "{blockers:?} rev");
+        }
+        for on_ray in [(1, 1, 5), (2, 2, 5), (3, 3, 5)] {
+            let w = world_with(1, &[on_ray]);
+            assert!(!w.line_of_sight(p(0, 0, 5), p(4, 4, 5)), "{on_ray:?} fwd");
+            assert!(!w.line_of_sight(p(4, 4, 5), p(0, 0, 5)), "{on_ray:?} rev");
+        }
+    }
+
+    #[test]
+    fn corner_touching_a_chunk_does_not_block() {
+        // The segment through (14,17) and (17,14) in the xy plane passes through the shared
+        // corner of four leaf chunks at (16,16). Cells that only touch the corner must not block.
+        let w = world_with(2, &[(15, 15, 5), (17, 17, 5), (16, 16, 5), (15, 17, 5)]);
+        assert!(w.line_of_sight(p(14, 17, 5), p(17, 14, 5)));
+        assert!(w.line_of_sight(p(17, 14, 5), p(14, 17, 5)));
+        // A solid right on the ray does block.
+        let w = world_with(2, &[(15, 16, 5)]);
+        assert!(!w.line_of_sight(p(14, 17, 5), p(17, 14, 5)));
+    }
+
+    #[test]
+    fn coarse_solid_blocks_only_when_crossed() {
+        let mut w = World::new(3);
+        w.set_uniform_solid([32, 0, 0], 16, 1); // middle-level 16^3 solid at x 32..48
+        assert!(!w.line_of_sight(p(0, 5, 5), p(100, 5, 5)));
+        assert!(!w.line_of_sight(p(100, 5, 5), p(0, 5, 5)));
+        assert!(w.line_of_sight(p(0, 5, 5), p(31, 5, 5)));
+        assert!(w.line_of_sight(p(48, 5, 5), p(100, 5, 5)));
+        assert!(w.line_of_sight(p(0, 20, 5), p(100, 20, 5)));
+        // an end voxel inside a coarse solid is not excluded
+        assert!(!w.line_of_sight(p(0, 5, 5), p(40, 5, 5)));
+        // root-level coarse solid (256^3) at depth 3
+        let mut w = World::new(3);
+        w.set_uniform_solid([256, 0, 0], 256, 2);
+        assert!(!w.line_of_sight(p(0, 5, 5), p(600, 5, 5)));
+        assert!(w.line_of_sight(p(0, 300, 5), p(600, 300, 5)));
+        assert!(w.line_of_sight(p(0, 5, 5), p(255, 5, 5)));
+    }
+
+    #[test]
+    fn randomized_dense_chunk_matches_exact_reference() {
+        // Small coordinate range, high density: lots of ties and edge/corner crossings.
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(0xD15EA5E);
+        for density in [0.05f64, 0.2, 0.5] {
+            let mut solids = Vec::new();
+            for z in 0..16 {
+                for y in 0..16 {
+                    for x in 0..16 {
+                        if rng.gen_bool(density) {
+                            solids.push((x, y, z));
+                        }
+                    }
+                }
+            }
+            let w = world_with(1, &solids);
+            for _ in 0..4000 {
+                let a = p(
+                    rng.gen_range(-4..20),
+                    rng.gen_range(-4..20),
+                    rng.gen_range(-4..20),
+                );
+                let b = p(
+                    rng.gen_range(-4..20),
+                    rng.gen_range(-4..20),
+                    rng.gen_range(-4..20),
+                );
+                if a == b {
+                    continue;
+                }
+                assert_eq!(
+                    w.line_of_sight(a, b),
+                    reference_visible(&solids, a, b),
+                    "density {density} {a:?}->{b:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn randomized_is_symmetric_for_empty_endpoints() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(0x5EED);
+        let solids: Vec<(i64, i64, i64)> = (0..1500)
+            .map(|_| {
+                (
+                    rng.gen_range(0..40),
+                    rng.gen_range(0..40),
+                    rng.gen_range(0..40),
+                )
+            })
+            .collect();
+        let w = world_with(2, &solids);
+        let mut checked = 0;
+        for _ in 0..3000 {
+            let a = p(
+                rng.gen_range(0..40),
+                rng.gen_range(0..40),
+                rng.gen_range(0..40),
+            );
+            let b = p(
+                rng.gen_range(0..40),
+                rng.gen_range(0..40),
+                rng.gen_range(0..40),
+            );
+            if a == b || w.get(a).is_some() || w.get(b).is_some() {
+                continue;
+            }
+            assert_eq!(
+                w.line_of_sight(a, b),
+                w.line_of_sight(b, a),
+                "{a:?} <-> {b:?}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 1000);
+    }
+
+    #[test]
+    fn randomized_with_coarse_solids_matches_exact_reference() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(0xC0A25E);
+        for trial in 0..12 {
+            let mut w = World::new(3);
+            let mut boxes: Vec<([i64; 3], i64)> = Vec::new();
+            // a few middle-level (16^3) and root-level (256^3) uniform solids
+            for _ in 0..3 {
+                let o = [
+                    rng.gen_range(0..40) * 16,
+                    rng.gen_range(0..4) * 16,
+                    rng.gen_range(0..40) * 16,
+                ];
+                w.set_uniform_solid(o, 16, 1);
+                boxes.push((o, 16));
+            }
+            if trial % 4 == 0 {
+                let o = [rng.gen_range(1..4) * 256, 0, rng.gen_range(1..4) * 256];
+                w.set_uniform_solid(o, 256, 2);
+                boxes.push((o, 256));
+            }
+            // plus scattered unit voxels outside the coarse boxes
+            for _ in 0..1500 {
+                let v = [
+                    rng.gen_range(0..700i64),
+                    rng.gen_range(0..64i64),
+                    rng.gen_range(0..700i64),
+                ];
+                let inside = boxes
+                    .iter()
+                    .any(|&(lo, sz)| (0..3).all(|a| v[a] >= lo[a] && v[a] < lo[a] + sz));
+                if !inside {
+                    w.set(p(v[0], v[1], v[2]), 3);
+                    boxes.push((v, 1));
+                }
+            }
+            for _ in 0..400 {
+                let a = p(
+                    rng.gen_range(0..700),
+                    rng.gen_range(0..64),
+                    rng.gen_range(0..700),
+                );
+                let b = p(
+                    rng.gen_range(0..700),
+                    rng.gen_range(0..64),
+                    rng.gen_range(0..700),
+                );
+                if a == b {
+                    continue;
+                }
+                assert_eq!(
+                    w.line_of_sight(a, b),
+                    reference_visible_boxes(&boxes, a, b),
+                    "trial {trial} {a:?}->{b:?}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod cow_tests {
+    //! `World::set`/`remove`/`subdivide_at`/`merge_at` must give the same structure as the
+    //! original implementation, which cloned the child `Voxel` (and thereby its `Arc`) before
+    //! `Arc::make_mut` and so deep-copied the leaf and middle chunk on every edit.
+    use super::test_util::assert_same_world;
+    use super::*;
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+
+    fn p(x: i64, y: i64, z: i64) -> WorldPos {
+        WorldPos::new(x, y, z)
+    }
+
+    // ---- Reference: the original algorithm, kept verbatim (modulo `self` -> `world`). ----
+
+    fn old_navigate_to_mut<'a>(
+        world: &'a mut World,
+        path: &[(u8, u8, u8)],
+        depth: usize,
+    ) -> &'a mut Chunk {
+        let mut current = Arc::make_mut(&mut world.root);
+
+        for &(x, y, z) in &path[..depth] {
+            let idx = Chunk::flat_index(x, y, z);
+
+            // Check if voxel exists and what type it is
+            let existing_voxel = if current.presence.contains(idx) {
+                let rank = current.presence.rank(idx) as usize;
+                Some(current.voxels[rank - 1].clone())
+            } else {
+                None
+            };
+
+            let needs_chunk = match &existing_voxel {
+                Some(Voxel::Chunk(_)) => false,
+                _ => true,
+            };
+
+            // Create or ensure it's a chunk
+            if needs_chunk {
+                let new_chunk = match existing_voxel {
+                    Some(Voxel::Solid(t)) => Chunk::full(t),
+                    _ => Chunk::new(),
+                };
+                current.set_chunk(x, y, z, new_chunk);
+            }
+
+            // Navigate into the chunk - need to use Arc::make_mut
+            let rank = current.presence.rank(idx) as usize;
+            match &mut current.voxels[rank - 1] {
+                Voxel::Chunk(chunk_arc) => {
+                    current = Arc::make_mut(chunk_arc);
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        current
+    }
+
+    fn old_set(world: &mut World, pos: WorldPos, voxel_type: VoxelType) {
+        let path = match world.position_to_path(pos) {
+            Ok(p) => p,
+            Err(_) => return, // Out of bounds, silently ignore
+        };
+
+        let depth = world.hierarchy_depth as usize;
+
+        if depth == 1 {
+            // Special case: single-level world, root IS the leaf chunk
+            let &(x, y, z) = path.last().unwrap();
+            Arc::make_mut(&mut world.root).set(x, y, z, voxel_type);
+            return;
+        }
+
+        // Navigate to the "grandparent" level (one above the leaf chunk level)
+        let grandparent = old_navigate_to_mut(world, &path, depth - 2);
+
+        // Ensure the leaf chunk exists at path[depth-2]
+        let &(lx, ly, lz) = &path[depth - 2];
+        let idx = Chunk::flat_index(lx, ly, lz);
+
+        // Check if we need to create or replace with a chunk
+        let existing_voxel = if grandparent.presence.contains(idx) {
+            let rank = grandparent.presence.rank(idx) as usize;
+            Some(grandparent.voxels[rank - 1].clone())
+        } else {
+            None
+        };
+
+        let needs_chunk = match &existing_voxel {
+            Some(Voxel::Chunk(_)) => false,
+            _ => true,
+        };
+
+        if needs_chunk {
+            // Create the leaf chunk (splitting a Solid voxel if it exists)
+            let new_chunk = match existing_voxel {
+                Some(Voxel::Solid(t)) => Chunk::full(t),
+                _ => Chunk::new(),
+            };
+            grandparent.set_chunk(lx, ly, lz, new_chunk);
+        }
+
+        // Now get the leaf chunk and set the voxel in it
+        let rank = grandparent.presence.rank(idx) as usize;
+        if let Voxel::Chunk(leaf_chunk_arc) = &mut grandparent.voxels[rank - 1] {
+            let &(x, y, z) = path.last().unwrap();
+            Arc::make_mut(leaf_chunk_arc).set(x, y, z, voxel_type);
+        }
+    }
+
+    fn old_remove(world: &mut World, pos: WorldPos) {
+        let path = match world.position_to_path(pos) {
+            Ok(p) => p,
+            Err(_) => return, // Out of bounds
+        };
+        let depth = world.hierarchy_depth as usize;
+        let parent = old_navigate_to_mut(world, &path, depth - 1);
+        let &(x, y, z) = path.last().unwrap();
+        parent.remove(x, y, z);
+    }
+
+    fn old_subdivide_at(world: &mut World, pos: WorldPos) -> Result<(), &'static str> {
+        let path = world.position_to_path(pos)?;
+        let depth = world.hierarchy_depth as usize;
+        let parent = old_navigate_to_mut(world, &path, depth - 1);
+        let &(x, y, z) = path.last().ok_or("Invalid path")?;
+        parent.subdivide(x, y, z)
+    }
+
+    fn old_merge_at(world: &mut World, pos: WorldPos) -> Result<bool, &'static str> {
+        let path = world.position_to_path(pos)?;
+        let depth = world.hierarchy_depth as usize;
+        let parent = old_navigate_to_mut(world, &path, depth - 1);
+        let &(x, y, z) = path.last().ok_or("Invalid path")?;
+        parent.try_merge(x, y, z)
+    }
+
+    /// Run the same pseudo-random edit sequence through the current implementation and the
+    /// original one and compare the resulting worlds.
+    fn run_equivalence(depth: u8, seed: u64, ops: usize) {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let size = 16i64.pow(depth as u32);
+        // Edits concentrate in a small region so leaf chunks fill up, with some far-flung ones.
+        let near = size.min(40);
+        let pick = |rng: &mut StdRng| {
+            if rng.gen_ratio(1, 8) {
+                p(
+                    rng.gen_range(0..size),
+                    rng.gen_range(0..size),
+                    rng.gen_range(0..size),
+                )
+            } else {
+                p(
+                    rng.gen_range(0..near),
+                    rng.gen_range(0..near),
+                    rng.gen_range(0..near),
+                )
+            }
+        };
+
+        // Base world with coarse uniform solids at the middle and root levels, so that edits
+        // also split Solid voxels at several depths.
+        let mut base = World::new(depth);
+        if depth >= 2 {
+            for k in 1..depth as u32 {
+                let sz = 16i64.pow(k);
+                for _ in 0..3 {
+                    let o = [
+                        rng.gen_range(0..(near / sz).max(1)) * sz,
+                        rng.gen_range(0..(near / sz).max(1)) * sz,
+                        rng.gen_range(0..(near / sz).max(1)) * sz,
+                    ];
+                    base.set_uniform_solid(o, sz, rng.gen_range(1..5));
+                }
+            }
+        }
+        let mut new_world = base.clone();
+        let mut old_world = base;
+
+        for i in 0..ops {
+            let pos = pick(&mut rng);
+            match rng.gen_range(0..100) {
+                0..=54 => {
+                    let t = rng.gen_range(1..7);
+                    new_world.set(pos, t);
+                    old_set(&mut old_world, pos, t);
+                }
+                55..=59 => {
+                    new_world.set(pos, 0);
+                    old_set(&mut old_world, pos, 0);
+                }
+                60..=84 => {
+                    new_world.remove(pos);
+                    old_remove(&mut old_world, pos);
+                }
+                85..=91 => {
+                    let r_new = new_world.subdivide_at(pos);
+                    let r_old = old_subdivide_at(&mut old_world, pos);
+                    assert_eq!(r_new, r_old, "subdivide_at result, op {i}");
+                }
+                92..=96 => {
+                    let r_new = new_world.merge_at(pos);
+                    let r_old = old_merge_at(&mut old_world, pos);
+                    assert_eq!(r_new, r_old, "merge_at result, op {i}");
+                }
+                _ => {
+                    // out of bounds: silently ignored
+                    let oob = p(-1 - rng.gen_range(0..5), pos.y, pos.z);
+                    new_world.set(oob, 1);
+                    old_set(&mut old_world, oob, 1);
+                    new_world.remove(p(size, 0, 0));
+                    old_remove(&mut old_world, p(size, 0, 0));
+                }
+            }
+            if i % 500 == 499 {
+                assert_same_world(&new_world, &old_world, &format!("depth {depth} op {i}"));
+            }
+        }
+        assert_same_world(&new_world, &old_world, &format!("depth {depth} final"));
+        assert_eq!(new_world.count(), old_world.count());
+    }
+
+    #[test]
+    fn edits_match_original_algorithm_depth1() {
+        run_equivalence(1, 11, 3000);
+    }
+
+    #[test]
+    fn edits_match_original_algorithm_depth2() {
+        run_equivalence(2, 22, 4000);
+    }
+
+    #[test]
+    fn edits_match_original_algorithm_depth3() {
+        run_equivalence(3, 33, 3000);
+    }
+
+    #[test]
+    fn edits_match_original_algorithm_depth4() {
+        run_equivalence(4, 44, 2000);
+    }
+
+    #[test]
+    fn splitting_coarse_solids_keeps_their_type() {
+        let mut w = World::new(3);
+        w.set_uniform_solid([0, 0, 0], 256, 4); // root-level solid
+        w.set(p(5, 6, 7), 9);
+        assert_eq!(w.get(p(5, 6, 7)), Some(9));
+        assert_eq!(w.get(p(5, 6, 8)), Some(4));
+        assert_eq!(w.get(p(255, 255, 255)), Some(4));
+        w.remove(p(100, 100, 100));
+        assert_eq!(w.get(p(100, 100, 100)), None);
+        assert_eq!(w.get(p(100, 100, 101)), Some(4));
+    }
+
+    fn leaf_ptr(w: &World, origin: WorldPos) -> *const Chunk {
+        w.get_leaf_chunk_at_origin(origin).unwrap() as *const Chunk
+    }
+
+    fn middle_ptr(w: &World, pos: WorldPos) -> *const Chunk {
+        let path = w.position_to_path(pos).unwrap();
+        w.navigate_to(&path, 1).unwrap() as *const Chunk
+    }
+
+    #[test]
+    fn unshared_chunks_are_edited_in_place() {
+        let mut w = World::new(3);
+        w.set(p(1, 1, 1), 1);
+        let (leaf, mid) = (leaf_ptr(&w, p(0, 0, 0)), middle_ptr(&w, p(1, 1, 1)));
+        for i in 2..10 {
+            w.set(p(i, 1, 1), 2);
+            w.remove(p(i - 1, 1, 1));
+        }
+        assert_eq!(leaf_ptr(&w, p(0, 0, 0)), leaf, "leaf chunk was reallocated");
+        assert_eq!(
+            middle_ptr(&w, p(1, 1, 1)),
+            mid,
+            "middle chunk was reallocated"
+        );
+
+        // The original algorithm reallocated both on every edit; make sure this check can tell.
+        let mut old = World::new(3);
+        old_set(&mut old, p(1, 1, 1), 1);
+        let (leaf, mid) = (leaf_ptr(&old, p(0, 0, 0)), middle_ptr(&old, p(1, 1, 1)));
+        old_set(&mut old, p(2, 1, 1), 2);
+        assert!(
+            leaf_ptr(&old, p(0, 0, 0)) != leaf || middle_ptr(&old, p(1, 1, 1)) != mid,
+            "reference implementation no longer copies; test is vacuous"
+        );
+    }
+
+    #[test]
+    fn shared_chunks_are_copied_on_write() {
+        let mut w = World::new(3);
+        w.set(p(1, 1, 1), 1);
+        w.set(p(40, 1, 1), 2); // a second leaf chunk
+        let snapshot = w.clone();
+        let (leaf_a, leaf_b) = (
+            leaf_ptr(&snapshot, p(0, 0, 0)),
+            leaf_ptr(&snapshot, p(32, 0, 0)),
+        );
+
+        w.set(p(2, 1, 1), 3);
+        w.remove(p(1, 1, 1));
+
+        // Snapshot untouched, edited world diverged
+        assert_eq!(snapshot.get(p(1, 1, 1)), Some(1));
+        assert_eq!(snapshot.get(p(2, 1, 1)), None);
+        assert_eq!(w.get(p(1, 1, 1)), None);
+        assert_eq!(w.get(p(2, 1, 1)), Some(3));
+        assert_eq!(leaf_ptr(&snapshot, p(0, 0, 0)), leaf_a);
+        assert!(leaf_ptr(&w, p(0, 0, 0)) != leaf_a);
+        // The sibling leaf chunk that was not edited is still shared with the snapshot
+        assert_eq!(leaf_ptr(&w, p(32, 0, 0)), leaf_b);
+        assert_eq!(leaf_ptr(&snapshot, p(32, 0, 0)), leaf_b);
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_set_old_vs_new() {
+        // Run with: cargo test --release --lib bench_set_old_vs_new -- --ignored --nocapture
+        fn fill(w: &mut World, nx: i64, ny: i64, nz: i64, f: fn(&mut World, WorldPos, VoxelType)) {
+            for z in 0..nz {
+                for y in 0..ny {
+                    for x in 0..nx {
+                        f(w, p(x, y, z), 1 + ((x + y + z) % 5) as u8);
+                    }
+                }
+            }
+        }
+        let t = std::time::Instant::now();
+        let mut old = World::new(3);
+        fill(&mut old, 128, 128, 64, old_set); // 1,048,576 sets
+        let old_t = t.elapsed();
+
+        let t = std::time::Instant::now();
+        let mut new = World::new(3);
+        fill(&mut new, 128, 128, 64, |w, pos, v| w.set(pos, v));
+        let new_t = t.elapsed();
+        assert_same_world(&new, &old, "bench world");
+        println!(
+            "BENCH 1.05M sets: old {:?} ({:.0} ns/set), new {:?} ({:.0} ns/set), {:.1}x",
+            old_t,
+            old_t.as_nanos() as f64 / 1_048_576.0,
+            new_t,
+            new_t.as_nanos() as f64 / 1_048_576.0,
+            old_t.as_secs_f64() / new_t.as_secs_f64()
+        );
+
+        let t = std::time::Instant::now();
+        let mut new = World::new(3);
+        fill(&mut new, 256, 256, 64, |w, pos, v| w.set(pos, v)); // 4,194,304 sets
+        println!("BENCH 4.19M sets: new {:?}", t.elapsed());
+    }
+}
+
+#[cfg(test)]
+mod coarse_solid_tests {
+    //! A uniform `Voxel::Solid` stored above the leaf level (a "coarse" solid covering a whole
+    //! sub-chunk) must answer lookups with its type at every voxel inside it, like a subdivided
+    //! chunk of the same type would.
+    use super::*;
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use std::collections::HashMap;
+
+    fn p(x: i64, y: i64, z: i64) -> WorldPos {
+        WorldPos::new(x, y, z)
+    }
+
+    #[test]
+    fn get_inside_middle_level_solid() {
+        let mut w = World::new(3);
+        w.set_uniform_solid([32, 16, 0], 16, 7);
+        for pos in [
+            p(32, 16, 0),
+            p(47, 31, 15),
+            p(40, 20, 5),
+            p(32, 31, 0),
+            p(47, 16, 15),
+        ] {
+            assert_eq!(w.get(pos), Some(7), "{pos:?}");
+        }
+        for pos in [
+            p(31, 16, 0),
+            p(48, 16, 0),
+            p(32, 15, 0),
+            p(32, 32, 0),
+            p(32, 16, 16),
+            p(32, 16, -1),
+        ] {
+            assert_eq!(w.get(pos), None, "{pos:?}");
+        }
+    }
+
+    #[test]
+    fn get_inside_root_level_solid() {
+        let mut w = World::new(3);
+        w.set_uniform_solid([256, 0, 512], 256, 3);
+        for pos in [
+            p(256, 0, 512),
+            p(511, 255, 767),
+            p(300, 17, 600),
+            p(256, 255, 767),
+        ] {
+            assert_eq!(w.get(pos), Some(3), "{pos:?}");
+        }
+        for pos in [
+            p(255, 0, 512),
+            p(512, 0, 512),
+            p(256, 256, 512),
+            p(256, 0, 511),
+        ] {
+            assert_eq!(w.get(pos), None, "{pos:?}");
+        }
+
+        // depth 2: a root-level solid is a 16^3 block
+        let mut w = World::new(2);
+        w.set_uniform_solid([16, 32, 48], 16, 5);
+        assert_eq!(w.get(p(31, 47, 63)), Some(5));
+        assert_eq!(w.get(p(32, 47, 63)), None);
+    }
+
+    #[test]
+    fn leaf_chunk_lookup_expands_uniform_solids() {
+        let mut w = World::new(3);
+        w.set_uniform_solid([32, 16, 0], 16, 7); // one leaf-sized cell
+        w.set_uniform_solid([256, 0, 512], 256, 3); // 16x16x16 leaf chunks
+        w.set(p(1, 1, 1), 1); // an ordinary subdivided leaf chunk
+
+        let origins = [
+            (p(32, 16, 0), 7),
+            (p(256, 0, 512), 3),
+            (p(256 + 16 * 5, 16 * 3, 512 + 16 * 15), 3),
+            (p(256 + 240, 240, 512 + 240), 3),
+        ];
+        for (origin, t) in origins {
+            let chunk = w
+                .get_leaf_chunk_at_origin(origin)
+                .unwrap_or_else(|| panic!("no chunk at {origin:?}"));
+            assert_eq!(chunk.count(), 4096, "{origin:?}");
+            assert!(
+                chunk
+                    .iter()
+                    .all(|(_, v)| matches!(v, Voxel::Solid(x) if *x == t)),
+                "{origin:?}"
+            );
+            assert_eq!(chunk.get_type(0, 0, 0), Some(t));
+            assert_eq!(chunk.get_type(15, 15, 15), Some(t));
+            let arc = w.get_leaf_chunk_arc_at_origin(origin).unwrap();
+            assert_eq!(arc.count(), 4096);
+            assert_eq!(arc.get_type(7, 8, 9), Some(t));
+        }
+
+        // ordinary and empty cells behave as before
+        assert_eq!(w.get_leaf_chunk_at_origin(p(0, 0, 0)).unwrap().count(), 1);
+        assert!(w.get_leaf_chunk_at_origin(p(48, 16, 0)).is_none());
+        assert!(w.get_leaf_chunk_at_origin(p(256 + 256, 0, 512)).is_none());
+        assert!(w.get_leaf_chunk_arc_at_origin(p(48, 16, 0)).is_none());
+        // unaligned and out-of-bounds origins are still rejected
+        assert!(w.get_leaf_chunk_at_origin(p(33, 16, 0)).is_none());
+        assert!(w.get_leaf_chunk_at_origin(p(-16, 0, 0)).is_none());
+        assert!(w.get_leaf_chunk_at_origin(p(4096, 0, 0)).is_none());
+    }
+
+    #[test]
+    fn leaf_chunk_lookup_expands_uniform_solids_depth2() {
+        let mut w = World::new(2);
+        w.set_uniform_solid([16, 0, 0], 16, 9);
+        let chunk = w.get_leaf_chunk_at_origin(p(16, 0, 0)).unwrap();
+        assert_eq!(chunk.count(), 4096);
+        assert_eq!(chunk.get_type(3, 4, 5), Some(9));
+        assert!(w.get_leaf_chunk_at_origin(p(0, 0, 0)).is_none());
+    }
+
+    #[test]
+    fn faces_next_to_a_coarse_solid_are_culled_by_the_neighbour_lookup() {
+        // The mesher / shell code asks the world for the neighbouring leaf chunks; a coarse solid
+        // neighbour must count as blocking the shared boundary.
+        let mut w = World::new(3);
+        w.set_uniform_solid([32, 0, 0], 16, 7);
+        w.set(p(31, 5, 5), 1); // local (15,5,5) of leaf chunk (16,0,0), touching the solid's -X face
+        let leaf = w.get_leaf_chunk_at_origin(p(16, 0, 0)).unwrap();
+        let px = w.get_leaf_chunk_arc_at_origin(p(32, 0, 0));
+        assert!(px.is_some());
+
+        let open = leaf.compute_visibility_mask_with_neighbors(None, None, None, None, None, None);
+        assert_eq!(open, 0b111111);
+        let covered =
+            leaf.compute_visibility_mask_with_neighbors(px.as_ref(), None, None, None, None, None);
+        assert_eq!(
+            covered, 0b111110,
+            "+X face against a coarse solid must not be exposed"
+        );
+    }
+
+    #[test]
+    fn non_allocating_leaf_lookup_agrees_with_the_arc_lookup() {
+        let mut w = World::new(3);
+        w.set_uniform_solid([32, 16, 0], 16, 7);
+        w.set_uniform_solid([256, 0, 512], 256, 3);
+        w.set(p(1, 1, 1), 1);
+        for (x, y, z) in [
+            (0, 0, 0),       // ordinary subdivided leaf
+            (32, 16, 0),     // leaf-sized coarse solid
+            (48, 16, 0),     // empty
+            (256, 0, 512),   // root-level coarse solid (first leaf)
+            (496, 240, 752), // root-level coarse solid (last leaf)
+            (512, 0, 512),   // just past it
+            (33, 16, 0),     // unaligned
+            (-16, 0, 0),     // outside
+            (4096, 0, 0),    // outside
+        ] {
+            let owned = w.get_leaf_chunk_arc_at_origin(p(x, y, z));
+            let borrowed = w.leaf_chunk_arc_ref_at_origin(p(x, y, z));
+            match (owned, borrowed) {
+                (None, None) => {}
+                (Some(a), Some(b)) => assert!(Arc::ptr_eq(&a, b), "({x},{y},{z})"),
+                (a, b) => panic!("({x},{y},{z}): {:?} vs {:?}", a.is_some(), b.is_some()),
+            }
+        }
+    }
+
+    #[test]
+    fn uniform_chunks_are_shared_and_typed() {
+        let mut w = World::new(3);
+        w.set_uniform_solid([32, 0, 0], 16, 7);
+        w.set_uniform_solid([48, 0, 0], 16, 7);
+        w.set_uniform_solid([64, 0, 0], 16, 8);
+        let a = w.get_leaf_chunk_arc_at_origin(p(32, 0, 0)).unwrap();
+        let b = w.get_leaf_chunk_arc_at_origin(p(48, 0, 0)).unwrap();
+        let c = w.get_leaf_chunk_arc_at_origin(p(64, 0, 0)).unwrap();
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "same-type uniform chunks should be shared"
+        );
+        assert!(!Arc::ptr_eq(&a, &c));
+        assert_eq!(a.dominant_type, 7);
+        assert_eq!(c.dominant_type, 8);
+    }
+
+    #[test]
+    fn editing_inside_a_coarse_solid_keeps_the_rest_of_it() {
+        let mut w = World::new(3);
+        w.set_uniform_solid([256, 0, 0], 256, 4);
+        assert_eq!(w.get(p(300, 20, 30)), Some(4));
+
+        w.remove(p(300, 20, 30));
+        assert_eq!(w.get(p(300, 20, 30)), None);
+        assert_eq!(w.get(p(301, 20, 30)), Some(4));
+        assert_eq!(w.get(p(300, 21, 30)), Some(4));
+        assert_eq!(w.get(p(511, 255, 255)), Some(4));
+        assert_eq!(w.get(p(256, 0, 0)), Some(4));
+
+        w.set(p(300, 20, 30), 9);
+        assert_eq!(w.get(p(300, 20, 30)), Some(9));
+        assert_eq!(w.get(p(300, 20, 31)), Some(4));
+        // the edited leaf chunk reports the edit, a neighbouring one is still uniform
+        let edited = w.get_leaf_chunk_at_origin(p(288, 16, 16)).unwrap();
+        assert_eq!(edited.get_type(12, 4, 14), Some(9));
+        assert_eq!(edited.get_type(11, 4, 14), Some(4));
+        assert_eq!(
+            w.get_leaf_chunk_at_origin(p(304, 16, 16)).unwrap().count(),
+            4096
+        );
+    }
+
+    #[test]
+    fn randomized_edits_match_a_shadow_model() {
+        let mut rng = StdRng::seed_from_u64(0xC0A25E5);
+        for depth in [2u8, 3, 4] {
+            let mut w = World::new(depth);
+            // coarse solids (lo, size, type), placed coarse -> fine so the finer one replaces part
+            // of the coarser one (the model lets the smallest box win)
+            let mut boxes: Vec<([i64; 3], i64, VoxelType)> = Vec::new();
+            let origins: [[i64; 3]; 3] = [[48, 16, 80], [256, 0, 256], [0, 0, 0]]; // by level k-1
+            for k in (1..depth as u32).rev() {
+                let sz = 16i64.pow(k);
+                let o = if depth == 2 {
+                    [32, 16, 48]
+                } else {
+                    origins[k as usize - 1]
+                };
+                w.set_uniform_solid(o, sz, 1 + k as u8);
+                boxes.push((o, sz, 1 + k as u8));
+            }
+            let base = |pos: WorldPos| -> Option<VoxelType> {
+                boxes
+                    .iter()
+                    .filter(|&&(lo, sz, _)| {
+                        (0..3).all(|a| {
+                            let c = [pos.x, pos.y, pos.z][a];
+                            c >= lo[a] && c < lo[a] + sz
+                        })
+                    })
+                    .min_by_key(|&&(_, sz, _)| sz)
+                    .map(|&(_, _, t)| t)
+            };
+            let mut overrides: HashMap<(i64, i64, i64), Option<VoxelType>> = HashMap::new();
+            let span = 16i64.pow(depth as u32).min(300);
+            for step in 0..3000 {
+                let pos = p(
+                    rng.gen_range(0..span),
+                    rng.gen_range(0..span.min(80)),
+                    rng.gen_range(0..span),
+                );
+                if rng.gen_bool(0.5) {
+                    let t = rng.gen_range(1..9);
+                    w.set(pos, t);
+                    overrides.insert((pos.x, pos.y, pos.z), Some(t));
+                } else {
+                    w.remove(pos);
+                    overrides.insert((pos.x, pos.y, pos.z), None);
+                }
+                // probe a few random positions
+                for _ in 0..4 {
+                    let q = p(
+                        rng.gen_range(0..span),
+                        rng.gen_range(0..span.min(80)),
+                        rng.gen_range(0..span),
+                    );
+                    let want = match overrides.get(&(q.x, q.y, q.z)) {
+                        Some(v) => *v,
+                        None => base(q),
+                    };
+                    assert_eq!(w.get(q), want, "depth {depth} step {step} {q:?}");
+                }
+            }
+            for (&(x, y, z), &v) in &overrides {
+                assert_eq!(w.get(p(x, y, z)), v, "depth {depth} final {x},{y},{z}");
+            }
+        }
     }
 }

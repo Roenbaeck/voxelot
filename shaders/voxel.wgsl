@@ -52,7 +52,31 @@ struct Uniforms {
     _pad_gi0: f32,
     _pad_gi1: f32,
     _pad_gi2: f32,
-    _pad_gi3: vec4<f32>,
+    // rgb = shared horizon haze colour (skybox horizon after the day/night transform),
+    // w = atmosphere.horizon_haze_strength: density scale of the shared model (0 = legacy fog colours).
+    haze_color: vec4<f32>,
+}
+
+// Shared sky/haze model constants (keep identical in water.wgsl, skybox.wgsl, impostor.wgsl).
+// Strength of the sun-facing brightening of haze.
+const HAZE_SUN_GLOW: f32 = 0.15;
+// Haze density falls off exponentially above the water level with this scale height, so
+// coastal horizons stay hazed while views from height keep their contrast.
+const HAZE_SCALE_HEIGHT: f32 = 140.0;
+
+// Fraction of light replaced by haze between `camera` and `point` (distance `dist`): the
+// exponential height profile integrated analytically along the segment.
+fn haze_amount(point: vec3<f32>, camera_pos: vec3<f32>, dist: f32, density: f32, base_height: f32) -> f32 {
+    let camera_height = max(camera_pos.y - base_height, 0.0);
+    let point_height = max(point.y - base_height, 0.0);
+    let camera_density = exp(-camera_height / HAZE_SCALE_HEIGHT);
+    let height_delta = point_height - camera_height;
+    var height_factor = camera_density;
+    if (abs(height_delta) > 1.0) {
+        height_factor = HAZE_SCALE_HEIGHT
+            * (camera_density - exp(-point_height / HAZE_SCALE_HEIGHT)) / height_delta;
+    }
+    return 1.0 - exp(-dist * density * height_factor);
 }
 
 struct LightProbe {
@@ -239,6 +263,22 @@ struct FogResult {
 }
 
 fn compute_fog(distance: f32, ray_dir: vec3<f32>, sun_dir: vec3<f32>) -> FogResult {
+    if (uniforms.haze_color.w > 0.0) {
+        // Shared sky/haze model: distant land fades to the colour the sky shows at the
+        // horizon (skybox.wgsl blends its horizon band to the same colour; water.wgsl and
+        // impostor.wgsl use the same terms), so land, water and sky meet without a seam.
+        // The haze colour is derived from the dimmed night sky, so night stays dark.
+        let point = uniforms.camera_shadow_strength.xyz + ray_dir * distance;
+        let fog_factor = haze_amount(
+            point,
+            uniforms.camera_shadow_strength.xyz,
+            distance,
+            uniforms.fog_time_pad.x * uniforms.haze_color.w,
+            uniforms.water_level,
+        );
+        let sun_glow = uniforms.sun_color_pad.xyz * HAZE_SUN_GLOW * max(dot(ray_dir, sun_dir), 0.0);
+        return FogResult(uniforms.haze_color.rgb, fog_factor, sun_glow);
+    }
     let base_fog_color = vec3<f32>(0.7, 0.8, 0.9);
     let skybox_brightness = uniforms.fog_time_pad.w;
     let night_fog = vec3<f32>(0.02, 0.02, 0.03);
@@ -361,6 +401,25 @@ struct FragmentOutput {
     @location(1) emissive: vec4<f32>,
     @location(2) normal: vec2<f32>,
     @location(3) material: f32,
+    // Surface G-buffer: rgb = albedo * haze transmittance (multiplies screen-space indirect
+    // light in post_composite.wgsl), a = share of the final radiance that contact AO may
+    // occlude (sky ambient, moon, probe GI: not shadow-mapped sun, emission or haze).
+    @location(4) surface: vec4<f32>,
+}
+
+const SURFACE_LUMA: vec3<f32> = vec3<f32>(0.2126, 0.7152, 0.0722);
+
+fn pack_surface(
+    albedo: vec3<f32>,
+    fog_factor: f32,
+    occludable_light: vec3<f32>,
+    surface_scale: f32,
+    final_rgb: vec3<f32>,
+) -> vec4<f32> {
+    let transmittance = clamp(1.0 - fog_factor, 0.0, 1.0);
+    let occludable = dot(albedo * occludable_light, SURFACE_LUMA) * transmittance * surface_scale;
+    let total = dot(final_rgb, SURFACE_LUMA);
+    return vec4<f32>(albedo * transmittance, clamp(occludable / max(total, 1.0e-4), 0.0, 1.0));
 }
 
 fn oct_encode(n_in: vec3<f32>) -> vec2<f32> {
@@ -414,6 +473,9 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     let indirect_light = compute_light_probes(input.world_pos);
     
     let lighting = ambient + sun_contribution + moon_light + indirect_light;
+    // The part of the surface light a nearby occluder can block (everything but shadow-mapped sun).
+    var occludable_lighting = ambient + moon_light + indirect_light;
+    var surface_ao = input.ao;
     
     // emissive_strength is already defined above
     let ao = input.ao; // AO passed separately from instance AO attribute
@@ -427,12 +489,14 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
 
     // Check if we are a fallback bounding box (scale is 16)
     if (input.scale > 15.0) {
+        surface_ao = 1.0; // fallback boxes are shaded without the per-instance AO
         let chunk_coord = vec3<i32>(floor(input.world_pos / 16.0)) - camera.gi_grid_origin;
         
         if (all(chunk_coord >= vec3<i32>(0)) && all(chunk_coord < camera.gi_grid_dims)) {
             let relaxed_phi = textureLoad(gi_relaxed_phi, chunk_coord, 0).rgb;
             let radiance = sample_radiance_int(chunk_coord, input.normal);
             let total_lighting = lighting + (relaxed_phi * 0.4 + radiance * uniforms.gi_scale);
+            occludable_lighting += relaxed_phi * 0.4 + radiance * uniforms.gi_scale;
             
             // Simplified distant reflection
             var reflection = vec3<f32>(0.0);
@@ -533,6 +597,13 @@ fn fs_main(input: VertexOutputInstanced) -> FragmentOutput {
     
     // Material reflectivity (1-channel unorm)
     out.material = reflectivity;
+    out.surface = pack_surface(
+        input.color.rgb,
+        fog_factor,
+        occludable_lighting * surface_ao,
+        uw.color_mod * (1.0 - uw.deep_fade),
+        brightened + final_emissive,
+    );
     return out;
 }
 
@@ -589,6 +660,8 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     
     let base_lighting = ambient + sun_contribution + moon_light + indirect_light;
     var lighting = base_lighting;
+    // The part of the surface light a nearby occluder can block (everything but shadow-mapped sun).
+    var occludable_lighting = ambient + moon_light + indirect_light;
     
     let chunk_coord = vec3<i32>(floor(input.world_pos / 16.0)) - camera.gi_grid_origin;
     if (all(chunk_coord >= vec3<i32>(0)) && all(chunk_coord < camera.gi_grid_dims)) {
@@ -596,7 +669,9 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
         let radiance = sample_radiance_int(chunk_coord, input.normal);
         // Reduce the weight of relaxed_phi when added to direct sun to prevent extreme overexposure.
         // It should act as an ambient/indirect term. 
-        lighting += (relaxed_phi * 0.4 + (radiance * uniforms.gi_scale));
+        let grid_light = relaxed_phi * 0.4 + (radiance * uniforms.gi_scale);
+        lighting += grid_light;
+        occludable_lighting += grid_light;
     }
     
     // emissive_strength is already defined above
@@ -683,8 +758,19 @@ fn fs_mesh(input: VertexOutputMesh) -> FragmentOutput {
     
     // Material reflectivity (1-channel unorm)
     out.material = reflectivity;
+    out.surface = pack_surface(
+        input.color.rgb,
+        fog_factor,
+        occludable_lighting * input.color.a,
+        uw_mesh.color_mod * (1.0 - uw_mesh.deep_fade),
+        brightened + final_emissive,
+    );
     return out;
 }
+
+// Width (in shadow-map UV) of the band inside the map edge over which shadows fade to
+// unshadowed, so the end of shadow coverage reads as a soft falloff rather than a line.
+const SHADOW_EDGE_FADE_UV: f32 = 0.06;
 
 fn compute_shadow(light_space_pos: vec4<f32>, normal: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
     if (light_space_pos.w <= 0.0) {
@@ -693,16 +779,23 @@ fn compute_shadow(light_space_pos: vec4<f32>, normal: vec3<f32>, sun_dir: vec3<f
 
     let proj_coords = light_space_pos.xyz / light_space_pos.w;
     let uv = vec2<f32>(proj_coords.x * 0.5 + 0.5, 0.5 - proj_coords.y * 0.5);
-    // If the projection falls outside the shadow map we still want a sensible
-    // fallback rather than returning fully unshadowed (1.0) which creates a
-    // visible horizontal 'cutoff' as the light or camera moves. Instead, clamp
-    // the UV to the shadow map edge and continue sampling; this produces a
-    // smoother transition at the shadow map boundary and avoids the hard
-    // brightness line seen at certain times of day.
-    let uv_clamped = clamp(uv, vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0));
-    let outside = (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0);
+    // Receivers outside this camera-centred shadow map are unshadowed. (Clamping their UV
+    // repeated the border texels across the distant world, smearing a large uniform
+    // rectangular shadow.) To avoid a hard brightness line at the map boundary, the shadow
+    // fades out over a band just inside the edge, starting beyond the PCF filter footprint.
+    if (proj_coords.z <= 0.0 || proj_coords.z >= 1.0) {
+        return 1.0;
+    }
+    let filter_margin = max(uniforms.shadow_texel_size_pad.x, uniforms.shadow_texel_size_pad.y)
+        * (uniforms.shadow_texel_size_pad.z + 1.0);
+    let edge_dist = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y)) - filter_margin;
+    if (edge_dist <= 0.0) {
+        return 1.0;
+    }
+    let edge_fade = smoothstep(0.0, SHADOW_EDGE_FADE_UV, edge_dist);
+    let uv_clamped = uv;
 
-    let depth = clamp(proj_coords.z, 0.0, 1.0);
+    let depth = proj_coords.z;
     let base_bias = uniforms.sun_direction_shadow_bias.w;
     let ndotl = max(dot(normal, sun_dir), 0.0);
     // Slope bias: more bias when surface is at grazing angle to light
@@ -747,13 +840,12 @@ fn compute_shadow(light_space_pos: vec4<f32>, normal: vec3<f32>, sun_dir: vec3<f
             let base_off = poisson[i];
             let roff = rot * base_off;
             let off = roff * texel_size * radius;
-            // Clamp sampling coordinates to avoid reading outside the shadow map
-            // when the fragment projects outside the shadow map. This helps
-            // remove the harsh transition between clamped/unclamped sampling.
-            shadow_val += textureSampleCompare(shadow_map, shadow_sampler, uv_clamped + off, depth_ref);
+            // Taps stay inside the map: receivers within `filter_margin` of the edge
+            // returned unshadowed above.
+            shadow_val += textureSampleCompareLevel(shadow_map, shadow_sampler, uv_clamped + off, depth_ref);
             count = count + 1;
         }
-        return shadow_val / f32(count);
+        return mix(1.0, shadow_val / f32(count), edge_fade);
     } else {
         // 3x3 Gaussian weights (sum = 16)
         let weights = array<f32, 9>(1.0, 2.0, 1.0, 2.0, 4.0, 2.0, 1.0, 2.0, 1.0);
@@ -762,11 +854,11 @@ fn compute_shadow(light_space_pos: vec4<f32>, normal: vec3<f32>, sun_dir: vec3<f
         for (var y: i32 = -1; y <= 1; y = y + 1) {
             for (var x: i32 = -1; x <= 1; x = x + 1) {
                 let off = vec2<f32>(f32(x), f32(y)) * texel_size * radius;
-                shadow += weights[idx] * textureSampleCompare(shadow_map, shadow_sampler, uv_clamped + off, depth_ref);
+                shadow += weights[idx] * textureSampleCompareLevel(shadow_map, shadow_sampler, uv_clamped + off, depth_ref);
                 idx = idx + 1;
             }
         }
-        return shadow / 16.0;
+        return mix(1.0, shadow / 16.0, edge_fade);
     }
 }
 
