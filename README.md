@@ -55,6 +55,9 @@ Storage is proportional to *entropy*, not volume.
 ## Quick Start
 
 ```bash
+# Shortest way: start the viewer with the demo city (or ./run.sh large_world_test, etc.)
+./run.sh
+
 # Run the interactive viewer (release recommended). Use the default `config.toml` in the
 # current working directory, or pass a custom config via `--config` or as a single positional
 # argument (the positional argument is identical to providing `--config` explicitly):

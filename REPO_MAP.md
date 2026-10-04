@@ -18,6 +18,7 @@ Path | Type | Description | Notes
 `Cargo.lock` | file | Locked dependency graph for reproducible CI/Builds. | Commit in app repos for stable CI.
 `README.md` | file | High-level project overview, quick-start, controls and architecture notes. | Good first read for contributors.
 `SELF.md` | file | The Agent's Living Identity — persistent context across model switches and sessions. | **Read first** to maintain cognitive continuity.
+`run.sh` | script | Starts the viewer (release) with a world: `./run.sh` = `worlds/flat_city_test.toml`, `./run.sh large_world_test`, or a config path. | Extra args go to the viewer; the viewer saves the config it was started with on exit.
 `LICENSE` | file | Project license text.
 `CONFIGURATION.md` | doc | Full reference for `config.toml` options and defaults (derived from `src/config.rs`). | Useful when editing runtime configuration.
 `WGPU_28.md` | doc | Migration notes and breaking-change checklist for `wgpu` v28. | Important when touching rendering/shader code.
