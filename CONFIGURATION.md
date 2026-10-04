@@ -266,6 +266,12 @@ Each entry shows the default value (as found in `src/config.rs`), a short descri
   - Used: `src/bin/voxelot.rs` (`build_composite_uniforms`, surface G-buffer target), `shaders/post_composite.wgsl`, `shaders/voxel.wgsl`, `shaders/impostor.wgsl`, `shaders/skybox.wgsl`
   - Effect of change: `false` restores the old behaviour: indirect light is added unmodulated (and without the x2 compensation).
 
+- `emissive_gain` (float)
+  - Default: `5.0`
+  - Description: Multiplier on the light that emissive voxels (windows, lamps) add to the GI probes (`src/gi.rs`). Probe rays now use correct line of sight, so an emitter only lights what it can see: buried emissive voxels no longer leak light through walls, and a window set flush in a facade is traced to the open cell in front of its exposed face (it only lights what that face points at). In the generated cities a window is a column of emissive voxels of which only the front one is exposed (about 3 of 4 are buried), so the exposed voxel stands in for the column behind it; 5 gives about the same total probe energy around the city as the old occlusion-free lighting had.
+  - Used: `src/gi.rs` (`GiSystem::with_emissive_gain`, `spawn_gi_worker`), `src/bin/voxelot.rs`
+  - Effect of change: Higher values make lit buildings glow more strongly on the surfaces facing their windows; `0` disables emissive probe light. Only affects the probes (not the screen-space window glow, SSAO or reflections).
+
 ---
 ### Screen-Space Reflections (`effects.ssr`)
 

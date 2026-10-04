@@ -3863,8 +3863,12 @@ impl App {
         // Spawn GI worker thread (similar to mesh workers)
         log::info!("Spawning GI worker thread...");
         let gi_grid_dims = glam::IVec3::from_array(cfg.effects.gi.grid_dims);
-        let (gi_request_tx, gi_result_rx) =
-            voxelot::gi::spawn_gi_worker(world.clone(), palette.clone(), gi_grid_dims);
+        let (gi_request_tx, gi_result_rx) = voxelot::gi::spawn_gi_worker(
+            world.clone(),
+            palette.clone(),
+            gi_grid_dims,
+            cfg.effects.gi.emissive_gain,
+        );
 
         let mesh_upload_baseline = cfg.performance.mesh_upload_baseline;
         let mesh_upload_max = (mesh_worker_count * 4).max(mesh_upload_baseline * 2);

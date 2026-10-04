@@ -43,9 +43,31 @@ pub struct GiProbeUpdate {
 struct EmissiveVoxel {
     /// Local position within chunk (0..15)
     local_pos: [u8; 3],
-    /// Pre-multiplied emission (color * intensity * 10.0)
+    /// Pre-multiplied emission (color * intensity * 10.0 * emissive gain)
     emission: Vec3,
+    /// Bit i set when the neighbour across face i (+X, -X, +Y, -Y, +Z, -Z) is empty, i.e. the
+    /// voxel can emit through that face.
+    exposed: u8,
 }
+
+/// Face normals in the bit order of `EmissiveVoxel::exposed`.
+const FACE_NORMALS: [(i64, i64, i64); 6] = [
+    (1, 0, 0),
+    (-1, 0, 0),
+    (0, 1, 0),
+    (0, -1, 0),
+    (0, 0, 1),
+    (0, 0, -1),
+];
+
+/// Default for `GiSystem::emissive_gain` (`effects.gi.emissive_gain`).
+///
+/// An emitter only lights what it can see, so voxels buried inside a building no longer leak
+/// light through its walls. In the generated cities a window is a column of emissive voxels of
+/// which only the front one is exposed (3 of 4 are buried), so the exposed voxel stands in for
+/// the column behind it. 5 restores about the same total probe energy the old
+/// (occlusion-free) lighting had around the city, now falling where windows actually face.
+pub const DEFAULT_EMISSIVE_GAIN: f32 = 5.0;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -81,10 +103,12 @@ pub struct GiSystem {
     // Caches
     probe_cache: HashMap<IVec3, GiProbe>,
     // Chunk coordinate -> List of emissive voxels (position, intensity)
-    light_cache: HashMap<IVec3, Vec<(Vec3, Vec3)>>,
+    light_cache: HashMap<IVec3, Vec<(Vec3, Vec3, u8)>>,
     // Separate index: chunk coordinate -> emissive voxels in that chunk
     // This avoids O(16³) scans when building light_cache
     emissive_index: HashMap<IVec3, Vec<EmissiveVoxel>>,
+    /// Multiplier on emissive voxels' light contribution to the probes.
+    emissive_gain: f32,
     // Track missing probes incrementally to avoid full grid scan every update
     missing_probes: Vec<IVec3>,
     last_grid_origin: IVec3,
@@ -98,9 +122,16 @@ impl GiSystem {
             probe_cache: HashMap::new(),
             light_cache: HashMap::new(),
             emissive_index: HashMap::new(),
+            emissive_gain: DEFAULT_EMISSIVE_GAIN,
             missing_probes: Vec::new(),
             last_grid_origin: IVec3::new(i32::MAX, i32::MAX, i32::MAX), // Force initial scan
         }
+    }
+
+    /// Set the multiplier on emissive voxels' light contribution (see `DEFAULT_EMISSIVE_GAIN`).
+    pub fn with_emissive_gain(mut self, gain: f32) -> Self {
+        self.emissive_gain = gain.max(0.0);
+        self
     }
 
     fn local_index_for_coord(&self, chunk_coord: IVec3) -> Option<u32> {
@@ -326,6 +357,7 @@ impl GiSystem {
 
             // 4. Build emissive index for new chunks (in parallel)
             // This replaces the O(16³) voxel scan with O(E) where E = # emissive voxels
+            let emissive_gain = self.emissive_gain;
             let new_emissive_data: Vec<(IVec3, Vec<EmissiveVoxel>)> = required_light_chunks
                 .par_iter()
                 .filter_map(|&chunk_coord| {
@@ -348,10 +380,40 @@ impl GiSystem {
                                     if let Some(vtype) = chunk.get_type(lx, ly, lz) {
                                         let (color, intensity) = palette.emissive(vtype as u32);
                                         if intensity > 0.0 {
-                                            let emission = Vec3::from(color) * intensity * 10.0;
+                                            let emission = Vec3::from(color)
+                                                * intensity
+                                                * 10.0
+                                                * emissive_gain;
+                                            let mut exposed = 0u8;
+                                            for (i, (dx, dy, dz)) in FACE_NORMALS.iter().enumerate()
+                                            {
+                                                let (nx, ny, nz) = (
+                                                    lx as i64 + dx,
+                                                    ly as i64 + dy,
+                                                    lz as i64 + dz,
+                                                );
+                                                let inside = (0..16).contains(&nx)
+                                                    && (0..16).contains(&ny)
+                                                    && (0..16).contains(&nz);
+                                                let empty = if inside {
+                                                    !chunk.contains(nx as u8, ny as u8, nz as u8)
+                                                } else {
+                                                    world
+                                                        .get(WorldPos::new(
+                                                            origin.x + nx,
+                                                            origin.y + ny,
+                                                            origin.z + nz,
+                                                        ))
+                                                        .is_none()
+                                                };
+                                                if empty {
+                                                    exposed |= 1 << i;
+                                                }
+                                            }
                                             emissives.push(EmissiveVoxel {
                                                 local_pos: [lx, ly, lz],
                                                 emission,
+                                                exposed,
                                             });
                                         }
                                     }
@@ -374,7 +436,7 @@ impl GiSystem {
             }
 
             // 4b. Build light_cache from emissive_index (fast, no voxel scanning)
-            let new_lights: Vec<(IVec3, Vec<(Vec3, Vec3)>)> = required_light_chunks
+            let new_lights: Vec<(IVec3, Vec<(Vec3, Vec3, u8)>)> = required_light_chunks
                 .into_iter()
                 .filter_map(|chunk_coord| {
                     let emissives = self.emissive_index.get(&chunk_coord)?;
@@ -382,7 +444,7 @@ impl GiSystem {
                         return None;
                     }
 
-                    let lights: Vec<(Vec3, Vec3)> = emissives
+                    let lights: Vec<(Vec3, Vec3, u8)> = emissives
                         .iter()
                         .map(|ev| {
                             let voxel_pos = Vec3::new(
@@ -390,7 +452,7 @@ impl GiSystem {
                                 (chunk_coord.y as f32 * 16.0) + ev.local_pos[1] as f32 + 0.5,
                                 (chunk_coord.z as f32 * 16.0) + ev.local_pos[2] as f32 + 0.5,
                             );
-                            (voxel_pos, ev.emission)
+                            (voxel_pos, ev.emission, ev.exposed)
                         })
                         .collect();
                     Some((chunk_coord, lights))
@@ -530,7 +592,7 @@ impl GiSystem {
                             continue;
                         }
 
-                        for (light_pos, light_energy) in &all_lights {
+                        for (light_pos, light_energy, exposed) in &all_lights {
                             let delta = *light_pos - face_center;
                             if delta.dot(face_normal) <= 0.0 {
                                 continue;
@@ -546,19 +608,46 @@ impl GiSystem {
                             let cos_theta = dir.dot(face_normal);
 
                             // Use hierarchical line_of_sight instead of DDA. The segment runs
-                            // between the centres of the face-centre voxel and the emitter voxel;
-                            // `end_pos` is the emitter's own voxel, which line_of_sight does not
-                            // count as a blocker, so it never shadows its own light.
+                            // between the centres of the face-centre voxel and the end voxel.
+                            // `end_pos` is not counted as a blocker, so an emitter never shadows
+                            // its own light.
                             let start_pos = WorldPos::new(
                                 face_center.x.floor() as i64,
                                 face_center.y.floor() as i64,
                                 face_center.z.floor() as i64,
                             );
-                            let end_pos = WorldPos::new(
+                            let mut end_pos = WorldPos::new(
                                 light_pos.x.floor() as i64,
                                 light_pos.y.floor() as i64,
                                 light_pos.z.floor() as i64,
                             );
+                            if *exposed != 0 {
+                                // An emitter lights what it faces: trace to the open cell in front
+                                // of the exposed face that points best at the receiver. Ending at
+                                // the voxel's own centre would make a window set flush in a facade
+                                // invisible from any angle beyond 45 degrees, because the ray
+                                // first crosses the facade voxels beside it. An emitter whose
+                                // exposed faces all point away from the receiver gives no light.
+                                let mut best = 0.0f32;
+                                let mut best_face = None;
+                                for (i, (nx, ny, nz)) in FACE_NORMALS.iter().enumerate() {
+                                    if exposed & (1 << i) == 0 {
+                                        continue;
+                                    }
+                                    let facing =
+                                        (-dir).dot(Vec3::new(*nx as f32, *ny as f32, *nz as f32));
+                                    if facing > best {
+                                        best = facing;
+                                        best_face = Some(i);
+                                    }
+                                }
+                                let Some(face) = best_face else {
+                                    continue;
+                                };
+                                let (nx, ny, nz) = FACE_NORMALS[face];
+                                end_pos =
+                                    WorldPos::new(end_pos.x + nx, end_pos.y + ny, end_pos.z + nz);
+                            }
 
                             if !world.line_of_sight(start_pos, end_pos) {
                                 continue;
@@ -607,6 +696,7 @@ pub fn spawn_gi_worker(
     initial_world: Arc<World>,
     palette: Arc<Palette>,
     grid_dims: IVec3,
+    emissive_gain: f32,
 ) -> (Sender<GiUpdateRequest>, Receiver<GiUpdateResult>) {
     let (request_tx, request_rx) = crossbeam_channel::unbounded::<GiUpdateRequest>();
     let (result_tx, result_rx) = crossbeam_channel::unbounded::<GiUpdateResult>();
@@ -614,7 +704,7 @@ pub fn spawn_gi_worker(
     std::thread::Builder::new()
         .name("gi-worker".to_string())
         .spawn(move || {
-            let mut gi_system = GiSystem::new(grid_dims);
+            let mut gi_system = GiSystem::new(grid_dims).with_emissive_gain(emissive_gain);
             let mut world = initial_world;
 
             while let Ok(request) = request_rx.recv() {
@@ -723,6 +813,69 @@ mod tests {
         world.set(WorldPos::new(7 * 16 + 9, 8, 5 * 16 + 8), 2);
         let probe = probe_at(&mut world, PROBE);
         assert!(probe.light_data[0][0] > 0.0);
+    }
+
+    /// A wall plane at x = 120 (chunk 7) spanning z 120..136 and y 4..13, with an emitter embedded
+    /// in it. The probe of chunk (5,0,5) samples its +X bin at (81, 8, 88); an emitter at z = 133 is
+    /// ~49 degrees off the wall normal and ~60 units away, so the straight ray to the emitter's
+    /// centre first crosses the wall's own voxels beside it.
+    fn world_with_wall_emitter(emitter_z: i64) -> World {
+        let mut world = World::new(3);
+        for y in 4..13 {
+            for z in 120..136 {
+                world.set(WorldPos::new(120, y, z), 1);
+            }
+        }
+        world.set(WorldPos::new(120, 8, emitter_z), 2);
+        world
+    }
+
+    #[test]
+    fn window_flush_in_a_wall_lights_a_probe_seen_at_an_angle() {
+        let mut world = world_with_wall_emitter(133);
+        let probe = probe_at(&mut world, PROBE);
+        assert!(
+            probe.light_data[0][0] > 0.0,
+            "an emitter flush in a facade must light what it faces, even at an angle: {:?}",
+            probe.light_data[0]
+        );
+    }
+
+    #[test]
+    fn emitter_whose_only_exposed_face_points_away_gives_no_light() {
+        // Probe on the -X side of a wall; the emitter is exposed only towards +X (away from it).
+        let mut world = World::new(3);
+        for y in 6..11 {
+            for z in 86..91 {
+                world.set(WorldPos::new(7 * 16 + 7, y, z), 1); // wall in front of the emitter
+                world.set(WorldPos::new(7 * 16 + 9, y, z), 0);
+            }
+        }
+        world.set(WorldPos::new(7 * 16 + 8, 8, 5 * 16 + 8), 2);
+        for (dy, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            world.set(WorldPos::new(7 * 16 + 8, 8 + dy, 5 * 16 + 8 + dz), 1);
+        }
+        let probe = probe_at(&mut world, PROBE);
+        assert_eq!(probe.light_data[0], [0.0; 4], "{:?}", probe.light_data[0]);
+    }
+
+    #[test]
+    fn emissive_gain_scales_the_probe_light() {
+        let light_with = |gain: f32| {
+            let mut world = world_with_emitter();
+            world.update_all_lod_metadata(&palette());
+            let mut gi = GiSystem::new(IVec3::new(9, 3, 9)).with_emissive_gain(gain);
+            let camera = (PROBE * 16).as_vec3() + Vec3::splat(8.0);
+            gi.update(&world, &palette(), camera, &[], &[]);
+            gi.probe_cache[&PROBE].light_data[0][0]
+        };
+        let one = light_with(1.0);
+        assert!(one > 0.0);
+        assert!(
+            (light_with(2.5) - 2.5 * one).abs() < 1e-3 * one,
+            "gain must scale linearly"
+        );
+        assert_eq!(light_with(0.0), 0.0);
     }
 
     #[test]

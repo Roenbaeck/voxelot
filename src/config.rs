@@ -299,6 +299,16 @@ pub struct GiConfig {
     /// and attenuate it by the same haze as direct light. false = legacy (added unmodulated).
     #[serde(default = "default_gi_albedo_modulated")]
     pub albedo_modulated: bool,
+    /// Multiplier on the light that emissive voxels (windows, lamps) add to the GI probes. An
+    /// emitter only lights what it can see, so buried emissive voxels no longer leak through
+    /// walls; the default compensates for that, since in the generated cities only the front
+    /// voxel of a window column is exposed. 0 disables emissive probe light.
+    #[serde(default = "default_gi_emissive_gain")]
+    pub emissive_gain: f32,
+}
+
+fn default_gi_emissive_gain() -> f32 {
+    crate::gi::DEFAULT_EMISSIVE_GAIN
 }
 
 fn default_gi_albedo_modulated() -> bool {
@@ -862,6 +872,7 @@ impl Default for GiConfig {
             fade_range: default_gi_fade_range(),
             grid_dims: default_gi_grid_dims(),
             albedo_modulated: default_gi_albedo_modulated(),
+            emissive_gain: default_gi_emissive_gain(),
         }
     }
 }
@@ -971,15 +982,17 @@ mod tests {
         let cfg: Config = toml::from_str("").unwrap();
         assert!((cfg.atmosphere.horizon_haze_strength - 0.35).abs() < 1e-6);
         assert!(cfg.effects.gi.albedo_modulated);
+        assert!((cfg.effects.gi.emissive_gain - crate::gi::DEFAULT_EMISSIVE_GAIN).abs() < 1e-6);
         assert!(cfg.effects.ssao.ambient_only);
         assert!(cfg.rendering.fxaa_enabled);
         let cfg: Config = toml::from_str(
-            "[atmosphere]\nhorizon_haze_strength = 0.0\n[effects.gi]\nalbedo_modulated = false\n\
+            "[atmosphere]\nhorizon_haze_strength = 0.0\n[effects.gi]\nalbedo_modulated = false\nemissive_gain = 2.5\n\
              [effects.ssao]\nambient_only = false\n",
         )
         .unwrap();
         assert_eq!(cfg.atmosphere.horizon_haze_strength, 0.0);
         assert!(!cfg.effects.gi.albedo_modulated);
+        assert_eq!(cfg.effects.gi.emissive_gain, 2.5);
         assert!(!cfg.effects.ssao.ambient_only);
     }
 }
